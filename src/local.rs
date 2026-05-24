@@ -9,23 +9,26 @@ use crate::api::{
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
-    AppendCommit, AppendLease, CreateFileRequest, FileInfo, NativeFile, NativeFileClient,
-    NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer,
-    NativeTransport,
+    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, KeyspaceInfo,
+    NativeFile, NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope, NativeResponse,
+    NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
 };
 use crate::id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
-    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, LogicalTime, MetadataNodeId,
-    RequestId, SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
+    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceGeneration, KeyspaceId,
+    KeyspaceRootId, LogicalTime, MetadataNodeId, RequestId, SegmentId, StorageNodeId,
+    WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, ForkRecord, LeafEntry,
-    MappingOwner, MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor,
-    ShardCommit, ShardRootUpdate,
+    Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
+    ForkRecord, KeyspaceCommit, KeyspaceFile, KeyspaceHead, KeyspaceRoot, LeafEntry, MappingOwner,
+    MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardCommit,
+    ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
-    MetadataFence, MetadataForkRequest, MetadataPlane, RetentionPolicy, SegmentReplicaCommit,
+    MetadataCreateKeyspaceRequest, MetadataFence, MetadataForkRequest, MetadataPlane,
+    MetadataSnapshotKeyspaceRequest, RetentionPolicy, SegmentReplicaCommit,
     SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent, SegmentStore,
 };
 
@@ -299,8 +302,12 @@ impl LocalObjectStore {
         })
     }
 
-    pub fn acquire_append_lease(&self, file_id: FileId) -> Result<AppendLease> {
-        self.metadata.acquire_append_lease(file_id)
+    pub fn acquire_append_lease(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<AppendLease> {
+        self.metadata.acquire_append_lease(keyspace_id, file_id)
     }
 
     pub fn append_file(
@@ -316,29 +323,66 @@ impl LocalObjectStore {
         }
         let data_len = u64::try_from(data.len())
             .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
-        if data_len % u64::from(self.metadata.config.block_size) != 0 {
-            return Err(StorageError::invalid_argument(
-                "append payload must be block aligned",
-            ));
-        }
 
-        let head = self.metadata.get_file_head(lease.file_id)?;
+        let head = self
+            .metadata
+            .get_file_head(lease.keyspace_id, lease.file_id)?;
         if head.version != lease.base_version {
             return Err(StorageError::conflict("stale append lease"));
         }
-        self.metadata
-            .validate_writer_epoch(lease.file_id, lease.writer_epoch)?;
+        self.metadata.validate_writer_epoch(
+            lease.keyspace_id,
+            lease.file_id,
+            lease.writer_epoch,
+        )?;
 
-        let owner = MappingOwner::NativeFile(lease.file_id);
+        let owner = MappingOwner::NativeKeyspace(lease.keyspace_id);
+        let block_size = u64::from(self.metadata.config.block_size);
+        let tail_bytes = head.size % block_size;
+        let segment_start_block = head.size / block_size;
+        let segment_payload_len = tail_bytes
+            .checked_add(data_len)
+            .ok_or_else(|| StorageError::invalid_argument("append segment length overflows"))?;
+        let segment_blocks = blocks_for_bytes(segment_payload_len, block_size)?;
+        let segment_len = segment_blocks.checked_mul(block_size).ok_or_else(|| {
+            StorageError::invalid_argument("append segment byte length overflows")
+        })?;
+        let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
+            StorageError::invalid_argument("append segment byte length overflows usize")
+        })?;
+        let mut segment_bytes = Vec::with_capacity(segment_len_usize);
+
+        if tail_bytes != 0 {
+            let tail_range = crate::api::BlockRange::new(
+                BlockIndex::from_raw(segment_start_block),
+                BlockCount::from_raw(1),
+            );
+            if !self.tree_has_mappings(head.root, tail_range)? {
+                return Err(StorageError::corrupt(
+                    "unaligned native file size has no tail block mapping",
+                ));
+            }
+            let block_size_usize = usize::try_from(block_size)
+                .map_err(|_| StorageError::invalid_argument("block size overflows usize"))?;
+            let tail_bytes_usize = usize::try_from(tail_bytes)
+                .map_err(|_| StorageError::invalid_argument("tail byte count overflows usize"))?;
+            let mut tail_block = vec![0; block_size_usize];
+            let root = self.metadata.get_metadata_node(head.root)?;
+            self.read_metadata_node(&root, tail_range, block_size, &mut tail_block)?;
+            segment_bytes.extend_from_slice(&tail_block[..tail_bytes_usize]);
+        }
+
+        segment_bytes.extend_from_slice(data);
+        segment_bytes.resize(segment_len_usize, 0);
+
         let reservation = self.write_segment_for_owner_with_intent(
             owner,
             WriteIntentId::from_raw(lease.lease_id.raw()),
-            data,
+            &segment_bytes,
         )?;
-        let block_size = u64::from(self.metadata.config.block_size);
         let append_range = crate::api::BlockRange::new(
-            BlockIndex::from_raw(head.size / block_size),
-            BlockCount::from_raw(data_len / block_size),
+            BlockIndex::from_raw(segment_start_block),
+            BlockCount::from_raw(segment_blocks),
         );
         let new_size = head
             .size
@@ -351,10 +395,24 @@ impl LocalObjectStore {
                 segment_base: append_range.start,
             }),
         };
-        if self.tree_has_mappings(head.root, append_range)? {
+        if tail_bytes == 0 && self.tree_has_mappings(head.root, append_range)? {
             return Err(StorageError::conflict(
                 "append range overlaps existing file metadata",
             ));
+        }
+        if tail_bytes != 0 && segment_blocks > 1 {
+            let next_block = segment_start_block
+                .checked_add(1)
+                .ok_or_else(|| StorageError::invalid_argument("append range overflows"))?;
+            let new_blocks = crate::api::BlockRange::new(
+                BlockIndex::from_raw(next_block),
+                BlockCount::from_raw(segment_blocks - 1),
+            );
+            if self.tree_has_mappings(head.root, new_blocks)? {
+                return Err(StorageError::conflict(
+                    "append range overlaps existing file metadata after tail block",
+                ));
+            }
         }
         let new_root = self.replace_tree_range(head.root, edit)?.root;
 
@@ -365,6 +423,7 @@ impl LocalObjectStore {
                 writer_epoch: lease.writer_epoch,
             },
             updates: vec![RootUpdate::FileRoot {
+                file_id: lease.file_id,
                 old_root: head.root,
                 new_root,
                 new_size,
@@ -372,13 +431,17 @@ impl LocalObjectStore {
         })?;
         self.segment_catalog
             .mark_segment_referenced(reservation.segment_id)?;
-        let committed = self.metadata.get_file_head(lease.file_id)?;
+        let committed = self
+            .metadata
+            .get_file_head(lease.keyspace_id, lease.file_id)?;
 
         Ok(AppendCommit {
+            keyspace_id: lease.keyspace_id,
             file_id: lease.file_id,
             extent_id: self.next_extent_id()?,
             range: ByteRange::new(head.size, data_len),
             version: committed.version,
+            commit_seq: committed.latest_commit,
             durability,
         })
     }
@@ -898,8 +961,14 @@ impl LocalObjectStore {
         Ok(())
     }
 
-    pub fn read_file(&self, file_id: FileId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
-        let head = self.metadata.get_file_head(file_id)?;
+    pub fn read_file(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
         let buf_len = u64::try_from(buf.len())
             .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
         if buf_len != range.len {
@@ -920,19 +989,37 @@ impl LocalObjectStore {
             return Ok(());
         }
 
-        if !range.is_aligned_to(self.metadata.config.block_size) {
-            return Err(StorageError::unsupported(
-                "non-empty native file reads require block alignment in this phase",
-            ));
-        }
-
         let block_size = u64::from(self.metadata.config.block_size);
+        let first_block = range.offset / block_size;
+        let requested_start = first_block
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("native read range overflows"))?;
+        let requested_blocks = blocks_for_bytes(end - requested_start, block_size)?;
         let requested = crate::api::BlockRange::new(
-            BlockIndex::from_raw(range.offset / block_size),
-            BlockCount::from_raw(range.len / block_size),
+            BlockIndex::from_raw(first_block),
+            BlockCount::from_raw(requested_blocks),
         );
         let root = self.metadata.get_metadata_node(head.root)?;
-        self.read_metadata_node(&root, requested, block_size, buf)
+        let scratch_len = requested_blocks.checked_mul(block_size).ok_or_else(|| {
+            StorageError::invalid_argument("native read scratch length overflows")
+        })?;
+        let scratch_len = usize::try_from(scratch_len).map_err(|_| {
+            StorageError::invalid_argument("native read scratch length overflows usize")
+        })?;
+        let mut scratch = vec![0; scratch_len];
+        self.read_metadata_node(&root, requested, block_size, &mut scratch)?;
+        let start = usize::try_from(range.offset % block_size)
+            .map_err(|_| StorageError::invalid_argument("native read offset overflows usize"))?;
+        let len = usize::try_from(range.len)
+            .map_err(|_| StorageError::invalid_argument("native read length overflows usize"))?;
+        let copy_end = start
+            .checked_add(len)
+            .ok_or_else(|| StorageError::invalid_argument("native read end overflows"))?;
+        let bytes = scratch.get(start..copy_end).ok_or_else(|| {
+            StorageError::corrupt("native read scratch range does not cover request")
+        })?;
+        buf.copy_from_slice(bytes);
+        Ok(())
     }
 
     fn read_metadata_node(
@@ -1077,8 +1164,10 @@ pub struct StorageNodeCustodianReport {
 #[derive(Debug)]
 struct MetadataInner {
     next_device_id: u128,
+    next_keyspace_id: u128,
     next_file_id: u128,
     next_metadata_node_id: u128,
+    next_keyspace_root_id: u128,
     next_commit_group_id: u128,
     next_commit_seq: u64,
     next_checkpoint_id: u128,
@@ -1086,12 +1175,14 @@ struct MetadataInner {
     device_heads: BTreeMap<DeviceId, DeviceHead>,
     deleted_device_heads: BTreeMap<DeviceId, DeviceHead>,
     device_specs: BTreeMap<DeviceId, crate::api::DeviceSpec>,
-    file_heads: BTreeMap<FileId, FileHead>,
-    file_specs: BTreeMap<FileId, crate::extent::FileSpec>,
-    file_writer_epochs: BTreeMap<FileId, WriterEpoch>,
+    keyspace_heads: BTreeMap<KeyspaceId, KeyspaceHead>,
+    keyspace_roots: BTreeMap<KeyspaceRootId, KeyspaceRoot>,
+    file_writer_epochs: BTreeMap<(KeyspaceId, FileId), WriterEpoch>,
     metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
     shard_commits: Vec<ShardCommit>,
+    keyspace_commits: Vec<KeyspaceCommit>,
+    file_commits: Vec<FileCommit>,
     fork_records: BTreeMap<CommitSeq, ForkRecord>,
     delete_records: BTreeMap<CommitSeq, DeleteRecord>,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
@@ -1103,8 +1194,10 @@ impl MetadataInner {
     fn new() -> Self {
         Self {
             next_device_id: 1,
+            next_keyspace_id: 1,
             next_file_id: 1,
             next_metadata_node_id: 1,
+            next_keyspace_root_id: 1,
             next_commit_group_id: 1,
             next_commit_seq: 1,
             next_checkpoint_id: 1,
@@ -1112,12 +1205,14 @@ impl MetadataInner {
             device_heads: BTreeMap::new(),
             deleted_device_heads: BTreeMap::new(),
             device_specs: BTreeMap::new(),
-            file_heads: BTreeMap::new(),
-            file_specs: BTreeMap::new(),
+            keyspace_heads: BTreeMap::new(),
+            keyspace_roots: BTreeMap::new(),
             file_writer_epochs: BTreeMap::new(),
             metadata_nodes: BTreeMap::new(),
             commit_groups: BTreeMap::new(),
             shard_commits: Vec::new(),
+            keyspace_commits: Vec::new(),
+            file_commits: Vec::new(),
             fork_records: BTreeMap::new(),
             delete_records: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
@@ -1142,6 +1237,22 @@ impl MetadataInner {
         Ok(())
     }
 
+    fn alloc_keyspace_id(&mut self) -> KeyspaceId {
+        let id = KeyspaceId::from_raw(self.next_keyspace_id);
+        self.next_keyspace_id += 1;
+        id
+    }
+
+    fn reserve_keyspace_id_at_least_after(&mut self, keyspace_id: KeyspaceId) -> Result<()> {
+        if keyspace_id.raw() >= self.next_keyspace_id {
+            self.next_keyspace_id = keyspace_id
+                .raw()
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("keyspace id overflow"))?;
+        }
+        Ok(())
+    }
+
     fn alloc_file_id(&mut self) -> FileId {
         let id = FileId::from_raw(self.next_file_id);
         self.next_file_id += 1;
@@ -1151,6 +1262,12 @@ impl MetadataInner {
     fn alloc_metadata_node_id(&mut self) -> MetadataNodeId {
         let id = MetadataNodeId::from_raw(self.next_metadata_node_id);
         self.next_metadata_node_id += 1;
+        id
+    }
+
+    fn alloc_keyspace_root_id(&mut self) -> KeyspaceRootId {
+        let id = KeyspaceRootId::from_raw(self.next_keyspace_root_id);
+        self.next_keyspace_root_id += 1;
         id
     }
 
@@ -1188,7 +1305,7 @@ impl MetadataInner {
         &mut self,
         owner: MappingOwner,
         commit_seq: CommitSeq,
-        shard_roots: Vec<MetadataNodeId>,
+        roots: CheckpointRoots,
     ) -> CheckpointId {
         let checkpoint_id = self.alloc_checkpoint_id();
         let checkpoint = Checkpoint {
@@ -1196,7 +1313,7 @@ impl MetadataInner {
             commit_seq,
             time: LogicalTime::from_raw(commit_seq.raw()),
             owner,
-            shard_roots,
+            roots,
         };
         self.checkpoints.insert(checkpoint_id, checkpoint);
         checkpoint_id
@@ -1304,6 +1421,33 @@ impl InMemoryMetadataPlane {
         Ok(Self::shard_commits_for_device_locked(&inner, device_id))
     }
 
+    pub fn keyspace_commits_for_keyspace(
+        &self,
+        keyspace_id: KeyspaceId,
+    ) -> Result<Vec<KeyspaceCommit>> {
+        let inner = lock(&self.inner)?;
+        Ok(Self::keyspace_commits_for_keyspace_locked(
+            &inner,
+            keyspace_id,
+        ))
+    }
+
+    pub fn file_commits_for_keyspace_file(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<Vec<FileCommit>> {
+        let inner = lock(&self.inner)?;
+        let mut commits: Vec<_> = inner
+            .file_commits
+            .iter()
+            .filter(|commit| commit.keyspace_id == keyspace_id && commit.file_id == file_id)
+            .cloned()
+            .collect();
+        commits.sort_by_key(|commit| commit.commit_seq.raw());
+        Ok(commits)
+    }
+
     pub fn replay_device_roots(
         &self,
         device_id: DeviceId,
@@ -1313,41 +1457,86 @@ impl InMemoryMetadataPlane {
         Self::replay_device_roots_locked(&inner, device_id, commit_seq, None)
     }
 
+    pub fn replay_keyspace_root(
+        &self,
+        keyspace_id: KeyspaceId,
+        commit_seq: CommitSeq,
+    ) -> Result<KeyspaceRootId> {
+        let inner = lock(&self.inner)?;
+        Self::replay_keyspace_root_locked(&inner, keyspace_id, commit_seq, None)
+    }
+
     pub fn validate_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()> {
         let inner = lock(&self.inner)?;
-        let MappingOwner::BlockDevice(device_id) = checkpoint.owner else {
-            return Err(StorageError::unsupported(
-                "phase 9 checkpoint validation supports block-device checkpoints",
-            ));
-        };
-        let replayed = match Self::replay_device_roots_locked(
-            &inner,
-            device_id,
-            checkpoint.commit_seq,
-            Some(checkpoint.checkpoint_id),
-        ) {
-            Ok(replayed) => replayed,
-            Err(_) if checkpoint.commit_seq.raw() == 0 => {
-                Self::validate_checkpoint_root_shape_locked(
+        match checkpoint.owner {
+            MappingOwner::BlockDevice(device_id) => {
+                let checkpoint_roots = Self::checkpoint_block_roots(checkpoint)?;
+                let replayed = match Self::replay_device_roots_locked(
                     &inner,
                     device_id,
-                    &checkpoint.shard_roots,
-                    self.config.shard_count,
-                )?;
-                return Ok(());
+                    checkpoint.commit_seq,
+                    Some(checkpoint.checkpoint_id),
+                ) {
+                    Ok(replayed) => replayed,
+                    Err(_) if checkpoint.commit_seq.raw() == 0 => {
+                        Self::validate_checkpoint_root_shape_locked(
+                            &inner,
+                            device_id,
+                            &checkpoint_roots,
+                            self.config.shard_count,
+                        )?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                if replayed != checkpoint_roots {
+                    return Err(StorageError::corrupt(
+                        "checkpoint roots do not match replayed timeline",
+                    ));
+                }
             }
-            Err(error) => return Err(error),
-        };
-        if replayed != checkpoint.shard_roots {
-            return Err(StorageError::corrupt(
-                "checkpoint roots do not match replayed timeline",
-            ));
+            MappingOwner::NativeKeyspace(keyspace_id) => {
+                let checkpoint_root = Self::checkpoint_keyspace_root(checkpoint)?;
+                let replayed = match Self::replay_keyspace_root_locked(
+                    &inner,
+                    keyspace_id,
+                    checkpoint.commit_seq,
+                    Some(checkpoint.checkpoint_id),
+                ) {
+                    Ok(replayed) => replayed,
+                    Err(_) if checkpoint.commit_seq.raw() == 0 => {
+                        if !inner.keyspace_roots.contains_key(&checkpoint_root) {
+                            return Err(StorageError::not_found(
+                                "keyspace_root",
+                                checkpoint_root.to_string(),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                if replayed != checkpoint_root {
+                    return Err(StorageError::corrupt(
+                        "keyspace checkpoint root does not match replayed timeline",
+                    ));
+                }
+            }
         }
         Ok(())
     }
 
     pub fn metadata_node_count(&self) -> Result<usize> {
         Ok(lock(&self.inner)?.metadata_nodes.len())
+    }
+
+    #[cfg(test)]
+    fn file_name_for_test(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<Option<String>> {
+        let inner = lock(&self.inner)?;
+        Self::file_name_locked(&inner, keyspace_id, file_id)
     }
 
     #[cfg(test)]
@@ -1369,16 +1558,17 @@ impl InMemoryMetadataPlane {
         })
     }
 
-    pub fn acquire_append_lease(&self, file_id: FileId) -> Result<AppendLease> {
+    pub fn acquire_append_lease(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<AppendLease> {
         let mut inner = lock(&self.inner)?;
-        let head = inner
-            .file_heads
-            .get(&file_id)
-            .cloned()
-            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))?;
+        let head = Self::file_head_locked(&inner, keyspace_id, file_id)?;
+        let key = (keyspace_id, file_id);
         let current_epoch = inner
             .file_writer_epochs
-            .get(&file_id)
+            .get(&key)
             .copied()
             .unwrap_or_else(|| WriterEpoch::from_raw(0));
         let writer_epoch = current_epoch
@@ -1386,8 +1576,9 @@ impl InMemoryMetadataPlane {
             .checked_add(1)
             .map(WriterEpoch::from_raw)
             .ok_or_else(|| StorageError::conflict("writer epoch overflow"))?;
-        inner.file_writer_epochs.insert(file_id, writer_epoch);
+        inner.file_writer_epochs.insert(key, writer_epoch);
         Ok(AppendLease {
+            keyspace_id,
             file_id,
             lease_id: AppendLeaseId::from_raw(writer_epoch.raw() as u128),
             writer_epoch,
@@ -1395,12 +1586,18 @@ impl InMemoryMetadataPlane {
         })
     }
 
-    pub fn validate_writer_epoch(&self, file_id: FileId, writer_epoch: WriterEpoch) -> Result<()> {
+    pub fn validate_writer_epoch(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        writer_epoch: WriterEpoch,
+    ) -> Result<()> {
         let inner = lock(&self.inner)?;
-        match inner.file_writer_epochs.get(&file_id) {
+        Self::file_head_locked(&inner, keyspace_id, file_id)?;
+        match inner.file_writer_epochs.get(&(keyspace_id, file_id)) {
             Some(current) if *current == writer_epoch => Ok(()),
             Some(_) => Err(StorageError::conflict("stale writer epoch")),
-            None => Err(StorageError::not_found("file", file_id.to_string())),
+            None => Err(StorageError::conflict("stale writer epoch")),
         }
     }
 
@@ -1480,12 +1677,108 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::conflict("device generation overflow"))
     }
 
+    fn next_keyspace_generation(generation: KeyspaceGeneration) -> Result<KeyspaceGeneration> {
+        generation
+            .raw()
+            .checked_add(1)
+            .map(KeyspaceGeneration::from_raw)
+            .ok_or_else(|| StorageError::conflict("keyspace generation overflow"))
+    }
+
     fn next_file_version(version: FileVersion) -> Result<FileVersion> {
         version
             .raw()
             .checked_add(1)
             .map(FileVersion::from_raw)
             .ok_or_else(|| StorageError::conflict("file version overflow"))
+    }
+
+    fn checkpoint_block_roots(checkpoint: &Checkpoint) -> Result<Vec<MetadataNodeId>> {
+        match &checkpoint.roots {
+            CheckpointRoots::BlockShard(roots) => Ok(roots.clone()),
+            CheckpointRoots::NativeKeyspace(_) => Err(StorageError::invalid_argument(
+                "checkpoint does not contain block shard roots",
+            )),
+        }
+    }
+
+    fn checkpoint_keyspace_root(checkpoint: &Checkpoint) -> Result<KeyspaceRootId> {
+        match checkpoint.roots {
+            CheckpointRoots::NativeKeyspace(root) => Ok(root),
+            CheckpointRoots::BlockShard(_) => Err(StorageError::invalid_argument(
+                "checkpoint does not contain native keyspace root",
+            )),
+        }
+    }
+
+    fn keyspace_root_locked(
+        inner: &MetadataInner,
+        root_id: KeyspaceRootId,
+    ) -> Result<KeyspaceRoot> {
+        inner
+            .keyspace_roots
+            .get(&root_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace_root", root_id.to_string()))
+    }
+
+    fn current_keyspace_root_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+    ) -> Result<KeyspaceRoot> {
+        let head = inner
+            .keyspace_heads
+            .get(&keyspace_id)
+            .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+        Self::keyspace_root_locked(inner, head.root)
+    }
+
+    fn file_head_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<FileHead> {
+        Self::current_keyspace_root_locked(inner, keyspace_id)?
+            .files
+            .get(&file_id)
+            .map(|entry| entry.head.clone())
+            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))
+    }
+
+    #[cfg(test)]
+    fn file_name_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<Option<String>> {
+        Self::current_keyspace_root_locked(inner, keyspace_id)?
+            .files
+            .get(&file_id)
+            .map(|entry| entry.name.clone())
+            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))
+    }
+
+    fn insert_keyspace_root_locked(
+        inner: &mut MetadataInner,
+        files: BTreeMap<FileId, KeyspaceFile>,
+    ) -> Result<KeyspaceRoot> {
+        let root = KeyspaceRoot {
+            root_id: inner.alloc_keyspace_root_id(),
+            files,
+        };
+        root.validate()?;
+        inner.keyspace_roots.insert(root.root_id, root.clone());
+        Ok(root)
+    }
+
+    fn collect_keyspace_metadata_roots_locked(
+        inner: &MetadataInner,
+        root_id: KeyspaceRootId,
+        out: &mut Vec<MetadataNodeId>,
+    ) -> Result<()> {
+        let root = Self::keyspace_root_locked(inner, root_id)?;
+        out.extend(root.files.values().map(|entry| entry.head.root));
+        Ok(())
     }
 
     fn shard_commits_for_device_locked(
@@ -1533,7 +1826,7 @@ impl InMemoryMetadataPlane {
             excluded_checkpoint,
         )
         .ok_or_else(|| StorageError::not_found("checkpoint", device_id.to_string()))?;
-        let mut roots = checkpoint.shard_roots;
+        let mut roots = Self::checkpoint_block_roots(&checkpoint)?;
 
         for commit in Self::shard_commits_for_device_locked(inner, device_id)
             .into_iter()
@@ -1558,6 +1851,71 @@ impl InMemoryMetadataPlane {
         }
 
         Ok(roots)
+    }
+
+    fn keyspace_commits_for_keyspace_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+    ) -> Vec<KeyspaceCommit> {
+        let mut commits: Vec<_> = inner
+            .keyspace_commits
+            .iter()
+            .filter(|commit| commit.keyspace_id == keyspace_id)
+            .cloned()
+            .collect();
+        commits.sort_by_key(|commit| commit.commit_seq.raw());
+        commits
+    }
+
+    fn latest_keyspace_checkpoint_at_or_before_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        commit_seq: CommitSeq,
+        excluded_checkpoint: Option<CheckpointId>,
+    ) -> Option<Checkpoint> {
+        inner
+            .checkpoints
+            .values()
+            .filter(|checkpoint| {
+                checkpoint.owner == MappingOwner::NativeKeyspace(keyspace_id)
+                    && checkpoint.commit_seq.raw() <= commit_seq.raw()
+                    && Some(checkpoint.checkpoint_id) != excluded_checkpoint
+            })
+            .max_by_key(|checkpoint| checkpoint.commit_seq.raw())
+            .cloned()
+    }
+
+    fn replay_keyspace_root_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        commit_seq: CommitSeq,
+        excluded_checkpoint: Option<CheckpointId>,
+    ) -> Result<KeyspaceRootId> {
+        let checkpoint = Self::latest_keyspace_checkpoint_at_or_before_locked(
+            inner,
+            keyspace_id,
+            commit_seq,
+            excluded_checkpoint,
+        )
+        .ok_or_else(|| StorageError::not_found("checkpoint", keyspace_id.to_string()))?;
+        let mut root = Self::checkpoint_keyspace_root(&checkpoint)?;
+
+        for commit in Self::keyspace_commits_for_keyspace_locked(inner, keyspace_id)
+            .into_iter()
+            .filter(|commit| {
+                commit.commit_seq.raw() > checkpoint.commit_seq.raw()
+                    && commit.commit_seq.raw() <= commit_seq.raw()
+            })
+        {
+            if root != commit.old_root {
+                return Err(StorageError::corrupt(
+                    "keyspace commit old_root does not match replay state",
+                ));
+            }
+            root = commit.new_root;
+        }
+
+        Ok(root)
     }
 
     fn validate_checkpoint_root_shape_locked(
@@ -1653,13 +2011,76 @@ impl InMemoryMetadataPlane {
             .any(|commit| commit.device_id == device_id && commit.commit_seq == commit_seq)
     }
 
-    fn roots_for_gc_locked(inner: &MetadataInner, policy: RetentionPolicy) -> Vec<MetadataNodeId> {
+    fn target_commit_for_keyspace_restore_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        point: RestorePoint,
+    ) -> Result<CommitSeq> {
+        match point {
+            RestorePoint::Commit(commit_seq) => {
+                if Self::keyspace_timeline_contains_commit_locked(inner, keyspace_id, commit_seq) {
+                    Ok(commit_seq)
+                } else {
+                    Err(StorageError::not_found("commit", commit_seq.to_string()))
+                }
+            }
+            RestorePoint::Checkpoint(checkpoint_id) => {
+                let checkpoint = inner.checkpoints.get(&checkpoint_id).ok_or_else(|| {
+                    StorageError::not_found("checkpoint", checkpoint_id.to_string())
+                })?;
+                if checkpoint.owner != MappingOwner::NativeKeyspace(keyspace_id) {
+                    return Err(StorageError::invalid_argument(
+                        "checkpoint does not belong to source keyspace",
+                    ));
+                }
+                Ok(checkpoint.commit_seq)
+            }
+            RestorePoint::Time(time) => {
+                let mut candidates: Vec<CommitSeq> = inner
+                    .checkpoints
+                    .values()
+                    .filter_map(|checkpoint| {
+                        (checkpoint.owner == MappingOwner::NativeKeyspace(keyspace_id)
+                            && checkpoint.time.raw() <= time.raw())
+                        .then_some(checkpoint.commit_seq)
+                    })
+                    .collect();
+                candidates.extend(inner.keyspace_commits.iter().filter_map(|commit| {
+                    (commit.keyspace_id == keyspace_id && commit.time.raw() <= time.raw())
+                        .then_some(commit.commit_seq)
+                }));
+                candidates
+                    .into_iter()
+                    .max_by_key(|seq| seq.raw())
+                    .ok_or_else(|| StorageError::not_found("restore_time", time.to_string()))
+            }
+        }
+    }
+
+    fn keyspace_timeline_contains_commit_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        inner.checkpoints.values().any(|checkpoint| {
+            checkpoint.owner == MappingOwner::NativeKeyspace(keyspace_id)
+                && checkpoint.commit_seq == commit_seq
+        }) || inner
+            .keyspace_commits
+            .iter()
+            .any(|commit| commit.keyspace_id == keyspace_id && commit.commit_seq == commit_seq)
+    }
+
+    fn roots_for_gc_locked(
+        inner: &MetadataInner,
+        policy: RetentionPolicy,
+    ) -> Result<Vec<MetadataNodeId>> {
         let mut roots = Vec::new();
         for head in inner.device_heads.values() {
             roots.extend(head.shard_roots.iter().copied());
         }
-        for head in inner.file_heads.values() {
-            roots.push(head.root);
+        for head in inner.keyspace_heads.values() {
+            Self::collect_keyspace_metadata_roots_locked(inner, head.root, &mut roots)?;
         }
         for checkpoint in inner.checkpoints.values() {
             match checkpoint.owner {
@@ -1670,14 +2091,15 @@ impl InMemoryMetadataPlane {
                         MappingOwner::BlockDevice(device_id),
                     ) && Self::retain_checkpoint_for_pitr_locked(inner, &policy, checkpoint)
                     {
-                        roots.extend(checkpoint.shard_roots.iter().copied());
+                        roots.extend(Self::checkpoint_block_roots(checkpoint)?);
                     }
                 }
-                MappingOwner::NativeFile(_) => {
+                MappingOwner::NativeKeyspace(_) => {
                     if Self::owner_has_retained_pitr_locked(inner, &policy, checkpoint.owner)
                         && Self::retain_checkpoint_for_pitr_locked(inner, &policy, checkpoint)
                     {
-                        roots.extend(checkpoint.shard_roots.iter().copied());
+                        let root = Self::checkpoint_keyspace_root(checkpoint)?;
+                        Self::collect_keyspace_metadata_roots_locked(inner, root, &mut roots)?;
                     }
                 }
             }
@@ -1685,6 +2107,11 @@ impl InMemoryMetadataPlane {
         for commit in &inner.shard_commits {
             if Self::retain_shard_commit_for_pitr_locked(inner, &policy, commit) {
                 roots.push(commit.new_root);
+            }
+        }
+        for commit in &inner.keyspace_commits {
+            if Self::retain_keyspace_commit_for_pitr_locked(inner, &policy, commit) {
+                Self::collect_keyspace_metadata_roots_locked(inner, commit.new_root, &mut roots)?;
             }
         }
         for (device_id, head) in &inner.deleted_device_heads {
@@ -1699,7 +2126,7 @@ impl InMemoryMetadataPlane {
         }
         roots.sort();
         roots.dedup();
-        roots
+        Ok(roots)
     }
 
     fn current_commit_seq_locked(inner: &MetadataInner) -> CommitSeq {
@@ -1743,7 +2170,9 @@ impl InMemoryMetadataPlane {
                 inner.device_heads.contains_key(&device_id)
                     || Self::retain_deleted_device_locked(inner, policy, device_id)
             }
-            MappingOwner::NativeFile(file_id) => inner.file_heads.contains_key(&file_id),
+            MappingOwner::NativeKeyspace(keyspace_id) => {
+                inner.keyspace_heads.contains_key(&keyspace_id)
+            }
         }
     }
 
@@ -1765,6 +2194,22 @@ impl InMemoryMetadataPlane {
                 let anchor = floor.raw().min(head.latest_commit.raw());
                 targets.insert(*device_id, CommitSeq::from_raw(anchor));
             }
+        }
+        targets
+    }
+
+    fn keyspace_pitr_anchor_targets_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+    ) -> BTreeMap<KeyspaceId, CommitSeq> {
+        let Some(floor) = Self::pitr_retention_floor_locked(inner, policy) else {
+            return BTreeMap::new();
+        };
+
+        let mut targets = BTreeMap::new();
+        for (keyspace_id, head) in &inner.keyspace_heads {
+            let anchor = floor.raw().min(head.latest_commit.raw());
+            targets.insert(*keyspace_id, CommitSeq::from_raw(anchor));
         }
         targets
     }
@@ -1791,7 +2236,17 @@ impl InMemoryMetadataPlane {
                 continue;
             }
             let roots = Self::replay_device_roots_locked(inner, device_id, anchor_seq, None)?;
-            inner.insert_checkpoint(owner, anchor_seq, roots);
+            inner.insert_checkpoint(owner, anchor_seq, CheckpointRoots::BlockShard(roots));
+        }
+
+        let targets = Self::keyspace_pitr_anchor_targets_locked(inner, policy);
+        for (keyspace_id, anchor_seq) in targets {
+            let owner = MappingOwner::NativeKeyspace(keyspace_id);
+            if Self::checkpoint_exists_locked(inner, owner, anchor_seq) {
+                continue;
+            }
+            let root = Self::replay_keyspace_root_locked(inner, keyspace_id, anchor_seq, None)?;
+            inner.insert_checkpoint(owner, anchor_seq, CheckpointRoots::NativeKeyspace(root));
         }
         Ok(())
     }
@@ -1847,6 +2302,22 @@ impl InMemoryMetadataPlane {
             || Self::retain_pitr_commit_locked(inner, policy, commit.commit_seq)
     }
 
+    fn retain_keyspace_commit_for_pitr_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+        commit: &KeyspaceCommit,
+    ) -> bool {
+        let owner = MappingOwner::NativeKeyspace(commit.keyspace_id);
+        if !Self::owner_has_retained_pitr_locked(inner, policy, owner) {
+            return false;
+        }
+        let Some(anchor) = Self::retained_pitr_anchor_locked(inner, policy, owner) else {
+            return Self::retain_pitr_commit_locked(inner, policy, commit.commit_seq);
+        };
+        commit.commit_seq.raw() > anchor.commit_seq.raw()
+            || Self::retain_pitr_commit_locked(inner, policy, commit.commit_seq)
+    }
+
     fn retained_checkpoint_ids_locked(
         inner: &MetadataInner,
         policy: &RetentionPolicy,
@@ -1862,7 +2333,7 @@ impl InMemoryMetadataPlane {
                         MappingOwner::BlockDevice(device_id),
                     ) && Self::retain_checkpoint_for_pitr_locked(inner, policy, checkpoint)
                 }
-                MappingOwner::NativeFile(_) => {
+                MappingOwner::NativeKeyspace(_) => {
                     Self::owner_has_retained_pitr_locked(inner, policy, checkpoint.owner)
                         && Self::retain_checkpoint_for_pitr_locked(inner, policy, checkpoint)
                 }
@@ -1880,6 +2351,20 @@ impl InMemoryMetadataPlane {
             let owner = MappingOwner::BlockDevice(*device_id);
             if let Some(anchor) = Self::retained_pitr_anchor_locked(inner, policy, owner) {
                 cutoffs.insert(*device_id, anchor.commit_seq);
+            }
+        }
+        cutoffs
+    }
+
+    fn retained_keyspace_commit_cutoffs_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+    ) -> BTreeMap<KeyspaceId, CommitSeq> {
+        let mut cutoffs = BTreeMap::new();
+        for keyspace_id in Self::keyspace_pitr_anchor_targets_locked(inner, policy).keys() {
+            let owner = MappingOwner::NativeKeyspace(*keyspace_id);
+            if let Some(anchor) = Self::retained_pitr_anchor_locked(inner, policy, owner) {
+                cutoffs.insert(*keyspace_id, anchor.commit_seq);
             }
         }
         cutoffs
@@ -1954,7 +2439,7 @@ impl InMemoryMetadataPlane {
         let mut inner = lock(&self.inner)?;
         Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
         let epoch = inner.alloc_gc_epoch()?;
-        let roots = Self::roots_for_gc_locked(&inner, policy.clone());
+        let roots = Self::roots_for_gc_locked(&inner, policy.clone())?;
         let (nodes, segments) = Self::collect_reachable_locked(&inner, &roots)?;
 
         for node_id in &nodes {
@@ -1989,7 +2474,7 @@ impl InMemoryMetadataPlane {
         }
         Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
 
-        let roots = Self::roots_for_gc_locked(&inner, policy.clone());
+        let roots = Self::roots_for_gc_locked(&inner, policy.clone())?;
         let (currently_reachable_nodes, currently_reachable_segments) =
             Self::collect_reachable_locked(&inner, &roots)?;
         let all_segments = Self::collect_all_segments_locked(&inner);
@@ -2025,6 +2510,8 @@ impl InMemoryMetadataPlane {
             let retained_checkpoints = Self::retained_checkpoint_ids_locked(&inner, &policy);
             let retained_commit_cutoffs =
                 Self::retained_shard_commit_cutoffs_locked(&inner, &policy);
+            let retained_keyspace_commit_cutoffs =
+                Self::retained_keyspace_commit_cutoffs_locked(&inner, &policy);
             let expired_devices: BTreeSet<_> = inner
                 .deleted_device_heads
                 .keys()
@@ -2047,13 +2534,25 @@ impl InMemoryMetadataPlane {
                         !expired_devices.contains(&device_id)
                             && retained_checkpoints.contains(&checkpoint.checkpoint_id)
                     }
-                    MappingOwner::NativeFile(_) => true,
+                    MappingOwner::NativeKeyspace(_) => {
+                        retained_checkpoints.contains(&checkpoint.checkpoint_id)
+                    }
                 });
             inner.shard_commits.retain(|commit| {
                 !expired_devices.contains(&commit.device_id)
                     && retained_commit_cutoffs
                         .get(&commit.device_id)
                         .is_some_and(|cutoff| commit.commit_seq.raw() > cutoff.raw())
+            });
+            inner.keyspace_commits.retain(|commit| {
+                retained_keyspace_commit_cutoffs
+                    .get(&commit.keyspace_id)
+                    .is_some_and(|cutoff| commit.commit_seq.raw() > cutoff.raw())
+            });
+            inner.file_commits.retain(|commit| {
+                retained_keyspace_commit_cutoffs
+                    .get(&commit.keyspace_id)
+                    .is_some_and(|cutoff| commit.commit_seq.raw() > cutoff.raw())
             });
             inner.fork_records.retain(|_, record| {
                 !expired_devices.contains(&record.source)
@@ -2135,14 +2634,65 @@ impl MetadataPlane for InMemoryMetadataPlane {
         inner.insert_checkpoint(
             MappingOwner::BlockDevice(device_id),
             head.latest_commit,
-            head.shard_roots.clone(),
+            CheckpointRoots::BlockShard(head.shard_roots.clone()),
         );
         Ok(head)
+    }
+
+    fn create_keyspace(&self, _request: MetadataCreateKeyspaceRequest) -> Result<KeyspaceHead> {
+        self.config.validate()?;
+        let mut inner = lock(&self.inner)?;
+        let keyspace_id = inner.alloc_keyspace_id();
+        let root = Self::insert_keyspace_root_locked(&mut inner, BTreeMap::new())?;
+        let head = KeyspaceHead {
+            keyspace_id,
+            generation: KeyspaceGeneration::from_raw(0),
+            root: root.root_id,
+            latest_commit: CommitSeq::from_raw(0),
+        };
+        inner.keyspace_heads.insert(keyspace_id, head.clone());
+        inner.insert_checkpoint(
+            MappingOwner::NativeKeyspace(keyspace_id),
+            head.latest_commit,
+            CheckpointRoots::NativeKeyspace(head.root),
+        );
+        Ok(head)
+    }
+
+    fn get_keyspace_head(&self, keyspace_id: KeyspaceId) -> Result<KeyspaceHead> {
+        let inner = lock(&self.inner)?;
+        inner
+            .keyspace_heads
+            .get(&keyspace_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))
+    }
+
+    fn get_keyspace_info(&self, keyspace_id: KeyspaceId) -> Result<KeyspaceInfo> {
+        let inner = lock(&self.inner)?;
+        let head = inner
+            .keyspace_heads
+            .get(&keyspace_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+        let root = Self::keyspace_root_locked(&inner, head.root)?;
+        Ok(KeyspaceInfo {
+            keyspace_id,
+            generation: head.generation,
+            latest_commit: head.latest_commit,
+            file_count: root.files.len(),
+        })
     }
 
     fn create_file(&self, request: MetadataCreateFileRequest) -> Result<FileHead> {
         self.config.validate()?;
         let mut inner = lock(&self.inner)?;
+        let keyspace_head = inner
+            .keyspace_heads
+            .get(&request.keyspace_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", request.keyspace_id.to_string()))?;
+        let keyspace_root = Self::keyspace_root_locked(&inner, keyspace_head.root)?;
         let file_id = inner.alloc_file_id();
         let root = Self::create_empty_tree(
             &mut inner,
@@ -2152,21 +2702,74 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 BlockCount::from_raw(self.config.file_root_blocks),
             ),
         )?;
-        let head = FileHead {
+        let commit_seq = inner.alloc_commit_seq()?;
+        let commit_group_id = inner.alloc_commit_group_id();
+        let file_head = FileHead {
             file_id,
             version: FileVersion::from_raw(0),
             root: root.node_id,
             size: 0,
-            latest_commit: CommitSeq::from_raw(0),
+            latest_commit: commit_seq,
         };
-        head.validate_current(root.covered_range, self.config.block_size)?;
+        file_head.validate_current(root.covered_range, self.config.block_size)?;
 
-        inner.file_specs.insert(file_id, request.request.spec);
-        inner.file_heads.insert(file_id, head.clone());
+        let mut files = keyspace_root.files.clone();
+        files.insert(
+            file_id,
+            KeyspaceFile {
+                name: request.request.spec.name.clone(),
+                head: file_head.clone(),
+            },
+        );
+        let new_keyspace_root = Self::insert_keyspace_root_locked(&mut inner, files)?;
+
+        let commit_group = CommitGroup {
+            commit_group: commit_group_id,
+            commit_seq,
+            owner: MappingOwner::NativeKeyspace(request.keyspace_id),
+            updates: vec![RootUpdate::FileCreated {
+                file_id,
+                new_root: root.node_id,
+                new_size: 0,
+            }],
+        };
+        let mut next_keyspace_head = keyspace_head.clone();
+        next_keyspace_head.generation =
+            Self::next_keyspace_generation(next_keyspace_head.generation)?;
+        next_keyspace_head.latest_commit = commit_seq;
+        next_keyspace_head.root = new_keyspace_root.root_id;
+
         inner
             .file_writer_epochs
-            .insert(file_id, WriterEpoch::from_raw(0));
-        Ok(head)
+            .insert((request.keyspace_id, file_id), WriterEpoch::from_raw(0));
+        inner
+            .keyspace_heads
+            .insert(request.keyspace_id, next_keyspace_head);
+        inner.keyspace_commits.push(KeyspaceCommit {
+            commit_seq,
+            commit_group: commit_group_id,
+            time: LogicalTime::from_raw(commit_seq.raw()),
+            keyspace_id: request.keyspace_id,
+            old_root: keyspace_root.root_id,
+            new_root: new_keyspace_root.root_id,
+        });
+        inner.file_commits.push(FileCommit {
+            commit_seq,
+            commit_group: commit_group_id,
+            time: LogicalTime::from_raw(commit_seq.raw()),
+            keyspace_id: request.keyspace_id,
+            file_id,
+            old_root: None,
+            new_root: root.node_id,
+            old_version: None,
+            new_version: FileVersion::from_raw(0),
+            old_size: 0,
+            new_size: 0,
+        });
+        inner
+            .commit_groups
+            .insert(commit_group.commit_group, commit_group);
+        Ok(file_head)
     }
 
     fn get_head(&self, device_id: DeviceId) -> Result<DeviceHead> {
@@ -2186,18 +2789,15 @@ impl MetadataPlane for InMemoryMetadataPlane {
         self.deleted_device_ids()
     }
 
-    fn get_file_head(&self, file_id: FileId) -> Result<FileHead> {
+    fn get_file_head(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileHead> {
         let inner = lock(&self.inner)?;
-        inner
-            .file_heads
-            .get(&file_id)
-            .cloned()
-            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))
+        Self::file_head_locked(&inner, keyspace_id, file_id)
     }
 
-    fn get_file_info(&self, file_id: FileId) -> Result<FileInfo> {
-        let head = self.get_file_head(file_id)?;
+    fn get_file_info(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileInfo> {
+        let head = self.get_file_head(keyspace_id, file_id)?;
         Ok(FileInfo {
+            keyspace_id,
             file_id,
             size: head.size,
             version: head.version,
@@ -2313,12 +2913,41 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     .insert(commit_group.commit_group, commit_group.clone());
                 Ok(commit_group)
             }
-            MappingOwner::NativeFile(file_id) => {
-                let current = inner
-                    .file_heads
+            MappingOwner::NativeKeyspace(keyspace_id) => {
+                let current_keyspace = inner
+                    .keyspace_heads
+                    .get(&keyspace_id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+                let current_catalog = Self::keyspace_root_locked(&inner, current_keyspace.root)?;
+                if intent.updates.len() != 1 {
+                    return Err(StorageError::invalid_argument(
+                        "native keyspace commit must include exactly one file-root update",
+                    ));
+                }
+
+                let (file_id, old_root, new_root, new_size) = match intent.updates.as_slice() {
+                    [
+                        RootUpdate::FileRoot {
+                            file_id,
+                            old_root,
+                            new_root,
+                            new_size,
+                        },
+                    ] => (*file_id, *old_root, *new_root, *new_size),
+                    [_] => {
+                        return Err(StorageError::invalid_argument(
+                            "native keyspace append commit requires a file-root update",
+                        ));
+                    }
+                    _ => unreachable!("length checked above"),
+                };
+                let current_entry = current_catalog
+                    .files
                     .get(&file_id)
                     .cloned()
                     .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))?;
+                let current = current_entry.head.clone();
                 match intent.fence {
                     MetadataFence::FileVersion(version) if version == current.version => {}
                     MetadataFence::FileVersion(_) => {
@@ -2328,7 +2957,8 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         base_version,
                         writer_epoch,
                     } if base_version == current.version
-                        && Some(&writer_epoch) == inner.file_writer_epochs.get(&file_id) => {}
+                        && Some(&writer_epoch)
+                            == inner.file_writer_epochs.get(&(keyspace_id, file_id)) => {}
                     MetadataFence::WriterEpoch { .. } => {
                         return Err(StorageError::conflict("stale writer epoch fence"));
                     }
@@ -2338,28 +2968,6 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         ));
                     }
                 }
-
-                if intent.updates.len() != 1 {
-                    return Err(StorageError::invalid_argument(
-                        "native file commit must include exactly one file-root update",
-                    ));
-                }
-
-                let (old_root, new_root, new_size) = match intent.updates.as_slice() {
-                    [
-                        RootUpdate::FileRoot {
-                            old_root,
-                            new_root,
-                            new_size,
-                        },
-                    ] => (*old_root, *new_root, *new_size),
-                    [_] => {
-                        return Err(StorageError::invalid_argument(
-                            "native file commit cannot include shard-root updates",
-                        ));
-                    }
-                    _ => unreachable!("length checked above"),
-                };
                 if current.root != old_root {
                     return Err(StorageError::conflict("stale file root"));
                 }
@@ -2384,6 +2992,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     commit_seq,
                     owner: intent.owner,
                     updates: vec![RootUpdate::FileRoot {
+                        file_id,
                         old_root,
                         new_root,
                         new_size,
@@ -2399,7 +3008,42 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     new_root_node.covered_range,
                     self.config.block_size,
                 )?;
-                inner.file_heads.insert(file_id, next_head);
+                let mut files = current_catalog.files.clone();
+                files.insert(
+                    file_id,
+                    KeyspaceFile {
+                        head: next_head.clone(),
+                        ..current_entry
+                    },
+                );
+                let new_catalog = Self::insert_keyspace_root_locked(&mut inner, files)?;
+                let mut next_keyspace = current_keyspace.clone();
+                next_keyspace.generation =
+                    Self::next_keyspace_generation(next_keyspace.generation)?;
+                next_keyspace.latest_commit = commit_seq;
+                next_keyspace.root = new_catalog.root_id;
+                inner.keyspace_heads.insert(keyspace_id, next_keyspace);
+                inner.keyspace_commits.push(KeyspaceCommit {
+                    commit_seq,
+                    commit_group: commit_group.commit_group,
+                    time: LogicalTime::from_raw(commit_seq.raw()),
+                    keyspace_id,
+                    old_root: current_catalog.root_id,
+                    new_root: new_catalog.root_id,
+                });
+                inner.file_commits.push(FileCommit {
+                    commit_seq,
+                    commit_group: commit_group.commit_group,
+                    time: LogicalTime::from_raw(commit_seq.raw()),
+                    keyspace_id,
+                    file_id,
+                    old_root: Some(current.root),
+                    new_root,
+                    old_version: Some(current.version),
+                    new_version: next_head.version,
+                    old_size: current.size,
+                    new_size,
+                });
                 inner
                     .commit_groups
                     .insert(commit_group.commit_group, commit_group.clone());
@@ -2453,7 +3097,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
         inner.insert_checkpoint(
             MappingOwner::BlockDevice(target),
             latest_commit,
-            head.shard_roots.clone(),
+            CheckpointRoots::BlockShard(head.shard_roots.clone()),
         );
         Ok(head)
     }
@@ -2490,7 +3134,71 @@ impl MetadataPlane for InMemoryMetadataPlane {
         inner.insert_checkpoint(
             MappingOwner::BlockDevice(target),
             latest_commit,
-            head.shard_roots.clone(),
+            CheckpointRoots::BlockShard(head.shard_roots.clone()),
+        );
+        Ok(head)
+    }
+
+    fn snapshot_keyspace(&self, request: MetadataSnapshotKeyspaceRequest) -> Result<KeyspaceHead> {
+        let mut inner = lock(&self.inner)?;
+        let source_head = inner
+            .keyspace_heads
+            .get(&request.source)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", request.source.to_string()))?;
+        let target = match request.target {
+            Some(target) => {
+                if inner.keyspace_heads.contains_key(&target) {
+                    return Err(StorageError::conflict("target keyspace already exists"));
+                }
+                inner.reserve_keyspace_id_at_least_after(target)?;
+                target
+            }
+            None => inner.alloc_keyspace_id(),
+        };
+        let latest_commit = inner.alloc_commit_seq()?;
+        let head = KeyspaceHead {
+            keyspace_id: target,
+            generation: KeyspaceGeneration::from_raw(0),
+            root: source_head.root,
+            latest_commit,
+        };
+        inner.keyspace_heads.insert(target, head.clone());
+        inner.insert_checkpoint(
+            MappingOwner::NativeKeyspace(target),
+            latest_commit,
+            CheckpointRoots::NativeKeyspace(head.root),
+        );
+        Ok(head)
+    }
+
+    fn restore_keyspace(
+        &self,
+        source: KeyspaceId,
+        point: crate::api::RestorePoint,
+    ) -> Result<KeyspaceHead> {
+        let mut inner = lock(&self.inner)?;
+        if !inner.keyspace_heads.contains_key(&source) {
+            return Err(StorageError::not_found("keyspace", source.to_string()));
+        }
+        let target_commit = Self::target_commit_for_keyspace_restore_locked(&inner, source, point)?;
+        let root = Self::replay_keyspace_root_locked(&inner, source, target_commit, None)?;
+        if !inner.keyspace_roots.contains_key(&root) {
+            return Err(StorageError::not_found("keyspace_root", root.to_string()));
+        }
+        let target = inner.alloc_keyspace_id();
+        let latest_commit = inner.alloc_commit_seq()?;
+        let head = KeyspaceHead {
+            keyspace_id: target,
+            generation: KeyspaceGeneration::from_raw(0),
+            root,
+            latest_commit,
+        };
+        inner.keyspace_heads.insert(target, head.clone());
+        inner.insert_checkpoint(
+            MappingOwner::NativeKeyspace(target),
+            latest_commit,
+            CheckpointRoots::NativeKeyspace(head.root),
         );
         Ok(head)
     }
@@ -2533,7 +3241,21 @@ impl MetadataPlane for InMemoryMetadataPlane {
         Ok(inner.insert_checkpoint(
             MappingOwner::BlockDevice(device_id),
             head.latest_commit,
-            head.shard_roots,
+            CheckpointRoots::BlockShard(head.shard_roots),
+        ))
+    }
+
+    fn checkpoint_keyspace(&self, keyspace_id: KeyspaceId) -> Result<CheckpointId> {
+        let mut inner = lock(&self.inner)?;
+        let head = inner
+            .keyspace_heads
+            .get(&keyspace_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+        Ok(inner.insert_checkpoint(
+            MappingOwner::NativeKeyspace(keyspace_id),
+            head.latest_commit,
+            CheckpointRoots::NativeKeyspace(head.root),
         ))
     }
 
@@ -2549,7 +3271,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
     fn roots_for_gc(&self, policy: RetentionPolicy) -> Result<Vec<MetadataNodeId>> {
         let mut inner = lock(&self.inner)?;
         Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
-        Ok(Self::roots_for_gc_locked(&inner, policy))
+        Self::roots_for_gc_locked(&inner, policy)
     }
 }
 
@@ -3163,7 +3885,7 @@ impl BlockServer for LocalBlockServer {
     }
 }
 
-/// Local native-file request coordinator.
+/// Local native keyspace/file request coordinator.
 #[derive(Debug, Clone)]
 pub struct LocalNativeServer {
     store: LocalObjectStore,
@@ -3229,36 +3951,61 @@ impl NativeServer for LocalNativeServer {
         lock(&self.request_log)?.push(request.request_id);
         let response = (|| -> Result<NativeResponse> {
             match request.request.clone() {
-                NativeRequest::CreateFile { request } => {
+                NativeRequest::CreateKeyspace { request } => {
                     let head = self
                         .store
                         .metadata
-                        .create_file(MetadataCreateFileRequest::from(request))?;
+                        .create_keyspace(MetadataCreateKeyspaceRequest { request })?;
+                    Ok(NativeResponse::KeyspaceCreated(head.keyspace_id))
+                }
+                NativeRequest::KeyspaceInfo { keyspace_id } => Ok(NativeResponse::KeyspaceInfo(
+                    self.store.metadata.get_keyspace_info(keyspace_id)?,
+                )),
+                NativeRequest::CreateFile {
+                    keyspace_id,
+                    request,
+                } => {
+                    let head = self.store.metadata.create_file(MetadataCreateFileRequest {
+                        keyspace_id,
+                        request,
+                    })?;
                     Ok(NativeResponse::FileCreated(head.file_id))
                 }
-                NativeRequest::FileInfo { file_id } => Ok(NativeResponse::FileInfo(
-                    self.store.metadata.get_file_info(file_id)?,
+                NativeRequest::FileInfo {
+                    keyspace_id,
+                    file_id,
+                } => Ok(NativeResponse::FileInfo(
+                    self.store.metadata.get_file_info(keyspace_id, file_id)?,
                 )),
-                NativeRequest::Read { file_id, range } => {
+                NativeRequest::Read {
+                    keyspace_id,
+                    file_id,
+                    range,
+                } => {
                     let len = usize::try_from(range.len).map_err(|_| {
                         StorageError::invalid_argument("read byte length overflows usize")
                     })?;
                     let mut bytes = vec![0; len];
-                    self.store.read_file(file_id, range, &mut bytes)?;
+                    self.store
+                        .read_file(keyspace_id, file_id, range, &mut bytes)?;
                     Ok(NativeResponse::Read(ReadResponse { bytes }))
                 }
-                NativeRequest::AcquireAppend { file_id } => Ok(NativeResponse::AppendLease(
-                    self.store.acquire_append_lease(file_id)?,
+                NativeRequest::AcquireAppend {
+                    keyspace_id,
+                    file_id,
+                } => Ok(NativeResponse::AppendLease(
+                    self.store.acquire_append_lease(keyspace_id, file_id)?,
                 )),
                 NativeRequest::Append {
+                    keyspace_id,
                     file_id,
                     lease,
                     bytes,
                     durability,
                 } => {
-                    if file_id != lease.file_id {
+                    if keyspace_id != lease.keyspace_id || file_id != lease.file_id {
                         Err(StorageError::invalid_argument(
-                            "append lease file_id does not match request file_id",
+                            "append lease target does not match request target",
                         ))
                     } else {
                         Ok(NativeResponse::Append(
@@ -3266,12 +4013,39 @@ impl NativeServer for LocalNativeServer {
                         ))
                     }
                 }
-                NativeRequest::Flush { file_id } => {
-                    let info = self.store.metadata.get_file_info(file_id)?;
+                NativeRequest::Flush {
+                    keyspace_id,
+                    file_id,
+                } => {
+                    let info = self.store.metadata.get_file_info(keyspace_id, file_id)?;
                     Ok(NativeResponse::Flush(FlushResult {
                         device_id: DeviceId::from_raw(info.file_id.raw()),
-                        durable_through: CommitSeq::from_raw(info.version.raw()),
+                        durable_through: self
+                            .store
+                            .metadata
+                            .get_file_head(keyspace_id, file_id)?
+                            .latest_commit,
                     }))
+                }
+                NativeRequest::CheckpointKeyspace { keyspace_id } => {
+                    Ok(NativeResponse::KeyspaceCheckpointed(
+                        self.store.metadata.checkpoint_keyspace(keyspace_id)?,
+                    ))
+                }
+                NativeRequest::SnapshotKeyspace { source, request } => {
+                    let head =
+                        self.store
+                            .metadata
+                            .snapshot_keyspace(MetadataSnapshotKeyspaceRequest {
+                                source,
+                                target: request.target,
+                                name: request.name,
+                            })?;
+                    Ok(NativeResponse::KeyspaceSnapshotted(head.keyspace_id))
+                }
+                NativeRequest::RestoreKeyspace { source, point } => {
+                    let head = self.store.metadata.restore_keyspace(source, point)?;
+                    Ok(NativeResponse::KeyspaceRestored(head.keyspace_id))
                 }
             }
         })();
@@ -3301,7 +4075,7 @@ impl BlockTransport for InProcessBlockTransport {
     }
 }
 
-/// In-process native-file transport.
+/// In-process native keyspace/file transport.
 #[derive(Clone)]
 pub struct InProcessNativeTransport {
     server: Arc<dyn NativeServer>,
@@ -3554,15 +4328,15 @@ impl BlockDevice for LocalBlockDevice {
     }
 }
 
-/// Local `NativeFileClient` backed by a native-file transport.
+/// Local `NativeKeyspaceClient` backed by a native transport.
 #[derive(Clone)]
-pub struct LocalNativeFileClient {
+pub struct LocalNativeClient {
     transport: InProcessNativeTransport,
     client_epoch: crate::id::ClientEpoch,
     next_request_id: Arc<Mutex<u128>>,
 }
 
-impl LocalNativeFileClient {
+impl LocalNativeClient {
     pub fn new(transport: InProcessNativeTransport) -> Self {
         Self {
             transport,
@@ -3571,9 +4345,10 @@ impl LocalNativeFileClient {
         }
     }
 
-    pub fn open_file(&self, file_id: FileId) -> Result<LocalNativeFile> {
-        self.file_info(file_id)?;
+    pub fn open_file(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<LocalNativeFile> {
+        self.file_info(keyspace_id, file_id)?;
         Ok(LocalNativeFile {
+            keyspace_id,
             file_id,
             transport: self.transport.clone(),
             client_epoch: self.client_epoch,
@@ -3586,13 +4361,42 @@ impl LocalNativeFileClient {
     }
 }
 
-impl NativeFileClient for LocalNativeFileClient {
-    fn create_file(&self, request: CreateFileRequest) -> Result<FileId> {
+impl NativeKeyspaceClient for LocalNativeClient {
+    fn create_keyspace(&self, request: CreateKeyspaceRequest) -> Result<KeyspaceId> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::CreateFile { request },
+            NativeRequest::CreateKeyspace { request },
+        ))?;
+        match response.response {
+            NativeResponse::KeyspaceCreated(keyspace_id) => Ok(keyspace_id),
+            _ => Err(StorageError::corrupt("unexpected create-keyspace response")),
+        }
+    }
+
+    fn keyspace_info(&self, keyspace_id: KeyspaceId) -> Result<KeyspaceInfo> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::KeyspaceInfo { keyspace_id },
+        ))?;
+        match response.response {
+            NativeResponse::KeyspaceInfo(info) => Ok(info),
+            _ => Err(StorageError::corrupt("unexpected keyspace-info response")),
+        }
+    }
+
+    fn create_file(&self, keyspace_id: KeyspaceId, request: CreateFileRequest) -> Result<FileId> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::CreateFile {
+                keyspace_id,
+                request,
+            },
         ))?;
         match response.response {
             NativeResponse::FileCreated(file_id) => Ok(file_id),
@@ -3600,12 +4404,15 @@ impl NativeFileClient for LocalNativeFileClient {
         }
     }
 
-    fn file_info(&self, file_id: FileId) -> Result<FileInfo> {
+    fn file_info(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileInfo> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::FileInfo { file_id },
+            NativeRequest::FileInfo {
+                keyspace_id,
+                file_id,
+            },
         ))?;
         match response.response {
             NativeResponse::FileInfo(info) => Ok(info),
@@ -3613,23 +4420,76 @@ impl NativeFileClient for LocalNativeFileClient {
         }
     }
 
-    fn acquire_append(&self, file_id: FileId) -> Result<AppendLease> {
+    fn acquire_append(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<AppendLease> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::AcquireAppend { file_id },
+            NativeRequest::AcquireAppend {
+                keyspace_id,
+                file_id,
+            },
         ))?;
         match response.response {
             NativeResponse::AppendLease(lease) => Ok(lease),
             _ => Err(StorageError::corrupt("unexpected append-lease response")),
         }
     }
+
+    fn checkpoint_keyspace(&self, keyspace_id: KeyspaceId) -> Result<CheckpointId> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::CheckpointKeyspace { keyspace_id },
+        ))?;
+        match response.response {
+            NativeResponse::KeyspaceCheckpointed(checkpoint_id) => Ok(checkpoint_id),
+            _ => Err(StorageError::corrupt(
+                "unexpected keyspace-checkpoint response",
+            )),
+        }
+    }
+
+    fn snapshot_keyspace(
+        &self,
+        source: KeyspaceId,
+        request: SnapshotKeyspaceRequest,
+    ) -> Result<KeyspaceId> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::SnapshotKeyspace { source, request },
+        ))?;
+        match response.response {
+            NativeResponse::KeyspaceSnapshotted(keyspace_id) => Ok(keyspace_id),
+            _ => Err(StorageError::corrupt(
+                "unexpected keyspace-snapshot response",
+            )),
+        }
+    }
+
+    fn restore_keyspace(&self, source: KeyspaceId, point: RestorePoint) -> Result<KeyspaceId> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::RestoreKeyspace { source, point },
+        ))?;
+        match response.response {
+            NativeResponse::KeyspaceRestored(keyspace_id) => Ok(keyspace_id),
+            _ => Err(StorageError::corrupt(
+                "unexpected keyspace-restore response",
+            )),
+        }
+    }
 }
 
-/// Local `NativeFile` handle backed by a native-file transport.
+/// Local `NativeFile` handle backed by a native keyspace/file transport.
 #[derive(Clone)]
 pub struct LocalNativeFile {
+    keyspace_id: KeyspaceId,
     file_id: FileId,
     transport: InProcessNativeTransport,
     client_epoch: crate::id::ClientEpoch,
@@ -3643,6 +4503,10 @@ impl LocalNativeFile {
 }
 
 impl NativeFile for LocalNativeFile {
+    fn keyspace_id(&self) -> KeyspaceId {
+        self.keyspace_id
+    }
+
     fn file_id(&self) -> FileId {
         self.file_id
     }
@@ -3653,6 +4517,7 @@ impl NativeFile for LocalNativeFile {
             self.client_epoch,
             None,
             NativeRequest::FileInfo {
+                keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
             },
         ))?;
@@ -3670,6 +4535,7 @@ impl NativeFile for LocalNativeFile {
             self.client_epoch,
             None,
             NativeRequest::Read {
+                keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
                 range: ByteRange::new(offset, len),
             },
@@ -3694,6 +4560,7 @@ impl NativeFile for LocalNativeFile {
             self.client_epoch,
             None,
             NativeRequest::AcquireAppend {
+                keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
             },
         ))?;
@@ -3709,6 +4576,7 @@ impl NativeFile for LocalNativeFile {
             self.client_epoch,
             None,
             NativeRequest::Append {
+                keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
                 lease,
                 bytes: data.to_vec(),
@@ -3727,6 +4595,7 @@ impl NativeFile for LocalNativeFile {
             self.client_epoch,
             None,
             NativeRequest::Flush {
+                keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
             },
         ))?;
@@ -3839,6 +4708,22 @@ fn coalesce_leaf_entries(entries: Vec<LeafEntry>) -> Result<Vec<LeafEntry>> {
         out.push(entry);
     }
     Ok(out)
+}
+
+fn blocks_for_bytes(bytes: u64, block_size: u64) -> Result<u64> {
+    if block_size == 0 {
+        return Err(StorageError::invalid_argument(
+            "block_size must be greater than zero",
+        ));
+    }
+    if bytes == 0 {
+        return Ok(0);
+    }
+
+    bytes
+        .checked_add(block_size - 1)
+        .map(|adjusted| adjusted / block_size)
+        .ok_or_else(|| StorageError::invalid_argument("byte count overflows block count"))
 }
 
 #[cfg(test)]
@@ -3976,8 +4861,14 @@ mod tests {
     #[test]
     fn file_commit_uses_version_fence_and_roots_for_gc_include_live_owners() {
         let metadata = InMemoryMetadataPlane::new(config()).unwrap();
+        let keyspace = metadata
+            .create_keyspace(MetadataCreateKeyspaceRequest {
+                request: CreateKeyspaceRequest { name: None },
+            })
+            .unwrap();
         let file = metadata
             .create_file(MetadataCreateFileRequest {
+                keyspace_id: keyspace.keyspace_id,
                 request: CreateFileRequest {
                     spec: FileSpec {
                         name: Some("log".to_string()),
@@ -3990,9 +4881,10 @@ mod tests {
 
         metadata
             .publish_commit_group(CommitGroupIntent {
-                owner: MappingOwner::NativeFile(file.file_id),
+                owner: MappingOwner::NativeKeyspace(keyspace.keyspace_id),
                 fence: MetadataFence::FileVersion(file.version),
                 updates: vec![RootUpdate::FileRoot {
+                    file_id: file.file_id,
                     old_root: file.root,
                     new_root: new_root.node_id,
                     new_size: 0,
@@ -4000,7 +4892,9 @@ mod tests {
             })
             .unwrap();
 
-        let updated = metadata.get_file_head(file.file_id).unwrap();
+        let updated = metadata
+            .get_file_head(keyspace.keyspace_id, file.file_id)
+            .unwrap();
         assert_eq!(updated.root, new_root.node_id);
         assert_eq!(updated.version, FileVersion::from_raw(1));
 
@@ -4107,7 +5001,7 @@ mod tests {
             .metadata()
             .roots_for_gc(RetentionPolicy::retain_everything())
             .unwrap();
-        for root in &checkpoint.shard_roots {
+        for root in &InMemoryMetadataPlane::checkpoint_block_roots(&checkpoint).unwrap() {
             assert!(with_pitr_retention.contains(root));
         }
         for root in &delete_record.shard_roots {
@@ -4212,13 +5106,10 @@ mod tests {
                             .trace
                             .record(format!("checkpoint step={step} device={device_id}"));
                         let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+                        let checkpoint = store.metadata().get_checkpoint(checkpoint).unwrap();
                         checkpoint_roots.push((
                             device_id,
-                            store
-                                .metadata()
-                                .get_checkpoint(checkpoint)
-                                .unwrap()
-                                .shard_roots,
+                            InMemoryMetadataPlane::checkpoint_block_roots(&checkpoint).unwrap(),
                         ));
                     }
                     2 if live_roots.len() + deleted_roots.len() < 8 => {
@@ -4743,9 +5634,8 @@ mod tests {
             .unwrap();
             let block_server = Arc::new(LocalBlockServer::new(store.clone()));
             let block_client = LocalBlockClient::new(InProcessBlockTransport::new(block_server));
-            let native_server = Arc::new(LocalNativeServer::new(store.clone()));
-            let native_client =
-                LocalNativeFileClient::new(InProcessNativeTransport::new(native_server));
+            let native_client = create_native_client(&store);
+            let native_keyspace = create_local_keyspace(&native_client);
             let mut device_models: BTreeMap<DeviceId, Vec<u8>> = BTreeMap::new();
             let mut deleted_devices = BTreeSet::new();
             let mut checkpoints: Vec<(DeviceId, CheckpointId, Vec<u8>)> = Vec::new();
@@ -4771,14 +5661,17 @@ mod tests {
                                 file_id
                             } else {
                                 let file_id = native_client
-                                    .create_file(CreateFileRequest {
-                                        spec: FileSpec { name: None },
-                                    })
+                                    .create_file(
+                                        native_keyspace,
+                                        CreateFileRequest {
+                                            spec: FileSpec { name: None },
+                                        },
+                                    )
                                     .unwrap();
                                 file_models.insert(file_id, Vec::new());
                                 file_id
                             };
-                            let file = native_client.open_file(file_id).unwrap();
+                            let file = native_client.open_file(native_keyspace, file_id).unwrap();
                             let stale = file.acquire_append().unwrap();
                             let fresh = file.acquire_append().unwrap();
                             assert!(
@@ -4976,9 +5869,12 @@ mod tests {
                     }
                     5 => {
                         let file_id = native_client
-                            .create_file(CreateFileRequest {
-                                spec: FileSpec { name: None },
-                            })
+                            .create_file(
+                                native_keyspace,
+                                CreateFileRequest {
+                                    spec: FileSpec { name: None },
+                                },
+                            )
                             .unwrap();
                         file_models.insert(file_id, Vec::new());
                         harness
@@ -4987,7 +5883,7 @@ mod tests {
                     }
                     6 if !file_models.is_empty() => {
                         let file_id = *file_models.keys().next().unwrap();
-                        let file = native_client.open_file(file_id).unwrap();
+                        let file = native_client.open_file(native_keyspace, file_id).unwrap();
                         let lease = file.acquire_append().unwrap();
                         let byte = (1 + harness.rng.next_u64() % 254) as u8;
                         file.append_with_lease(lease, &[byte; 4096]).unwrap();
@@ -5016,7 +5912,7 @@ mod tests {
                     &device_models,
                 );
                 for (file_id, model) in &file_models {
-                    let file = native_client.open_file(*file_id).unwrap();
+                    let file = native_client.open_file(native_keyspace, *file_id).unwrap();
                     let mut actual = vec![0; model.len() * 4096];
                     file.read_at(0, &mut actual).unwrap();
                     assert_model_blocks(
@@ -5327,11 +6223,24 @@ mod tests {
 
         let native_server = Arc::new(LocalNativeServer::new(store));
         let native_transport = InProcessNativeTransport::new(native_server.clone());
-        let create_file = NativeRequestEnvelope::new(
+        let create_keyspace = NativeRequestEnvelope::new(
             RequestId::from_raw(3),
             ClientEpoch::from_raw(1),
             None,
+            NativeRequest::CreateKeyspace {
+                request: CreateKeyspaceRequest { name: None },
+            },
+        );
+        let keyspace_id = match native_transport.call(create_keyspace).unwrap().response {
+            NativeResponse::KeyspaceCreated(keyspace_id) => keyspace_id,
+            _ => panic!("unexpected native response"),
+        };
+        let create_file = NativeRequestEnvelope::new(
+            RequestId::from_raw(4),
+            ClientEpoch::from_raw(1),
+            None,
             NativeRequest::CreateFile {
+                keyspace_id,
                 request: CreateFileRequest {
                     spec: FileSpec { name: None },
                 },
@@ -5340,7 +6249,7 @@ mod tests {
         let created = native_transport.call(create_file.clone()).unwrap();
         let duplicate_created = native_transport.call(create_file).unwrap();
         assert_eq!(duplicate_created, created);
-        assert_eq!(created.request_id, RequestId::from_raw(3));
+        assert_eq!(created.request_id, RequestId::from_raw(4));
         let file_id = match created.response {
             NativeResponse::FileCreated(file_id) => file_id,
             _ => panic!("unexpected native response"),
@@ -5351,15 +6260,19 @@ mod tests {
                     RequestId::from_raw(3),
                     ClientEpoch::from_raw(1),
                     None,
-                    NativeRequest::FileInfo { file_id },
+                    NativeRequest::FileInfo {
+                        keyspace_id,
+                        file_id,
+                    },
                 ))
                 .is_err()
         );
         let invalid_read = NativeRequestEnvelope::new(
-            RequestId::from_raw(4),
+            RequestId::from_raw(5),
             ClientEpoch::from_raw(1),
             None,
             NativeRequest::Read {
+                keyspace_id,
                 file_id,
                 range: ByteRange::new(0, 1),
             },
@@ -5368,7 +6281,11 @@ mod tests {
         assert!(native_transport.call(invalid_read).is_err());
         assert_eq!(
             native_server.request_log().unwrap(),
-            vec![RequestId::from_raw(3), RequestId::from_raw(4)]
+            vec![
+                RequestId::from_raw(3),
+                RequestId::from_raw(4),
+                RequestId::from_raw(5)
+            ]
         );
     }
 
@@ -5477,17 +6394,21 @@ mod tests {
     #[test]
     fn local_native_file_client_creates_opens_and_reads_empty_file() {
         let store = LocalObjectStore::with_config(config()).unwrap();
-        let server = Arc::new(LocalNativeServer::new(store));
-        let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
         let file_id = client
-            .create_file(CreateFileRequest {
-                spec: FileSpec {
-                    name: Some("empty".to_string()),
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("empty".to_string()),
+                    },
                 },
-            })
+            )
             .unwrap();
 
-        let file = client.open_file(file_id).unwrap();
+        let file = client.open_file(keyspace_id, file_id).unwrap();
+        assert_eq!(file.keyspace_id(), keyspace_id);
         assert_eq!(file.file_id(), file_id);
         let info = file.info().unwrap();
         assert_eq!(info.size, 0);
@@ -5739,14 +6660,9 @@ mod tests {
         for seed in 0..16 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
             let store = LocalObjectStore::with_config(tree_config()).unwrap();
-            let server = Arc::new(LocalNativeServer::new(store.clone()));
-            let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
-            let file_id = client
-                .create_file(CreateFileRequest {
-                    spec: FileSpec { name: None },
-                })
-                .unwrap();
-            let file = client.open_file(file_id).unwrap();
+            let client = create_native_client(&store);
+            let keyspace_id = create_local_keyspace(&client);
+            let (file_id, file) = create_local_file(&client, keyspace_id);
             let mut model = Vec::new();
 
             for step in 0..16 {
@@ -5766,7 +6682,11 @@ mod tests {
 
                 let mut actual = vec![0; model.len() * 4096];
                 file.read_at(0, &mut actual).unwrap();
-                let root = store.metadata().get_file_head(file_id).unwrap().root;
+                let root = store
+                    .metadata()
+                    .get_file_head(keyspace_id, file_id)
+                    .unwrap()
+                    .root;
                 assert_model_blocks(
                     &actual,
                     &model,
@@ -5980,11 +6900,10 @@ mod tests {
                 .metadata()
                 .replay_device_roots(device_id, commit1.commit_seq)
                 .unwrap(),
-            store
-                .metadata()
-                .get_checkpoint(checkpoint1)
-                .unwrap()
-                .shard_roots
+            InMemoryMetadataPlane::checkpoint_block_roots(
+                &store.metadata().get_checkpoint(checkpoint1).unwrap()
+            )
+            .unwrap()
         );
 
         let shard_commits = store
@@ -6147,7 +7066,11 @@ mod tests {
         assert!(store.metadata().validate_checkpoint(&checkpoint).is_ok());
 
         let mut corrupted = checkpoint;
-        corrupted.shard_roots[0] = initial_roots[0];
+        if let CheckpointRoots::BlockShard(roots) = &mut corrupted.roots {
+            roots[0] = initial_roots[0];
+        } else {
+            panic!("expected block checkpoint roots");
+        }
         assert!(store.metadata().validate_checkpoint(&corrupted).is_err());
     }
 
@@ -6341,14 +7264,9 @@ mod tests {
     #[test]
     fn native_append_valid_stale_and_stolen_leases_are_deterministic() {
         let store = LocalObjectStore::with_config(config()).unwrap();
-        let server = Arc::new(LocalNativeServer::new(store.clone()));
-        let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
-        let file_id = client
-            .create_file(CreateFileRequest {
-                spec: FileSpec { name: None },
-            })
-            .unwrap();
-        let file = client.open_file(file_id).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, file) = create_local_file(&client, keyspace_id);
 
         let first = file.acquire_append().unwrap();
         let stolen = file.acquire_append().unwrap();
@@ -6372,7 +7290,10 @@ mod tests {
         file.read_at(0, &mut actual).unwrap();
         assert_eq!(actual, repeated_blocks(2, 2));
 
-        let head = store.metadata().get_file_head(file_id).unwrap();
+        let head = store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap();
         let root = store.metadata().get_metadata_node(head.root).unwrap();
         let MetadataNodeKind::Leaf { entries } = root.kind else {
             panic!("default test native file root should remain a leaf");
@@ -6392,14 +7313,9 @@ mod tests {
             ..config()
         })
         .unwrap();
-        let server = Arc::new(LocalNativeServer::new(store.clone()));
-        let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
-        let file_id = client
-            .create_file(CreateFileRequest {
-                spec: FileSpec { name: None },
-            })
-            .unwrap();
-        let file = client.open_file(file_id).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
         let lease = file.acquire_append().unwrap();
 
         let failed = file.append_with_lease(lease, &repeated_blocks(2, 4));
@@ -6413,6 +7329,401 @@ mod tests {
             store.segment_catalog().state(reservation).unwrap(),
             SegmentLifecycleState::DurablePendingMetadata
         );
+    }
+
+    #[test]
+    fn native_file_accepts_unaligned_appends_and_reads() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+
+        let first = file
+            .append_with_lease(file.acquire_append().unwrap(), b"abc")
+            .unwrap();
+        assert_eq!(first.range, ByteRange::new(0, 3));
+        assert_eq!(file.info().unwrap().size, 3);
+
+        let middle = vec![4; 4090];
+        let second = file
+            .append_with_lease(file.acquire_append().unwrap(), &middle)
+            .unwrap();
+        assert_eq!(second.range, ByteRange::new(3, 4090));
+
+        let suffix = vec![5; 8];
+        let third = file
+            .append_with_lease(file.acquire_append().unwrap(), &suffix)
+            .unwrap();
+        assert_eq!(third.range, ByteRange::new(4093, 8));
+        assert_eq!(file.info().unwrap().size, 4101);
+
+        let mut expected = b"abc".to_vec();
+        expected.extend_from_slice(&middle);
+        expected.extend_from_slice(&suffix);
+
+        let mut full = vec![0; expected.len()];
+        file.read_at(0, &mut full).unwrap();
+        assert_eq!(full, expected);
+
+        let mut crossing = vec![0; 11];
+        file.read_at(4090, &mut crossing).unwrap();
+        assert_eq!(crossing, expected[4090..4101]);
+
+        let mut single = vec![0; 1];
+        file.read_at(2, &mut single).unwrap();
+        assert_eq!(single, b"c");
+        assert!(file.read_at(4098, &mut [0; 4]).is_err());
+    }
+
+    #[test]
+    fn native_keyspace_snapshot_and_restore_are_filesystem_level() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let file_a_id = client
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("a".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let file_b_id = client
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("b".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let file_a = client.open_file(keyspace_id, file_a_id).unwrap();
+        let file_b = client.open_file(keyspace_id, file_b_id).unwrap();
+
+        file_a
+            .append_with_lease(file_a.acquire_append().unwrap(), &repeated_blocks(1, 1))
+            .unwrap();
+        file_b
+            .append_with_lease(file_b.acquire_append().unwrap(), &repeated_blocks(1, 2))
+            .unwrap();
+        let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
+        let checkpoint_root = store
+            .metadata()
+            .get_keyspace_head(keyspace_id)
+            .unwrap()
+            .root;
+        let stale_source_lease = file_a.acquire_append().unwrap();
+
+        file_a
+            .append_with_lease(stale_source_lease.clone(), &repeated_blocks(1, 3))
+            .unwrap();
+
+        let nodes_before_restore = store.metadata().metadata_node_count().unwrap();
+        let restored_keyspace = client
+            .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(checkpoint))
+            .unwrap();
+        assert_eq!(
+            store
+                .metadata()
+                .get_keyspace_head(restored_keyspace)
+                .unwrap()
+                .root,
+            checkpoint_root
+        );
+        assert_eq!(
+            store.metadata().metadata_node_count().unwrap(),
+            nodes_before_restore
+        );
+        assert_eq!(
+            store
+                .metadata()
+                .file_name_for_test(restored_keyspace, file_a_id)
+                .unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            store
+                .metadata()
+                .file_name_for_test(restored_keyspace, file_b_id)
+                .unwrap(),
+            Some("b".to_string())
+        );
+        let restored_by_time = client
+            .restore_keyspace(
+                keyspace_id,
+                RestorePoint::Time(store.metadata().get_checkpoint(checkpoint).unwrap().time),
+            )
+            .unwrap();
+        let restored_a = client.open_file(restored_keyspace, file_a_id).unwrap();
+        let restored_b = client.open_file(restored_keyspace, file_b_id).unwrap();
+        let restored_time_a = client.open_file(restored_by_time, file_a_id).unwrap();
+        assert_eq!(read_file_bytes(&restored_a, 1), repeated_blocks(1, 1));
+        assert_eq!(read_file_bytes(&restored_b, 1), repeated_blocks(1, 2));
+        assert_eq!(read_file_bytes(&restored_time_a, 1), repeated_blocks(1, 1));
+        assert_eq!(
+            read_file_bytes(&file_a, 2),
+            repeated_blocks(1, 1)
+                .into_iter()
+                .chain(repeated_blocks(1, 3))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            restored_a
+                .append_with_lease(stale_source_lease, &repeated_blocks(1, 4))
+                .is_err()
+        );
+        restored_a
+            .append_with_lease(restored_a.acquire_append().unwrap(), &repeated_blocks(1, 5))
+            .unwrap();
+        assert_eq!(
+            read_file_bytes(&restored_a, 2),
+            repeated_blocks(1, 1)
+                .into_iter()
+                .chain(repeated_blocks(1, 5))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            read_file_bytes(&file_a, 2),
+            repeated_blocks(1, 1)
+                .into_iter()
+                .chain(repeated_blocks(1, 3))
+                .collect::<Vec<_>>()
+        );
+
+        let snapshot_source_root = store
+            .metadata()
+            .get_keyspace_head(keyspace_id)
+            .unwrap()
+            .root;
+        let nodes_before_snapshot = store.metadata().metadata_node_count().unwrap();
+        let snapshot_keyspace = client
+            .snapshot_keyspace(
+                keyspace_id,
+                SnapshotKeyspaceRequest {
+                    target: None,
+                    name: Some("current".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .metadata()
+                .get_keyspace_head(snapshot_keyspace)
+                .unwrap()
+                .root,
+            snapshot_source_root
+        );
+        assert_eq!(
+            store.metadata().metadata_node_count().unwrap(),
+            nodes_before_snapshot
+        );
+        assert_eq!(
+            store
+                .metadata()
+                .file_name_for_test(snapshot_keyspace, file_a_id)
+                .unwrap(),
+            Some("a".to_string())
+        );
+        assert!(
+            client
+                .snapshot_keyspace(
+                    keyspace_id,
+                    SnapshotKeyspaceRequest {
+                        target: Some(snapshot_keyspace),
+                        name: Some("duplicate".to_string()),
+                    },
+                )
+                .is_err()
+        );
+        let snapshot_a = client.open_file(snapshot_keyspace, file_a_id).unwrap();
+        let snapshot_b = client.open_file(snapshot_keyspace, file_b_id).unwrap();
+        assert_eq!(
+            read_file_bytes(&snapshot_a, 2),
+            repeated_blocks(1, 1)
+                .into_iter()
+                .chain(repeated_blocks(1, 3))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(read_file_bytes(&snapshot_b, 1), repeated_blocks(1, 2));
+
+        snapshot_b
+            .append_with_lease(snapshot_b.acquire_append().unwrap(), &repeated_blocks(1, 6))
+            .unwrap();
+        assert_eq!(read_file_bytes(&file_b, 1), repeated_blocks(1, 2));
+        assert_eq!(
+            read_file_bytes(&snapshot_b, 2),
+            repeated_blocks(1, 2)
+                .into_iter()
+                .chain(repeated_blocks(1, 6))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn native_keyspace_checkpoint_validation_rejects_mismatched_root() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+        let checkpoint1 = client.checkpoint_keyspace(keyspace_id).unwrap();
+
+        file.append_with_lease(file.acquire_append().unwrap(), &repeated_blocks(1, 9))
+            .unwrap();
+        let checkpoint2 = client.checkpoint_keyspace(keyspace_id).unwrap();
+        let first = store.metadata().get_checkpoint(checkpoint1).unwrap();
+        let mut corrupted = store.metadata().get_checkpoint(checkpoint2).unwrap();
+        assert!(store.metadata().validate_checkpoint(&corrupted).is_ok());
+
+        corrupted.roots = first.roots;
+        assert!(store.metadata().validate_checkpoint(&corrupted).is_err());
+    }
+
+    #[test]
+    fn native_keyspace_pitr_gc_respects_commit_window() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, file) = create_local_file(&client, keyspace_id);
+
+        let commit1 = file
+            .append_with_lease(file.acquire_append().unwrap(), &repeated_blocks(1, 1))
+            .unwrap();
+        let checkpoint1 = client.checkpoint_keyspace(keyspace_id).unwrap();
+        let commit2 = file
+            .append_with_lease(file.acquire_append().unwrap(), &repeated_blocks(1, 2))
+            .unwrap();
+        let commit3 = file
+            .append_with_lease(file.acquire_append().unwrap(), &repeated_blocks(1, 3))
+            .unwrap();
+
+        let report = store
+            .run_metadata_custodian(
+                RetentionPolicy::expire_deleted_immediately().with_pitr_grace_commits(2),
+            )
+            .unwrap();
+
+        assert!(report.sweep.released_segments.is_empty());
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(2))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(3))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+
+        let retained = store
+            .metadata()
+            .keyspace_commits_for_keyspace(keyspace_id)
+            .unwrap();
+        assert!(
+            !retained
+                .iter()
+                .any(|commit| commit.commit_seq == commit1.commit_seq)
+        );
+        assert!(
+            !retained
+                .iter()
+                .any(|commit| commit.commit_seq == commit2.commit_seq)
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|commit| commit.commit_seq == commit3.commit_seq)
+        );
+
+        let restored = client
+            .restore_keyspace(keyspace_id, RestorePoint::Commit(commit2.commit_seq))
+            .unwrap();
+        let restored_file = client.open_file(restored, file_id).unwrap();
+        assert_eq!(
+            read_file_bytes(&restored_file, 2),
+            repeated_blocks(1, 1)
+                .into_iter()
+                .chain(repeated_blocks(1, 2))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            client
+                .restore_keyspace(keyspace_id, RestorePoint::Commit(commit1.commit_seq))
+                .is_err()
+        );
+        assert!(store.metadata().get_checkpoint(checkpoint1).is_err());
+    }
+
+    #[test]
+    fn generated_native_keyspace_restores_match_historical_model() {
+        for seed in 0..8 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let store = LocalObjectStore::with_config(tree_config()).unwrap();
+            let client = create_native_client(&store);
+            let keyspace_id = create_local_keyspace(&client);
+            let (file_a, handle_a) = create_local_file(&client, keyspace_id);
+            let (file_b, handle_b) = create_local_file(&client, keyspace_id);
+            let mut model: BTreeMap<FileId, Vec<u8>> =
+                BTreeMap::from([(file_a, Vec::new()), (file_b, Vec::new())]);
+            let mut history = vec![(
+                client.keyspace_info(keyspace_id).unwrap().latest_commit,
+                model.clone(),
+            )];
+
+            for step in 0..18 {
+                let (file_id, handle) = if harness.rng.next_u64() % 2 == 0 {
+                    (file_a, &handle_a)
+                } else {
+                    (file_b, &handle_b)
+                };
+                let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                harness
+                    .trace
+                    .record(format!("append step={step} file={file_id} byte={byte}"));
+                let commit = handle
+                    .append_with_lease(handle.acquire_append().unwrap(), &[byte; 4096])
+                    .unwrap();
+                model.get_mut(&file_id).unwrap().push(byte);
+                history.push((commit.commit_seq, model.clone()));
+                if harness.rng.next_u64() % 4 == 0 {
+                    client.checkpoint_keyspace(keyspace_id).unwrap();
+                }
+            }
+
+            for _ in 0..6 {
+                let index = harness.rng.choose_index(history.len()).unwrap();
+                let (commit_seq, expected) = &history[index];
+                let restored = client
+                    .restore_keyspace(keyspace_id, RestorePoint::Commit(*commit_seq))
+                    .unwrap();
+                for (file_id, expected_blocks) in expected {
+                    let restored_file = client.open_file(restored, *file_id).unwrap();
+                    let mut actual = vec![0; expected_blocks.len() * 4096];
+                    restored_file.read_at(0, &mut actual).unwrap();
+                    assert_model_blocks(
+                        &actual,
+                        expected_blocks,
+                        seed,
+                        harness.trace.events(),
+                        "native keyspace restore",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6572,13 +7883,16 @@ mod tests {
         assert!(store.metadata().get_head(DeviceId::from_raw(404)).is_err());
 
         let native = LocalNativeServer::new(store);
+        let keyspace_id = KeyspaceId::from_raw(1);
         let response = native.handle(NativeRequestEnvelope::new(
             RequestId::from_raw(11),
             ClientEpoch::from_raw(1),
             None,
             NativeRequest::Append {
+                keyspace_id,
                 file_id: FileId::from_raw(1),
                 lease: crate::extent::AppendLease {
+                    keyspace_id,
                     file_id: FileId::from_raw(1),
                     lease_id: crate::id::AppendLeaseId::from_raw(1),
                     writer_epoch: WriterEpoch::from_raw(0),
@@ -6634,6 +7948,33 @@ mod tests {
         client.open_device(device_id).unwrap()
     }
 
+    fn create_native_client(store: &LocalObjectStore) -> LocalNativeClient {
+        let server = Arc::new(LocalNativeServer::new(store.clone()));
+        LocalNativeClient::new(InProcessNativeTransport::new(server))
+    }
+
+    fn create_local_keyspace(client: &LocalNativeClient) -> KeyspaceId {
+        client
+            .create_keyspace(CreateKeyspaceRequest { name: None })
+            .unwrap()
+    }
+
+    fn create_local_file(
+        client: &LocalNativeClient,
+        keyspace_id: KeyspaceId,
+    ) -> (FileId, LocalNativeFile) {
+        let file_id = client
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            )
+            .unwrap();
+        let file = client.open_file(keyspace_id, file_id).unwrap();
+        (file_id, file)
+    }
+
     fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {
         vec![byte; blocks as usize * 4096]
     }
@@ -6641,6 +7982,12 @@ mod tests {
     fn read_device_bytes(device: &LocalBlockDevice, blocks: u64) -> Vec<u8> {
         let mut out = vec![0; blocks as usize * 4096];
         device.read_at(0, &mut out).unwrap();
+        out
+    }
+
+    fn read_file_bytes(file: &LocalNativeFile, blocks: u64) -> Vec<u8> {
+        let mut out = vec![0; blocks as usize * 4096];
+        file.read_at(0, &mut out).unwrap();
         out
     }
 

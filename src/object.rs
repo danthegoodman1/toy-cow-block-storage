@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
+
 use crate::api::BlockRange;
 use crate::error::{Result, StorageError};
 use crate::id::{
     BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq, DeviceGeneration, DeviceId,
-    FileId, FileVersion, LogicalTime, MetadataNodeId, SegmentId, ShardId,
+    FileId, FileVersion, KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalTime,
+    MetadataNodeId, SegmentId, ShardId,
 };
 
 /// Owner namespace for shared metadata roots.
@@ -13,7 +16,7 @@ use crate::id::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MappingOwner {
     BlockDevice(DeviceId),
-    NativeFile(FileId),
+    NativeKeyspace(KeyspaceId),
 }
 
 /// Current committed block-device root set.
@@ -26,6 +29,19 @@ pub struct DeviceHead {
     pub device_id: DeviceId,
     pub generation: DeviceGeneration,
     pub shard_roots: Vec<MetadataNodeId>,
+    pub latest_commit: CommitSeq,
+}
+
+/// Current committed native keyspace catalog root.
+///
+/// A `KeyspaceHead` is the durable publication unit for the native
+/// filesystem-like API. Snapshots and restores copy its immutable catalog root
+/// pointer, not individual file metadata roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspaceHead {
+    pub keyspace_id: KeyspaceId,
+    pub generation: KeyspaceGeneration,
+    pub root: KeyspaceRootId,
     pub latest_commit: CommitSeq,
 }
 
@@ -49,11 +65,12 @@ impl DeviceHead {
     }
 }
 
-/// Current committed native file root.
+/// Current committed native file root inside a keyspace catalog.
 ///
-/// A `FileHead` is the durable publication unit for a native file. Providers
-/// must advance `version`, `root`, `size`, and `latest_commit` together so
-/// stale append writers can be rejected by version/epoch fencing.
+/// A `FileHead` is published by replacing the containing immutable
+/// `KeyspaceRoot`. Providers must advance `version`, `root`, `size`, and
+/// `latest_commit` together so stale append writers can be rejected by
+/// version/epoch fencing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHead {
     pub file_id: FileId,
@@ -116,6 +133,42 @@ impl FileHead {
             ));
         }
 
+        Ok(())
+    }
+}
+
+/// Immutable native keyspace catalog entry.
+///
+/// File creation metadata lives with the committed file head in the immutable
+/// keyspace catalog. Snapshots and restores therefore copy the entire namespace
+/// view by root pointer, not by consulting side tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspaceFile {
+    pub name: Option<String>,
+    pub head: FileHead,
+}
+
+/// Immutable native keyspace catalog.
+///
+/// The local v1 catalog body is a deterministic `BTreeMap` from scoped
+/// `FileId` to catalog entries. The public API depends only on the immutable
+/// catalog root boundary, so a later implementation can replace this body with
+/// a sharded or tree-backed catalog without changing callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspaceRoot {
+    pub root_id: KeyspaceRootId,
+    pub files: BTreeMap<FileId, KeyspaceFile>,
+}
+
+impl KeyspaceRoot {
+    pub fn validate(&self) -> Result<()> {
+        for (file_id, entry) in &self.files {
+            if *file_id != entry.head.file_id {
+                return Err(StorageError::invalid_argument(
+                    "keyspace catalog key does not match file head",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -284,7 +337,13 @@ pub struct ShardRootUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootUpdate {
     BlockShard(ShardRootUpdate),
+    FileCreated {
+        file_id: FileId,
+        new_root: MetadataNodeId,
+        new_size: u64,
+    },
     FileRoot {
+        file_id: FileId,
         old_root: MetadataNodeId,
         new_root: MetadataNodeId,
         new_size: u64,
@@ -332,6 +391,37 @@ pub struct ShardCommit {
     pub new_root: MetadataNodeId,
 }
 
+/// Append-only native keyspace catalog-root timeline record.
+///
+/// A native file create or append publishes a new immutable keyspace catalog
+/// root. PITR replay starts from a native keyspace checkpoint and applies these
+/// records in commit order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspaceCommit {
+    pub commit_seq: CommitSeq,
+    pub commit_group: CommitGroupId,
+    pub time: LogicalTime,
+    pub keyspace_id: KeyspaceId,
+    pub old_root: KeyspaceRootId,
+    pub new_root: KeyspaceRootId,
+}
+
+/// Append-only native file-root audit record inside a keyspace commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCommit {
+    pub commit_seq: CommitSeq,
+    pub commit_group: CommitGroupId,
+    pub time: LogicalTime,
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
+    pub old_root: Option<MetadataNodeId>,
+    pub new_root: MetadataNodeId,
+    pub old_version: Option<FileVersion>,
+    pub new_version: FileVersion,
+    pub old_size: u64,
+    pub new_size: u64,
+}
+
 /// Append-only device deletion timeline record.
 ///
 /// Deleting a device removes it from the live catalog but records the roots
@@ -345,6 +435,13 @@ pub struct DeleteRecord {
     pub shard_roots: Vec<MetadataNodeId>,
 }
 
+/// Root payload for a durable PITR checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointRoots {
+    BlockShard(Vec<MetadataNodeId>),
+    NativeKeyspace(KeyspaceRootId),
+}
+
 /// Durable PITR checkpoint.
 ///
 /// Checkpoints summarize owner roots at a commit sequence so restore can replay
@@ -355,7 +452,7 @@ pub struct Checkpoint {
     pub commit_seq: CommitSeq,
     pub time: LogicalTime,
     pub owner: MappingOwner,
-    pub shard_roots: Vec<MetadataNodeId>,
+    pub roots: CheckpointRoots,
 }
 
 fn byte_capacity(range: BlockRange, block_size: u32) -> Result<u64> {

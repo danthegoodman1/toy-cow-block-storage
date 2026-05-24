@@ -1,22 +1,22 @@
 use crate::api::{ByteRange, CreateDeviceRequest, DeleteResult, DeviceSpec, RestorePoint};
 use crate::error::Result;
-use crate::extent::{CreateFileRequest, FileInfo};
+use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileInfo, KeyspaceInfo};
 use crate::id::{
-    CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion, MetadataNodeId,
-    SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
+    CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion, KeyspaceId,
+    MetadataNodeId, SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, MappingOwner, MetadataNode,
-    RootUpdate, SegmentDescriptor,
+    Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, KeyspaceHead, MappingOwner,
+    MetadataNode, RootUpdate, SegmentDescriptor,
 };
 
 /// A metadata-root publish request.
 ///
 /// Implementors must treat this as the atomic metadata transition for one owner.
 /// For block devices, all shard-root updates in the intent become visible
-/// together or none do. For native files, the file root/version transition
-/// becomes visible together or none does. Successful publishes must be
-/// durably replayable before success is returned.
+/// together or none do. For native keyspaces, the catalog-root transition and
+/// enclosed file root/version transition become visible together or none does.
+/// Successful publishes must be durably replayable before success is returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitGroupIntent {
     pub owner: MappingOwner,
@@ -52,13 +52,13 @@ pub struct MetadataCreateDeviceRequest {
 /// Internal create-file request accepted by the metadata plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataCreateFileRequest {
+    pub keyspace_id: KeyspaceId,
     pub request: CreateFileRequest,
 }
 
-impl From<CreateFileRequest> for MetadataCreateFileRequest {
-    fn from(request: CreateFileRequest) -> Self {
-        Self { request }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCreateKeyspaceRequest {
+    pub request: CreateKeyspaceRequest,
 }
 
 impl From<CreateDeviceRequest> for MetadataCreateDeviceRequest {
@@ -74,6 +74,13 @@ impl From<CreateDeviceRequest> for MetadataCreateDeviceRequest {
 pub struct MetadataForkRequest {
     pub source: DeviceId,
     pub target: Option<DeviceId>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataSnapshotKeyspaceRequest {
+    pub source: KeyspaceId,
+    pub target: Option<KeyspaceId>,
     pub name: Option<String>,
 }
 
@@ -171,10 +178,24 @@ pub trait MetadataPlane: Send + Sync {
     /// layout, but every live device must have a complete root set.
     fn create_device(&self, request: MetadataCreateDeviceRequest) -> Result<DeviceHead>;
 
-    /// Create a native file and publish its initial empty file root.
+    /// Create a native keyspace and publish its initial empty catalog root.
+    ///
+    /// Success means the returned `KeyspaceHead` is durable and visible to
+    /// subsequent native keyspace/file operations.
+    fn create_keyspace(&self, request: MetadataCreateKeyspaceRequest) -> Result<KeyspaceHead>;
+
+    /// Return the latest committed native keyspace head.
+    fn get_keyspace_head(&self, keyspace_id: KeyspaceId) -> Result<KeyspaceHead>;
+
+    /// Return user-facing native keyspace information derived from committed
+    /// state.
+    fn get_keyspace_info(&self, keyspace_id: KeyspaceId) -> Result<KeyspaceInfo>;
+
+    /// Create a native file inside a keyspace and publish a new keyspace
+    /// catalog root containing its initial empty file root.
     ///
     /// Success means the returned `FileHead` is durable, versioned, and visible
-    /// to subsequent `get_file_head` calls.
+    /// to subsequent keyspace-scoped `get_file_head` calls.
     fn create_file(&self, request: MetadataCreateFileRequest) -> Result<FileHead>;
 
     /// Return the latest committed block device head.
@@ -201,10 +222,10 @@ pub trait MetadataPlane: Send + Sync {
     /// Return the latest committed native file head.
     ///
     /// Must not return a head from a stale append lease or failed append commit.
-    fn get_file_head(&self, file_id: FileId) -> Result<FileHead>;
+    fn get_file_head(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileHead>;
 
     /// Return user-facing native file information derived from committed state.
-    fn get_file_info(&self, file_id: FileId) -> Result<FileInfo>;
+    fn get_file_info(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileInfo>;
 
     /// Persist an immutable metadata node.
     ///
@@ -235,6 +256,18 @@ pub trait MetadataPlane: Send + Sync {
     /// state. Missing or expired restore points must fail cleanly.
     fn restore_device(&self, source: DeviceId, point: RestorePoint) -> Result<DeviceHead>;
 
+    /// Snapshot the current native keyspace catalog into a new keyspace.
+    ///
+    /// Success copies the source keyspace's immutable catalog root pointer and
+    /// does not walk file metadata leaves or bump deep segment references.
+    fn snapshot_keyspace(&self, request: MetadataSnapshotKeyspaceRequest) -> Result<KeyspaceHead>;
+
+    /// Restore a native keyspace to a retained point in time as a new keyspace.
+    ///
+    /// Restore creates a new committed keyspace head rather than mutating
+    /// historical state. Missing or expired restore points must fail cleanly.
+    fn restore_keyspace(&self, source: KeyspaceId, point: RestorePoint) -> Result<KeyspaceHead>;
+
     /// Remove a block device from the live catalog and append deletion evidence.
     ///
     /// Success means `get_head`, live listings, and public block operations no
@@ -255,13 +288,20 @@ pub trait MetadataPlane: Send + Sync {
     /// reports.
     fn checkpoint(&self, device_id: DeviceId) -> Result<CheckpointId>;
 
+    /// Write a durable checkpoint for a native keyspace.
+    ///
+    /// The checkpoint captures one immutable keyspace catalog root, making
+    /// restore filesystem-level instead of per-file.
+    fn checkpoint_keyspace(&self, keyspace_id: KeyspaceId) -> Result<CheckpointId>;
+
     /// Fetch a durable checkpoint by ID.
     fn get_checkpoint(&self, checkpoint_id: CheckpointId) -> Result<Checkpoint>;
 
     /// Enumerate metadata roots that must be treated as live for GC.
     ///
-    /// Must include live block roots, live native file roots, and retained PITR
-    /// roots required by `policy`. Returning too few roots is data loss.
+    /// Must include live block roots, live native keyspace file roots, and
+    /// retained PITR roots required by `policy`. Returning too few roots is
+    /// data loss.
     ///
     /// Implementors may create deterministic replay-anchor checkpoints required
     /// by the retention policy before returning roots, but must not make user
@@ -443,8 +483,12 @@ mod tests {
             },
         };
 
-        let metadata = MetadataCreateFileRequest::from(public.clone());
+        let metadata = MetadataCreateFileRequest {
+            keyspace_id: KeyspaceId::from_raw(7),
+            request: public.clone(),
+        };
 
+        assert_eq!(metadata.keyspace_id, KeyspaceId::from_raw(7));
         assert_eq!(metadata.request, public);
     }
 }

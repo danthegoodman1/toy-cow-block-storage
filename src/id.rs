@@ -28,10 +28,12 @@ macro_rules! id_type {
 }
 
 id_type!(DeviceId, u128);
+id_type!(KeyspaceId, u128);
 id_type!(FileId, u128);
 id_type!(RequestId, u128);
 id_type!(ClientEpoch, u64);
 id_type!(DeviceGeneration, u64);
+id_type!(KeyspaceGeneration, u64);
 id_type!(FileVersion, u64);
 id_type!(WriterEpoch, u64);
 id_type!(CommitSeq, u64);
@@ -40,6 +42,7 @@ id_type!(CheckpointId, u128);
 id_type!(SegmentId, u128);
 id_type!(StorageNodeId, u128);
 id_type!(MetadataNodeId, u128);
+id_type!(KeyspaceRootId, u128);
 id_type!(ShardId, u32);
 id_type!(WriteIntentId, u128);
 id_type!(AppendLeaseId, u128);

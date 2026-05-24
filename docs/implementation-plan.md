@@ -55,8 +55,9 @@ Deliverables:
 - [x] Public `BlockClient` trait for create and device info lookup.
 - [x] Public `BlockDevice` trait for aligned reads, writes, flush, zeroing,
   discard, fork, restore, delete, and info.
-- [x] Public `NativeFileClient` trait for native file create/info/append-lease
-  lookup.
+- [x] Public `NativeKeyspaceClient` trait for native keyspace create/info,
+  file create/info/append-lease lookup, keyspace checkpoint, snapshot, and
+  restore.
 - [x] Public `NativeFile` trait for native file reads, append leases, leased
   appends, flush, and info.
 - [x] `BlockServer` actor boundary.
@@ -66,9 +67,9 @@ Deliverables:
 - [x] Typed request and response envelopes with request ID, client epoch, and
   optional logical deadline.
 - [x] Public device spec limited to logical device size and block size.
-- [x] `MetadataPlane` contract for device heads, metadata nodes, commit groups,
-  native file heads, file versions, PITR, checkpoints, forks, restores, and GC
-  roots.
+- [x] `MetadataPlane` contract for device heads, native keyspace heads,
+  metadata nodes, commit groups, native file heads, file versions, PITR,
+  checkpoints, forks, restores, and GC roots.
 - [x] `SegmentStore` contract for immutable segment bytes on one storage
   endpoint.
 - [x] `LocalSegmentCatalog` contract for per-storage-node replica placement.
@@ -464,8 +465,9 @@ The completed local phases prove the state transitions in one process. The
 following local shortcuts are intentional, but each must become a durable,
 remote, replayable, or concurrent boundary in the owning future phase:
 
-- Phase 14 owns native file PITR and snapshot semantics over the shared segment
-  substrate, including file-root commit records and restore/snapshot API shape.
+- Phase 14 owns native keyspace PITR and snapshot semantics over the shared
+  segment substrate, including keyspace catalog-root records, file-root audit
+  records, and restore/snapshot API shape.
 - Phase 15 owns real durability for segment sync, metadata WAL/transaction
   sync, commit-group replay, write-intent recovery, native append lease/session
   records, checkpoint/timeline persistence, and cache coherence after restart.
@@ -482,44 +484,60 @@ distributed boundary is done. A later phase is complete only when the handoff is
 durable or replayable, idempotent under retries, and covered by deterministic
 delay, duplication, reorder, failure, and restart tests.
 
-## Phase 14: Native File PITR and Snapshots
+## Phase 14: Native Keyspace PITR and Snapshots
 
-Status: not started.
+Status: complete.
 
-Add point-in-time history for native files without routing native operations
-through block-device mappings. This phase proves that file-root timelines,
-append-lease fencing, and GC retention work for the native API before durable or
-remote providers have to persist those records.
+Add point-in-time history for native keyspaces without routing native operations
+through block-device mappings. This phase proves that keyspace catalog-root
+timelines, file-root audit records, append-lease fencing, and GC retention work
+for the native API before durable or remote providers have to persist those
+records.
+
+The snapshot/restore boundary is the native keyspace, not an individual file.
+Per-file snapshots are intentionally not part of this phase because they do not
+produce coherent filesystem-level restore points.
 
 Deliverables:
 
-- [ ] Public native restore/snapshot API shape documented in the spec.
-- [ ] Append-only `FileCommit` records with old/new file roots, old/new file
+- [x] Public native keyspace restore/snapshot API shape documented in the spec.
+- [x] Native file append/read semantics are byte-oriented while local segment
+  storage remains block-aligned internally.
+- [x] Append-only `KeyspaceCommit` records with old/new keyspace catalog roots,
+  commit sequence, commit group, and logical time.
+- [x] Append-only `FileCommit` records with old/new file roots, old/new file
   versions, size, commit sequence, commit group, and logical time.
-- [ ] Native file checkpoint records or shared owner checkpoints that can
-  reconstruct a `FileHead`.
-- [ ] Restore algorithm from checkpoint plus file commits.
-- [ ] Native snapshot or restore operation that creates a new file lineage
-  without mutating the source file.
-- [ ] PITR retention and replay-anchor materialization for native file roots.
-- [ ] GC roots include retained native PITR checkpoints and file-root timeline
-  records.
-- [ ] Generated traces compare native file restores against a simple historical
-  file model.
+- [x] Native keyspace checkpoint records that can reconstruct a `KeyspaceHead`.
+- [x] Immutable keyspace catalog entries include file creation metadata, so
+  snapshots and restores preserve namespace metadata by root-pointer copy.
+- [x] Restore algorithm from checkpoint plus keyspace commits.
+- [x] Native snapshot or restore operation that creates a new keyspace lineage
+  without mutating the source keyspace.
+- [x] PITR retention and replay-anchor materialization for native keyspace
+  roots.
+- [x] GC roots include retained native PITR checkpoints and keyspace-root
+  timeline records.
+- [x] Generated traces compare native keyspace restores against a simple
+  historical keyspace/file model.
 
 Exit gate:
 
-- [ ] Native restore to selected commits and times returns expected file bytes,
-  size, and file version.
-- [ ] Stale append leases cannot publish across a restore or snapshot lineage
+- [x] Native keyspace restore to selected commits, checkpoints, and times returns
+  expected file bytes, size, and file version for every restored file.
+- [x] Snapshot and restore reuse the retained `KeyspaceRoot` pointer and do not
+  allocate file metadata-tree nodes.
+- [x] Native checkpoint validation rejects mismatched keyspace roots.
+- [x] Unaligned native appends and reads across a block boundary preserve exact
+  file bytes and size.
+- [x] Stale append leases cannot publish across a restore or snapshot lineage
   boundary.
-- [ ] Native PITR GC never deletes metadata or segments needed by retained
-  native restore points.
-- [ ] Expired native restore points fail cleanly after GC sweeps the needed
+- [x] Native PITR GC never deletes metadata or segments needed by retained
+  native keyspace restore points.
+- [x] Expired native restore points fail cleanly after GC sweeps the needed
   roots.
-- [ ] Block PITR behavior remains unchanged; native PITR shares the lower
+- [x] Block PITR behavior remains unchanged; native PITR shares the lower
   substrate but not block-device logical mappings.
-- [ ] Criterion covers native checkpoint restore.
+- [x] Criterion covers native keyspace checkpoint restore.
 
 ## Phase 15: Durable Provider
 
@@ -536,7 +554,8 @@ Deliverables:
 - [ ] Crash-consistent `sync_segment` and `flush` definitions, including exact
   `durable_through` semantics.
 - [ ] Durable metadata transaction or WAL records for commit groups, checkpoints,
-  delete records, fork records, and native file-root commits.
+  delete records, fork records, native keyspace commits, and native file-root
+  audit commits.
 - [ ] Durable write-intent table with logical expiration, cancellation/failure
   evidence, and restart recovery scan.
 - [ ] Durable native append lease/session records with restart-safe writer

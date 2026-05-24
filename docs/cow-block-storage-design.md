@@ -234,7 +234,7 @@ The first implementation runs locally in one process, but the service
 boundaries should be real from the beginning:
 
 ```text
-BlockClient / BlockDevice API       NativeFileClient / NativeFile API
+BlockClient / BlockDevice API       NativeKeyspaceClient / NativeFile API
   -> BlockTransport
      -> BlockServer actor           -> NativeTransport
                                       -> NativeServer actor
@@ -292,25 +292,54 @@ Public guarantees:
 - `delete` removes the live device but does not imply immediate physical
   reclamation.
 
-### `NativeFileClient` and `NativeFile`
+### `NativeKeyspaceClient` and `NativeFile`
 
-`NativeFileClient` and `NativeFile` are the native extent/file-facing API. This
-API is for custom filesystems or direct users that want to preserve append
-ownership, file versions, and stale-writer fencing instead of encoding those
-semantics into ordinary block writes.
+`NativeKeyspaceClient` and `NativeFile` are the native keyspace/file-facing API.
+This API is for custom filesystems or direct users that want filesystem-level
+snapshots, append ownership, file versions, and stale-writer fencing instead of
+encoding those semantics into ordinary block writes.
+
+The snapshot and restore boundary is the native keyspace, not an individual
+file. A keyspace is a filesystem-like namespace whose committed head points to
+an immutable catalog root:
+
+```text
+KeyspaceHead {
+  keyspace_id
+  generation
+  root -> KeyspaceRoot
+}
+
+KeyspaceRoot {
+  file_id -> {
+    name
+    FileHead
+  }
+}
+```
+
+File IDs are scoped by `keyspace_id`. A snapshot or restore creates a new
+keyspace lineage by copying the retained `KeyspaceRoot` pointer, so all files in
+the namespace and their catalog metadata are restored to one coherent point in
+time. File creation metadata belongs inside the immutable catalog root; it must
+not live in a mutable side table that snapshots have to rediscover.
 
 The native API publishes mappings shaped like:
 
 ```text
-file_id, file_version, file_range -> segment_id, segment_offset
+keyspace_id, file_id, file_version, file_range -> segment_id, segment_offset
 ```
 
 Public native guarantees:
 
+- Keyspace snapshots and restores are atomic namespace-level operations.
 - File appends are fenced by append leases with writer epochs.
+- Native file reads and appends are byte-oriented; block alignment is an
+  implementation-private segment detail.
 - The metadata plane rejects stale append commits whose file version or writer
-  epoch no longer matches.
-- A successful append commit advances the file version atomically.
+  epoch no longer matches the keyspace-scoped file.
+- A successful append commit advances the file version and keyspace catalog root
+  atomically.
 - Segment bytes are durable before file extent metadata references them.
 - Failed or stale append commits leave only orphan segment data that custodians
   can reclaim.
@@ -347,14 +376,15 @@ deterministically.
 `MetadataPlane` owns globally meaningful metadata durability:
 
 - device catalog records
-- native file catalog records
+- native keyspace catalog records
 - current device heads
-- current file heads and file versions
+- current keyspace heads, file heads, and file versions
 - shard-root publish and compare-and-swap
-- native file root publish with file-version and writer-epoch fencing
+- native keyspace catalog-root publish with file-version and writer-epoch
+  fencing
 - commit groups for multi-shard atomic public writes
 - commit groups for native append/file extent commits
-- PITR shard commits and checkpoints
+- PITR shard commits, keyspace commits, and checkpoints
 - metadata node durability
 - retained roots for GC
 - cache of hot heads and metadata nodes
@@ -474,8 +504,8 @@ server:
    durable-pending-metadata.
 7. Persists the new immutable metadata nodes that reference the durable segment
    slices.
-8. Publishes the block or native file metadata update through a metadata commit
-   group.
+8. Publishes the block metadata update or native keyspace catalog update through
+   a metadata commit group.
 9. Marks durable local replica catalog entries as referenced by the successful
    commit.
 10. Acknowledges the public write only after the metadata commit group succeeds.
@@ -530,10 +560,10 @@ Invariants:
   root.
 - Shared metadata and segments remain immutable.
 
-Native files do not get a public fork API in v1. The native API is for
-append-lease and file-version semantics, and a later native snapshot feature
-should be designed explicitly around those fences rather than piggybacking on
-block-device forks.
+Native files do not get a public per-file fork API in v1. The native API
+snapshots and restores whole keyspaces so a filesystem namespace remains
+coherent; those operations copy keyspace catalog-root pointers rather than
+piggybacking on block-device forks.
 
 ### Read Range
 
@@ -619,9 +649,10 @@ Invariants:
 
 ### Native File Create
 
-Creating a native file initializes an empty file metadata root and a file version
-of zero. File metadata roots are GC roots while the file is live or retained by
-PITR policy.
+Creating a native file initializes an empty file metadata root and a file
+version of zero, then publishes a new immutable keyspace catalog root containing
+that file head. File metadata roots are GC roots while their keyspace catalog
+root is live or retained by PITR policy.
 
 Invariants:
 
@@ -710,8 +741,8 @@ The first implementation should prefer correctness over clever packing:
 ## 10. Point-In-Time Recovery
 
 PITR is a timeline of root changes. The system should not rewrite a full device
-or file manifest on every write. For block devices, it appends per-shard commit
-records:
+or keyspace manifest on every write. For block devices, it appends per-shard
+commit records:
 
 ```text
 ShardCommit {
@@ -725,15 +756,26 @@ ShardCommit {
 }
 ```
 
-Native file commits currently publish the latest file root and file version but
-do not expose a public native restore API. A later native PITR feature should
-append file-root commit records:
+Native operations append keyspace catalog-root commit records. File-root
+changes are also recorded as audit/replay evidence inside the keyspace commit:
+
+```text
+KeyspaceCommit {
+  commit_seq
+  commit_group
+  time
+  keyspace_id
+  old_root
+  new_root
+}
+```
 
 ```text
 FileCommit {
   commit_seq
   commit_group
   time
+  keyspace_id
   file_id
   old_version
   new_version
@@ -750,15 +792,15 @@ Checkpoint {
   commit_seq
   time
   owner
-  roots[]
+  roots: block shard roots | native keyspace root
 }
 ```
 
 Restore an owner to time `T`:
 
-1. Load the latest checkpoint for the device or file at or before `T`.
+1. Load the latest checkpoint for the device or keyspace at or before `T`.
 2. Replay root commits for that owner after the checkpoint and up to `T`.
-3. Return a reconstructed `DeviceHead` or `FileHead`.
+3. Return a reconstructed `DeviceHead` or `KeyspaceHead`.
 
 The local v1 block restore API creates a new device from the reconstructed root
 set. The restored device starts a new lineage with its own `device_id`,
@@ -767,13 +809,17 @@ mutate the source device or historical roots. Device creation and fork creation
 also write baseline checkpoints so replay always has a deterministic starting
 root set.
 
+The native restore API creates a new keyspace from the reconstructed
+`KeyspaceRoot`. This is intentionally not a per-file restore: every file in the
+catalog is restored together, and a stale append lease from the source keyspace
+cannot publish into the restored keyspace because leases carry `keyspace_id`.
+
 Invariants:
 
 - `commit_seq` is total ordered within the timeline provider.
 - All shard commits in a public multi-shard write share a commit-group identity.
-- Native file root publishes are fenced by file version or writer epoch. When
-  native PITR is added, file-root commit records must record old and new file
-  versions.
+- Native file root publishes are fenced by keyspace, file version, and writer
+  epoch. `FileCommit` records must record old and new file versions.
 - Replaying checkpoint plus commits is deterministic.
 - Checkpoint roots must match replayed state at the checkpoint sequence.
 - Restoring to a named commit requires that commit to exist in the selected
@@ -782,11 +828,11 @@ Invariants:
 - PITR retention policy is part of GC root selection. Local v1 uses a
   deterministic commit-age window: a restore point is retained while
   `current_commit - restore_commit < pitr_grace_commits`.
-- Because replay starts from a checkpoint and then applies shard commits, GC must
-  materialize or retain a checkpoint at the window floor as a replay anchor,
-  plus the shard-commit roots needed after that anchor. This prevents sparse
-  checkpoint cadence from quietly extending the PITR data-retention window back
-  to device creation.
+- Because replay starts from a checkpoint and then applies block shard commits
+  or native keyspace commits, GC must materialize or retain a checkpoint at the
+  window floor as a replay anchor, plus the commit roots needed after that
+  anchor. This prevents sparse checkpoint cadence from quietly extending the
+  PITR data-retention window back to owner creation.
 
 ## 11. Garbage Collection
 
@@ -795,8 +841,8 @@ being O(1), and every snapshot would require walking metadata.
 
 Use tracing GC:
 
-1. Start from all live device shard roots, live native file roots, and retained
-   PITR checkpoint/timeline roots.
+1. Start from all live device shard roots, live native keyspace catalog roots,
+   and retained PITR checkpoint/timeline roots.
 2. Mark reachable metadata nodes.
 3. Mark segment IDs referenced by reachable leaf entries.
 4. Sweep unmarked metadata nodes after the mark epoch is safe.
@@ -829,16 +875,16 @@ retained until a configured number of commit sequence advancements has elapsed
 since the delete commit. PITR roots may be retained for a configured number of
 commit sequence advancements. If no checkpoint exists at the PITR window floor,
 the metadata custodian creates a deterministic replay-anchor checkpoint before
-sweeping, then keeps only the anchor and later shard-commit roots needed for
-replay. Commit-age retention is the v1 stand-in for production TTLs; later
-wall-clock-facing policies must be implemented through injected logical time so
-generated tests can replay them.
+sweeping, then keeps only the anchor and later block shard or native keyspace
+commit roots needed for replay. Commit-age retention is the v1 stand-in for
+production TTLs; later wall-clock-facing policies must be implemented through
+injected logical time so generated tests can replay them.
 
 Invariants:
 
 - Mark traversal starts only from committed roots.
 - Sweep never deletes an object marked in the latest safe epoch.
-- Device/file deletion and PITR retention changes affect only root selection,
+- Device/keyspace deletion and PITR retention changes affect only root selection,
   not object mutability.
 - Expiring retention is one-way for the expired roots; restore must fail
   cleanly after their metadata has been swept.
@@ -854,7 +900,7 @@ split between metadata and storage-node custodians.
 
 The metadata custodian owns global reachability. It periodically:
 
-1. Enumerates all live device heads and native file heads.
+1. Enumerates all live device heads and native keyspace heads.
 2. Adds retained PITR checkpoint and timeline roots.
 3. Traverses reachable metadata nodes.
 4. Records segment IDs referenced by reachable leaf entries.
@@ -941,11 +987,12 @@ Provider and service boundaries:
 - `BlockClient`: public control handle for create and device lookup.
 - `BlockServer`: actor boundary that handles block requests.
 - `BlockTransport`: typed request/response transport.
+- `NativeKeyspaceClient`: public native keyspace control handle.
 - `NativeFile`: public native file handle with append leases and file-version
   commits.
-- `NativeFileClient`: public native file control handle.
-- `NativeServer`: actor boundary that handles native file requests.
-- `NativeTransport`: typed request/response transport for native file requests.
+- `NativeServer`: actor boundary that handles native keyspace/file requests.
+- `NativeTransport`: typed request/response transport for native keyspace/file
+  requests.
 - `MetadataPlane`: device catalog, metadata nodes, commit groups, PITR, and GC
   roots for both block and native file metadata.
 - `SegmentStore`: write and read immutable segment bytes.
@@ -965,7 +1012,9 @@ The simulator and tests should check these invariants after every delivered
 command:
 
 - Every live device has exactly `N` shard roots.
-- Every live native file has one current file root and monotonic file version.
+- Every live native keyspace has one current catalog root.
+- Every file in a live native keyspace has one current file root and monotonic
+  file version.
 - Every committed shard root points to an existing metadata node.
 - Every metadata child pointer points to an existing metadata node.
 - Every leaf segment reference points to an existing segment.
@@ -975,15 +1024,17 @@ command:
   publish.
 - Reads after writes return the latest committed bytes for the target device.
 - Public writes spanning shards are atomic at request granularity.
-- Native append commits are atomic at file-version granularity.
-- Stale native append leases cannot publish file metadata.
+- Native append commits are atomic at file-version and keyspace-catalog
+  granularity.
+- Stale native append leases cannot publish file metadata across keyspace
+  lineage boundaries.
 - Forked devices initially read identically to their parent.
 - After divergence, writes to one fork do not change reads from the other fork.
 - A failed publish does not expose partially written metadata.
 - A failed publish after durable segment write leaves only reclaimable orphan
   segment data.
-- Replaying PITR checkpoint plus commits reconstructs the same device or file
-  head.
+- Replaying PITR checkpoint plus commits reconstructs the same device or
+  keyspace head.
 - GC never deletes an object reachable from live or retained PITR roots.
 - Custodians eventually reclaim expired reservations, failed writes, orphan
   segments, and missed async frees without deleting reachable data.

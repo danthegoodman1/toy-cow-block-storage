@@ -25,19 +25,20 @@ pub use api::{
 };
 pub use error::{Result, StorageError};
 pub use extent::{
-    AppendCommit, AppendLease, CreateFileRequest, FileInfo, FileSpec, NativeFile, NativeFileClient,
-    NativeOperation, NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope,
-    NativeServer, NativeTransport,
+    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, FileSpec,
+    KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeOperation, NativeRequest,
+    NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer, NativeTransport,
+    SnapshotKeyspaceRequest,
 };
 pub use id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,
-    DeviceId, ExtentId, FileId, FileVersion, LogicalDeadline, LogicalTime, RequestId,
-    StorageNodeId, WriteIntentId, WriterEpoch,
+    DeviceId, ExtentId, FileId, FileVersion, KeyspaceGeneration, KeyspaceId, KeyspaceRootId,
+    LogicalDeadline, LogicalTime, RequestId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
     InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
-    LocalBlockServer, LocalNativeFile, LocalNativeFileClient, LocalNativeServer, LocalObjectStore,
+    LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer, LocalObjectStore,
     LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
     SegmentLifecycleState, StorageNodeCustodianReport,
 };

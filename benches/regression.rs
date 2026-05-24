@@ -12,8 +12,8 @@ use toy_cow_block_storage::provider::{
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
     AppendLease, AppendLeaseId, BlockClient, BlockDevice, BlockRequest, ByteRange, DeviceId,
-    DeviceSpec, FileId, FileVersion, ForkRequest, NativeFile, NativeFileClient, NativeRequest,
-    RestorePoint, WriteDurability, WriterEpoch,
+    DeviceSpec, FileId, FileVersion, ForkRequest, KeyspaceId, NativeFile, NativeKeyspaceClient,
+    NativeRequest, RestorePoint, WriteDurability, WriterEpoch,
 };
 
 fn bench_byte_range_validation(c: &mut Criterion) {
@@ -349,15 +349,26 @@ fn bench_local_native_append(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let store = LocalObjectStore::new();
+                let keyspace = store
+                    .metadata()
+                    .create_keyspace(
+                        toy_cow_block_storage::provider::MetadataCreateKeyspaceRequest {
+                            request: toy_cow_block_storage::CreateKeyspaceRequest { name: None },
+                        },
+                    )
+                    .unwrap();
                 let head = store
                     .metadata()
                     .create_file(toy_cow_block_storage::provider::MetadataCreateFileRequest {
+                        keyspace_id: keyspace.keyspace_id,
                         request: toy_cow_block_storage::CreateFileRequest {
                             spec: toy_cow_block_storage::FileSpec { name: None },
                         },
                     })
                     .unwrap();
-                let lease = store.acquire_append_lease(head.file_id).unwrap();
+                let lease = store
+                    .acquire_append_lease(keyspace.keyspace_id, head.file_id)
+                    .unwrap();
                 (store, lease, vec![4; 4096])
             },
             |(store, lease, bytes)| {
@@ -377,15 +388,21 @@ fn bench_local_native_append(c: &mut Criterion) {
 fn bench_local_native_stale_lease_rejection(c: &mut Criterion) {
     let store = LocalObjectStore::new();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(store));
-    let client = toy_cow_block_storage::LocalNativeFileClient::new(
+    let client = toy_cow_block_storage::LocalNativeClient::new(
         toy_cow_block_storage::InProcessNativeTransport::new(server),
     );
-    let file_id = client
-        .create_file(toy_cow_block_storage::CreateFileRequest {
-            spec: toy_cow_block_storage::FileSpec { name: None },
-        })
+    let keyspace_id = client
+        .create_keyspace(toy_cow_block_storage::CreateKeyspaceRequest { name: None })
         .unwrap();
-    let file = client.open_file(file_id).unwrap();
+    let file_id = client
+        .create_file(
+            keyspace_id,
+            toy_cow_block_storage::CreateFileRequest {
+                spec: toy_cow_block_storage::FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let file = client.open_file(keyspace_id, file_id).unwrap();
     let stale = file.acquire_append().unwrap();
     let _fresh = file.acquire_append().unwrap();
     let bytes = vec![1; 4096];
@@ -499,6 +516,70 @@ fn bench_local_checkpoint_restore(c: &mut Criterion) {
     });
 }
 
+fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
+    c.bench_function("local_native_keyspace_checkpoint_restore", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                    shard_count: 1,
+                    block_size: 4096,
+                    file_root_blocks: 1024,
+                    metadata_fanout: 4,
+                    metadata_leaf_blocks: 16,
+                    storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                })
+                .unwrap();
+                let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(
+                    store.clone(),
+                ));
+                let client = toy_cow_block_storage::LocalNativeClient::new(
+                    toy_cow_block_storage::InProcessNativeTransport::new(server),
+                );
+                let keyspace_id = client
+                    .create_keyspace(toy_cow_block_storage::CreateKeyspaceRequest { name: None })
+                    .unwrap();
+                for file_index in 0..8 {
+                    let file_id = client
+                        .create_file(
+                            keyspace_id,
+                            toy_cow_block_storage::CreateFileRequest {
+                                spec: toy_cow_block_storage::FileSpec {
+                                    name: Some(format!("file-{file_index}")),
+                                },
+                            },
+                        )
+                        .unwrap();
+                    let file = client.open_file(keyspace_id, file_id).unwrap();
+                    file.append_with_lease(file.acquire_append().unwrap(), &[7; 4096])
+                        .unwrap();
+                }
+                let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
+                let file_id = client
+                    .create_file(
+                        keyspace_id,
+                        toy_cow_block_storage::CreateFileRequest {
+                            spec: toy_cow_block_storage::FileSpec { name: None },
+                        },
+                    )
+                    .unwrap();
+                let file = client.open_file(keyspace_id, file_id).unwrap();
+                file.append_with_lease(file.acquire_append().unwrap(), &[9; 4096])
+                    .unwrap();
+                (client, keyspace_id, checkpoint)
+            },
+            |(client, keyspace_id, checkpoint)| {
+                client
+                    .restore_keyspace(
+                        black_box(keyspace_id),
+                        black_box(RestorePoint::Checkpoint(checkpoint)),
+                    )
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_roots_for_gc_with_deleted_retention(c: &mut Criterion) {
     let store = LocalObjectStore::with_config(LocalStoreConfig {
         shard_count: 8,
@@ -584,10 +665,13 @@ fn bench_metadata_gc_mark_traversal(c: &mut Criterion) {
 }
 
 fn bench_native_append_validation(c: &mut Criterion) {
+    let keyspace_id = KeyspaceId::from_raw(5);
     let file_id = FileId::from_raw(9);
     let request = NativeRequest::Append {
+        keyspace_id,
         file_id,
         lease: AppendLease {
+            keyspace_id,
             file_id,
             lease_id: AppendLeaseId::from_raw(7),
             writer_epoch: WriterEpoch::from_raw(3),
@@ -605,6 +689,6 @@ fn bench_native_append_validation(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng
 }
 criterion_main!(regression);

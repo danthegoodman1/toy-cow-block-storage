@@ -360,7 +360,7 @@ mod tests {
             commit_seq: CommitSeq::from_raw(5),
             time: LogicalTime::from_raw(44),
             owner: owner(),
-            shard_roots: vec![MetadataNodeId::from_raw(4)],
+            roots: crate::object::CheckpointRoots::BlockShard(vec![MetadataNodeId::from_raw(4)]),
         }
     }
 
