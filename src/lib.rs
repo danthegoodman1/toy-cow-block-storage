@@ -12,6 +12,7 @@ pub mod core;
 pub mod error;
 pub mod extent;
 pub mod id;
+pub mod local;
 pub mod object;
 pub mod provider;
 pub mod sim;
@@ -32,4 +33,9 @@ pub use id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,
     DeviceId, ExtentId, FileId, FileVersion, LogicalDeadline, LogicalTime, RequestId,
     StorageNodeId, WriteIntentId, WriterEpoch,
+};
+pub use local::{
+    InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
+    InProcessBlockTransport, InProcessNativeTransport, LocalBlockServer, LocalNativeServer,
+    LocalObjectStore, LocalStoreConfig, SegmentLifecycleState,
 };

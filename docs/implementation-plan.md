@@ -166,37 +166,38 @@ Exit gate:
 
 ## Phase 4: Local In-Process Services and Object Store
 
-Status: not started.
+Status: complete.
 
 Build local implementations of the service boundaries without durable storage.
 
 Deliverables:
 
-- [ ] Local `BlockServer` implementation.
-- [ ] Local `NativeServer` implementation.
-- [ ] Local in-process `BlockTransport`.
-- [ ] Local in-process `NativeTransport`.
-- [ ] In-memory `MetadataPlane`.
-- [ ] In-memory `SegmentStore`.
-- [ ] In-memory `LocalSegmentCatalog`.
-- [ ] Local segment lifecycle states for `Reserved`, `Writing`,
+- [x] Local `BlockServer` implementation.
+- [x] Local `NativeServer` implementation.
+- [x] Local in-process `BlockTransport`.
+- [x] Local in-process `NativeTransport`.
+- [x] In-memory `MetadataPlane`.
+- [x] In-memory `SegmentStore`.
+- [x] In-memory `LocalSegmentCatalog`.
+- [x] Local segment lifecycle states for `Reserved`, `Writing`,
   `DurablePendingMetadata`, `Referenced`, `Released`, and `Freed`.
-- [ ] Provider conformance tests for immutable writes, lookup, idempotency, and
+- [x] Provider conformance tests for immutable writes, lookup, idempotency, and
   missing-object errors.
+- [x] Criterion baselines for in-memory metadata lookup and segment read.
 
 Exit gate:
 
-- [ ] Existing object IDs are immutable.
-- [ ] Duplicate writes with identical content are idempotent or rejected by a
+- [x] Existing object IDs are immutable.
+- [x] Duplicate writes with identical content are idempotent or rejected by a
   documented rule.
-- [ ] Duplicate writes with different content cannot mutate the original object.
-- [ ] Local services preserve request identity and deterministic ordering.
-- [ ] Block and native services share segment lifecycle and write-intent
+- [x] Duplicate writes with different content cannot mutate the original object.
+- [x] Local services preserve request identity and deterministic ordering.
+- [x] Block and native services share segment lifecycle and write-intent
   machinery instead of duplicating it.
-- [ ] Local segment catalog transitions reject invalid state jumps.
-- [ ] Expired reservations and failed writes can be reconciled without metadata
+- [x] Local segment catalog transitions reject invalid state jumps.
+- [x] Expired reservations and failed writes can be reconciled without metadata
   changes.
-- [ ] Provider behavior is deterministic under ordered commands.
+- [x] Provider behavior is deterministic under ordered commands.
 
 ## Phase 5: Empty Devices and Sparse Reads
 

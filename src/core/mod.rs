@@ -38,6 +38,9 @@ pub enum StorageCommand {
     Noop,
     CreateWriteIntent(WriteIntentRecord),
     ReserveSegment(SegmentReservationIntent),
+    BeginSegmentWrite {
+        reservation: SegmentReservation,
+    },
     WriteSegment {
         reservation: SegmentReservation,
         bytes: Vec<u8>,
@@ -53,6 +56,15 @@ pub enum StorageCommand {
         segment_id: SegmentId,
         owner: MappingOwner,
         commit_group: CommitGroupId,
+    },
+    ReleaseSegment {
+        segment_id: SegmentId,
+    },
+    ExpireSegmentReservation {
+        segment_id: SegmentId,
+    },
+    FailSegmentWrite {
+        segment_id: SegmentId,
     },
     PersistMetadataNode {
         node: Box<MetadataNode>,
@@ -92,6 +104,9 @@ pub enum StorageCommand {
 pub enum StorageEffect {
     CreateWriteIntent(WriteIntentRecord),
     ReserveSegment(SegmentReservationIntent),
+    BeginSegmentWrite {
+        reservation: SegmentReservation,
+    },
     WriteSegment {
         reservation: SegmentReservation,
         bytes: Vec<u8>,
@@ -107,6 +122,15 @@ pub enum StorageEffect {
         segment_id: SegmentId,
         owner: MappingOwner,
         commit_group: CommitGroupId,
+    },
+    ReleaseSegment {
+        segment_id: SegmentId,
+    },
+    ExpireSegmentReservation {
+        segment_id: SegmentId,
+    },
+    FailSegmentWrite {
+        segment_id: SegmentId,
     },
     PersistMetadataNode {
         node: Box<MetadataNode>,
@@ -152,6 +176,9 @@ impl StorageState {
                 vec![StorageEffect::CreateWriteIntent(intent)]
             }
             StorageCommand::ReserveSegment(intent) => vec![StorageEffect::ReserveSegment(intent)],
+            StorageCommand::BeginSegmentWrite { reservation } => {
+                vec![StorageEffect::BeginSegmentWrite { reservation }]
+            }
             StorageCommand::WriteSegment { reservation, bytes } => {
                 vec![StorageEffect::WriteSegment { reservation, bytes }]
             }
@@ -174,6 +201,15 @@ impl StorageState {
                 owner,
                 commit_group,
             }],
+            StorageCommand::ReleaseSegment { segment_id } => {
+                vec![StorageEffect::ReleaseSegment { segment_id }]
+            }
+            StorageCommand::ExpireSegmentReservation { segment_id } => {
+                vec![StorageEffect::ExpireSegmentReservation { segment_id }]
+            }
+            StorageCommand::FailSegmentWrite { segment_id } => {
+                vec![StorageEffect::FailSegmentWrite { segment_id }]
+            }
             StorageCommand::PersistMetadataNode { node } => {
                 vec![StorageEffect::PersistMetadataNode { node }]
             }
@@ -357,6 +393,14 @@ mod tests {
                 vec![StorageEffect::ReserveSegment(reservation_intent())],
             ),
             (
+                StorageCommand::BeginSegmentWrite {
+                    reservation: reservation(),
+                },
+                vec![StorageEffect::BeginSegmentWrite {
+                    reservation: reservation(),
+                }],
+            ),
+            (
                 StorageCommand::WriteSegment {
                     reservation: reservation(),
                     bytes: vec![1, 2, 3, 4],
@@ -394,6 +438,30 @@ mod tests {
                     segment_id: SegmentId::from_raw(2),
                     owner: owner(),
                     commit_group: CommitGroupId::from_raw(6),
+                }],
+            ),
+            (
+                StorageCommand::ReleaseSegment {
+                    segment_id: SegmentId::from_raw(2),
+                },
+                vec![StorageEffect::ReleaseSegment {
+                    segment_id: SegmentId::from_raw(2),
+                }],
+            ),
+            (
+                StorageCommand::ExpireSegmentReservation {
+                    segment_id: SegmentId::from_raw(2),
+                },
+                vec![StorageEffect::ExpireSegmentReservation {
+                    segment_id: SegmentId::from_raw(2),
+                }],
+            ),
+            (
+                StorageCommand::FailSegmentWrite {
+                    segment_id: SegmentId::from_raw(2),
+                },
+                vec![StorageEffect::FailSegmentWrite {
+                    segment_id: SegmentId::from_raw(2),
                 }],
             ),
             (

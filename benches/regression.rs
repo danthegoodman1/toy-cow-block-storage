@@ -2,7 +2,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId};
+use toy_cow_block_storage::local::{InMemoryMetadataPlane, InMemorySegmentStore, LocalStoreConfig};
 use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
+use toy_cow_block_storage::provider::{MetadataPlane, SegmentReservation, SegmentStore};
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
     AppendLease, AppendLeaseId, BlockRequest, ByteRange, DeviceId, DeviceSpec, FileId, FileVersion,
@@ -108,6 +110,46 @@ fn bench_metadata_leaf_validation(c: &mut Criterion) {
     });
 }
 
+fn bench_in_memory_metadata_node_lookup(c: &mut Criterion) {
+    let metadata = InMemoryMetadataPlane::new(LocalStoreConfig::default()).unwrap();
+    let node = MetadataNode {
+        node_id: MetadataNodeId::from_raw(99),
+        covered_range: BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(128)),
+        kind: MetadataNodeKind::Leaf {
+            entries: Vec::new(),
+        },
+    };
+    metadata.persist_metadata_node(node.clone()).unwrap();
+
+    c.bench_function("in_memory_metadata_node_lookup", |b| {
+        b.iter(|| metadata.get_metadata_node(black_box(node.node_id)))
+    });
+}
+
+fn bench_in_memory_segment_read(c: &mut Criterion) {
+    let store = InMemorySegmentStore::new(LocalStoreConfig::default()).unwrap();
+    let reservation = SegmentReservation {
+        segment_id: SegmentId::from_raw(42),
+        bytes: 4096,
+    };
+    store.write_segment(&reservation, &[7; 4096]).unwrap();
+    store.sync_segment(reservation.segment_id).unwrap();
+    let mut buf = vec![0; 4096];
+
+    c.bench_function("in_memory_segment_read", |b| {
+        b.iter(|| {
+            store
+                .read_segment(
+                    black_box(reservation.segment_id),
+                    black_box(ByteRange::new(0, 4096)),
+                    black_box(&mut buf),
+                )
+                .unwrap();
+            black_box(buf[0])
+        })
+    });
+}
+
 fn bench_native_append_validation(c: &mut Criterion) {
     let file_id = FileId::from_raw(9);
     let request = NativeRequest::Append {
@@ -130,6 +172,6 @@ fn bench_native_append_validation(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_seeded_rng
 }
 criterion_main!(regression);

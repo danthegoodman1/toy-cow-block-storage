@@ -262,6 +262,12 @@ pub trait LocalSegmentCatalog: Send + Sync {
     /// Reserve local segment space for a write intent.
     fn reserve_segment(&self, intent: SegmentReservationIntent) -> Result<SegmentReservation>;
 
+    /// Mark a reserved segment as actively being written.
+    ///
+    /// This transition is local catalog state only. It must not make bytes
+    /// readable or metadata-reachable.
+    fn begin_write(&self, reservation: &SegmentReservation) -> Result<()>;
+
     /// Commit a written segment replica into durable-pending-metadata state.
     ///
     /// This must not by itself make the segment reachable from reads; metadata
@@ -271,6 +277,21 @@ pub trait LocalSegmentCatalog: Send + Sync {
         reservation: SegmentReservation,
         commit: SegmentReplicaCommit,
     ) -> Result<()>;
+
+    /// Mark a durable-pending segment as referenced by committed metadata.
+    fn mark_segment_referenced(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Mark a referenced segment as released by metadata reachability evidence.
+    ///
+    /// Release does not necessarily delete bytes immediately; it makes the
+    /// replica eligible for `delete_segment`.
+    fn release_segment(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Reconcile a reservation that expired before any durable write.
+    fn expire_reservation(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Reconcile a write that failed before durable-pending-metadata state.
+    fn fail_write(&self, segment_id: SegmentId) -> Result<()>;
 
     /// Locate this storage endpoint's local replica placement.
     fn locate_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaPlacement>;
