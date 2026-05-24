@@ -401,6 +401,87 @@ impl LocalObjectStore {
         self.metadata.delete_device(device_id)
     }
 
+    pub fn mark_reachable_for_gc(&self, policy: RetentionPolicy) -> Result<MetadataMarkReport> {
+        self.metadata.mark_reachable_for_gc(policy)
+    }
+
+    pub fn sweep_metadata_after_mark(
+        &self,
+        policy: RetentionPolicy,
+        epoch: u64,
+    ) -> Result<MetadataSweepReport> {
+        let sweep = self.metadata.sweep_unmarked_after_mark(policy, epoch)?;
+        for segment_id in &sweep.released_segments {
+            if self.segment_catalog.state(*segment_id)? == SegmentLifecycleState::Referenced {
+                self.segment_catalog.release_segment(*segment_id)?;
+            }
+        }
+        Ok(sweep)
+    }
+
+    pub fn run_metadata_custodian(
+        &self,
+        policy: RetentionPolicy,
+    ) -> Result<MetadataCustodianReport> {
+        let mark = self.mark_reachable_for_gc(policy.clone())?;
+        let sweep = self.sweep_metadata_after_mark(policy, mark.epoch)?;
+        let mut catalog_released_segments = Vec::new();
+        for segment_id in &sweep.released_segments {
+            if self.segment_catalog.state(*segment_id)? == SegmentLifecycleState::Released {
+                catalog_released_segments.push(*segment_id);
+            }
+        }
+        Ok(MetadataCustodianReport {
+            mark,
+            sweep,
+            catalog_released_segments,
+        })
+    }
+
+    pub fn run_storage_node_custodian(
+        &self,
+        expired_write_intents: &BTreeSet<WriteIntentId>,
+    ) -> Result<StorageNodeCustodianReport> {
+        let mut report = StorageNodeCustodianReport {
+            expired_reservations: Vec::new(),
+            failed_writes: Vec::new(),
+            orphan_segments: Vec::new(),
+            deleted_released_segments: Vec::new(),
+        };
+
+        for (segment_id, state, write_intent) in self.segment_catalog.entries()? {
+            match state {
+                SegmentLifecycleState::Reserved
+                    if expired_write_intents.contains(&write_intent) =>
+                {
+                    self.segment_catalog.expire_reservation(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.expired_reservations.push(segment_id);
+                }
+                SegmentLifecycleState::Writing if expired_write_intents.contains(&write_intent) => {
+                    self.segment_catalog.fail_write(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.failed_writes.push(segment_id);
+                }
+                SegmentLifecycleState::DurablePendingMetadata
+                    if expired_write_intents.contains(&write_intent) =>
+                {
+                    self.segment_catalog.free_orphan_segment(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.orphan_segments.push(segment_id);
+                }
+                SegmentLifecycleState::Released => {
+                    self.segment_catalog.delete_segment(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.deleted_released_segments.push(segment_id);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(report)
+    }
+
     fn split_device_range(
         &self,
         info: &DeviceInfo,
@@ -963,6 +1044,36 @@ pub struct MetadataTreeStats {
     pub max_depth: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataMarkReport {
+    pub epoch: u64,
+    pub roots: Vec<MetadataNodeId>,
+    pub metadata_nodes: Vec<MetadataNodeId>,
+    pub segments: Vec<SegmentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataSweepReport {
+    pub epoch: u64,
+    pub deleted_metadata_nodes: Vec<MetadataNodeId>,
+    pub released_segments: Vec<SegmentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCustodianReport {
+    pub mark: MetadataMarkReport,
+    pub sweep: MetadataSweepReport,
+    pub catalog_released_segments: Vec<SegmentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageNodeCustodianReport {
+    pub expired_reservations: Vec<SegmentId>,
+    pub failed_writes: Vec<SegmentId>,
+    pub orphan_segments: Vec<SegmentId>,
+    pub deleted_released_segments: Vec<SegmentId>,
+}
+
 #[derive(Debug)]
 struct MetadataInner {
     next_device_id: u128,
@@ -971,6 +1082,7 @@ struct MetadataInner {
     next_commit_group_id: u128,
     next_commit_seq: u64,
     next_checkpoint_id: u128,
+    next_gc_epoch: u64,
     device_heads: BTreeMap<DeviceId, DeviceHead>,
     deleted_device_heads: BTreeMap<DeviceId, DeviceHead>,
     device_specs: BTreeMap<DeviceId, crate::api::DeviceSpec>,
@@ -983,6 +1095,8 @@ struct MetadataInner {
     fork_records: BTreeMap<CommitSeq, ForkRecord>,
     delete_records: BTreeMap<CommitSeq, DeleteRecord>,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
+    metadata_last_mark_epoch: BTreeMap<MetadataNodeId, u64>,
+    segment_last_mark_epoch: BTreeMap<SegmentId, u64>,
 }
 
 impl MetadataInner {
@@ -994,6 +1108,7 @@ impl MetadataInner {
             next_commit_group_id: 1,
             next_commit_seq: 1,
             next_checkpoint_id: 1,
+            next_gc_epoch: 1,
             device_heads: BTreeMap::new(),
             deleted_device_heads: BTreeMap::new(),
             device_specs: BTreeMap::new(),
@@ -1006,6 +1121,8 @@ impl MetadataInner {
             fork_records: BTreeMap::new(),
             delete_records: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            metadata_last_mark_epoch: BTreeMap::new(),
+            segment_last_mark_epoch: BTreeMap::new(),
         }
     }
 
@@ -1056,6 +1173,15 @@ impl MetadataInner {
         let id = CheckpointId::from_raw(self.next_checkpoint_id);
         self.next_checkpoint_id += 1;
         id
+    }
+
+    fn alloc_gc_epoch(&mut self) -> Result<u64> {
+        let epoch = self.next_gc_epoch;
+        self.next_gc_epoch = self
+            .next_gc_epoch
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("GC epoch overflow"))?;
+        Ok(epoch)
     }
 
     fn insert_checkpoint(
@@ -1526,6 +1652,201 @@ impl InMemoryMetadataPlane {
             .iter()
             .any(|commit| commit.device_id == device_id && commit.commit_seq == commit_seq)
     }
+
+    fn roots_for_gc_locked(inner: &MetadataInner, policy: RetentionPolicy) -> Vec<MetadataNodeId> {
+        let mut roots = Vec::new();
+        for head in inner.device_heads.values() {
+            roots.extend(head.shard_roots.iter().copied());
+        }
+        for head in inner.file_heads.values() {
+            roots.push(head.root);
+        }
+        for checkpoint in inner.checkpoints.values() {
+            match checkpoint.owner {
+                MappingOwner::BlockDevice(device_id) => {
+                    if inner.device_heads.contains_key(&device_id)
+                        || policy.retain_deleted_devices
+                            && inner.deleted_device_heads.contains_key(&device_id)
+                    {
+                        roots.extend(checkpoint.shard_roots.iter().copied());
+                    }
+                }
+                MappingOwner::NativeFile(_) => {
+                    roots.extend(checkpoint.shard_roots.iter().copied());
+                }
+            }
+        }
+        if policy.retain_deleted_devices {
+            for head in inner.deleted_device_heads.values() {
+                roots.extend(head.shard_roots.iter().copied());
+            }
+            for record in inner.delete_records.values() {
+                roots.extend(record.shard_roots.iter().copied());
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    fn collect_node_segments(node: &MetadataNode, out: &mut BTreeSet<SegmentId>) {
+        if let MetadataNodeKind::Leaf { entries } = &node.kind {
+            for entry in entries {
+                out.insert(entry.segment_id);
+            }
+        }
+    }
+
+    fn collect_all_segments_locked(inner: &MetadataInner) -> BTreeSet<SegmentId> {
+        let mut segments = BTreeSet::new();
+        for node in inner.metadata_nodes.values() {
+            Self::collect_node_segments(node, &mut segments);
+        }
+        segments
+    }
+
+    fn collect_reachable_locked(
+        inner: &MetadataInner,
+        roots: &[MetadataNodeId],
+    ) -> Result<(BTreeSet<MetadataNodeId>, BTreeSet<SegmentId>)> {
+        let mut nodes = BTreeSet::new();
+        let mut segments = BTreeSet::new();
+        let mut stack: Vec<_> = roots.iter().copied().rev().collect();
+
+        while let Some(node_id) = stack.pop() {
+            if !nodes.insert(node_id) {
+                continue;
+            }
+            let node = inner
+                .metadata_nodes
+                .get(&node_id)
+                .ok_or_else(|| StorageError::not_found("metadata_node", node_id.to_string()))?;
+            match &node.kind {
+                MetadataNodeKind::Internal { children } => {
+                    for child in children.iter().rev() {
+                        stack.push(child.node_id);
+                    }
+                }
+                MetadataNodeKind::Leaf { entries } => {
+                    for entry in entries {
+                        segments.insert(entry.segment_id);
+                    }
+                }
+            }
+        }
+
+        Ok((nodes, segments))
+    }
+
+    pub fn mark_reachable_for_gc(&self, policy: RetentionPolicy) -> Result<MetadataMarkReport> {
+        let mut inner = lock(&self.inner)?;
+        let epoch = inner.alloc_gc_epoch()?;
+        let roots = Self::roots_for_gc_locked(&inner, policy.clone());
+        let (nodes, segments) = Self::collect_reachable_locked(&inner, &roots)?;
+
+        for node_id in &nodes {
+            inner.metadata_last_mark_epoch.insert(*node_id, epoch);
+        }
+        for segment_id in &segments {
+            inner.segment_last_mark_epoch.insert(*segment_id, epoch);
+        }
+
+        Ok(MetadataMarkReport {
+            epoch,
+            roots,
+            metadata_nodes: nodes.into_iter().collect(),
+            segments: segments.into_iter().collect(),
+        })
+    }
+
+    pub fn sweep_unmarked_after_mark(
+        &self,
+        policy: RetentionPolicy,
+        epoch: u64,
+    ) -> Result<MetadataSweepReport> {
+        if epoch == 0 {
+            return Err(StorageError::invalid_argument(
+                "GC epoch must be greater than zero",
+            ));
+        }
+
+        let mut inner = lock(&self.inner)?;
+        if epoch >= inner.next_gc_epoch {
+            return Err(StorageError::invalid_argument("unknown GC epoch"));
+        }
+
+        let roots = Self::roots_for_gc_locked(&inner, policy.clone());
+        let (currently_reachable_nodes, currently_reachable_segments) =
+            Self::collect_reachable_locked(&inner, &roots)?;
+        let all_segments = Self::collect_all_segments_locked(&inner);
+        let mut deleted_metadata_nodes = Vec::new();
+
+        let candidate_nodes: Vec<_> = inner
+            .metadata_nodes
+            .keys()
+            .copied()
+            .filter(|node_id| {
+                inner.metadata_last_mark_epoch.get(node_id).copied() != Some(epoch)
+                    && !currently_reachable_nodes.contains(node_id)
+            })
+            .collect();
+        for node_id in candidate_nodes {
+            inner.metadata_nodes.remove(&node_id);
+            inner.metadata_last_mark_epoch.remove(&node_id);
+            deleted_metadata_nodes.push(node_id);
+        }
+
+        let mut released_segments: Vec<_> = all_segments
+            .into_iter()
+            .filter(|segment_id| {
+                inner.segment_last_mark_epoch.get(segment_id).copied() != Some(epoch)
+                    && !currently_reachable_segments.contains(segment_id)
+            })
+            .collect();
+        released_segments.sort();
+        released_segments.dedup();
+        deleted_metadata_nodes.sort();
+
+        if !policy.retain_deleted_devices {
+            let expired_devices: BTreeSet<_> = inner.deleted_device_heads.keys().copied().collect();
+            for device_id in &expired_devices {
+                inner.deleted_device_heads.remove(device_id);
+                inner.device_specs.remove(device_id);
+            }
+            inner
+                .delete_records
+                .retain(|_, record| !expired_devices.contains(&record.device_id));
+            inner
+                .checkpoints
+                .retain(|_, checkpoint| match checkpoint.owner {
+                    MappingOwner::BlockDevice(device_id) => !expired_devices.contains(&device_id),
+                    MappingOwner::NativeFile(_) => true,
+                });
+            inner
+                .shard_commits
+                .retain(|commit| !expired_devices.contains(&commit.device_id));
+            inner.fork_records.retain(|_, record| {
+                !expired_devices.contains(&record.source)
+                    && !expired_devices.contains(&record.target)
+            });
+        }
+
+        Ok(MetadataSweepReport {
+            epoch,
+            deleted_metadata_nodes,
+            released_segments,
+        })
+    }
+
+    pub fn last_mark_epoch_for_node(&self, node_id: MetadataNodeId) -> Result<Option<u64>> {
+        let inner = lock(&self.inner)?;
+        Ok(inner.metadata_last_mark_epoch.get(&node_id).copied())
+    }
+
+    pub fn last_mark_epoch_for_segment(&self, segment_id: SegmentId) -> Result<Option<u64>> {
+        let inner = lock(&self.inner)?;
+        Ok(inner.segment_last_mark_epoch.get(&segment_id).copied())
+    }
 }
 
 impl MetadataPlane for InMemoryMetadataPlane {
@@ -1992,39 +2313,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
 
     fn roots_for_gc(&self, policy: RetentionPolicy) -> Result<Vec<MetadataNodeId>> {
         let inner = lock(&self.inner)?;
-        let mut roots = Vec::new();
-        for head in inner.device_heads.values() {
-            roots.extend(head.shard_roots.iter().copied());
-        }
-        for head in inner.file_heads.values() {
-            roots.push(head.root);
-        }
-        for checkpoint in inner.checkpoints.values() {
-            match checkpoint.owner {
-                MappingOwner::BlockDevice(device_id) => {
-                    if inner.device_heads.contains_key(&device_id)
-                        || policy.retain_deleted_devices
-                            && inner.deleted_device_heads.contains_key(&device_id)
-                    {
-                        roots.extend(checkpoint.shard_roots.iter().copied());
-                    }
-                }
-                MappingOwner::NativeFile(_) => {
-                    roots.extend(checkpoint.shard_roots.iter().copied());
-                }
-            }
-        }
-        if policy.retain_deleted_devices {
-            for head in inner.deleted_device_heads.values() {
-                roots.extend(head.shard_roots.iter().copied());
-            }
-            for record in inner.delete_records.values() {
-                roots.extend(record.shard_roots.iter().copied());
-            }
-        }
-        roots.sort();
-        roots.dedup();
-        Ok(roots)
+        Ok(Self::roots_for_gc_locked(&inner, policy))
     }
 }
 
@@ -2067,6 +2356,10 @@ impl InMemorySegmentStore {
             .get(&segment_id)
             .map(|record| record.synced)
             .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))
+    }
+
+    pub fn contains_segment(&self, segment_id: SegmentId) -> Result<bool> {
+        Ok(lock(&self.inner)?.segments.contains_key(&segment_id))
     }
 }
 
@@ -2185,6 +2478,11 @@ impl SegmentStore for InMemorySegmentStore {
         record.synced = true;
         Ok(())
     }
+
+    fn delete_segment(&self, segment_id: SegmentId) -> Result<()> {
+        lock(&self.inner)?.segments.remove(&segment_id);
+        Ok(())
+    }
 }
 
 /// Local segment lifecycle state.
@@ -2259,6 +2557,15 @@ impl InMemoryLocalSegmentCatalog {
             .get(&segment_id)
             .map(|entry| entry.intent.clone())
             .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))
+    }
+
+    pub fn entries(&self) -> Result<Vec<(SegmentId, SegmentLifecycleState, WriteIntentId)>> {
+        let inner = lock(&self.inner)?;
+        Ok(inner
+            .entries
+            .iter()
+            .map(|(segment_id, entry)| (*segment_id, entry.state, entry.intent.write_intent))
+            .collect())
     }
 
     fn get_entry_mut(inner: &mut CatalogInner, segment_id: SegmentId) -> Result<&mut CatalogEntry> {
@@ -2421,6 +2728,21 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
             SegmentLifecycleState::Freed => Ok(()),
             _ => Err(StorageError::conflict(
                 "only Writing segments can fail as writes",
+            )),
+        }
+    }
+
+    fn free_orphan_segment(&self, segment_id: SegmentId) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        let entry = Self::get_entry_mut(&mut inner, segment_id)?;
+        match entry.state {
+            SegmentLifecycleState::DurablePendingMetadata => {
+                entry.state = SegmentLifecycleState::Freed;
+                Ok(())
+            }
+            SegmentLifecycleState::Freed => Ok(()),
+            _ => Err(StorageError::conflict(
+                "only DurablePendingMetadata orphan segments can be freed",
             )),
         }
     }
@@ -3667,6 +3989,424 @@ mod tests {
                     RestorePoint::Time(LogicalTime::from_raw(delete.commit_seq.raw()))
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_gc_releases_deleted_device_segments_after_retention_expires() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 16);
+        let device_id = device.device_id();
+        device.write_at(0, &[7; 4096]).unwrap();
+        device.delete().unwrap();
+
+        let report = store
+            .run_metadata_custodian(RetentionPolicy {
+                retain_deleted_devices: false,
+            })
+            .unwrap();
+
+        assert!(!report.sweep.deleted_metadata_nodes.is_empty());
+        assert_eq!(report.sweep.released_segments, vec![SegmentId::from_raw(1)]);
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Released
+        );
+        assert!(
+            store
+                .segment_store()
+                .contains_segment(SegmentId::from_raw(1))
+                .unwrap()
+        );
+
+        let storage_report = store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        assert_eq!(
+            storage_report.deleted_released_segments,
+            vec![SegmentId::from_raw(1)]
+        );
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Freed
+        );
+        assert!(
+            !store
+                .segment_store()
+                .contains_segment(SegmentId::from_raw(1))
+                .unwrap()
+        );
+        assert!(store.metadata().get_head(device_id).is_err());
+    }
+
+    #[test]
+    fn retention_expiring_gc_prunes_deleted_pitr_catalog() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 16);
+        let device_id = device.device_id();
+        device.write_at(0, &[7; 4096]).unwrap();
+        let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+        device.delete().unwrap();
+
+        store
+            .run_metadata_custodian(RetentionPolicy {
+                retain_deleted_devices: false,
+            })
+            .unwrap();
+
+        assert_eq!(store.metadata().list_deleted_devices().unwrap(), Vec::new());
+        assert!(
+            store
+                .metadata()
+                .roots_for_gc(RetentionPolicy {
+                    retain_deleted_devices: true,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_gc_retains_deleted_pitr_roots_when_policy_requires_it() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let device_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        let device = client.open_device(device_id).unwrap();
+        device.write_at(0, &[9; 4096]).unwrap();
+        let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+        device.delete().unwrap();
+
+        let report = store
+            .run_metadata_custodian(RetentionPolicy {
+                retain_deleted_devices: true,
+            })
+            .unwrap();
+
+        assert!(report.sweep.released_segments.is_empty());
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+        let restored_id = store
+            .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+            .unwrap();
+        let restored = client.open_device(restored_id).unwrap();
+        let mut bytes = [0; 4096];
+        restored.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [9; 4096]);
+    }
+
+    #[test]
+    fn paused_gc_sweep_preserves_nodes_marked_in_epoch() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 16);
+        device.write_at(0, &[5; 4096]).unwrap();
+        let mark = store
+            .mark_reachable_for_gc(RetentionPolicy {
+                retain_deleted_devices: false,
+            })
+            .unwrap();
+        assert!(mark.metadata_nodes.iter().all(|node| {
+            store.metadata().last_mark_epoch_for_node(*node).unwrap() == Some(mark.epoch)
+        }));
+        assert_eq!(
+            store
+                .metadata()
+                .last_mark_epoch_for_segment(SegmentId::from_raw(1))
+                .unwrap(),
+            Some(mark.epoch)
+        );
+
+        device.delete().unwrap();
+        let first_sweep = store
+            .sweep_metadata_after_mark(
+                RetentionPolicy {
+                    retain_deleted_devices: false,
+                },
+                mark.epoch,
+            )
+            .unwrap();
+        assert!(first_sweep.deleted_metadata_nodes.is_empty());
+        assert!(first_sweep.released_segments.is_empty());
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+
+        let second = store
+            .run_metadata_custodian(RetentionPolicy {
+                retain_deleted_devices: false,
+            })
+            .unwrap();
+        assert!(!second.sweep.deleted_metadata_nodes.is_empty());
+        assert_eq!(second.sweep.released_segments, vec![SegmentId::from_raw(1)]);
+    }
+
+    #[test]
+    fn generated_gc_interleavings_preserve_live_device_models() {
+        fn assert_live_models(
+            store: &LocalObjectStore,
+            client: &LocalBlockClient,
+            models: &BTreeMap<DeviceId, Vec<u8>>,
+            seed: u64,
+            trace: &[String],
+        ) {
+            for (device_id, model) in models {
+                let device = client.open_device(*device_id).unwrap();
+                let mut actual = vec![0; model.len() * 4096];
+                device.read_at(0, &mut actual).unwrap();
+                assert_model_blocks(
+                    &actual,
+                    model,
+                    seed,
+                    trace,
+                    &render_device_roots(store, *device_id),
+                );
+                validate_device_roots(store, *device_id);
+            }
+        }
+
+        for seed in 0..8 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let store = LocalObjectStore::with_config(LocalStoreConfig {
+                shard_count: 2,
+                ..tree_config()
+            })
+            .unwrap();
+            let server = Arc::new(LocalBlockServer::new(store.clone()));
+            let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+            let root = client
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 16,
+                        block_size: 4096,
+                    },
+                    name: None,
+                })
+                .unwrap();
+            let mut models = BTreeMap::from([(root, vec![0u8; 16])]);
+            let mut deleted = BTreeSet::new();
+
+            for step in 0..36 {
+                let paused_gc = harness.rng.next_u64() % 3 == 0;
+                let policy = RetentionPolicy {
+                    retain_deleted_devices: harness.rng.next_u64() % 2 == 0,
+                };
+                let paused_mark = if paused_gc {
+                    let mark = store.mark_reachable_for_gc(policy.clone()).unwrap();
+                    harness.trace.record(format!(
+                        "mark step={step} epoch={} retain_deleted={}",
+                        mark.epoch, policy.retain_deleted_devices
+                    ));
+                    Some(mark)
+                } else {
+                    None
+                };
+
+                if models.is_empty() {
+                    let device_id = client
+                        .create_device(CreateDeviceRequest {
+                            spec: DeviceSpec {
+                                logical_blocks: 16,
+                                block_size: 4096,
+                            },
+                            name: Some(format!("recreated-{seed}-{step}")),
+                        })
+                        .unwrap();
+                    harness
+                        .trace
+                        .record(format!("create step={step} device={device_id}"));
+                    models.insert(device_id, vec![0u8; 16]);
+                }
+
+                let device_ids: Vec<_> = models.keys().copied().collect();
+                let device_id = device_ids[harness.rng.choose_index(device_ids.len()).unwrap()];
+                match harness.rng.next_u64() % 4 {
+                    0 => {
+                        let block = harness.rng.next_u64() % 16;
+                        let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                        harness.trace.record(format!(
+                            "write step={step} device={device_id} block={block} byte={byte}"
+                        ));
+                        client
+                            .open_device(device_id)
+                            .unwrap()
+                            .write_at(block * 4096, &[byte; 4096])
+                            .unwrap();
+                        models.get_mut(&device_id).unwrap()[block as usize] = byte;
+                    }
+                    1 if models.len() < 6 => {
+                        let child = client
+                            .open_device(device_id)
+                            .unwrap()
+                            .fork(ForkRequest {
+                                target: None,
+                                name: Some(format!("gc-child-{seed}-{step}")),
+                            })
+                            .unwrap();
+                        harness
+                            .trace
+                            .record(format!("fork step={step} source={device_id} child={child}"));
+                        models.insert(child, models.get(&device_id).unwrap().clone());
+                    }
+                    2 => {
+                        harness
+                            .trace
+                            .record(format!("checkpoint step={step} device={device_id}"));
+                        store.metadata().checkpoint(device_id).unwrap();
+                    }
+                    _ => {
+                        harness
+                            .trace
+                            .record(format!("delete step={step} device={device_id}"));
+                        client.open_device(device_id).unwrap().delete().unwrap();
+                        models.remove(&device_id);
+                        deleted.insert(device_id);
+                    }
+                }
+
+                if let Some(mark) = paused_mark {
+                    let sweep = store.sweep_metadata_after_mark(policy, mark.epoch).unwrap();
+                    harness.trace.record(format!(
+                        "sweep step={step} epoch={} deleted_nodes={} released_segments={}",
+                        sweep.epoch,
+                        sweep.deleted_metadata_nodes.len(),
+                        sweep.released_segments.len()
+                    ));
+                } else if harness.rng.next_u64() % 2 == 0 {
+                    let report = store.run_metadata_custodian(policy).unwrap();
+                    harness.trace.record(format!(
+                        "gc step={step} epoch={} deleted_nodes={} released_segments={}",
+                        report.mark.epoch,
+                        report.sweep.deleted_metadata_nodes.len(),
+                        report.sweep.released_segments.len()
+                    ));
+                }
+                store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+                assert_live_models(&store, &client, &models, seed, harness.trace.events());
+                for device_id in &deleted {
+                    assert!(store.metadata().get_head(*device_id).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn storage_node_custodian_reclaims_expired_failed_orphan_and_released_segments() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let reserved = store
+            .segment_catalog()
+            .reserve_segment(SegmentReservationIntent {
+                write_intent: WriteIntentId::from_raw(10),
+                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                bytes: 4096,
+            })
+            .unwrap();
+        let writing = store
+            .segment_catalog()
+            .reserve_segment(SegmentReservationIntent {
+                write_intent: WriteIntentId::from_raw(11),
+                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                bytes: 4096,
+            })
+            .unwrap();
+        store.segment_catalog().begin_write(&writing).unwrap();
+        let orphan = store
+            .segment_catalog()
+            .reserve_segment(SegmentReservationIntent {
+                write_intent: WriteIntentId::from_raw(12),
+                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                bytes: 4096,
+            })
+            .unwrap();
+        store.segment_catalog().begin_write(&orphan).unwrap();
+        let orphan_commit = store
+            .segment_store()
+            .write_segment(&orphan, &[3; 4096])
+            .unwrap();
+        store
+            .segment_store()
+            .sync_segment(orphan.segment_id)
+            .unwrap();
+        store
+            .segment_catalog()
+            .commit_segment(orphan.clone(), orphan_commit)
+            .unwrap();
+        let referenced = store
+            .write_segment_for_owner(MappingOwner::BlockDevice(DeviceId::from_raw(1)), &[4; 4096])
+            .unwrap();
+        store
+            .segment_catalog()
+            .mark_segment_referenced(referenced.segment_id)
+            .unwrap();
+        store
+            .segment_catalog()
+            .release_segment(referenced.segment_id)
+            .unwrap();
+
+        let untouched = store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        assert!(untouched.expired_reservations.is_empty());
+        assert!(untouched.failed_writes.is_empty());
+        assert!(untouched.orphan_segments.is_empty());
+        assert_eq!(
+            untouched.deleted_released_segments,
+            vec![referenced.segment_id]
+        );
+        assert_eq!(
+            store.segment_catalog().state(orphan.segment_id).unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+
+        let expired = BTreeSet::from([
+            WriteIntentId::from_raw(10),
+            WriteIntentId::from_raw(11),
+            WriteIntentId::from_raw(12),
+        ]);
+        let report = store.run_storage_node_custodian(&expired).unwrap();
+        assert_eq!(report.expired_reservations, vec![reserved.segment_id]);
+        assert_eq!(report.failed_writes, vec![writing.segment_id]);
+        assert_eq!(report.orphan_segments, vec![orphan.segment_id]);
+        assert_eq!(
+            store.segment_catalog().state(reserved.segment_id).unwrap(),
+            SegmentLifecycleState::Freed
+        );
+        assert_eq!(
+            store.segment_catalog().state(writing.segment_id).unwrap(),
+            SegmentLifecycleState::Freed
+        );
+        assert_eq!(
+            store.segment_catalog().state(orphan.segment_id).unwrap(),
+            SegmentLifecycleState::Freed
+        );
+        assert!(
+            !store
+                .segment_store()
+                .contains_segment(orphan.segment_id)
+                .unwrap()
         );
     }
 

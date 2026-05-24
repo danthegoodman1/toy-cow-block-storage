@@ -38,5 +38,6 @@ pub use local::{
     InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
     LocalBlockServer, LocalNativeFile, LocalNativeFileClient, LocalNativeServer, LocalObjectStore,
-    LocalStoreConfig, SegmentLifecycleState,
+    LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
+    SegmentLifecycleState, StorageNodeCustodianReport,
 };

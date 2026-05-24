@@ -369,36 +369,36 @@ Exit gate:
 
 ## Phase 11: Tracing Garbage Collection
 
-Status: not started.
+Status: complete.
 
 Build reachability-based reclamation and custodian-driven physical cleanup.
 
 Deliverables:
 
-- [ ] Mark traversal from root enumerator.
-- [ ] `last_mark_epoch` tracking.
-- [ ] Sweep candidate selection.
-- [ ] Delete effects for unreachable metadata nodes.
-- [ ] Segment release evidence for storage-node custodians.
-- [ ] Metadata custodian that publishes safe reachability epochs.
-- [ ] Storage-node custodian that frees expired reservations, failed writes,
+- [x] Mark traversal from root enumerator.
+- [x] `last_mark_epoch` tracking.
+- [x] Sweep candidate selection.
+- [x] Delete effects for unreachable metadata nodes.
+- [x] Segment release evidence for storage-node custodians.
+- [x] Metadata custodian that publishes safe reachability epochs.
+- [x] Storage-node custodian that frees expired reservations, failed writes,
   orphan durable segments, released segments, and missed async frees.
-- [ ] GC simulator hooks for interleaving writes, forks, deletes, PITR changes,
+- [x] GC simulator hooks for interleaving writes, forks, deletes, PITR changes,
   write-intent expiry, orphan cleanup, missed frees, and sweeps.
 
 Exit gate:
 
-- [ ] GC never deletes objects reachable from live or retained PITR roots.
-- [ ] Unreachable objects are eventually selected for deletion.
-- [ ] Orphan durable segments are eventually freed after their write intent can
+- [x] GC never deletes objects reachable from live or retained PITR roots.
+- [x] Unreachable objects are eventually selected for deletion.
+- [x] Orphan durable segments are eventually freed after their write intent can
   no longer commit.
-- [ ] `DurablePendingMetadata` segments are not freed while their write intent
+- [x] `DurablePendingMetadata` segments are not freed while their write intent
   may still publish.
-- [ ] Missed asynchronous frees are corrected by periodic storage-node
+- [x] Missed asynchronous frees are corrected by periodic storage-node
   reconciliation.
-- [ ] Mark and sweep can be paused and resumed deterministically.
-- [ ] Generated tests inject GC at adversarial points in operation traces.
-- [ ] Criterion covers GC traversal.
+- [x] Mark and sweep can be paused and resumed deterministically.
+- [x] Generated tests inject GC at adversarial points in operation traces.
+- [x] Criterion covers GC traversal.
 
 ## Phase 12: Deterministic End-to-End Simulator
 

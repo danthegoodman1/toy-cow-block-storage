@@ -236,6 +236,15 @@ pub trait SegmentStore: Send + Sync {
     /// Flush/sync a segment to the durability level needed before metadata
     /// publish.
     fn sync_segment(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Delete local immutable segment bytes after catalog evidence says they
+    /// are safe to free.
+    ///
+    /// Implementors should make this idempotent for already-missing local bytes
+    /// so storage-node custodians can reconcile missed frees. Deleting bytes
+    /// must not mutate metadata reachability; callers must obtain release
+    /// evidence through metadata GC and local catalog state first.
+    fn delete_segment(&self, segment_id: SegmentId) -> Result<()>;
 }
 
 /// Segment reservation request for a specific write intent and mapping owner.
@@ -322,6 +331,13 @@ pub trait LocalSegmentCatalog: Send + Sync {
 
     /// Reconcile a write that failed before durable-pending-metadata state.
     fn fail_write(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Reconcile a durable-pending segment whose write intent can no longer
+    /// publish metadata.
+    ///
+    /// This is the orphan cleanup path for bytes that became durable before a
+    /// metadata publish failed, expired, or was fenced off.
+    fn free_orphan_segment(&self, segment_id: SegmentId) -> Result<()>;
 
     /// Locate this storage endpoint's local replica placement.
     fn locate_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaPlacement>;

@@ -741,10 +741,17 @@ last_mark_epoch
 ```
 
 The metadata sweeper deletes metadata objects not marked in the latest safe
-sweep. Segment bytes are freed by storage-node custodians after they receive
-release evidence. The exact safe sweep rule depends on the provider, but the
-deterministic model must prove that objects reachable from any live root or
-retained PITR root are never deleted.
+sweep and not reachable from the current committed roots at sweep time. This
+lets mark and sweep pause deterministically without deleting nodes created or
+published after a mark started. Segment bytes are freed by storage-node
+custodians after they receive release evidence. The exact safe sweep rule
+depends on the provider, but the deterministic model must prove that objects
+reachable from any live root or retained PITR root are never deleted.
+
+When deleted-device retention is disabled for a safe GC epoch, the metadata
+custodian may also expire that deleted device's retained PITR catalog state.
+After that point a later policy change cannot resurrect roots that have already
+become unreachable and eligible for sweep.
 
 Invariants:
 
@@ -752,6 +759,8 @@ Invariants:
 - Sweep never deletes an object marked in the latest safe epoch.
 - Device/file deletion and PITR retention changes affect only root selection,
   not object mutability.
+- Expiring retention is one-way for the expired roots; restore must fail
+  cleanly after their metadata has been swept.
 
 ## 12. Custodians and Orphan Reclamation
 
