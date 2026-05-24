@@ -98,8 +98,8 @@ pub struct RetentionPolicy {
     /// heads and separately retained deleted roots. A value of `N` keeps restore
     /// points while `current_commit - restore_commit < N`.
     ///
-    /// Implementations may also retain one older checkpoint as a replay anchor
-    /// for commits inside the window.
+    /// Implementations may materialize a checkpoint at the PITR window floor as
+    /// a replay anchor for commits inside the window.
     pub pitr_grace_commits: u64,
 }
 
@@ -262,6 +262,10 @@ pub trait MetadataPlane: Send + Sync {
     ///
     /// Must include live block roots, live native file roots, and retained PITR
     /// roots required by `policy`. Returning too few roots is data loss.
+    ///
+    /// Implementors may create deterministic replay-anchor checkpoints required
+    /// by the retention policy before returning roots, but must not make user
+    /// data visible or free any object from this call alone.
     fn roots_for_gc(&self, policy: RetentionPolicy) -> Result<Vec<MetadataNodeId>>;
 }
 

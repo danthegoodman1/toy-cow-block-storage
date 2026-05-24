@@ -779,9 +779,10 @@ Invariants:
   deterministic commit-age window: a restore point is retained while
   `current_commit - restore_commit < pitr_grace_commits`.
 - Because replay starts from a checkpoint and then applies shard commits, GC must
-  also retain the latest checkpoint at or before the window floor as a replay
-  anchor, plus the shard-commit roots needed after that anchor. Checkpoint
-  cadence bounds any extra history retained by this anchor.
+  materialize or retain a checkpoint at the window floor as a replay anchor,
+  plus the shard-commit roots needed after that anchor. This prevents sparse
+  checkpoint cadence from quietly extending the PITR data-retention window back
+  to device creation.
 
 ## 11. Garbage Collection
 
@@ -822,10 +823,12 @@ deleted-device roots and PITR roots. Deleted device roots may be retained
 indefinitely, expired immediately after a safe GC proves them unreachable, or
 retained until a configured number of commit sequence advancements has elapsed
 since the delete commit. PITR roots may be retained for a configured number of
-commit sequence advancements, with one older checkpoint retained when needed as
-a replay anchor. Commit-age retention is the v1 stand-in for production TTLs;
-later wall-clock-facing policies must be implemented through injected logical
-time so generated tests can replay them.
+commit sequence advancements. If no checkpoint exists at the PITR window floor,
+the metadata custodian creates a deterministic replay-anchor checkpoint before
+sweeping, then keeps only the anchor and later shard-commit roots needed for
+replay. Commit-age retention is the v1 stand-in for production TTLs; later
+wall-clock-facing policies must be implemented through injected logical time so
+generated tests can replay them.
 
 Invariants:
 

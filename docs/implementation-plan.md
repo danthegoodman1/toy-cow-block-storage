@@ -335,7 +335,7 @@ Deliverables:
 - [x] Periodic `Checkpoint` records.
 - [x] Restore algorithm from checkpoint plus commits.
 - [x] Deterministic PITR commit-age retention window with replay-anchor
-  checkpoint handling.
+  checkpoint materialization.
 - [x] Public restore request that creates a new device.
 - [x] Timeline validation.
 - [x] Tests for create, write, fork, and restore interactions.
@@ -389,8 +389,8 @@ Deliverables:
 - [x] Metadata custodian that publishes safe reachability epochs.
 - [x] Storage-node custodian that frees expired reservations, failed writes,
   orphan durable segments, released segments, and missed async frees.
-- [x] GC roots include retained PITR checkpoints, timeline roots, and any older
-  checkpoint anchor needed to replay points inside the PITR commit-age window.
+- [x] GC roots include retained PITR checkpoints, timeline roots, and a
+  materialized checkpoint anchor at the PITR commit-age window floor.
 - [x] GC simulator hooks for interleaving writes, forks, deletes, PITR changes,
   write-intent expiry, orphan cleanup, missed frees, and sweeps.
 

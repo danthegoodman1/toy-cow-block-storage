@@ -1747,6 +1747,55 @@ impl InMemoryMetadataPlane {
         }
     }
 
+    fn block_pitr_anchor_targets_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+    ) -> BTreeMap<DeviceId, CommitSeq> {
+        let Some(floor) = Self::pitr_retention_floor_locked(inner, policy) else {
+            return BTreeMap::new();
+        };
+
+        let mut targets = BTreeMap::new();
+        for (device_id, head) in &inner.device_heads {
+            let anchor = floor.raw().min(head.latest_commit.raw());
+            targets.insert(*device_id, CommitSeq::from_raw(anchor));
+        }
+        for (device_id, head) in &inner.deleted_device_heads {
+            if Self::retain_deleted_device_locked(inner, policy, *device_id) {
+                let anchor = floor.raw().min(head.latest_commit.raw());
+                targets.insert(*device_id, CommitSeq::from_raw(anchor));
+            }
+        }
+        targets
+    }
+
+    fn checkpoint_exists_locked(
+        inner: &MetadataInner,
+        owner: MappingOwner,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        inner
+            .checkpoints
+            .values()
+            .any(|checkpoint| checkpoint.owner == owner && checkpoint.commit_seq == commit_seq)
+    }
+
+    fn ensure_pitr_anchor_checkpoints_locked(
+        inner: &mut MetadataInner,
+        policy: &RetentionPolicy,
+    ) -> Result<()> {
+        let targets = Self::block_pitr_anchor_targets_locked(inner, policy);
+        for (device_id, anchor_seq) in targets {
+            let owner = MappingOwner::BlockDevice(device_id);
+            if Self::checkpoint_exists_locked(inner, owner, anchor_seq) {
+                continue;
+            }
+            let roots = Self::replay_device_roots_locked(inner, device_id, anchor_seq, None)?;
+            inner.insert_checkpoint(owner, anchor_seq, roots);
+        }
+        Ok(())
+    }
+
     fn latest_checkpoint_at_or_before_floor_locked(
         inner: &MetadataInner,
         owner: MappingOwner,
@@ -1796,6 +1845,44 @@ impl InMemoryMetadataPlane {
         };
         commit.commit_seq.raw() > anchor.commit_seq.raw()
             || Self::retain_pitr_commit_locked(inner, policy, commit.commit_seq)
+    }
+
+    fn retained_checkpoint_ids_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+    ) -> BTreeSet<CheckpointId> {
+        inner
+            .checkpoints
+            .values()
+            .filter(|checkpoint| match checkpoint.owner {
+                MappingOwner::BlockDevice(device_id) => {
+                    Self::owner_has_retained_pitr_locked(
+                        inner,
+                        policy,
+                        MappingOwner::BlockDevice(device_id),
+                    ) && Self::retain_checkpoint_for_pitr_locked(inner, policy, checkpoint)
+                }
+                MappingOwner::NativeFile(_) => {
+                    Self::owner_has_retained_pitr_locked(inner, policy, checkpoint.owner)
+                        && Self::retain_checkpoint_for_pitr_locked(inner, policy, checkpoint)
+                }
+            })
+            .map(|checkpoint| checkpoint.checkpoint_id)
+            .collect()
+    }
+
+    fn retained_shard_commit_cutoffs_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+    ) -> BTreeMap<DeviceId, CommitSeq> {
+        let mut cutoffs = BTreeMap::new();
+        for device_id in Self::block_pitr_anchor_targets_locked(inner, policy).keys() {
+            let owner = MappingOwner::BlockDevice(*device_id);
+            if let Some(anchor) = Self::retained_pitr_anchor_locked(inner, policy, owner) {
+                cutoffs.insert(*device_id, anchor.commit_seq);
+            }
+        }
+        cutoffs
     }
 
     fn retain_deleted_device_locked(
@@ -1865,6 +1952,7 @@ impl InMemoryMetadataPlane {
 
     pub fn mark_reachable_for_gc(&self, policy: RetentionPolicy) -> Result<MetadataMarkReport> {
         let mut inner = lock(&self.inner)?;
+        Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
         let epoch = inner.alloc_gc_epoch()?;
         let roots = Self::roots_for_gc_locked(&inner, policy.clone());
         let (nodes, segments) = Self::collect_reachable_locked(&inner, &roots)?;
@@ -1899,6 +1987,7 @@ impl InMemoryMetadataPlane {
         if epoch >= inner.next_gc_epoch {
             return Err(StorageError::invalid_argument("unknown GC epoch"));
         }
+        Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
 
         let roots = Self::roots_for_gc_locked(&inner, policy.clone());
         let (currently_reachable_nodes, currently_reachable_segments) =
@@ -1933,6 +2022,9 @@ impl InMemoryMetadataPlane {
         deleted_metadata_nodes.sort();
 
         {
+            let retained_checkpoints = Self::retained_checkpoint_ids_locked(&inner, &policy);
+            let retained_commit_cutoffs =
+                Self::retained_shard_commit_cutoffs_locked(&inner, &policy);
             let expired_devices: BTreeSet<_> = inner
                 .deleted_device_heads
                 .keys()
@@ -1951,12 +2043,18 @@ impl InMemoryMetadataPlane {
             inner
                 .checkpoints
                 .retain(|_, checkpoint| match checkpoint.owner {
-                    MappingOwner::BlockDevice(device_id) => !expired_devices.contains(&device_id),
+                    MappingOwner::BlockDevice(device_id) => {
+                        !expired_devices.contains(&device_id)
+                            && retained_checkpoints.contains(&checkpoint.checkpoint_id)
+                    }
                     MappingOwner::NativeFile(_) => true,
                 });
-            inner
-                .shard_commits
-                .retain(|commit| !expired_devices.contains(&commit.device_id));
+            inner.shard_commits.retain(|commit| {
+                !expired_devices.contains(&commit.device_id)
+                    && retained_commit_cutoffs
+                        .get(&commit.device_id)
+                        .is_some_and(|cutoff| commit.commit_seq.raw() > cutoff.raw())
+            });
             inner.fork_records.retain(|_, record| {
                 !expired_devices.contains(&record.source)
                     && !expired_devices.contains(&record.target)
@@ -2449,7 +2547,8 @@ impl MetadataPlane for InMemoryMetadataPlane {
     }
 
     fn roots_for_gc(&self, policy: RetentionPolicy) -> Result<Vec<MetadataNodeId>> {
-        let inner = lock(&self.inner)?;
+        let mut inner = lock(&self.inner)?;
+        Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
         Ok(Self::roots_for_gc_locked(&inner, policy))
     }
 }
@@ -4269,7 +4368,7 @@ mod tests {
         device.delete().unwrap();
 
         let report = store
-            .run_metadata_custodian(RetentionPolicy::retain_deleted_devices())
+            .run_metadata_custodian(RetentionPolicy::retain_everything())
             .unwrap();
 
         assert!(report.sweep.released_segments.is_empty());
@@ -5807,9 +5906,8 @@ mod tests {
 
         let commit1 = device.write_at(0, &[1; 4096]).unwrap();
         let checkpoint1 = store.metadata().checkpoint(device_id).unwrap();
-        let _commit2 = device.write_at(0, &[2; 4096]).unwrap();
-        let checkpoint2 = store.metadata().checkpoint(device_id).unwrap();
-        let _commit3 = device.write_at(0, &[3; 4096]).unwrap();
+        let commit2 = device.write_at(0, &[2; 4096]).unwrap();
+        let commit3 = device.write_at(0, &[3; 4096]).unwrap();
 
         let report = store
             .run_metadata_custodian(
@@ -5840,8 +5938,28 @@ mod tests {
             SegmentLifecycleState::Referenced
         );
 
+        let retained_commits = store
+            .metadata()
+            .shard_commits_for_device(device_id)
+            .unwrap();
+        assert!(
+            !retained_commits
+                .iter()
+                .any(|commit| commit.commit_seq == commit1.commit_seq)
+        );
+        assert!(
+            !retained_commits
+                .iter()
+                .any(|commit| commit.commit_seq == commit2.commit_seq)
+        );
+        assert!(
+            retained_commits
+                .iter()
+                .any(|commit| commit.commit_seq == commit3.commit_seq)
+        );
+
         let restored = device
-            .restore(RestorePoint::Checkpoint(checkpoint2))
+            .restore(RestorePoint::Commit(commit2.commit_seq))
             .unwrap();
         assert_eq!(
             read_device_bytes(&client.open_device(restored).unwrap(), 8),
@@ -5855,6 +5973,7 @@ mod tests {
                 .restore(RestorePoint::Commit(commit1.commit_seq))
                 .is_err()
         );
+        assert!(store.metadata().get_checkpoint(checkpoint1).is_err());
         assert!(
             device
                 .restore(RestorePoint::Checkpoint(checkpoint1))
