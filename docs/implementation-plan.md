@@ -140,17 +140,17 @@ Exit gate:
 
 ## Phase 3: Deterministic Core Contract
 
-Status: not started.
+Status: complete.
 
 Define the state-machine boundary before implementing storage behavior.
 
 Deliverables:
 
-- [ ] `StorageState`.
-- [ ] `StorageCommand`.
-- [ ] `StorageEffect`.
-- [ ] `StorageState::step(command) -> Vec<StorageEffect>`.
-- [ ] Explicit effects for write-intent creation, segment reservations, segment
+- [x] `StorageState`.
+- [x] `StorageCommand`.
+- [x] `StorageEffect`.
+- [x] `StorageState::step(command) -> Vec<StorageEffect>`.
+- [x] Explicit effects for write-intent creation, segment reservations, segment
   writes, segment syncs, durable-pending-metadata catalog commits, referenced
   catalog commits, metadata writes, device-head publishes, file-head publishes,
   commit-group publishes, timeline appends, checkpoints, custodian scans, and GC
@@ -158,10 +158,10 @@ Deliverables:
 
 Exit gate:
 
-- [ ] Compile-time module boundaries make hidden side effects awkward.
-- [ ] Tests prove identical initial state, seed, and command trace produce
+- [x] Compile-time module boundaries make hidden side effects awkward.
+- [x] Tests prove identical initial state, seed, and command trace produce
   identical effects.
-- [ ] No async, I/O, wall-clock reads, provider calls, or process-global
+- [x] No async, I/O, wall-clock reads, provider calls, or process-global
   randomness in the core.
 
 ## Phase 4: Local In-Process Services and Object Store
