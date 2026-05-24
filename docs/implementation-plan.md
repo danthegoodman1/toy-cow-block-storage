@@ -468,13 +468,15 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 14 owns native keyspace PITR and snapshot semantics over the shared
   segment substrate, including keyspace catalog-root records, file-root audit
   records, and restore/snapshot API shape.
-- Phase 15 owns real durability for segment sync, metadata WAL/transaction
+- Phase 15 owns native keyspace performance characterization and any benchmark-
+  proven local catalog scaling work needed before durable formats are chosen.
+- Phase 16 owns real durability for segment sync, metadata WAL/transaction
   sync, commit-group replay, write-intent recovery, native append lease/session
   records, checkpoint/timeline persistence, and cache coherence after restart.
-- Phase 16 owns remote transport serialization, retry/deduplication, stale
+- Phase 17 owns remote transport serialization, retry/deduplication, stale
   response rejection, server incarnation fencing, deadlines, mailbox semantics,
   backpressure, and concurrency rules for non-conflicting requests.
-- Phase 17 owns placement, replica-set selection, replica reference evidence,
+- Phase 18 owns placement, replica-set selection, replica reference evidence,
   release evidence logs or per-node queues, storage-node cursors, repair
   records, orphan replica reconciliation, stale placement handling, and physical
   free reconciliation across storage nodes.
@@ -539,12 +541,75 @@ Exit gate:
   substrate but not block-device logical mappings.
 - [x] Criterion covers native keyspace checkpoint restore.
 
-## Phase 15: Durable Provider
+## Phase 15: Native Keyspace Performance and Scaling
 
 Status: not started.
 
-Add a durable provider only after the local in-memory model and conformance suite
-are boringly correct.
+Characterize the local native keyspace implementation before durable providers
+freeze the wrong shape into a storage format. The goal is not to optimize by
+instinct. The goal is to prove which costs are acceptable for a correctness
+model, which costs are only local-provider artifacts, and whether the public
+API and deterministic core leave room for high-performance implementations.
+
+The current local catalog is intentionally simple: each immutable `KeyspaceRoot`
+contains a deterministic map of file catalog entries. That is a good
+correctness model, but it is not by itself proof that large keyspaces or
+high-concurrency native workloads scale. This phase either proves the simple
+model is good enough for the next phase, or replaces it with the smallest
+benchmark-justified scalable structure, such as sharded immutable keyspace
+catalog roots.
+
+Deliverables:
+
+- [ ] Criterion benchmarks for native file create, info, append, read,
+  checkpoint, snapshot, restore, and stale-lease rejection at keyspace sizes
+  `1`, `1k`, `100k`, and the largest practical local stress size.
+- [ ] Benchmarks for concurrent native appends across independent files and,
+  separately, conflicting append attempts against one file.
+- [ ] Benchmarks for aligned append/read versus unaligned append/read,
+  including the partial-tail-block COW path.
+- [ ] Benchmarks that assert keyspace snapshot and restore stay O(1) in file
+  metadata-tree nodes and do not walk file contents.
+- [ ] Regression thresholds or documented baseline ranges for native hot paths
+  in the Criterion suite.
+- [ ] A written decision record in the design spec: keep the local catalog as a
+  correctness model, or implement a sharded keyspace catalog before durable
+  providers.
+- [ ] If benchmarks show `O(file_count)` publish cost is material, replace the
+  local `BTreeMap` catalog root body with sharded immutable catalog roots or an
+  equally simple measured alternative.
+- [ ] If catalog sharding is added, deterministic generated tests compare
+  native keyspace behavior against the existing simple historical model.
+- [ ] If catalog sharding is added, benchmark and test that independent file
+  publishes contend at catalog-shard granularity rather than whole-keyspace
+  granularity.
+- [ ] Documentation of the intended high-performance implementation shape:
+  cached hot file heads, sharded catalog-root publishes, append-only timeline
+  records, and provider-private indexes that do not leak into public APIs.
+
+Exit gate:
+
+- [ ] Native keyspace benchmarks report headline numbers for normal operations,
+  large keyspaces, concurrent independent-file operations, conflicting-file
+  operations, snapshot, restore, and fork-like root-pointer copy behavior.
+- [ ] The measured local implementation has no hidden whole-keyspace work on
+  snapshot or restore.
+- [ ] Any remaining whole-keyspace work on append/create is explicitly
+  classified as a local-provider limitation or eliminated before Phase 16.
+- [ ] The public `NativeKeyspaceClient`, `NativeFile`, `MetadataPlane`, and
+  transport interfaces do not require callers to coordinate catalog shards,
+  metadata placement, storage placement, or replica durability.
+- [ ] A future durable or remote provider can implement the measured scalable
+  shape without changing public APIs.
+- [ ] Performance optimizations are backed by benchmarks and deterministic
+  conformance tests, not by speculative abstractions.
+
+## Phase 16: Durable Provider
+
+Status: not started.
+
+Add a durable provider only after the local in-memory model, conformance suite,
+and native keyspace scaling characterization are boringly correct.
 
 Deliverables:
 
@@ -581,7 +646,7 @@ Exit gate:
   older than the accepted fence/version.
 - [ ] No provider-specific behavior leaks into core metadata logic.
 
-## Phase 16: Remote Transport
+## Phase 17: Remote Transport
 
 Status: not started.
 
@@ -615,7 +680,7 @@ Exit gate:
 - [ ] Deterministic transport simulation covers delay, duplication, drop, and
   reorder faults.
 
-## Phase 17: Storage Replication
+## Phase 18: Storage Replication
 
 Status: not started.
 
@@ -670,7 +735,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 18: Optional ublk Adapter
+## Phase 19: Optional ublk Adapter
 
 Status: not started.
 
