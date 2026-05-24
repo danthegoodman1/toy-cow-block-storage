@@ -1,5 +1,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
+use toy_cow_block_storage::api::BlockRange;
+use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId};
+use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
     AppendLease, AppendLeaseId, BlockRequest, ByteRange, DeviceId, DeviceSpec, FileId, FileVersion,
@@ -48,6 +51,63 @@ fn bench_seeded_rng(c: &mut Criterion) {
     });
 }
 
+fn bench_block_range_helpers(c: &mut Criterion) {
+    let range = BlockRange::new(BlockIndex::from_raw(10), BlockCount::from_raw(1024));
+    let other = BlockRange::new(BlockIndex::from_raw(512), BlockCount::from_raw(64));
+
+    c.bench_function("block_range_helpers", |b| {
+        b.iter(|| {
+            let range = black_box(range);
+            let other = black_box(other);
+            black_box(range.end_exclusive()).unwrap();
+            black_box(range.contains_range(other)).unwrap();
+            black_box(range.overlaps(other)).unwrap();
+            black_box(range.split_at(BlockIndex::from_raw(512))).unwrap()
+        })
+    });
+}
+
+fn bench_metadata_leaf_validation(c: &mut Criterion) {
+    let segments = vec![
+        SegmentDescriptor {
+            segment_id: SegmentId::from_raw(1),
+            blocks: BlockCount::from_raw(128),
+            bytes: 128 * 4096,
+            checksum: None,
+        },
+        SegmentDescriptor {
+            segment_id: SegmentId::from_raw(2),
+            blocks: BlockCount::from_raw(128),
+            bytes: 128 * 4096,
+            checksum: None,
+        },
+    ];
+    let node = MetadataNode {
+        node_id: MetadataNodeId::from_raw(1),
+        covered_range: BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(256)),
+        kind: MetadataNodeKind::Leaf {
+            entries: vec![
+                LeafEntry {
+                    logical_start: BlockIndex::from_raw(0),
+                    blocks: BlockCount::from_raw(64),
+                    segment_id: SegmentId::from_raw(1),
+                    segment_offset: BlockIndex::from_raw(0),
+                },
+                LeafEntry {
+                    logical_start: BlockIndex::from_raw(128),
+                    blocks: BlockCount::from_raw(64),
+                    segment_id: SegmentId::from_raw(2),
+                    segment_offset: BlockIndex::from_raw(0),
+                },
+            ],
+        },
+    };
+
+    c.bench_function("metadata_leaf_validation", |b| {
+        b.iter(|| black_box(&node).validate(black_box(&segments)))
+    });
+}
+
 fn bench_native_append_validation(c: &mut Criterion) {
     let file_id = FileId::from_raw(9);
     let request = NativeRequest::Append {
@@ -70,6 +130,6 @@ fn bench_native_append_validation(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_seeded_rng
 }
 criterion_main!(regression);

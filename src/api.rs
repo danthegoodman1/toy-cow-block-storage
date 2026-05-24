@@ -126,6 +126,81 @@ impl BlockRange {
     pub const fn new(start: BlockIndex, blocks: BlockCount) -> Self {
         Self { start, blocks }
     }
+
+    pub fn end_exclusive(self) -> Result<BlockIndex> {
+        self.start
+            .raw()
+            .checked_add(self.blocks.raw())
+            .map(BlockIndex::from_raw)
+            .ok_or_else(|| StorageError::invalid_argument("block range overflows u64"))
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.blocks.raw() == 0
+    }
+
+    pub fn validate_non_empty(self) -> Result<()> {
+        self.end_exclusive()?;
+
+        if self.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "block range must contain at least one block",
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn contains_range(self, other: Self) -> Result<bool> {
+        let self_end = self.end_exclusive()?.raw();
+        let other_end = other.end_exclusive()?.raw();
+
+        Ok(other.start.raw() >= self.start.raw() && other_end <= self_end)
+    }
+
+    pub fn overlaps(self, other: Self) -> Result<bool> {
+        let self_end = self.end_exclusive()?.raw();
+        let other_end = other.end_exclusive()?.raw();
+
+        if self.is_empty() || other.is_empty() {
+            return Ok(false);
+        }
+
+        Ok(self.start.raw() < other_end && other.start.raw() < self_end)
+    }
+
+    pub fn is_adjacent_to(self, other: Self) -> Result<bool> {
+        let self_end = self.end_exclusive()?.raw();
+        let other_end = other.end_exclusive()?.raw();
+
+        if self.is_empty() || other.is_empty() {
+            return Ok(false);
+        }
+
+        Ok(self_end == other.start.raw() || other_end == self.start.raw())
+    }
+
+    pub fn split_at(self, split: BlockIndex) -> Result<(Self, Self)> {
+        let end = self.end_exclusive()?.raw();
+        let split = split.raw();
+
+        if split < self.start.raw() || split > end {
+            return Err(StorageError::invalid_argument(
+                "split point must be inside block range bounds",
+            ));
+        }
+
+        let left_blocks = split - self.start.raw();
+        let right_blocks = end - split;
+
+        Ok((
+            Self::new(self.start, BlockCount::from_raw(left_blocks)),
+            Self::new(
+                BlockIndex::from_raw(split),
+                BlockCount::from_raw(right_blocks),
+            ),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +658,81 @@ mod tests {
                 .is_ok()
         );
         assert!(ByteRange::new(1, 0).validate_for_device(&spec).is_err());
+    }
+
+    #[test]
+    fn block_range_helpers_cover_bounds_overlap_adjacency_and_split() {
+        let range = BlockRange::new(BlockIndex::from_raw(10), BlockCount::from_raw(5));
+
+        assert_eq!(range.end_exclusive().unwrap(), BlockIndex::from_raw(15));
+        assert!(range.validate_non_empty().is_ok());
+        assert!(
+            range
+                .contains_range(BlockRange::new(
+                    BlockIndex::from_raw(11),
+                    BlockCount::from_raw(2),
+                ))
+                .unwrap()
+        );
+        assert!(
+            range
+                .overlaps(BlockRange::new(
+                    BlockIndex::from_raw(14),
+                    BlockCount::from_raw(4),
+                ))
+                .unwrap()
+        );
+        assert!(
+            range
+                .is_adjacent_to(BlockRange::new(
+                    BlockIndex::from_raw(15),
+                    BlockCount::from_raw(2),
+                ))
+                .unwrap()
+        );
+
+        let (left, right) = range.split_at(BlockIndex::from_raw(12)).unwrap();
+        assert_eq!(
+            left,
+            BlockRange::new(BlockIndex::from_raw(10), BlockCount::from_raw(2))
+        );
+        assert_eq!(
+            right,
+            BlockRange::new(BlockIndex::from_raw(12), BlockCount::from_raw(3))
+        );
+
+        let (empty_left, full_right) = range.split_at(BlockIndex::from_raw(10)).unwrap();
+        assert!(empty_left.is_empty());
+        assert_eq!(full_right, range);
+    }
+
+    #[test]
+    fn block_range_helpers_reject_overflow_empty_and_out_of_bounds_split() {
+        let overflowing = BlockRange::new(BlockIndex::from_raw(u64::MAX), BlockCount::from_raw(1));
+        assert!(overflowing.end_exclusive().is_err());
+
+        let empty = BlockRange::new(BlockIndex::from_raw(1), BlockCount::from_raw(0));
+        assert!(empty.validate_non_empty().is_err());
+        assert!(
+            !empty
+                .overlaps(BlockRange::new(
+                    BlockIndex::from_raw(1),
+                    BlockCount::from_raw(1),
+                ))
+                .unwrap()
+        );
+        assert!(
+            !empty
+                .is_adjacent_to(BlockRange::new(
+                    BlockIndex::from_raw(1),
+                    BlockCount::from_raw(1),
+                ))
+                .unwrap()
+        );
+
+        let range = BlockRange::new(BlockIndex::from_raw(10), BlockCount::from_raw(5));
+        assert!(range.split_at(BlockIndex::from_raw(9)).is_err());
+        assert!(range.split_at(BlockIndex::from_raw(16)).is_err());
     }
 
     #[test]

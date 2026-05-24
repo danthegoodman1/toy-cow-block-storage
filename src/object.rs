@@ -1,4 +1,5 @@
 use crate::api::BlockRange;
+use crate::error::{Result, StorageError};
 use crate::id::{
     BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq, DeviceGeneration, DeviceId,
     FileId, FileVersion, LogicalTime, MetadataNodeId, SegmentId, ShardId,
@@ -28,6 +29,26 @@ pub struct DeviceHead {
     pub latest_commit: CommitSeq,
 }
 
+impl DeviceHead {
+    /// Validate the committed head shape for a fixed-shard device lineage.
+    pub fn validate(&self, expected_shard_count: usize) -> Result<()> {
+        if expected_shard_count == 0 {
+            return Err(StorageError::invalid_argument(
+                "expected shard count must be greater than zero",
+            ));
+        }
+
+        if self.shard_roots.len() != expected_shard_count {
+            return Err(StorageError::invalid_argument(format!(
+                "device head has {} shard roots, expected {expected_shard_count}",
+                self.shard_roots.len()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
 /// Current committed native file root.
 ///
 /// A `FileHead` is the durable publication unit for a native file. Providers
@@ -42,6 +63,63 @@ pub struct FileHead {
     pub latest_commit: CommitSeq,
 }
 
+impl FileHead {
+    /// Validate the current file head against its root coverage.
+    ///
+    /// The caller supplies root coverage because the head stores only the root
+    /// ID. Provider implementations must fetch the root node and pass its
+    /// covered range here before accepting a committed head.
+    pub fn validate_current(&self, root_coverage: BlockRange, block_size: u32) -> Result<()> {
+        let capacity = byte_capacity(root_coverage, block_size)?;
+
+        if self.size > capacity {
+            return Err(StorageError::invalid_argument(
+                "file size exceeds current root coverage",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate a file-head transition against the previous committed head.
+    pub fn validate_transition_from(
+        &self,
+        previous: &Self,
+        root_coverage: BlockRange,
+        block_size: u32,
+    ) -> Result<()> {
+        self.validate_current(root_coverage, block_size)?;
+
+        if self.file_id != previous.file_id {
+            return Err(StorageError::invalid_argument(
+                "file-head transition changed file_id",
+            ));
+        }
+
+        if self.version.raw() < previous.version.raw() {
+            return Err(StorageError::invalid_argument(
+                "file version must not regress",
+            ));
+        }
+
+        if self.latest_commit.raw() < previous.latest_commit.raw() {
+            return Err(StorageError::invalid_argument(
+                "file latest_commit must not regress",
+            ));
+        }
+
+        if (self.root != previous.root || self.size != previous.size)
+            && self.version.raw() == previous.version.raw()
+        {
+            return Err(StorageError::invalid_argument(
+                "file root or size changes must advance file version",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Immutable metadata tree node.
 ///
 /// A node ID names exactly one node body. Providers may accept an identical
@@ -51,6 +129,26 @@ pub struct MetadataNode {
     pub node_id: MetadataNodeId,
     pub covered_range: BlockRange,
     pub kind: MetadataNodeKind,
+}
+
+impl MetadataNode {
+    /// Validate metadata node shape and local references.
+    ///
+    /// Segment descriptors are supplied explicitly so validation stays pure and
+    /// provider-free. Empty leaf entries are valid for sparse regions; empty
+    /// covered node ranges are not.
+    pub fn validate(&self, segments: &[SegmentDescriptor]) -> Result<()> {
+        self.covered_range.validate_non_empty()?;
+
+        match &self.kind {
+            MetadataNodeKind::Internal { children } => {
+                validate_child_ranges(self.covered_range, children)
+            }
+            MetadataNodeKind::Leaf { entries } => {
+                validate_leaf_entries(self.covered_range, entries, segments)
+            }
+        }
+    }
 }
 
 /// Metadata node payload.
@@ -82,6 +180,48 @@ pub struct LeafEntry {
     pub segment_offset: BlockIndex,
 }
 
+impl LeafEntry {
+    pub const fn logical_range(&self) -> BlockRange {
+        BlockRange::new(self.logical_start, self.blocks)
+    }
+
+    pub fn segment_end_exclusive(&self) -> Result<BlockIndex> {
+        self.segment_offset
+            .raw()
+            .checked_add(self.blocks.raw())
+            .map(BlockIndex::from_raw)
+            .ok_or_else(|| StorageError::invalid_argument("segment slice overflows u64"))
+    }
+
+    pub fn validate_against(
+        &self,
+        covered_range: BlockRange,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<()> {
+        self.logical_range().validate_non_empty()?;
+
+        if !covered_range.contains_range(self.logical_range())? {
+            return Err(StorageError::invalid_argument(
+                "leaf entry is outside node covered range",
+            ));
+        }
+
+        if self.segment_id != descriptor.segment_id {
+            return Err(StorageError::invalid_argument(
+                "leaf entry segment_id does not match descriptor",
+            ));
+        }
+
+        if self.segment_end_exclusive()?.raw() > descriptor.blocks.raw() {
+            return Err(StorageError::invalid_argument(
+                "leaf entry segment slice exceeds segment bounds",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Immutable data segment descriptor.
 ///
 /// A descriptor describes committed bytes. Segment stores must not mutate the
@@ -94,6 +234,42 @@ pub struct SegmentDescriptor {
     pub blocks: BlockCount,
     pub bytes: u64,
     pub checksum: Option<u64>,
+}
+
+impl SegmentDescriptor {
+    pub fn validate(&self, block_size: u32) -> Result<()> {
+        if block_size == 0 {
+            return Err(StorageError::invalid_argument(
+                "block_size must be greater than zero",
+            ));
+        }
+
+        if !block_size.is_power_of_two() {
+            return Err(StorageError::invalid_argument(
+                "block_size must be a power of two",
+            ));
+        }
+
+        if self.blocks.raw() == 0 {
+            return Err(StorageError::invalid_argument(
+                "segment must contain at least one block",
+            ));
+        }
+
+        let expected_bytes = self
+            .blocks
+            .raw()
+            .checked_mul(u64::from(block_size))
+            .ok_or_else(|| StorageError::invalid_argument("segment byte size overflows u64"))?;
+
+        if self.bytes != expected_bytes {
+            return Err(StorageError::invalid_argument(
+                "segment byte size must equal blocks * block_size",
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Single shard-root replacement in a block-device commit group.
@@ -137,4 +313,389 @@ pub struct Checkpoint {
     pub time: LogicalTime,
     pub owner: MappingOwner,
     pub shard_roots: Vec<MetadataNodeId>,
+}
+
+fn byte_capacity(range: BlockRange, block_size: u32) -> Result<u64> {
+    range.validate_non_empty()?;
+
+    if block_size == 0 {
+        return Err(StorageError::invalid_argument(
+            "block_size must be greater than zero",
+        ));
+    }
+
+    if !block_size.is_power_of_two() {
+        return Err(StorageError::invalid_argument(
+            "block_size must be a power of two",
+        ));
+    }
+
+    range
+        .blocks
+        .raw()
+        .checked_mul(u64::from(block_size))
+        .ok_or_else(|| StorageError::invalid_argument("range byte capacity overflows u64"))
+}
+
+fn validate_child_ranges(covered_range: BlockRange, children: &[MetadataChild]) -> Result<()> {
+    if children.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "internal metadata node must have children",
+        ));
+    }
+
+    let mut previous: Option<BlockRange> = None;
+
+    for child in children {
+        child.range.validate_non_empty()?;
+
+        if !covered_range.contains_range(child.range)? {
+            return Err(StorageError::invalid_argument(
+                "metadata child range is outside node covered range",
+            ));
+        }
+
+        if let Some(previous) = previous {
+            if child.range.start.raw() < previous.start.raw() {
+                return Err(StorageError::invalid_argument(
+                    "metadata child ranges must be sorted",
+                ));
+            }
+
+            if child.range.start.raw() < previous.end_exclusive()?.raw() {
+                return Err(StorageError::invalid_argument(
+                    "metadata child ranges must not overlap",
+                ));
+            }
+        }
+
+        previous = Some(child.range);
+    }
+
+    Ok(())
+}
+
+fn validate_leaf_entries(
+    covered_range: BlockRange,
+    entries: &[LeafEntry],
+    segments: &[SegmentDescriptor],
+) -> Result<()> {
+    let mut previous: Option<BlockRange> = None;
+
+    for entry in entries {
+        let descriptor = segments
+            .iter()
+            .find(|segment| segment.segment_id == entry.segment_id)
+            .ok_or_else(|| {
+                StorageError::invalid_argument("leaf entry references missing segment")
+            })?;
+
+        entry.validate_against(covered_range, descriptor)?;
+
+        let range = entry.logical_range();
+        if let Some(previous) = previous {
+            if range.start.raw() < previous.start.raw() {
+                return Err(StorageError::invalid_argument(
+                    "leaf entries must be sorted",
+                ));
+            }
+
+            if range.start.raw() < previous.end_exclusive()?.raw() {
+                return Err(StorageError::invalid_argument(
+                    "leaf entries must not overlap",
+                ));
+            }
+        }
+
+        previous = Some(range);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK_SIZE: u32 = 4096;
+
+    fn range(start: u64, blocks: u64) -> BlockRange {
+        BlockRange::new(BlockIndex::from_raw(start), BlockCount::from_raw(blocks))
+    }
+
+    fn segment(segment_id: u128, blocks: u64) -> SegmentDescriptor {
+        SegmentDescriptor {
+            segment_id: SegmentId::from_raw(segment_id),
+            blocks: BlockCount::from_raw(blocks),
+            bytes: blocks * u64::from(BLOCK_SIZE),
+            checksum: None,
+        }
+    }
+
+    fn entry(logical_start: u64, blocks: u64, segment_id: u128, segment_offset: u64) -> LeafEntry {
+        LeafEntry {
+            logical_start: BlockIndex::from_raw(logical_start),
+            blocks: BlockCount::from_raw(blocks),
+            segment_id: SegmentId::from_raw(segment_id),
+            segment_offset: BlockIndex::from_raw(segment_offset),
+        }
+    }
+
+    #[test]
+    fn device_head_validation_requires_fixed_nonzero_shard_count() {
+        let head = DeviceHead {
+            device_id: DeviceId::from_raw(1),
+            generation: DeviceGeneration::from_raw(1),
+            shard_roots: vec![MetadataNodeId::from_raw(10), MetadataNodeId::from_raw(11)],
+            latest_commit: CommitSeq::from_raw(0),
+        };
+
+        assert!(head.validate(2).is_ok());
+        assert!(head.validate(0).is_err());
+        assert!(head.validate(1).is_err());
+        assert!(head.validate(3).is_err());
+    }
+
+    #[test]
+    fn file_head_validation_rejects_out_of_bounds_size_and_regressing_transition() {
+        let previous = FileHead {
+            file_id: FileId::from_raw(7),
+            version: FileVersion::from_raw(4),
+            root: MetadataNodeId::from_raw(1),
+            size: 8 * u64::from(BLOCK_SIZE),
+            latest_commit: CommitSeq::from_raw(9),
+        };
+        let current = FileHead {
+            version: FileVersion::from_raw(5),
+            root: MetadataNodeId::from_raw(2),
+            size: 9 * u64::from(BLOCK_SIZE),
+            latest_commit: CommitSeq::from_raw(10),
+            ..previous.clone()
+        };
+
+        assert!(
+            current
+                .validate_transition_from(&previous, range(0, 16), BLOCK_SIZE)
+                .is_ok()
+        );
+
+        let too_large = FileHead {
+            size: 17 * u64::from(BLOCK_SIZE),
+            ..current.clone()
+        };
+        assert!(
+            too_large
+                .validate_transition_from(&previous, range(0, 16), BLOCK_SIZE)
+                .is_err()
+        );
+
+        let regressed_version = FileHead {
+            version: FileVersion::from_raw(3),
+            ..current.clone()
+        };
+        assert!(
+            regressed_version
+                .validate_transition_from(&previous, range(0, 16), BLOCK_SIZE)
+                .is_err()
+        );
+
+        let regressed_commit = FileHead {
+            latest_commit: CommitSeq::from_raw(8),
+            ..current.clone()
+        };
+        assert!(
+            regressed_commit
+                .validate_transition_from(&previous, range(0, 16), BLOCK_SIZE)
+                .is_err()
+        );
+
+        let changed_without_version = FileHead {
+            version: previous.version,
+            root: MetadataNodeId::from_raw(3),
+            size: 9 * u64::from(BLOCK_SIZE),
+            latest_commit: CommitSeq::from_raw(10),
+            ..previous.clone()
+        };
+        assert!(
+            changed_without_version
+                .validate_transition_from(&previous, range(0, 16), BLOCK_SIZE)
+                .is_err()
+        );
+
+        let wrong_file = FileHead {
+            file_id: FileId::from_raw(8),
+            ..current
+        };
+        assert!(
+            wrong_file
+                .validate_transition_from(&previous, range(0, 16), BLOCK_SIZE)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn segment_descriptor_validation_checks_shape_and_byte_size() {
+        assert!(segment(1, 4).validate(BLOCK_SIZE).is_ok());
+
+        let zero_blocks = SegmentDescriptor {
+            blocks: BlockCount::from_raw(0),
+            bytes: 0,
+            ..segment(1, 4)
+        };
+        assert!(zero_blocks.validate(BLOCK_SIZE).is_err());
+
+        let byte_mismatch = SegmentDescriptor {
+            bytes: 1,
+            ..segment(1, 4)
+        };
+        assert!(byte_mismatch.validate(BLOCK_SIZE).is_err());
+
+        let overflow = SegmentDescriptor {
+            blocks: BlockCount::from_raw(u64::MAX),
+            bytes: u64::MAX,
+            ..segment(1, 4)
+        };
+        assert!(overflow.validate(BLOCK_SIZE).is_err());
+
+        assert!(segment(1, 4).validate(3000).is_err());
+    }
+
+    #[test]
+    fn metadata_leaf_validation_accepts_sorted_non_overlapping_entries() {
+        let node = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(10, 20),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(10, 2, 1, 0), entry(15, 3, 2, 4)],
+            },
+        };
+        let segments = [segment(1, 10), segment(2, 10)];
+
+        assert!(node.validate(&segments).is_ok());
+    }
+
+    #[test]
+    fn metadata_leaf_validation_rejects_bad_entry_shapes() {
+        let segments = [segment(1, 10)];
+
+        let overlapping = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 10),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(1, 4, 1, 0), entry(3, 2, 1, 4)],
+            },
+        };
+        assert!(overlapping.validate(&segments).is_err());
+
+        let unsorted = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 30),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(20, 2, 1, 0), entry(10, 2, 1, 2)],
+            },
+        };
+        assert!(unsorted.validate(&segments).is_err());
+
+        let zero_length = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 10),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(1, 0, 1, 0)],
+            },
+        };
+        assert!(zero_length.validate(&segments).is_err());
+
+        let out_of_range = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 10),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(9, 2, 1, 0)],
+            },
+        };
+        assert!(out_of_range.validate(&segments).is_err());
+
+        let missing_segment = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 10),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(1, 2, 99, 0)],
+            },
+        };
+        assert!(missing_segment.validate(&segments).is_err());
+
+        let segment_bounds = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 10),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(1, 2, 1, 9)],
+            },
+        };
+        assert!(segment_bounds.validate(&segments).is_err());
+
+        let segment_slice_overflow = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 10),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![entry(1, 1, 1, u64::MAX)],
+            },
+        };
+        assert!(segment_slice_overflow.validate(&segments).is_err());
+    }
+
+    #[test]
+    fn metadata_internal_validation_checks_children() {
+        let valid = MetadataNode {
+            node_id: MetadataNodeId::from_raw(1),
+            covered_range: range(0, 100),
+            kind: MetadataNodeKind::Internal {
+                children: vec![
+                    MetadataChild {
+                        range: range(0, 10),
+                        node_id: MetadataNodeId::from_raw(2),
+                    },
+                    MetadataChild {
+                        range: range(10, 10),
+                        node_id: MetadataNodeId::from_raw(3),
+                    },
+                ],
+            },
+        };
+        assert!(valid.validate(&[]).is_ok());
+
+        let empty = MetadataNode {
+            kind: MetadataNodeKind::Internal {
+                children: Vec::new(),
+            },
+            ..valid.clone()
+        };
+        assert!(empty.validate(&[]).is_err());
+
+        let overlapping = MetadataNode {
+            kind: MetadataNodeKind::Internal {
+                children: vec![
+                    MetadataChild {
+                        range: range(0, 10),
+                        node_id: MetadataNodeId::from_raw(2),
+                    },
+                    MetadataChild {
+                        range: range(5, 10),
+                        node_id: MetadataNodeId::from_raw(3),
+                    },
+                ],
+            },
+            ..valid.clone()
+        };
+        assert!(overlapping.validate(&[]).is_err());
+
+        let out_of_bounds = MetadataNode {
+            kind: MetadataNodeKind::Internal {
+                children: vec![MetadataChild {
+                    range: range(99, 2),
+                    node_id: MetadataNodeId::from_raw(2),
+                }],
+            },
+            ..valid
+        };
+        assert!(out_of_bounds.validate(&[]).is_err());
+    }
 }

@@ -113,29 +113,30 @@ Exit gate:
 
 ## Phase 2: Core Types and Invariants
 
-Status: not started.
+Status: complete.
 
 Define the internal identities and immutable object shapes before implementing
 operations.
 
 Deliverables:
 
-- [ ] `DeviceHead` validation with fixed `shard_roots`.
-- [ ] `FileHead` validation with current file root and monotonic file version.
-- [ ] `MetadataNode` validation for internal and leaf variants.
-- [ ] `LeafEntry` validation for range-to-segment mappings.
-- [ ] Range helpers for split, overlap, adjacency, and bounds checks.
-- [ ] Segment descriptor validation.
+- [x] `DeviceHead` validation with fixed `shard_roots`.
+- [x] `FileHead` validation with current file root and monotonic file version.
+- [x] `MetadataNode` validation for internal and leaf variants.
+- [x] `LeafEntry` validation for range-to-segment mappings.
+- [x] Range helpers for split, overlap, adjacency, and bounds checks.
+- [x] Segment descriptor validation.
+- [x] Criterion baselines for range helpers and metadata leaf validation.
 
 Exit gate:
 
-- [ ] Unit tests cover range arithmetic edge cases.
-- [ ] Leaf validation rejects overlaps, unsorted entries, zero-length entries,
+- [x] Unit tests cover range arithmetic edge cases.
+- [x] Leaf validation rejects overlaps, unsorted entries, zero-length entries,
   and out-of-bounds segment slices.
-- [ ] Device-head validation requires exactly the configured shard count.
-- [ ] File-head validation rejects regressing versions and out-of-bounds file
+- [x] Device-head validation requires exactly the configured shard count.
+- [x] File-head validation rejects regressing versions and out-of-bounds file
   sizes.
-- [ ] Core object types do not perform I/O or read wall-clock time.
+- [x] Core object types do not perform I/O or read wall-clock time.
 
 ## Phase 3: Deterministic Core Contract
 
