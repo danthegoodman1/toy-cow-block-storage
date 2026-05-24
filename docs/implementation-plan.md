@@ -507,12 +507,17 @@ Deliverables:
   replica commit per selected storage endpoint.
 - [ ] Metadata publish waits for the requested replica durability before making
   the logical segment visible.
+- [ ] Durable metadata-to-storage release evidence stream or per-node release
+  queues keyed by safe reachability epoch.
+- [ ] Storage-node release cursors and idempotent apply path for released logical
+  segments.
 - [ ] Repair path that can add missing background replicas after metadata
   publish without changing public block or native APIs.
 - [ ] Custodian reconciliation for failed replica writes, orphan replicas, and
   stale local catalog state.
 - [ ] Fault simulation for replica delay, loss, duplication, stale writes,
-  partial quorum success, and repair races.
+  partial quorum success, delayed/duplicated/reordered release evidence, missed
+  release notifications, and repair races.
 
 Exit gate:
 
@@ -523,6 +528,11 @@ Exit gate:
   metadata publish both succeed.
 - [ ] Failed metadata publish after durable replica writes leaves only
   reclaimable orphan replicas.
+- [ ] Storage nodes never infer deletion by reading current metadata heads; they
+  free physical bytes only from durable release evidence, expired intents, or
+  local failed-write evidence.
+- [ ] Release evidence replay is idempotent and can resume from per-node cursors
+  after storage-node or metadata-service restart.
 - [ ] Repair never makes uncommitted data visible.
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.

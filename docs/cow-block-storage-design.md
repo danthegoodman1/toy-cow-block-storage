@@ -398,6 +398,15 @@ than the desired background replica count but enough for the requested
 durability, repair can add missing replicas later without changing the public
 block or native API.
 
+Replicated storage also needs a durable release-evidence boundary between the
+metadata custodian and storage-node custodians. The local v1 implementation may
+return released segment IDs in process, but a remote implementation must persist
+release records by safe reachability epoch and let storage nodes consume them
+idempotently. Storage nodes must not crawl metadata trees or infer deletion from
+current heads. They apply metadata-produced release evidence to their local
+replica catalogs, free matching physical bytes, and record progress so missed,
+duplicated, delayed, or reordered release notifications can be reconciled.
+
 ### Write Ordering Contract
 
 Writes use a data-before-metadata commit discipline. Metadata must never publish
@@ -782,6 +791,14 @@ The metadata custodian owns global reachability. It periodically:
 The metadata custodian does not delete local segment bytes directly. It produces
 evidence that a segment is no longer referenced by committed metadata or retained
 PITR roots.
+
+In the local in-process implementation, that evidence can be a deterministic
+list of released segment IDs returned by the metadata sweep. In a remote or
+replicated implementation, the same concept must become a durable release log or
+per-storage-node release queue keyed by safe reachability epoch. Consumers must
+be able to replay from a cursor, tolerate duplicate records, and reconcile
+missed release events without asking storage nodes to interpret global metadata
+reachability themselves.
 
 ### Storage-Node Custodian
 
