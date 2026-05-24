@@ -428,25 +428,25 @@ Exit gate:
 
 ## Phase 13: Performance Baselines
 
-Status: not started.
+Status: complete.
 
 Broaden regression detection after the simple implementation exists.
 
 Deliverables:
 
-- [ ] Benchmarks for fork cost versus device size.
-- [ ] Benchmarks for single-shard write cost versus tree depth.
-- [ ] Benchmarks for multi-shard atomic write cost.
-- [ ] Benchmarks for native append with valid leases and stale-lease rejection.
-- [ ] Benchmarks for read lookup cost and read amplification.
-- [ ] Benchmarks for checkpoint restore and GC traversal.
+- [x] Benchmarks for fork cost versus device size.
+- [x] Benchmarks for single-shard write cost versus tree depth.
+- [x] Benchmarks for multi-shard atomic write cost.
+- [x] Benchmarks for native append with valid leases and stale-lease rejection.
+- [x] Benchmarks for read lookup cost and read amplification.
+- [x] Benchmarks for checkpoint restore and GC traversal.
 
 Exit gate:
 
-- [ ] Benchmarks establish baseline numbers with reproducible inputs.
-- [ ] Fork remains O(1) in measured object count.
-- [ ] Write cost scales with changed shard paths, not whole-device metadata.
-- [ ] Any proposed optimization links to a benchmark or failing test.
+- [x] Benchmarks establish baseline numbers with reproducible inputs.
+- [x] Fork remains O(1) in measured object count.
+- [x] Write cost scales with changed shard paths, not whole-device metadata.
+- [x] Any proposed optimization links to a benchmark or failing test.
 
 ## Phase 14: Durable Provider
 

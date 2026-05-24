@@ -12,8 +12,8 @@ use toy_cow_block_storage::provider::{
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
     AppendLease, AppendLeaseId, BlockClient, BlockDevice, BlockRequest, ByteRange, DeviceId,
-    DeviceSpec, FileId, FileVersion, ForkRequest, NativeRequest, RestorePoint, WriteDurability,
-    WriterEpoch,
+    DeviceSpec, FileId, FileVersion, ForkRequest, NativeFile, NativeFileClient, NativeRequest,
+    RestorePoint, WriteDurability, WriterEpoch,
 };
 
 fn bench_byte_range_validation(c: &mut Criterion) {
@@ -263,6 +263,87 @@ fn bench_local_single_shard_write_by_tree_depth(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_local_multi_shard_atomic_write(c: &mut Criterion) {
+    c.bench_function("local_multi_shard_atomic_write", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                    shard_count: 4,
+                    block_size: 4096,
+                    file_root_blocks: 128,
+                    metadata_fanout: 4,
+                    metadata_leaf_blocks: 8,
+                    storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                })
+                .unwrap();
+                let server =
+                    std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store));
+                let client = toy_cow_block_storage::LocalBlockClient::new(
+                    toy_cow_block_storage::InProcessBlockTransport::new(server),
+                );
+                let device_id = client
+                    .create_device(toy_cow_block_storage::CreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 64,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                (client.open_device(device_id).unwrap(), vec![11; 64 * 4096])
+            },
+            |(device, bytes)| device.write_at(black_box(0), black_box(&bytes)).unwrap(),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+fn bench_local_read_by_mapping_count(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_read_mapping_count");
+    for mapping_count in [1_u64, 8, 32] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(mapping_count),
+            &mapping_count,
+            |b, &mapping_count| {
+                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                    shard_count: 4,
+                    block_size: 4096,
+                    file_root_blocks: 128,
+                    metadata_fanout: 4,
+                    metadata_leaf_blocks: 4,
+                    storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                })
+                .unwrap();
+                let server =
+                    std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store));
+                let client = toy_cow_block_storage::LocalBlockClient::new(
+                    toy_cow_block_storage::InProcessBlockTransport::new(server),
+                );
+                let device_id = client
+                    .create_device(toy_cow_block_storage::CreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 128,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                let device = client.open_device(device_id).unwrap();
+                for index in 0..mapping_count {
+                    let block = index * (128 / mapping_count);
+                    device.write_at(block * 4096, &[index as u8; 4096]).unwrap();
+                }
+                let mut buf = vec![0; 128 * 4096];
+                b.iter(|| {
+                    device.read_at(black_box(0), black_box(&mut buf)).unwrap();
+                    black_box(buf[0])
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_local_native_append(c: &mut Criterion) {
     c.bench_function("local_native_append", |b| {
         b.iter_batched(
@@ -290,6 +371,32 @@ fn bench_local_native_append(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         )
+    });
+}
+
+fn bench_local_native_stale_lease_rejection(c: &mut Criterion) {
+    let store = LocalObjectStore::new();
+    let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(store));
+    let client = toy_cow_block_storage::LocalNativeFileClient::new(
+        toy_cow_block_storage::InProcessNativeTransport::new(server),
+    );
+    let file_id = client
+        .create_file(toy_cow_block_storage::CreateFileRequest {
+            spec: toy_cow_block_storage::FileSpec { name: None },
+        })
+        .unwrap();
+    let file = client.open_file(file_id).unwrap();
+    let stale = file.acquire_append().unwrap();
+    let _fresh = file.acquire_append().unwrap();
+    let bytes = vec![1; 4096];
+
+    c.bench_function("local_native_stale_lease_rejection", |b| {
+        b.iter(|| {
+            black_box(
+                file.append_with_lease(black_box(stale.clone()), black_box(&bytes))
+                    .is_err(),
+            )
+        })
     });
 }
 
@@ -502,6 +609,6 @@ fn bench_native_append_validation(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_native_append, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng
 }
 criterion_main!(regression);
