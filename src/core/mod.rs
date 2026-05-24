@@ -514,14 +514,10 @@ mod tests {
             ),
             (
                 StorageCommand::RunMetadataCustodian {
-                    policy: RetentionPolicy {
-                        retain_deleted_devices: true,
-                    },
+                    policy: RetentionPolicy::retain_deleted_devices(),
                 },
                 vec![StorageEffect::RunMetadataCustodian {
-                    policy: RetentionPolicy {
-                        retain_deleted_devices: true,
-                    },
+                    policy: RetentionPolicy::retain_deleted_devices(),
                 }],
             ),
             (

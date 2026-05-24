@@ -356,7 +356,8 @@ Deliverables:
 
 - [x] Public delete request through `BlockDevice` and `BlockServer`.
 - [x] Device catalog state for live and deleted devices.
-- [x] PITR retention policy model.
+- [x] PITR retention policy model with indefinite retention, immediate expiry,
+  and deterministic commit-age grace for deleted-device roots.
 - [x] Root enumerator for live devices plus retained PITR state.
 - [x] Delete interaction tests for retained PITR checkpoints and timelines.
 
@@ -365,6 +366,7 @@ Exit gate:
 - [x] Deleted devices are absent from live listings.
 - [x] Deleted device objects remain readable only through retained PITR roots.
 - [x] Root enumeration is deterministic and independently testable.
+- [x] Deleted-device retention does not depend on wall-clock time.
 - [x] Deletion never directly deletes metadata nodes or segments.
 
 ## Phase 11: Tracing Garbage Collection
@@ -448,6 +450,28 @@ Exit gate:
 - [x] Write cost scales with changed shard paths, not whole-device metadata.
 - [x] Any proposed optimization links to a benchmark or failing test.
 
+## Local V1 Boundary Audit
+
+The completed local phases prove the state transitions in one process. The
+following local shortcuts are intentional, but each must become a durable,
+remote, replayable, or concurrent boundary in the owning future phase:
+
+- Phase 14 owns real durability for segment sync, metadata WAL/transaction
+  sync, commit-group replay, write-intent recovery, native append lease/session
+  records, checkpoint/timeline persistence, and cache coherence after restart.
+- Phase 15 owns remote transport serialization, retry/deduplication, stale
+  response rejection, server incarnation fencing, deadlines, mailbox semantics,
+  backpressure, and concurrency rules for non-conflicting requests.
+- Phase 16 owns placement, replica-set selection, replica reference evidence,
+  release evidence logs or per-node queues, storage-node cursors, repair
+  records, orphan replica reconciliation, stale placement handling, and physical
+  free reconciliation across storage nodes.
+
+Do not treat an in-process handoff in the local provider as evidence that the
+distributed boundary is done. A later phase is complete only when the handoff is
+durable or replayable, idempotent under retries, and covered by deterministic
+delay, duplication, reorder, failure, and restart tests.
+
 ## Phase 14: Durable Provider
 
 Status: not started.
@@ -460,6 +484,16 @@ Deliverables:
 - [ ] Provider choice documented in the spec.
 - [ ] Durable segment, local segment catalog, metadata plane, device catalog, and
   timeline implementations.
+- [ ] Crash-consistent `sync_segment` and `flush` definitions, including exact
+  `durable_through` semantics.
+- [ ] Durable metadata transaction or WAL records for commit groups, checkpoints,
+  delete records, fork records, and native file-root commits.
+- [ ] Durable write-intent table with logical expiration, cancellation/failure
+  evidence, and restart recovery scan.
+- [ ] Durable native append lease/session records with restart-safe writer
+  epochs and stale-writer rejection after recovery.
+- [ ] Cache coherence rules for hot heads, metadata nodes, checkpoints, and
+  segment descriptors after restart.
 - [ ] Crash/restart tests using the provider conformance suite.
 - [ ] PITR and GC tests against the durable provider.
 
@@ -469,6 +503,14 @@ Exit gate:
   provider.
 - [ ] Crash/restart tests preserve committed device contents.
 - [ ] Partial writes do not expose uncommitted roots.
+- [ ] Partial metadata publishes replay as either the old roots or the complete
+  committed root set, never a partial commit group.
+- [ ] Pending segment writes left by crashed, expired, or fenced write intents
+  become reclaimable without exposing data.
+- [ ] Flush reports only commit sequences whose segment bytes and metadata
+  records satisfy the provider's documented durability contract.
+- [ ] Cached reads after restart or stale cache invalidation cannot observe roots
+  older than the accepted fence/version.
 - [ ] No provider-specific behavior leaks into core metadata logic.
 
 ## Phase 15: Remote Transport
@@ -482,7 +524,13 @@ Deliverables:
 
 - [ ] Remote transport choice documented in the spec.
 - [ ] Serialization format for request and response envelopes.
-- [ ] Retry, deadline, and stale-response tests.
+- [ ] Retry, deadline, duplicate-request, duplicate-response, and stale-response
+  tests.
+- [ ] Bounded request deduplication keyed by request ID, client epoch, and server
+  incarnation.
+- [ ] Server actor mailbox, backpressure, and shutdown semantics.
+- [ ] Concurrency model that serializes or fences conflicting operations while
+  allowing non-conflicting shard/file operations to proceed independently.
 - [ ] Local and remote transport conformance tests.
 
 Exit gate:
@@ -490,6 +538,12 @@ Exit gate:
 - [ ] `BlockDevice` and `NativeFile` callers do not change when transport
   changes.
 - [ ] Request identity and client epoch fence duplicate or stale responses.
+- [ ] Server incarnation changes prevent old retry streams from being applied to
+  a restarted server instance.
+- [ ] Backpressure is explicit and testable; unbounded queues are not hidden in
+  the transport.
+- [ ] Non-conflicting operations are not forced through a whole-server global
+  lock by the interface.
 - [ ] Deterministic transport simulation covers delay, duplication, drop, and
   reorder faults.
 
@@ -503,21 +557,27 @@ the same conformance suite and remote transport behavior is deterministic.
 Deliverables:
 
 - [ ] Placement coordinator that chooses replica sets for logical segments.
+- [ ] Storage-node identity, capacity, and failure-domain policy inputs for
+  placement decisions.
 - [ ] Replica write path that reserves, writes, syncs, and records one local
   replica commit per selected storage endpoint.
 - [ ] Metadata publish waits for the requested replica durability before making
   the logical segment visible.
+- [ ] Durable metadata-to-storage reference evidence stream or reconciliation
+  path so durable-pending replicas become `Referenced` after metadata publish.
 - [ ] Durable metadata-to-storage release evidence stream or per-node release
   queues keyed by safe reachability epoch.
-- [ ] Storage-node release cursors and idempotent apply path for released logical
-  segments.
+- [ ] Storage-node reference/release cursors and idempotent apply paths for
+  referenced and released logical segments.
 - [ ] Repair path that can add missing background replicas after metadata
   publish without changing public block or native APIs.
+- [ ] Repair records and cursors for idempotent copy, source selection, checksum
+  validation, and restart after interrupted repair.
 - [ ] Custodian reconciliation for failed replica writes, orphan replicas, and
-  stale local catalog state.
+  stale local catalog or stale placement state.
 - [ ] Fault simulation for replica delay, loss, duplication, stale writes,
-  partial quorum success, delayed/duplicated/reordered release evidence, missed
-  release notifications, and repair races.
+  partial quorum success, delayed/duplicated/reordered reference and release
+  evidence, missed storage-node notifications, and repair races.
 
 Exit gate:
 
@@ -528,12 +588,17 @@ Exit gate:
   metadata publish both succeed.
 - [ ] Failed metadata publish after durable replica writes leaves only
   reclaimable orphan replicas.
+- [ ] Storage nodes do not consider durable-pending replicas referenced until
+  metadata-produced reference evidence or reconciliation proves the metadata
+  commit succeeded.
 - [ ] Storage nodes never infer deletion by reading current metadata heads; they
   free physical bytes only from durable release evidence, expired intents, or
   local failed-write evidence.
-- [ ] Release evidence replay is idempotent and can resume from per-node cursors
-  after storage-node or metadata-service restart.
+- [ ] Reference and release evidence replay is idempotent and can resume from
+  per-node cursors after storage-node or metadata-service restart.
 - [ ] Repair never makes uncommitted data visible.
+- [ ] Stale placement decisions cannot overwrite, free, or repair the wrong
+  logical segment or replica placement.
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 

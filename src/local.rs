@@ -1665,8 +1665,7 @@ impl InMemoryMetadataPlane {
             match checkpoint.owner {
                 MappingOwner::BlockDevice(device_id) => {
                     if inner.device_heads.contains_key(&device_id)
-                        || policy.retain_deleted_devices
-                            && inner.deleted_device_heads.contains_key(&device_id)
+                        || Self::retain_deleted_device_locked(inner, &policy, device_id)
                     {
                         roots.extend(checkpoint.shard_roots.iter().copied());
                     }
@@ -1676,17 +1675,39 @@ impl InMemoryMetadataPlane {
                 }
             }
         }
-        if policy.retain_deleted_devices {
-            for head in inner.deleted_device_heads.values() {
+        for (device_id, head) in &inner.deleted_device_heads {
+            if Self::retain_deleted_device_locked(inner, &policy, *device_id) {
                 roots.extend(head.shard_roots.iter().copied());
             }
-            for record in inner.delete_records.values() {
+        }
+        for record in inner.delete_records.values() {
+            if Self::retain_deleted_device_locked(inner, &policy, record.device_id) {
                 roots.extend(record.shard_roots.iter().copied());
             }
         }
         roots.sort();
         roots.dedup();
         roots
+    }
+
+    fn current_commit_seq_locked(inner: &MetadataInner) -> CommitSeq {
+        CommitSeq::from_raw(inner.next_commit_seq.saturating_sub(1))
+    }
+
+    fn retain_deleted_device_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+        device_id: DeviceId,
+    ) -> bool {
+        if policy.retain_deleted_devices {
+            return inner.deleted_device_heads.contains_key(&device_id);
+        }
+
+        let Some(head) = inner.deleted_device_heads.get(&device_id) else {
+            return false;
+        };
+        let current = Self::current_commit_seq_locked(inner);
+        current.raw().saturating_sub(head.latest_commit.raw()) < policy.deleted_device_grace_commits
     }
 
     fn collect_node_segments(node: &MetadataNode, out: &mut BTreeSet<SegmentId>) {
@@ -1807,8 +1828,15 @@ impl InMemoryMetadataPlane {
         released_segments.dedup();
         deleted_metadata_nodes.sort();
 
-        if !policy.retain_deleted_devices {
-            let expired_devices: BTreeSet<_> = inner.deleted_device_heads.keys().copied().collect();
+        {
+            let expired_devices: BTreeSet<_> = inner
+                .deleted_device_heads
+                .keys()
+                .copied()
+                .filter(|device_id| {
+                    !Self::retain_deleted_device_locked(&inner, &policy, *device_id)
+                })
+                .collect();
             for device_id in &expired_devices {
                 inner.deleted_device_heads.remove(device_id);
                 inner.device_specs.remove(device_id);
@@ -3670,9 +3698,7 @@ mod tests {
         assert_eq!(updated.version, FileVersion::from_raw(1));
 
         let roots = metadata
-            .roots_for_gc(RetentionPolicy {
-                retain_deleted_devices: false,
-            })
+            .roots_for_gc(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
         assert!(roots.contains(&new_root.node_id));
     }
@@ -3754,17 +3780,13 @@ mod tests {
 
         let without_retention = store
             .metadata()
-            .roots_for_gc(RetentionPolicy {
-                retain_deleted_devices: false,
-            })
+            .roots_for_gc(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
         assert!(without_retention.is_empty());
 
         let with_retention = store
             .metadata()
-            .roots_for_gc(RetentionPolicy {
-                retain_deleted_devices: true,
-            })
+            .roots_for_gc(RetentionPolicy::retain_deleted_devices())
             .unwrap();
         let mut sorted = with_retention.clone();
         sorted.sort();
@@ -3930,9 +3952,7 @@ mod tests {
                 assert_eq!(
                     store
                         .metadata()
-                        .roots_for_gc(RetentionPolicy {
-                            retain_deleted_devices: false,
-                        })
+                        .roots_for_gc(RetentionPolicy::expire_deleted_immediately())
                         .unwrap(),
                     expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, false),
                     "seed={seed} trace={:?}",
@@ -3941,9 +3961,7 @@ mod tests {
                 assert_eq!(
                     store
                         .metadata()
-                        .roots_for_gc(RetentionPolicy {
-                            retain_deleted_devices: true,
-                        })
+                        .roots_for_gc(RetentionPolicy::retain_deleted_devices())
                         .unwrap(),
                     expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, true),
                     "seed={seed} trace={:?}",
@@ -4001,9 +4019,7 @@ mod tests {
         device.delete().unwrap();
 
         let report = store
-            .run_metadata_custodian(RetentionPolicy {
-                retain_deleted_devices: false,
-            })
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
 
         assert!(!report.sweep.deleted_metadata_nodes.is_empty());
@@ -4044,6 +4060,48 @@ mod tests {
     }
 
     #[test]
+    fn deleted_device_retention_can_expire_by_commit_age() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 16);
+        let device_id = device.device_id();
+        device.write_at(0, &[7; 4096]).unwrap();
+        device.delete().unwrap();
+
+        let retained = store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_after_commits(2))
+            .unwrap();
+        assert!(retained.sweep.released_segments.is_empty());
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+        assert_eq!(
+            store.metadata().list_deleted_devices().unwrap(),
+            vec![device_id]
+        );
+
+        let other = create_local_device(&store, 16);
+        other.write_at(0, &[8; 4096]).unwrap();
+        let still_retained = store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_after_commits(2))
+            .unwrap();
+        assert!(still_retained.sweep.released_segments.is_empty());
+
+        other.write_at(4096, &[9; 4096]).unwrap();
+        let expired = store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_after_commits(2))
+            .unwrap();
+        assert_eq!(
+            expired.sweep.released_segments,
+            vec![SegmentId::from_raw(1)]
+        );
+        assert_eq!(store.metadata().list_deleted_devices().unwrap(), Vec::new());
+    }
+
+    #[test]
     fn retention_expiring_gc_prunes_deleted_pitr_catalog() {
         let store = LocalObjectStore::with_config(config()).unwrap();
         let device = create_local_device(&store, 16);
@@ -4053,18 +4111,14 @@ mod tests {
         device.delete().unwrap();
 
         store
-            .run_metadata_custodian(RetentionPolicy {
-                retain_deleted_devices: false,
-            })
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
 
         assert_eq!(store.metadata().list_deleted_devices().unwrap(), Vec::new());
         assert!(
             store
                 .metadata()
-                .roots_for_gc(RetentionPolicy {
-                    retain_deleted_devices: true,
-                })
+                .roots_for_gc(RetentionPolicy::retain_deleted_devices())
                 .unwrap()
                 .is_empty()
         );
@@ -4095,9 +4149,7 @@ mod tests {
         device.delete().unwrap();
 
         let report = store
-            .run_metadata_custodian(RetentionPolicy {
-                retain_deleted_devices: true,
-            })
+            .run_metadata_custodian(RetentionPolicy::retain_deleted_devices())
             .unwrap();
 
         assert!(report.sweep.released_segments.is_empty());
@@ -4123,9 +4175,7 @@ mod tests {
         let device = create_local_device(&store, 16);
         device.write_at(0, &[5; 4096]).unwrap();
         let mark = store
-            .mark_reachable_for_gc(RetentionPolicy {
-                retain_deleted_devices: false,
-            })
+            .mark_reachable_for_gc(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
         assert!(mark.metadata_nodes.iter().all(|node| {
             store.metadata().last_mark_epoch_for_node(*node).unwrap() == Some(mark.epoch)
@@ -4140,12 +4190,7 @@ mod tests {
 
         device.delete().unwrap();
         let first_sweep = store
-            .sweep_metadata_after_mark(
-                RetentionPolicy {
-                    retain_deleted_devices: false,
-                },
-                mark.epoch,
-            )
+            .sweep_metadata_after_mark(RetentionPolicy::expire_deleted_immediately(), mark.epoch)
             .unwrap();
         assert!(first_sweep.deleted_metadata_nodes.is_empty());
         assert!(first_sweep.released_segments.is_empty());
@@ -4158,9 +4203,7 @@ mod tests {
         );
 
         let second = store
-            .run_metadata_custodian(RetentionPolicy {
-                retain_deleted_devices: false,
-            })
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
         assert!(!second.sweep.deleted_metadata_nodes.is_empty());
         assert_eq!(second.sweep.released_segments, vec![SegmentId::from_raw(1)]);
@@ -4213,8 +4256,10 @@ mod tests {
 
             for step in 0..36 {
                 let paused_gc = harness.rng.next_u64() % 3 == 0;
-                let policy = RetentionPolicy {
-                    retain_deleted_devices: harness.rng.next_u64() % 2 == 0,
+                let policy = if harness.rng.next_u64() % 2 == 0 {
+                    RetentionPolicy::retain_deleted_devices()
+                } else {
+                    RetentionPolicy::expire_deleted_immediately()
                 };
                 let paused_mark = if paused_gc {
                     let mark = store.mark_reachable_for_gc(policy.clone()).unwrap();
@@ -4329,9 +4374,7 @@ mod tests {
                 metadata_nodes: store.metadata().metadata_node_count().unwrap(),
                 gc_roots: store
                     .metadata()
-                    .roots_for_gc(RetentionPolicy {
-                        retain_deleted_devices: true,
-                    })
+                    .roots_for_gc(RetentionPolicy::retain_deleted_devices())
                     .unwrap()
                     .len(),
                 referenced_segments: entries
@@ -4448,8 +4491,10 @@ mod tests {
                                 .record(format!("fault duplicate_effect step={step}"));
                         }
                         crate::sim::FaultKind::DelayedEffect => {
-                            let policy = RetentionPolicy {
-                                retain_deleted_devices: harness.rng.next_u64() % 2 == 0,
+                            let policy = if harness.rng.next_u64() % 2 == 0 {
+                                RetentionPolicy::retain_deleted_devices()
+                            } else {
+                                RetentionPolicy::expire_deleted_immediately()
                             };
                             let mark = store.mark_reachable_for_gc(policy.clone()).unwrap();
                             harness.trace.record(format!(
@@ -4499,9 +4544,9 @@ mod tests {
                         }
                         crate::sim::FaultKind::MissedAsyncFree => {
                             store
-                                .run_metadata_custodian(RetentionPolicy {
-                                    retain_deleted_devices: false,
-                                })
+                                .run_metadata_custodian(
+                                    RetentionPolicy::expire_deleted_immediately(),
+                                )
                                 .unwrap();
                             store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
                             harness
@@ -4632,11 +4677,12 @@ mod tests {
                             .record(format!("append step={step} file={file_id} byte={byte}"));
                     }
                     _ => {
-                        store
-                            .run_metadata_custodian(RetentionPolicy {
-                                retain_deleted_devices: harness.rng.next_u64() % 2 == 0,
-                            })
-                            .unwrap();
+                        let policy = if harness.rng.next_u64() % 2 == 0 {
+                            RetentionPolicy::retain_deleted_devices()
+                        } else {
+                            RetentionPolicy::expire_deleted_immediately()
+                        };
+                        store.run_metadata_custodian(policy).unwrap();
                         store.run_storage_node_custodian(&expired_intents).unwrap();
                         harness.trace.record(format!("gc step={step}"));
                     }
@@ -6031,9 +6077,7 @@ mod tests {
             .unwrap();
         let roots = store
             .metadata()
-            .roots_for_gc(RetentionPolicy {
-                retain_deleted_devices: false,
-            })
+            .roots_for_gc(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
 
         (

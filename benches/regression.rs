@@ -534,9 +534,7 @@ fn bench_roots_for_gc_with_deleted_retention(c: &mut Criterion) {
         b.iter(|| {
             store
                 .metadata()
-                .roots_for_gc(black_box(RetentionPolicy {
-                    retain_deleted_devices: true,
-                }))
+                .roots_for_gc(black_box(RetentionPolicy::retain_deleted_devices()))
                 .unwrap()
         })
     });
@@ -579,9 +577,7 @@ fn bench_metadata_gc_mark_traversal(c: &mut Criterion) {
     c.bench_function("metadata_gc_mark_traversal", |b| {
         b.iter(|| {
             store
-                .mark_reachable_for_gc(black_box(RetentionPolicy {
-                    retain_deleted_devices: true,
-                }))
+                .mark_reachable_for_gc(black_box(RetentionPolicy::retain_deleted_devices()))
                 .unwrap()
         })
     });

@@ -78,9 +78,46 @@ pub struct MetadataForkRequest {
 }
 
 /// Retention settings used when enumerating GC roots.
+///
+/// The policy is deliberately expressed in commit-age terms instead of wall
+/// clock time so retention can be simulated and replayed deterministically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPolicy {
+    /// Retain every deleted device root indefinitely.
     pub retain_deleted_devices: bool,
+    /// When deleted devices are not retained indefinitely, keep their roots
+    /// until at least this many commits have elapsed since the delete commit.
+    ///
+    /// A value of zero makes deleted-device roots eligible immediately. A value
+    /// of `N` keeps roots while `current_commit - delete_commit < N`.
+    pub deleted_device_grace_commits: u64,
+}
+
+impl RetentionPolicy {
+    /// Retain deleted devices indefinitely.
+    pub const fn retain_deleted_devices() -> Self {
+        Self {
+            retain_deleted_devices: true,
+            deleted_device_grace_commits: 0,
+        }
+    }
+
+    /// Make deleted-device roots eligible as soon as the next safe GC epoch
+    /// proves them unreachable.
+    pub const fn expire_deleted_immediately() -> Self {
+        Self {
+            retain_deleted_devices: false,
+            deleted_device_grace_commits: 0,
+        }
+    }
+
+    /// Retain deleted-device roots until the supplied commit age has elapsed.
+    pub const fn expire_deleted_after_commits(commits: u64) -> Self {
+        Self {
+            retain_deleted_devices: false,
+            deleted_device_grace_commits: commits,
+        }
+    }
 }
 
 /// Global metadata contract for block and native file mapping layers.

@@ -407,6 +407,51 @@ current heads. They apply metadata-produced release evidence to their local
 replica catalogs, free matching physical bytes, and record progress so missed,
 duplicated, delayed, or reordered release notifications can be reconciled.
 
+### Local V1 Boundaries That Must Become Real
+
+Several v1 components intentionally prove semantics in process before the system
+has durable or remote machinery. These are not compatibility layers and should
+not become permanent shortcuts:
+
+- In-process transports prove typed request/response semantics. Remote
+  transports must add serialization, bounded retry/deduplication, server
+  incarnation fencing, stale-response rejection, and deterministic fault tests.
+- Local servers serialize through a simple actor boundary. Remote-capable
+  servers must replace that with explicit mailbox, backpressure, and
+  per-shard/per-file conflict fencing so unrelated operations can proceed
+  concurrently.
+- In-memory `sync_segment` and `flush` prove data-before-metadata ordering.
+  Durable providers must define crash-consistent segment sync, metadata WAL or
+  transaction sync, and exact `durable_through` semantics.
+- In-memory commit groups prove atomic root visibility inside one metadata
+  plane. Durable providers must persist transaction records, replay partial
+  publish attempts safely, and preserve compare-and-swap fences after restart.
+- Write-intent expiry is injected by deterministic tests. Durable providers must
+  store write-intent state, logical expiration, recovery scans, and custodian
+  evidence for when pending segment data can no longer publish.
+- Local segment catalog transitions to `Referenced` happen in process after
+  metadata publish. Remote storage nodes need durable reference evidence or
+  reconciliation so `DurablePendingMetadata` replicas become referenced after
+  missed notifications or restarts.
+- Segment release evidence is returned as an in-process vector in v1. Replicated
+  storage needs durable release logs or per-node release queues with replay
+  cursors.
+- Placement is one local storage endpoint in v1. Replication needs storage-node
+  identity, capacity and failure-domain policy, replica-set selection, and stale
+  placement tests.
+- Repair is only a design hook in v1. Replication needs repair queues/cursors,
+  idempotent copy, source selection, checksum validation, and tests proving
+  repair never exposes uncommitted data.
+- PITR retention is deterministic commit-age policy in v1. Durable providers may
+  add richer per-owner policies, but expiration must still be driven by injected
+  logical time or commit epochs, not hidden wall-clock reads.
+- Native append lease stealing is local metadata state in v1. Durable providers
+  need lease/session records, restart-safe writer epochs, and tests where stale
+  writers race after durable segment writes.
+- Caches are ordinary in-memory maps in v1. Durable or remote implementations
+  must document cache coherence, invalidation, and fence/version checks instead
+  of relying on provider-local object identity.
+
 ### Write Ordering Contract
 
 Writes use a data-before-metadata commit discipline. Metadata must never publish
@@ -562,6 +607,10 @@ Invariants:
 - PITR retention policy decides whether older checkpoints, shard-root commits,
   and delete records can still make deleted device state reachable for restore
   and GC.
+- Deleted-device retention may be indefinite, immediate, or based on deterministic
+  commit age. Retention must not depend on hidden wall-clock reads; providers
+  that expose time-based retention must use injected logical time that can be
+  replayed by the simulator.
 - Restoring a deleted source is valid only to a retained point before deletion,
   such as a checkpoint or commit before the delete record. Time-based restore at
   or after the delete record observes the deletion and fails cleanly.
@@ -762,6 +811,13 @@ custodian may also expire that deleted device's retained PITR catalog state.
 After that point a later policy change cannot resurrect roots that have already
 become unreachable and eligible for sweep.
 
+The local retention policy supports three deterministic modes: retain deleted
+device roots indefinitely, expire them immediately after a safe GC proves them
+unreachable, or retain them until a configured number of commit sequence
+advancements has elapsed since the delete commit. Commit-age retention is the
+v1 stand-in for a production TTL; later wall-clock-facing policies must be
+implemented through injected logical time so generated tests can replay them.
+
 Invariants:
 
 - Mark traversal starts only from committed roots.
@@ -940,6 +996,7 @@ V1 uses:
   referenced, released, and freed.
 - Append-only shard commit records.
 - Periodic full device checkpoints.
+- Deterministic commit-age retention for deleted-device roots.
 - Tracing GC.
 - Metadata and storage-node custodians.
 - In-memory provider first.
