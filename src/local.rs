@@ -14,7 +14,7 @@ use crate::extent::{
     NativeTransport,
 };
 use crate::id::{
-    AppendLeaseId, BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq,
+    AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
     DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, LogicalTime, MetadataNodeId,
     RequestId, SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
@@ -3023,10 +3023,25 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
 }
 
 /// Local block request coordinator.
+type RequestKey = (ClientEpoch, RequestId);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedBlockRequest {
+    request: BlockRequest,
+    result: Result<BlockResponseEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedNativeRequest {
+    request: NativeRequest,
+    result: Result<NativeResponseEnvelope>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalBlockServer {
     store: LocalObjectStore,
     request_log: Arc<Mutex<Vec<RequestId>>>,
+    responses: Arc<Mutex<BTreeMap<RequestKey, CachedBlockRequest>>>,
     serial: Arc<Mutex<()>>,
 }
 
@@ -3035,6 +3050,7 @@ impl LocalBlockServer {
         Self {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(BTreeMap::new())),
             serial: Arc::new(Mutex::new(())),
         }
     }
@@ -3042,69 +3058,108 @@ impl LocalBlockServer {
     pub fn request_log(&self) -> Result<Vec<RequestId>> {
         Ok(lock(&self.request_log)?.clone())
     }
+
+    fn cached_response(
+        &self,
+        request: &BlockRequestEnvelope,
+    ) -> Result<Option<BlockResponseEnvelope>> {
+        let key = (request.client_epoch, request.request_id);
+        let responses = lock(&self.responses)?;
+        let Some(cached) = responses.get(&key) else {
+            return Ok(None);
+        };
+        if cached.request != request.request {
+            return Err(StorageError::conflict(
+                "request ID and client epoch reused for a different block request",
+            ));
+        }
+        cached.result.clone().map(Some)
+    }
+
+    fn remember_response(
+        &self,
+        request: &BlockRequestEnvelope,
+        result: Result<BlockResponseEnvelope>,
+    ) -> Result<BlockResponseEnvelope> {
+        let key = (request.client_epoch, request.request_id);
+        lock(&self.responses)?.insert(
+            key,
+            CachedBlockRequest {
+                request: request.request.clone(),
+                result: result.clone(),
+            },
+        );
+        result
+    }
 }
 
 impl BlockServer for LocalBlockServer {
     fn handle(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope> {
         let _serial_guard = lock(&self.serial)?;
+        if let Some(response) = self.cached_response(&request)? {
+            return Ok(response);
+        }
         lock(&self.request_log)?.push(request.request_id);
-        let response = match request.request {
-            BlockRequest::Create { request } => {
-                let head = self
-                    .store
-                    .metadata
-                    .create_device(MetadataCreateDeviceRequest::from(request))?;
-                BlockResponse::Created(head.device_id)
-            }
-            BlockRequest::Info { device_id } => {
-                BlockResponse::Info(self.store.metadata.device_info(device_id)?)
-            }
-            BlockRequest::Read { device_id, range } => {
-                let len = usize::try_from(range.len).map_err(|_| {
-                    StorageError::invalid_argument("read byte length overflows usize")
-                })?;
-                let mut bytes = vec![0; len];
-                self.store.read_device(device_id, range, &mut bytes)?;
-                BlockResponse::Read(ReadResponse { bytes })
-            }
-            BlockRequest::Write {
-                device_id,
-                offset,
-                bytes,
-                durability,
-            } => BlockResponse::Write(
-                self.store
-                    .write_device(device_id, offset, &bytes, durability)?,
-            ),
-            BlockRequest::WriteZeroes { device_id, range } => BlockResponse::Write(
-                self.store
-                    .write_zeroes(device_id, range.offset, range.len)?,
-            ),
-            BlockRequest::Discard { device_id, range } => BlockResponse::Write(
-                self.store
-                    .discard_device(device_id, range.offset, range.len)?,
-            ),
-            BlockRequest::Flush { device_id, .. } => {
-                let info = self.store.metadata.device_info(device_id)?;
-                BlockResponse::Flush(FlushResult {
+        let response = (|| -> Result<BlockResponse> {
+            match request.request.clone() {
+                BlockRequest::Create { request } => {
+                    let head = self
+                        .store
+                        .metadata
+                        .create_device(MetadataCreateDeviceRequest::from(request))?;
+                    Ok(BlockResponse::Created(head.device_id))
+                }
+                BlockRequest::Info { device_id } => Ok(BlockResponse::Info(
+                    self.store.metadata.device_info(device_id)?,
+                )),
+                BlockRequest::Read { device_id, range } => {
+                    let len = usize::try_from(range.len).map_err(|_| {
+                        StorageError::invalid_argument("read byte length overflows usize")
+                    })?;
+                    let mut bytes = vec![0; len];
+                    self.store.read_device(device_id, range, &mut bytes)?;
+                    Ok(BlockResponse::Read(ReadResponse { bytes }))
+                }
+                BlockRequest::Write {
                     device_id,
-                    durable_through: info.latest_commit,
-                })
+                    offset,
+                    bytes,
+                    durability,
+                } => Ok(BlockResponse::Write(
+                    self.store
+                        .write_device(device_id, offset, &bytes, durability)?,
+                )),
+                BlockRequest::WriteZeroes { device_id, range } => Ok(BlockResponse::Write(
+                    self.store
+                        .write_zeroes(device_id, range.offset, range.len)?,
+                )),
+                BlockRequest::Discard { device_id, range } => Ok(BlockResponse::Write(
+                    self.store
+                        .discard_device(device_id, range.offset, range.len)?,
+                )),
+                BlockRequest::Flush { device_id, .. } => {
+                    let info = self.store.metadata.device_info(device_id)?;
+                    Ok(BlockResponse::Flush(FlushResult {
+                        device_id,
+                        durable_through: info.latest_commit,
+                    }))
+                }
+                BlockRequest::Fork { source, request } => Ok(BlockResponse::Forked(
+                    self.store.fork_device(source, request)?,
+                )),
+                BlockRequest::Restore { source, point } => Ok(BlockResponse::Restored(
+                    self.store.restore_device(source, point)?,
+                )),
+                BlockRequest::Delete { device_id } => {
+                    Ok(BlockResponse::Deleted(self.store.delete_device(device_id)?))
+                }
             }
-            BlockRequest::Fork { source, request } => {
-                BlockResponse::Forked(self.store.fork_device(source, request)?)
-            }
-            BlockRequest::Restore { source, point } => {
-                BlockResponse::Restored(self.store.restore_device(source, point)?)
-            }
-            BlockRequest::Delete { device_id } => {
-                BlockResponse::Deleted(self.store.delete_device(device_id)?)
-            }
-        };
-        Ok(BlockResponseEnvelope {
+        })();
+        let result = response.map(|response| BlockResponseEnvelope {
             request_id: request.request_id,
             response,
-        })
+        });
+        self.remember_response(&request, result)
     }
 }
 
@@ -3113,6 +3168,7 @@ impl BlockServer for LocalBlockServer {
 pub struct LocalNativeServer {
     store: LocalObjectStore,
     request_log: Arc<Mutex<Vec<RequestId>>>,
+    responses: Arc<Mutex<BTreeMap<RequestKey, CachedNativeRequest>>>,
     serial: Arc<Mutex<()>>,
 }
 
@@ -3121,6 +3177,7 @@ impl LocalNativeServer {
         Self {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(BTreeMap::new())),
             serial: Arc::new(Mutex::new(())),
         }
     }
@@ -3128,59 +3185,101 @@ impl LocalNativeServer {
     pub fn request_log(&self) -> Result<Vec<RequestId>> {
         Ok(lock(&self.request_log)?.clone())
     }
+
+    fn cached_response(
+        &self,
+        request: &NativeRequestEnvelope,
+    ) -> Result<Option<NativeResponseEnvelope>> {
+        let key = (request.client_epoch, request.request_id);
+        let responses = lock(&self.responses)?;
+        let Some(cached) = responses.get(&key) else {
+            return Ok(None);
+        };
+        if cached.request != request.request {
+            return Err(StorageError::conflict(
+                "request ID and client epoch reused for a different native request",
+            ));
+        }
+        cached.result.clone().map(Some)
+    }
+
+    fn remember_response(
+        &self,
+        request: &NativeRequestEnvelope,
+        result: Result<NativeResponseEnvelope>,
+    ) -> Result<NativeResponseEnvelope> {
+        let key = (request.client_epoch, request.request_id);
+        lock(&self.responses)?.insert(
+            key,
+            CachedNativeRequest {
+                request: request.request.clone(),
+                result: result.clone(),
+            },
+        );
+        result
+    }
 }
 
 impl NativeServer for LocalNativeServer {
     fn handle(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope> {
         let _serial_guard = lock(&self.serial)?;
+        if let Some(response) = self.cached_response(&request)? {
+            return Ok(response);
+        }
         lock(&self.request_log)?.push(request.request_id);
-        let response = match request.request {
-            NativeRequest::CreateFile { request } => {
-                let head = self
-                    .store
-                    .metadata
-                    .create_file(MetadataCreateFileRequest::from(request))?;
-                NativeResponse::FileCreated(head.file_id)
-            }
-            NativeRequest::FileInfo { file_id } => {
-                NativeResponse::FileInfo(self.store.metadata.get_file_info(file_id)?)
-            }
-            NativeRequest::Read { file_id, range } => {
-                let len = usize::try_from(range.len).map_err(|_| {
-                    StorageError::invalid_argument("read byte length overflows usize")
-                })?;
-                let mut bytes = vec![0; len];
-                self.store.read_file(file_id, range, &mut bytes)?;
-                NativeResponse::Read(ReadResponse { bytes })
-            }
-            NativeRequest::AcquireAppend { file_id } => {
-                NativeResponse::AppendLease(self.store.acquire_append_lease(file_id)?)
-            }
-            NativeRequest::Append {
-                file_id,
-                lease,
-                bytes,
-                durability,
-            } => {
-                if file_id != lease.file_id {
-                    return Err(StorageError::invalid_argument(
-                        "append lease file_id does not match request file_id",
-                    ));
+        let response = (|| -> Result<NativeResponse> {
+            match request.request.clone() {
+                NativeRequest::CreateFile { request } => {
+                    let head = self
+                        .store
+                        .metadata
+                        .create_file(MetadataCreateFileRequest::from(request))?;
+                    Ok(NativeResponse::FileCreated(head.file_id))
                 }
-                NativeResponse::Append(self.store.append_file(lease, &bytes, durability)?)
+                NativeRequest::FileInfo { file_id } => Ok(NativeResponse::FileInfo(
+                    self.store.metadata.get_file_info(file_id)?,
+                )),
+                NativeRequest::Read { file_id, range } => {
+                    let len = usize::try_from(range.len).map_err(|_| {
+                        StorageError::invalid_argument("read byte length overflows usize")
+                    })?;
+                    let mut bytes = vec![0; len];
+                    self.store.read_file(file_id, range, &mut bytes)?;
+                    Ok(NativeResponse::Read(ReadResponse { bytes }))
+                }
+                NativeRequest::AcquireAppend { file_id } => Ok(NativeResponse::AppendLease(
+                    self.store.acquire_append_lease(file_id)?,
+                )),
+                NativeRequest::Append {
+                    file_id,
+                    lease,
+                    bytes,
+                    durability,
+                } => {
+                    if file_id != lease.file_id {
+                        Err(StorageError::invalid_argument(
+                            "append lease file_id does not match request file_id",
+                        ))
+                    } else {
+                        Ok(NativeResponse::Append(
+                            self.store.append_file(lease, &bytes, durability)?,
+                        ))
+                    }
+                }
+                NativeRequest::Flush { file_id } => {
+                    let info = self.store.metadata.get_file_info(file_id)?;
+                    Ok(NativeResponse::Flush(FlushResult {
+                        device_id: DeviceId::from_raw(info.file_id.raw()),
+                        durable_through: CommitSeq::from_raw(info.version.raw()),
+                    }))
+                }
             }
-            NativeRequest::Flush { file_id } => {
-                let info = self.store.metadata.get_file_info(file_id)?;
-                NativeResponse::Flush(FlushResult {
-                    device_id: DeviceId::from_raw(info.file_id.raw()),
-                    durable_through: CommitSeq::from_raw(info.version.raw()),
-                })
-            }
-        };
-        Ok(NativeResponseEnvelope {
+        })();
+        let result = response.map(|response| NativeResponseEnvelope {
             request_id: request.request_id,
             response,
-        })
+        });
+        self.remember_response(&request, result)
     }
 }
 
@@ -5180,12 +5279,24 @@ mod tests {
                 },
             },
         );
-        let created = block_transport.call(create).unwrap();
+        let created = block_transport.call(create.clone()).unwrap();
+        let duplicate_created = block_transport.call(create.clone()).unwrap();
+        assert_eq!(duplicate_created, created);
         assert_eq!(created.request_id, RequestId::from_raw(1));
-        let device_id = match created.response {
+        let device_id = match created.response.clone() {
             BlockResponse::Created(device_id) => device_id,
             _ => panic!("unexpected block response"),
         };
+        assert!(
+            block_transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(1),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Info { device_id },
+                ))
+                .is_err()
+        );
         let info = block_transport
             .call(BlockRequestEnvelope::new(
                 RequestId::from_raw(2),
@@ -5195,29 +5306,69 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(info.request_id, RequestId::from_raw(2));
+        let missing = BlockRequestEnvelope::new(
+            RequestId::from_raw(3),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Info {
+                device_id: DeviceId::from_raw(404),
+            },
+        );
+        assert!(block_transport.call(missing.clone()).is_err());
+        assert!(block_transport.call(missing).is_err());
         assert_eq!(
             block_server.request_log().unwrap(),
-            vec![RequestId::from_raw(1), RequestId::from_raw(2)]
+            vec![
+                RequestId::from_raw(1),
+                RequestId::from_raw(2),
+                RequestId::from_raw(3),
+            ]
         );
 
         let native_server = Arc::new(LocalNativeServer::new(store));
         let native_transport = InProcessNativeTransport::new(native_server.clone());
-        let created = native_transport
-            .call(NativeRequestEnvelope::new(
-                RequestId::from_raw(3),
-                ClientEpoch::from_raw(1),
-                None,
-                NativeRequest::CreateFile {
-                    request: CreateFileRequest {
-                        spec: FileSpec { name: None },
-                    },
+        let create_file = NativeRequestEnvelope::new(
+            RequestId::from_raw(3),
+            ClientEpoch::from_raw(1),
+            None,
+            NativeRequest::CreateFile {
+                request: CreateFileRequest {
+                    spec: FileSpec { name: None },
                 },
-            ))
-            .unwrap();
+            },
+        );
+        let created = native_transport.call(create_file.clone()).unwrap();
+        let duplicate_created = native_transport.call(create_file).unwrap();
+        assert_eq!(duplicate_created, created);
         assert_eq!(created.request_id, RequestId::from_raw(3));
+        let file_id = match created.response {
+            NativeResponse::FileCreated(file_id) => file_id,
+            _ => panic!("unexpected native response"),
+        };
+        assert!(
+            native_transport
+                .call(NativeRequestEnvelope::new(
+                    RequestId::from_raw(3),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    NativeRequest::FileInfo { file_id },
+                ))
+                .is_err()
+        );
+        let invalid_read = NativeRequestEnvelope::new(
+            RequestId::from_raw(4),
+            ClientEpoch::from_raw(1),
+            None,
+            NativeRequest::Read {
+                file_id,
+                range: ByteRange::new(0, 1),
+            },
+        );
+        assert!(native_transport.call(invalid_read.clone()).is_err());
+        assert!(native_transport.call(invalid_read).is_err());
         assert_eq!(
             native_server.request_log().unwrap(),
-            vec![RequestId::from_raw(3)]
+            vec![RequestId::from_raw(3), RequestId::from_raw(4)]
         );
     }
 

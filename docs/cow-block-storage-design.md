@@ -725,7 +725,9 @@ ShardCommit {
 }
 ```
 
-For native files, it appends file-root commit records:
+Native file commits currently publish the latest file root and file version but
+do not expose a public native restore API. A later native PITR feature should
+append file-root commit records:
 
 ```text
 FileCommit {
@@ -769,7 +771,9 @@ Invariants:
 
 - `commit_seq` is total ordered within the timeline provider.
 - All shard commits in a public multi-shard write share a commit-group identity.
-- Native file commits record old and new file versions.
+- Native file root publishes are fenced by file version or writer epoch. When
+  native PITR is added, file-root commit records must record old and new file
+  versions.
 - Replaying checkpoint plus commits is deterministic.
 - Checkpoint roots must match replayed state at the checkpoint sequence.
 - Restoring to a named commit requires that commit to exist in the selected
