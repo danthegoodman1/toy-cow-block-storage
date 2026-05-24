@@ -303,6 +303,19 @@ pub struct CommitGroup {
     pub updates: Vec<RootUpdate>,
 }
 
+/// Durable fork catalog record.
+///
+/// Fork records capture the O(1) root-pointer copy that created a child device.
+/// They are intentionally separate from shard-root commit groups because a fork
+/// creates a new owner without changing the source device's roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkRecord {
+    pub commit_seq: CommitSeq,
+    pub source: DeviceId,
+    pub target: DeviceId,
+    pub shard_roots: Vec<MetadataNodeId>,
+}
+
 /// Durable PITR checkpoint.
 ///
 /// Checkpoints summarize owner roots at a commit sequence so restore can replay

@@ -19,8 +19,8 @@ use crate::id::{
     RequestId, SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CommitGroup, DeviceHead, FileHead, LeafEntry, MappingOwner, MetadataChild,
-    MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardRootUpdate,
+    Checkpoint, CommitGroup, DeviceHead, FileHead, ForkRecord, LeafEntry, MappingOwner,
+    MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
@@ -380,6 +380,15 @@ impl LocalObjectStore {
             version: committed.version,
             durability,
         })
+    }
+
+    pub fn fork_device(&self, source: DeviceId, request: ForkRequest) -> Result<DeviceId> {
+        let head = self.metadata.fork_device(MetadataForkRequest {
+            source,
+            target: request.target,
+            name: request.name,
+        })?;
+        Ok(head.device_id)
     }
 
     fn split_device_range(
@@ -959,6 +968,7 @@ struct MetadataInner {
     file_writer_epochs: BTreeMap<FileId, WriterEpoch>,
     metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
+    fork_records: BTreeMap<CommitSeq, ForkRecord>,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
 }
 
@@ -978,6 +988,7 @@ impl MetadataInner {
             file_writer_epochs: BTreeMap::new(),
             metadata_nodes: BTreeMap::new(),
             commit_groups: BTreeMap::new(),
+            fork_records: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
         }
     }
@@ -986,6 +997,16 @@ impl MetadataInner {
         let id = DeviceId::from_raw(self.next_device_id);
         self.next_device_id += 1;
         id
+    }
+
+    fn reserve_device_id_at_least_after(&mut self, device_id: DeviceId) -> Result<()> {
+        if device_id.raw() >= self.next_device_id {
+            self.next_device_id = device_id
+                .raw()
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("device id overflow"))?;
+        }
+        Ok(())
     }
 
     fn alloc_file_id(&mut self) -> FileId {
@@ -1076,6 +1097,31 @@ impl InMemoryMetadataPlane {
             .collect();
         groups.sort_by_key(|group| group.commit_group.raw());
         Ok(groups)
+    }
+
+    pub fn fork_records_for_source(&self, source: DeviceId) -> Result<Vec<ForkRecord>> {
+        let inner = lock(&self.inner)?;
+        let mut records: Vec<_> = inner
+            .fork_records
+            .values()
+            .filter(|record| record.source == source)
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| record.commit_seq.raw());
+        Ok(records)
+    }
+
+    pub fn fork_record(&self, commit_seq: CommitSeq) -> Result<ForkRecord> {
+        let inner = lock(&self.inner)?;
+        inner
+            .fork_records
+            .get(&commit_seq)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("fork_record", commit_seq.to_string()))
+    }
+
+    pub fn metadata_node_count(&self) -> Result<usize> {
+        Ok(lock(&self.inner)?.metadata_nodes.len())
     }
 
     pub fn allocate_metadata_node(
@@ -1530,20 +1576,29 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 if inner.device_heads.contains_key(&target) {
                     return Err(StorageError::conflict("target device already exists"));
                 }
+                inner.reserve_device_id_at_least_after(target)?;
                 target
             }
             None => inner.alloc_device_id(),
         };
         let latest_commit = inner.alloc_commit_seq()?;
+        let shard_roots = source_head.shard_roots.clone();
         let head = DeviceHead {
             device_id: target,
             generation: DeviceGeneration::from_raw(0),
-            shard_roots: source_head.shard_roots,
+            shard_roots: shard_roots.clone(),
             latest_commit,
         };
         head.validate(self.config.shard_count)?;
+        let record = ForkRecord {
+            commit_seq: latest_commit,
+            source: request.source,
+            target,
+            shard_roots,
+        };
         inner.device_specs.insert(target, source_spec);
         inner.device_heads.insert(target, head.clone());
+        inner.fork_records.insert(latest_commit, record);
         Ok(head)
     }
 
@@ -2108,11 +2163,12 @@ impl BlockServer for LocalBlockServer {
                     durable_through: info.latest_commit,
                 })
             }
-            BlockRequest::Fork { .. }
-            | BlockRequest::Restore { .. }
-            | BlockRequest::Delete { .. } => {
+            BlockRequest::Fork { source, request } => {
+                BlockResponse::Forked(self.store.fork_device(source, request)?)
+            }
+            BlockRequest::Restore { .. } | BlockRequest::Delete { .. } => {
                 return Err(StorageError::unsupported(
-                    "fork, restore, and delete are implemented in later phases",
+                    "restore and delete are implemented in later phases",
                 ));
             }
         };
@@ -2422,10 +2478,20 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn fork(&self, _request: ForkRequest) -> Result<DeviceId> {
-        Err(StorageError::unsupported(
-            "block fork is implemented in a later phase",
-        ))
+    fn fork(&self, request: ForkRequest) -> Result<DeviceId> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Fork {
+                source: self.device_id,
+                request,
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Forked(device_id) => Ok(device_id),
+            _ => Err(StorageError::corrupt("unexpected fork response")),
+        }
     }
 
     fn restore(&self, _point: RestorePoint) -> Result<DeviceId> {
@@ -3488,6 +3554,173 @@ mod tests {
     }
 
     #[test]
+    fn fork_copies_roots_without_allocating_metadata_and_records_catalog() {
+        let store = LocalObjectStore::with_config(LocalStoreConfig {
+            shard_count: 2,
+            ..tree_config()
+        })
+        .unwrap();
+        let device = create_local_device(&store, 32);
+        device.write_at(0, &repeated_blocks(8, 1)).unwrap();
+        device.write_at(20 * 4096, &repeated_blocks(4, 2)).unwrap();
+        let parent_head = store.metadata().get_head(device.device_id()).unwrap();
+        let metadata_nodes_before = store.metadata().metadata_node_count().unwrap();
+
+        let child_id = device
+            .fork(ForkRequest {
+                target: Some(DeviceId::from_raw(99)),
+                name: Some("child".to_string()),
+            })
+            .unwrap();
+
+        let child_head = store.metadata().get_head(child_id).unwrap();
+        assert_eq!(child_id, DeviceId::from_raw(99));
+        assert_eq!(child_head.shard_roots, parent_head.shard_roots);
+        assert_eq!(
+            store.metadata().get_head(device.device_id()).unwrap(),
+            parent_head
+        );
+        assert_eq!(
+            store.metadata().metadata_node_count().unwrap(),
+            metadata_nodes_before
+        );
+
+        let record = store
+            .metadata()
+            .fork_record(child_head.latest_commit)
+            .unwrap();
+        assert_eq!(record.source, device.device_id());
+        assert_eq!(record.target, child_id);
+        assert_eq!(record.shard_roots, parent_head.shard_roots);
+        assert_eq!(
+            store
+                .metadata()
+                .fork_records_for_source(device.device_id())
+                .unwrap(),
+            vec![record]
+        );
+    }
+
+    #[test]
+    fn forked_devices_initially_match_and_then_diverge() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let parent_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 8,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        let parent = client.open_device(parent_id).unwrap();
+        parent.write_at(0, &repeated_blocks(8, 1)).unwrap();
+
+        let child_id = parent
+            .fork(ForkRequest {
+                target: None,
+                name: Some("child".to_string()),
+            })
+            .unwrap();
+        let child = client.open_device(child_id).unwrap();
+        assert_eq!(read_device_bytes(&parent, 8), repeated_blocks(8, 1));
+        assert_eq!(read_device_bytes(&child, 8), repeated_blocks(8, 1));
+
+        parent.write_at(0, &repeated_blocks(1, 2)).unwrap();
+        assert_eq!(&read_device_bytes(&parent, 8)[0..4096], vec![2; 4096]);
+        assert_eq!(&read_device_bytes(&child, 8)[0..4096], vec![1; 4096]);
+
+        child.write_at(7 * 4096, &repeated_blocks(1, 3)).unwrap();
+        assert_eq!(
+            &read_device_bytes(&child, 8)[7 * 4096..8 * 4096],
+            vec![3; 4096]
+        );
+        assert_eq!(
+            &read_device_bytes(&parent, 8)[7 * 4096..8 * 4096],
+            vec![1; 4096]
+        );
+    }
+
+    #[test]
+    fn generated_repeated_forks_and_divergent_writes_match_reference_model() {
+        for seed in 0..12 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let store = LocalObjectStore::with_config(LocalStoreConfig {
+                shard_count: 2,
+                ..tree_config()
+            })
+            .unwrap();
+            let server = Arc::new(LocalBlockServer::new(store.clone()));
+            let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+            let root_id = client
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 32,
+                        block_size: 4096,
+                    },
+                    name: Some("root".to_string()),
+                })
+                .unwrap();
+            let mut device_ids = vec![root_id];
+            let mut models = BTreeMap::from([(root_id, vec![0u8; 32])]);
+
+            for step in 0..32 {
+                let fork = harness.rng.next_u64() % 3 == 0 && device_ids.len() < 8;
+                if fork {
+                    let source_index = harness.rng.choose_index(device_ids.len()).unwrap();
+                    let source_id = device_ids[source_index];
+                    let source = client.open_device(source_id).unwrap();
+                    let child_id = source
+                        .fork(ForkRequest {
+                            target: None,
+                            name: Some(format!("child-{seed}-{step}")),
+                        })
+                        .unwrap();
+                    harness.trace.record(format!(
+                        "fork step={step} source={source_id} child={child_id}"
+                    ));
+                    device_ids.push(child_id);
+                    models.insert(child_id, models.get(&source_id).unwrap().clone());
+                } else {
+                    let target_index = harness.rng.choose_index(device_ids.len()).unwrap();
+                    let target_id = device_ids[target_index];
+                    let start = harness.rng.next_u64() % 32;
+                    let max_blocks = (32 - start).min(4);
+                    let blocks = 1 + harness.rng.next_u64() % max_blocks;
+                    let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                    harness.trace.record(format!(
+                        "write step={step} device={target_id} start={start} blocks={blocks} byte={byte}"
+                    ));
+                    let device = client.open_device(target_id).unwrap();
+                    device
+                        .write_at(start * 4096, &repeated_blocks(blocks, byte))
+                        .unwrap();
+                    let model = models.get_mut(&target_id).unwrap();
+                    for block in start..start + blocks {
+                        model[block as usize] = byte;
+                    }
+                }
+
+                for device_id in &device_ids {
+                    let device = client.open_device(*device_id).unwrap();
+                    let mut actual = vec![0; 32 * 4096];
+                    device.read_at(0, &mut actual).unwrap();
+                    assert_model_blocks(
+                        &actual,
+                        models.get(device_id).unwrap(),
+                        seed,
+                        harness.trace.events(),
+                        &render_device_roots(&store, *device_id),
+                    );
+                    validate_device_roots(&store, *device_id);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn discard_removes_mapping_and_write_zeroes_reads_as_zeroes() {
         let store = LocalObjectStore::with_config(config()).unwrap();
         let device = create_local_device(&store, 8);
@@ -3866,6 +4099,12 @@ mod tests {
 
     fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {
         vec![byte; blocks as usize * 4096]
+    }
+
+    fn read_device_bytes(device: &LocalBlockDevice, blocks: u64) -> Vec<u8> {
+        let mut out = vec![0; blocks as usize * 4096];
+        device.read_at(0, &mut out).unwrap();
+        out
     }
 
     fn validate_device_roots(store: &LocalObjectStore, device_id: DeviceId) {

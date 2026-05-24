@@ -463,6 +463,11 @@ No data is copied. No metadata tree is walked. No per-leaf or per-segment
 refcount is bumped. The child receives a distinct `device_id` and a new device
 head that points to the same immutable shard roots.
 
+The metadata plane records the fork as a catalog/timeline event containing the
+source device, target device, commit sequence, and copied shard-root pointers.
+That record is for replay, audit, PITR, and tests; it must not imply a deep
+metadata traversal.
+
 Invariants:
 
 - A forked child reads exactly the same logical contents as the parent at fork
@@ -470,6 +475,11 @@ Invariants:
 - A later write to either device publishes only that device's changed shard
   root.
 - Shared metadata and segments remain immutable.
+
+Native files do not get a public fork API in v1. The native API is for
+append-lease and file-version semantics, and a later native snapshot feature
+should be designed explicitly around those fences rather than piggybacking on
+block-device forks.
 
 ### Read Range
 

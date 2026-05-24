@@ -301,27 +301,27 @@ Exit gate:
 
 ## Phase 8: Forks
 
-Status: not started.
+Status: complete.
 
 Implement O(1) device forks.
 
 Deliverables:
 
-- [ ] Public fork request through `BlockDevice` and `BlockServer`.
-- [ ] Child device-head creation by copying shard roots.
-- [ ] Native file snapshot/fork decision documented before adding it to the
+- [x] Public fork request through `BlockDevice` and `BlockServer`.
+- [x] Child device-head creation by copying shard roots.
+- [x] Native file snapshot/fork decision documented before adding it to the
   native API.
-- [ ] Fork timeline/catalog record.
-- [ ] Tests that prove no metadata walk occurs during fork.
+- [x] Fork timeline/catalog record.
+- [x] Tests that prove no metadata walk occurs during fork.
 
 Exit gate:
 
-- [ ] Fork cost is independent of logical device size and tree size.
-- [ ] Parent and child initially read identical bytes.
-- [ ] Writing parent after fork does not change child reads.
-- [ ] Writing child after fork does not change parent reads.
-- [ ] Generated tests cover repeated forks and divergent write histories.
-- [ ] Criterion covers fork cost versus device size.
+- [x] Fork cost is independent of logical device size and tree size.
+- [x] Parent and child initially read identical bytes.
+- [x] Writing parent after fork does not change child reads.
+- [x] Writing child after fork does not change parent reads.
+- [x] Generated tests cover repeated forks and divergent write histories.
+- [x] Criterion covers fork cost versus device size.
 
 ## Phase 9: Point-In-Time Recovery
 
