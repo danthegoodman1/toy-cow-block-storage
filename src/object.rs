@@ -287,6 +287,7 @@ pub enum RootUpdate {
     FileRoot {
         old_root: MetadataNodeId,
         new_root: MetadataNodeId,
+        new_size: u64,
     },
 }
 

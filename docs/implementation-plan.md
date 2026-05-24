@@ -228,53 +228,53 @@ Exit gate:
 
 ## Phase 6: Atomic Writes and Commit Groups
 
-Status: not started.
+Status: complete.
 
 Implement the block write path with public request-granularity atomicity and the
 native append path with file-version atomicity.
 
 Deliverables:
 
-- [ ] Range splitter from public byte writes to shard-local chunks.
-- [ ] Stable write-intent identity for each public write or commit group.
-- [ ] Stable write-intent identity tied to each native append lease.
-- [ ] Block-server selection and local segment reservation.
-- [ ] Segment creation for written bytes.
-- [ ] Segment sync before metadata references are created.
-- [ ] Local segment catalog commit to `DurablePendingMetadata` before metadata
+- [x] Range splitter from public byte writes to shard-local chunks.
+- [x] Stable write-intent identity for each public write or commit group.
+- [x] Stable write-intent identity tied to each native append lease.
+- [x] Block-server selection and local segment reservation.
+- [x] Segment creation for written bytes.
+- [x] Segment sync before metadata references are created.
+- [x] Local segment catalog commit to `DurablePendingMetadata` before metadata
   publish.
-- [ ] Local segment catalog transition to `Referenced` after metadata publish
+- [x] Local segment catalog transition to `Referenced` after metadata publish
   succeeds.
-- [ ] Leaf insertion, replacement, and splitting for overwrites.
-- [ ] Root-to-leaf path copy for each affected shard.
-- [ ] Commit-group prepare/publish model for multi-shard writes.
-- [ ] Native append commit model with file-version and writer-epoch fencing.
-- [ ] Per-shard commit records linked by commit-group identity.
-- [ ] Native file extent commit records linked by commit-group identity.
-- [ ] Orphan segment records when durable segment writes outlive failed metadata
+- [x] Leaf insertion, replacement, and splitting for overwrites.
+- [x] Root-to-leaf path copy for each affected shard.
+- [x] Commit-group prepare/publish model for multi-shard writes.
+- [x] Native append commit model with file-version and writer-epoch fencing.
+- [x] Per-shard commit records linked by commit-group identity.
+- [x] Native file extent commit records linked by commit-group identity.
+- [x] Orphan segment records when durable segment writes outlive failed metadata
   publish attempts.
-- [ ] Retry policy for publish conflicts.
+- [x] Documented no-implicit-retry policy for publish conflicts.
 
 Exit gate:
 
-- [ ] Read-after-write returns the latest committed bytes.
-- [ ] Overwrites preserve untouched prefix and suffix mappings.
-- [ ] Failed publish leaves all old roots readable.
-- [ ] Failed publish after durable segment write creates no readable data and
+- [x] Read-after-write returns the latest committed bytes.
+- [x] Overwrites preserve untouched prefix and suffix mappings.
+- [x] Failed publish leaves all old roots readable.
+- [x] Failed publish after durable segment write creates no readable data and
   leaves a reclaimable orphan.
-- [ ] Metadata leaves never reference segments before segment sync and local
+- [x] Metadata leaves never reference segments before segment sync and local
   catalog commit.
-- [ ] Public writes spanning shards expose either the old mapping or the complete
+- [x] Public writes spanning shards expose either the old mapping or the complete
   new mapping, never a partial update.
-- [ ] Native appends expose either the old file version or the complete new file
+- [x] Native appends expose either the old file version or the complete new file
   version, never a partial extent update.
-- [ ] Stale native append leases are rejected deterministically.
-- [ ] Conflicting writes to the same shard resolve deterministically.
-- [ ] Table-driven tests cover beginning, middle, end, full-range, same-range,
+- [x] Stale native append leases are rejected deterministically.
+- [x] Conflicting writes to the same shard resolve deterministically.
+- [x] Table-driven tests cover beginning, middle, end, full-range, same-range,
   and cross-shard overwrites.
-- [ ] Table-driven tests cover valid append, stale lease rejection, lease
+- [x] Table-driven tests cover valid append, stale lease rejection, lease
   stealing, and append publish failure orphan cleanup.
-- [ ] Criterion has baseline write benchmarks.
+- [x] Criterion has baseline write benchmarks.
 
 ## Phase 7: Metadata Tree Shape
 

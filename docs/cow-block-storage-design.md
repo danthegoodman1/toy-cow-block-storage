@@ -413,6 +413,13 @@ durable local replica data but not reachable from any committed device or file
 root. Orphans are not user-visible and must be reclaimed by custodian work after
 their write intent can no longer commit.
 
+The v1 local server does not hide publish conflicts behind implicit retries. It
+serializes local requests before commit assembly, and stale direct metadata
+publishes fail with a deterministic conflict. Later remote transports may retry
+requests with the same request identity, but they must preserve the same
+data-before-metadata visibility rule and must not introduce a second
+cross-shard atomicity mechanism beside commit groups.
+
 ## 7. Operations
 
 ### Create Device

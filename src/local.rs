@@ -13,13 +13,13 @@ use crate::extent::{
     NativeTransport,
 };
 use crate::id::{
-    BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq, DeviceGeneration, DeviceId,
-    FileId, FileVersion, LogicalTime, MetadataNodeId, RequestId, SegmentId, StorageNodeId,
-    WriterEpoch,
+    AppendLeaseId, BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq,
+    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, LogicalTime, MetadataNodeId,
+    RequestId, SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CommitGroup, DeviceHead, FileHead, MappingOwner, MetadataNode, MetadataNodeKind,
-    RootUpdate, SegmentDescriptor,
+    Checkpoint, CommitGroup, DeviceHead, FileHead, LeafEntry, MappingOwner, MetadataNode,
+    MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
@@ -83,6 +83,8 @@ pub struct LocalObjectStore {
     metadata: Arc<InMemoryMetadataPlane>,
     segment_store: Arc<InMemorySegmentStore>,
     segment_catalog: Arc<InMemoryLocalSegmentCatalog>,
+    next_write_intent: Arc<Mutex<u128>>,
+    next_extent_id: Arc<Mutex<u128>>,
 }
 
 impl LocalObjectStore {
@@ -96,6 +98,8 @@ impl LocalObjectStore {
             metadata: Arc::new(InMemoryMetadataPlane::new(config)?),
             segment_store: Arc::new(InMemorySegmentStore::new(config)?),
             segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::new(config)?),
+            next_write_intent: Arc::new(Mutex::new(1)),
+            next_extent_id: Arc::new(Mutex::new(1)),
         })
     }
 
@@ -109,6 +113,371 @@ impl LocalObjectStore {
 
     pub fn segment_catalog(&self) -> Arc<InMemoryLocalSegmentCatalog> {
         Arc::clone(&self.segment_catalog)
+    }
+
+    pub fn write_device(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+    ) -> Result<WriteCommit> {
+        let info = self.metadata.device_info(device_id)?;
+        let len = u64::try_from(data.len())
+            .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
+        let range = ByteRange::new(offset, len);
+        range.validate_for_device(&info.spec)?;
+
+        if len == 0 {
+            return Ok(WriteCommit {
+                device_id,
+                commit_seq: info.latest_commit,
+                range,
+                durability,
+            });
+        }
+
+        let block_size = u64::from(info.spec.block_size);
+        let chunks = self.split_device_range(&info, range)?;
+        let owner = MappingOwner::BlockDevice(device_id);
+        let write_intent = self.next_write_intent()?;
+        let mut updates = Vec::with_capacity(chunks.len());
+        let mut segment_ids = Vec::with_capacity(chunks.len());
+
+        for chunk in chunks {
+            let chunk_offset = chunk
+                .range
+                .start
+                .raw()
+                .checked_mul(block_size)
+                .and_then(|start| start.checked_sub(offset))
+                .ok_or_else(|| StorageError::invalid_argument("write chunk offset overflows"))?;
+            let byte_start = usize::try_from(chunk_offset).map_err(|_| {
+                StorageError::invalid_argument("write chunk offset overflows usize")
+            })?;
+            let chunk_len = chunk
+                .range
+                .blocks
+                .raw()
+                .checked_mul(block_size)
+                .ok_or_else(|| StorageError::invalid_argument("write chunk length overflows"))?;
+            let byte_len = usize::try_from(chunk_len).map_err(|_| {
+                StorageError::invalid_argument("write chunk length overflows usize")
+            })?;
+            let byte_end = byte_start
+                .checked_add(byte_len)
+                .ok_or_else(|| StorageError::invalid_argument("write chunk end overflows"))?;
+            let chunk_bytes = data
+                .get(byte_start..byte_end)
+                .ok_or_else(|| StorageError::corrupt("write chunk is outside request bytes"))?;
+            let reservation =
+                self.write_segment_for_owner_with_intent(owner, write_intent, chunk_bytes)?;
+            segment_ids.push(reservation.segment_id);
+
+            let old_root = self.metadata.get_metadata_node(chunk.old_root)?;
+            let new_entries = replace_leaf_entries(
+                &old_root,
+                chunk.range,
+                Some(LeafEntry {
+                    logical_start: chunk.range.start,
+                    blocks: chunk.range.blocks,
+                    segment_id: reservation.segment_id,
+                    segment_offset: BlockIndex::from_raw(0),
+                }),
+            )?;
+            let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
+            let new_node = self.metadata.allocate_metadata_node(
+                old_root.covered_range,
+                MetadataNodeKind::Leaf {
+                    entries: new_entries,
+                },
+            )?;
+            new_node.validate(&segment_descriptors)?;
+            self.metadata.persist_metadata_node(new_node.clone())?;
+            updates.push(RootUpdate::BlockShard(ShardRootUpdate {
+                shard_id: chunk.shard_id,
+                old_root: chunk.old_root,
+                new_root: new_node.node_id,
+            }));
+        }
+
+        let current = self.metadata.get_head(device_id)?;
+        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+            owner,
+            fence: MetadataFence::DeviceGeneration(current.generation),
+            updates,
+        })?;
+
+        for segment_id in segment_ids {
+            self.segment_catalog.mark_segment_referenced(segment_id)?;
+        }
+
+        Ok(WriteCommit {
+            device_id,
+            commit_seq: commit_group.commit_seq,
+            range,
+            durability,
+        })
+    }
+
+    pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
+        let zeroes = usize::try_from(len)
+            .map_err(|_| StorageError::invalid_argument("zero range length overflows usize"))?;
+        self.write_device(
+            device_id,
+            offset,
+            &vec![0; zeroes],
+            crate::api::WriteDurability::Acknowledged,
+        )
+    }
+
+    pub fn discard_device(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
+        let info = self.metadata.device_info(device_id)?;
+        let range = ByteRange::new(offset, len);
+        range.validate_for_device(&info.spec)?;
+
+        if len == 0 {
+            return Ok(WriteCommit {
+                device_id,
+                commit_seq: info.latest_commit,
+                range,
+                durability: crate::api::WriteDurability::Acknowledged,
+            });
+        }
+
+        let chunks = self.split_device_range(&info, range)?;
+        let owner = MappingOwner::BlockDevice(device_id);
+        let mut updates = Vec::with_capacity(chunks.len());
+
+        for chunk in chunks {
+            let old_root = self.metadata.get_metadata_node(chunk.old_root)?;
+            let new_entries = replace_leaf_entries(&old_root, chunk.range, None)?;
+            let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
+            let new_node = self.metadata.allocate_metadata_node(
+                old_root.covered_range,
+                MetadataNodeKind::Leaf {
+                    entries: new_entries,
+                },
+            )?;
+            new_node.validate(&segment_descriptors)?;
+            self.metadata.persist_metadata_node(new_node.clone())?;
+            updates.push(RootUpdate::BlockShard(ShardRootUpdate {
+                shard_id: chunk.shard_id,
+                old_root: chunk.old_root,
+                new_root: new_node.node_id,
+            }));
+        }
+
+        let current = self.metadata.get_head(device_id)?;
+        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+            owner,
+            fence: MetadataFence::DeviceGeneration(current.generation),
+            updates,
+        })?;
+
+        Ok(WriteCommit {
+            device_id,
+            commit_seq: commit_group.commit_seq,
+            range,
+            durability: crate::api::WriteDurability::Acknowledged,
+        })
+    }
+
+    pub fn acquire_append_lease(&self, file_id: FileId) -> Result<AppendLease> {
+        self.metadata.acquire_append_lease(file_id)
+    }
+
+    pub fn append_file(
+        &self,
+        lease: AppendLease,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+    ) -> Result<AppendCommit> {
+        if data.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "append payload must not be empty",
+            ));
+        }
+        let data_len = u64::try_from(data.len())
+            .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
+        if data_len % u64::from(self.metadata.config.block_size) != 0 {
+            return Err(StorageError::invalid_argument(
+                "append payload must be block aligned",
+            ));
+        }
+
+        let head = self.metadata.get_file_head(lease.file_id)?;
+        if head.version != lease.base_version {
+            return Err(StorageError::conflict("stale append lease"));
+        }
+        self.metadata
+            .validate_writer_epoch(lease.file_id, lease.writer_epoch)?;
+
+        let owner = MappingOwner::NativeFile(lease.file_id);
+        let reservation = self.write_segment_for_owner_with_intent(
+            owner,
+            WriteIntentId::from_raw(lease.lease_id.raw()),
+            data,
+        )?;
+        let old_root = self.metadata.get_metadata_node(head.root)?;
+        let block_size = u64::from(self.metadata.config.block_size);
+        let append_range = crate::api::BlockRange::new(
+            BlockIndex::from_raw(head.size / block_size),
+            BlockCount::from_raw(data_len / block_size),
+        );
+        let new_size = head
+            .size
+            .checked_add(data_len)
+            .ok_or_else(|| StorageError::invalid_argument("file size overflows u64"))?;
+        let new_entries = append_leaf_entry(
+            &old_root,
+            LeafEntry {
+                logical_start: append_range.start,
+                blocks: append_range.blocks,
+                segment_id: reservation.segment_id,
+                segment_offset: BlockIndex::from_raw(0),
+            },
+        )?;
+        let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
+        let new_node = self.metadata.allocate_metadata_node(
+            old_root.covered_range,
+            MetadataNodeKind::Leaf {
+                entries: new_entries,
+            },
+        )?;
+        new_node.validate(&segment_descriptors)?;
+        self.metadata.persist_metadata_node(new_node.clone())?;
+
+        self.metadata.publish_commit_group(CommitGroupIntent {
+            owner,
+            fence: MetadataFence::WriterEpoch {
+                base_version: lease.base_version,
+                writer_epoch: lease.writer_epoch,
+            },
+            updates: vec![RootUpdate::FileRoot {
+                old_root: head.root,
+                new_root: new_node.node_id,
+                new_size,
+            }],
+        })?;
+        self.segment_catalog
+            .mark_segment_referenced(reservation.segment_id)?;
+        let committed = self.metadata.get_file_head(lease.file_id)?;
+
+        Ok(AppendCommit {
+            file_id: lease.file_id,
+            extent_id: self.next_extent_id()?,
+            range: ByteRange::new(head.size, data_len),
+            version: committed.version,
+            durability,
+        })
+    }
+
+    fn split_device_range(
+        &self,
+        info: &DeviceInfo,
+        range: ByteRange,
+    ) -> Result<Vec<DeviceWriteChunk>> {
+        let block_size = u64::from(info.spec.block_size);
+        let requested = crate::api::BlockRange::new(
+            BlockIndex::from_raw(range.offset / block_size),
+            BlockCount::from_raw(range.len / block_size),
+        );
+        let head = self.metadata.get_head(info.device_id)?;
+        let mut chunks = Vec::new();
+
+        for (shard, root) in head.shard_roots.iter().enumerate() {
+            let node = self.metadata.get_metadata_node(*root)?;
+            let Some(overlap) = node.covered_range.intersection(requested)? else {
+                continue;
+            };
+            let shard_id = u32::try_from(shard)
+                .map_err(|_| StorageError::invalid_argument("shard index overflows u32"))?;
+            chunks.push(DeviceWriteChunk {
+                shard_id: crate::id::ShardId::from_raw(shard_id),
+                old_root: *root,
+                range: overlap,
+            });
+        }
+
+        if chunks.is_empty() && range.len != 0 {
+            return Err(StorageError::corrupt(
+                "device range did not overlap any shard roots",
+            ));
+        }
+
+        Ok(chunks)
+    }
+
+    #[cfg(test)]
+    fn write_segment_for_owner(
+        &self,
+        owner: MappingOwner,
+        data: &[u8],
+    ) -> Result<SegmentReservation> {
+        let write_intent = self.next_write_intent()?;
+        self.write_segment_for_owner_with_intent(owner, write_intent, data)
+    }
+
+    fn write_segment_for_owner_with_intent(
+        &self,
+        owner: MappingOwner,
+        write_intent: WriteIntentId,
+        data: &[u8],
+    ) -> Result<SegmentReservation> {
+        let intent = SegmentReservationIntent {
+            write_intent,
+            owner,
+            bytes: u64::try_from(data.len()).map_err(|_| {
+                StorageError::invalid_argument("segment reservation byte length overflows u64")
+            })?,
+        };
+        let reservation = self.segment_catalog.reserve_segment(intent)?;
+        self.segment_catalog.begin_write(&reservation)?;
+        let commit = self.segment_store.write_segment(&reservation, data)?;
+        self.segment_store.sync_segment(reservation.segment_id)?;
+        self.segment_catalog
+            .commit_segment(reservation.clone(), commit)?;
+        Ok(reservation)
+    }
+
+    fn descriptors_for_entries(&self, entries: &[LeafEntry]) -> Result<Vec<SegmentDescriptor>> {
+        let mut descriptors: BTreeMap<SegmentId, SegmentDescriptor> = BTreeMap::new();
+        for entry in entries {
+            if let std::collections::btree_map::Entry::Vacant(vacant) =
+                descriptors.entry(entry.segment_id)
+            {
+                vacant.insert(
+                    self.segment_catalog
+                        .commit_for_segment(entry.segment_id)?
+                        .descriptor,
+                );
+            }
+        }
+        Ok(descriptors.into_values().collect())
+    }
+
+    fn next_write_intent(&self) -> Result<WriteIntentId> {
+        let mut next = lock(&self.next_write_intent)?;
+        let id = WriteIntentId::from_raw(*next);
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("write intent id overflow"))?;
+        Ok(id)
+    }
+
+    fn next_extent_id(&self) -> Result<ExtentId> {
+        let mut next = lock(&self.next_extent_id)?;
+        let id = ExtentId::from_raw(*next);
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("extent id overflow"))?;
+        Ok(id)
     }
 
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
@@ -224,6 +593,13 @@ impl Default for LocalObjectStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceWriteChunk {
+    shard_id: crate::id::ShardId,
+    old_root: MetadataNodeId,
+    range: crate::api::BlockRange,
 }
 
 #[derive(Debug)]
@@ -346,6 +722,66 @@ impl InMemoryMetadataPlane {
             .get(&commit_group)
             .cloned()
             .ok_or_else(|| StorageError::not_found("commit_group", commit_group.to_string()))
+    }
+
+    pub fn commit_groups_for_seq(&self, commit_seq: CommitSeq) -> Result<Vec<CommitGroup>> {
+        let inner = lock(&self.inner)?;
+        let mut groups: Vec<_> = inner
+            .commit_groups
+            .values()
+            .filter(|group| group.commit_seq == commit_seq)
+            .cloned()
+            .collect();
+        groups.sort_by_key(|group| group.commit_group.raw());
+        Ok(groups)
+    }
+
+    pub fn allocate_metadata_node(
+        &self,
+        covered_range: crate::api::BlockRange,
+        kind: MetadataNodeKind,
+    ) -> Result<MetadataNode> {
+        let mut inner = lock(&self.inner)?;
+        Ok(MetadataNode {
+            node_id: inner.alloc_metadata_node_id(),
+            covered_range,
+            kind,
+        })
+    }
+
+    pub fn acquire_append_lease(&self, file_id: FileId) -> Result<AppendLease> {
+        let mut inner = lock(&self.inner)?;
+        let head = inner
+            .file_heads
+            .get(&file_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))?;
+        let current_epoch = inner
+            .file_writer_epochs
+            .get(&file_id)
+            .copied()
+            .unwrap_or_else(|| WriterEpoch::from_raw(0));
+        let writer_epoch = current_epoch
+            .raw()
+            .checked_add(1)
+            .map(WriterEpoch::from_raw)
+            .ok_or_else(|| StorageError::conflict("writer epoch overflow"))?;
+        inner.file_writer_epochs.insert(file_id, writer_epoch);
+        Ok(AppendLease {
+            file_id,
+            lease_id: AppendLeaseId::from_raw(writer_epoch.raw() as u128),
+            writer_epoch,
+            base_version: head.version,
+        })
+    }
+
+    pub fn validate_writer_epoch(&self, file_id: FileId, writer_epoch: WriterEpoch) -> Result<()> {
+        let inner = lock(&self.inner)?;
+        match inner.file_writer_epochs.get(&file_id) {
+            Some(current) if *current == writer_epoch => Ok(()),
+            Some(_) => Err(StorageError::conflict("stale writer epoch")),
+            None => Err(StorageError::not_found("file", file_id.to_string())),
+        }
     }
 
     fn create_empty_leaf(inner: &mut MetadataInner, range: crate::api::BlockRange) -> MetadataNode {
@@ -558,7 +994,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     owner: intent.owner,
                     updates: intent.updates,
                 };
-                let mut next_head = current;
+                let mut next_head = current.clone();
                 next_head.generation = Self::next_generation(next_head.generation)?;
                 next_head.latest_commit = commit_seq;
                 next_head.shard_roots = next_roots;
@@ -600,8 +1036,14 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     ));
                 }
 
-                let (old_root, new_root) = match intent.updates.as_slice() {
-                    [RootUpdate::FileRoot { old_root, new_root }] => (*old_root, *new_root),
+                let (old_root, new_root, new_size) = match intent.updates.as_slice() {
+                    [
+                        RootUpdate::FileRoot {
+                            old_root,
+                            new_root,
+                            new_size,
+                        },
+                    ] => (*old_root, *new_root, *new_size),
                     [_] => {
                         return Err(StorageError::invalid_argument(
                             "native file commit cannot include shard-root updates",
@@ -618,18 +1060,36 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         new_root.to_string(),
                     ));
                 }
+                let new_root_node =
+                    inner
+                        .metadata_nodes
+                        .get(&new_root)
+                        .cloned()
+                        .ok_or_else(|| {
+                            StorageError::not_found("metadata_node", new_root.to_string())
+                        })?;
 
                 let commit_seq = inner.alloc_commit_seq()?;
                 let commit_group = CommitGroup {
                     commit_group: inner.alloc_commit_group_id(),
                     commit_seq,
                     owner: intent.owner,
-                    updates: vec![RootUpdate::FileRoot { old_root, new_root }],
+                    updates: vec![RootUpdate::FileRoot {
+                        old_root,
+                        new_root,
+                        new_size,
+                    }],
                 };
-                let mut next_head = current;
+                let mut next_head = current.clone();
                 next_head.version = Self::next_file_version(next_head.version)?;
                 next_head.latest_commit = commit_seq;
                 next_head.root = new_root;
+                next_head.size = new_size;
+                next_head.validate_transition_from(
+                    &current,
+                    new_root_node.covered_range,
+                    self.config.block_size,
+                )?;
                 inner.file_heads.insert(file_id, next_head);
                 inner
                     .commit_groups
@@ -929,6 +1389,27 @@ impl InMemoryLocalSegmentCatalog {
             .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))
     }
 
+    pub fn commit_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaCommit> {
+        let inner = lock(&self.inner)?;
+        let entry = inner
+            .entries
+            .get(&segment_id)
+            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+        entry
+            .commit
+            .clone()
+            .ok_or_else(|| StorageError::unavailable("segment has no durable commit"))
+    }
+
+    pub fn intent_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReservationIntent> {
+        let inner = lock(&self.inner)?;
+        inner
+            .entries
+            .get(&segment_id)
+            .map(|entry| entry.intent.clone())
+            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))
+    }
+
     fn get_entry_mut(inner: &mut CatalogInner, segment_id: SegmentId) -> Result<&mut CatalogEntry> {
         inner
             .entries
@@ -1137,6 +1618,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
 pub struct LocalBlockServer {
     store: LocalObjectStore,
     request_log: Arc<Mutex<Vec<RequestId>>>,
+    serial: Arc<Mutex<()>>,
 }
 
 impl LocalBlockServer {
@@ -1144,6 +1626,7 @@ impl LocalBlockServer {
         Self {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
+            serial: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1154,6 +1637,7 @@ impl LocalBlockServer {
 
 impl BlockServer for LocalBlockServer {
     fn handle(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope> {
+        let _serial_guard = lock(&self.serial)?;
         lock(&self.request_log)?.push(request.request_id);
         let response = match request.request {
             BlockRequest::Create { request } => {
@@ -1174,15 +1658,35 @@ impl BlockServer for LocalBlockServer {
                 self.store.read_device(device_id, range, &mut bytes)?;
                 BlockResponse::Read(ReadResponse { bytes })
             }
-            BlockRequest::Write { .. }
-            | BlockRequest::Flush { .. }
-            | BlockRequest::WriteZeroes { .. }
-            | BlockRequest::Discard { .. }
-            | BlockRequest::Fork { .. }
+            BlockRequest::Write {
+                device_id,
+                offset,
+                bytes,
+                durability,
+            } => BlockResponse::Write(
+                self.store
+                    .write_device(device_id, offset, &bytes, durability)?,
+            ),
+            BlockRequest::WriteZeroes { device_id, range } => BlockResponse::Write(
+                self.store
+                    .write_zeroes(device_id, range.offset, range.len)?,
+            ),
+            BlockRequest::Discard { device_id, range } => BlockResponse::Write(
+                self.store
+                    .discard_device(device_id, range.offset, range.len)?,
+            ),
+            BlockRequest::Flush { device_id, .. } => {
+                let info = self.store.metadata.device_info(device_id)?;
+                BlockResponse::Flush(FlushResult {
+                    device_id,
+                    durable_through: info.latest_commit,
+                })
+            }
+            BlockRequest::Fork { .. }
             | BlockRequest::Restore { .. }
             | BlockRequest::Delete { .. } => {
                 return Err(StorageError::unsupported(
-                    "mutating block operations are implemented in later phases",
+                    "fork, restore, and delete are implemented in later phases",
                 ));
             }
         };
@@ -1198,6 +1702,7 @@ impl BlockServer for LocalBlockServer {
 pub struct LocalNativeServer {
     store: LocalObjectStore,
     request_log: Arc<Mutex<Vec<RequestId>>>,
+    serial: Arc<Mutex<()>>,
 }
 
 impl LocalNativeServer {
@@ -1205,6 +1710,7 @@ impl LocalNativeServer {
         Self {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
+            serial: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1215,6 +1721,7 @@ impl LocalNativeServer {
 
 impl NativeServer for LocalNativeServer {
     fn handle(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope> {
+        let _serial_guard = lock(&self.serial)?;
         lock(&self.request_log)?.push(request.request_id);
         let response = match request.request {
             NativeRequest::CreateFile { request } => {
@@ -1235,12 +1742,28 @@ impl NativeServer for LocalNativeServer {
                 self.store.read_file(file_id, range, &mut bytes)?;
                 NativeResponse::Read(ReadResponse { bytes })
             }
-            NativeRequest::AcquireAppend { .. }
-            | NativeRequest::Append { .. }
-            | NativeRequest::Flush { .. } => {
-                return Err(StorageError::unsupported(
-                    "native append and flush operations are implemented in later phases",
-                ));
+            NativeRequest::AcquireAppend { file_id } => {
+                NativeResponse::AppendLease(self.store.acquire_append_lease(file_id)?)
+            }
+            NativeRequest::Append {
+                file_id,
+                lease,
+                bytes,
+                durability,
+            } => {
+                if file_id != lease.file_id {
+                    return Err(StorageError::invalid_argument(
+                        "append lease file_id does not match request file_id",
+                    ));
+                }
+                NativeResponse::Append(self.store.append_file(lease, &bytes, durability)?)
+            }
+            NativeRequest::Flush { file_id } => {
+                let info = self.store.metadata.get_file_info(file_id)?;
+                NativeResponse::Flush(FlushResult {
+                    device_id: DeviceId::from_raw(info.file_id.raw()),
+                    durable_through: CommitSeq::from_raw(info.version.raw()),
+                })
             }
         };
         Ok(NativeResponseEnvelope {
@@ -1407,28 +1930,70 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<WriteCommit> {
-        Err(StorageError::unsupported(
-            "block writes are implemented in a later phase",
-        ))
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<WriteCommit> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Write {
+                device_id: self.device_id,
+                offset,
+                bytes: data.to_vec(),
+                durability: crate::api::WriteDurability::Acknowledged,
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Write(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt("unexpected block-write response")),
+        }
     }
 
     fn flush(&self) -> Result<FlushResult> {
-        Err(StorageError::unsupported(
-            "block flush is implemented in a later phase",
-        ))
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Flush {
+                device_id: self.device_id,
+                scope: crate::api::FlushScope::Device,
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Flush(flush) => Ok(flush),
+            _ => Err(StorageError::corrupt("unexpected block-flush response")),
+        }
     }
 
-    fn write_zeroes(&self, _offset: u64, _len: u64) -> Result<WriteCommit> {
-        Err(StorageError::unsupported(
-            "write-zeroes is implemented in a later phase",
-        ))
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<WriteCommit> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::WriteZeroes {
+                device_id: self.device_id,
+                range: ByteRange::new(offset, len),
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Write(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt("unexpected write-zeroes response")),
+        }
     }
 
-    fn discard(&self, _offset: u64, _len: u64) -> Result<WriteCommit> {
-        Err(StorageError::unsupported(
-            "discard is implemented in a later phase",
-        ))
+    fn discard(&self, offset: u64, len: u64) -> Result<WriteCommit> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Discard {
+                device_id: self.device_id,
+                range: ByteRange::new(offset, len),
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Write(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt("unexpected discard response")),
+        }
     }
 
     fn fork(&self, _request: ForkRequest) -> Result<DeviceId> {
@@ -1509,10 +2074,17 @@ impl NativeFileClient for LocalNativeFileClient {
         }
     }
 
-    fn acquire_append(&self, _file_id: FileId) -> Result<AppendLease> {
-        Err(StorageError::unsupported(
-            "native append leases are implemented in a later phase",
-        ))
+    fn acquire_append(&self, file_id: FileId) -> Result<AppendLease> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::AcquireAppend { file_id },
+        ))?;
+        match response.response {
+            NativeResponse::AppendLease(lease) => Ok(lease),
+            _ => Err(StorageError::corrupt("unexpected append-lease response")),
+        }
     }
 }
 
@@ -1578,21 +2150,51 @@ impl NativeFile for LocalNativeFile {
     }
 
     fn acquire_append(&self) -> Result<AppendLease> {
-        Err(StorageError::unsupported(
-            "native append leases are implemented in a later phase",
-        ))
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::AcquireAppend {
+                file_id: self.file_id,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendLease(lease) => Ok(lease),
+            _ => Err(StorageError::corrupt("unexpected append-lease response")),
+        }
     }
 
-    fn append_with_lease(&self, _lease: AppendLease, _data: &[u8]) -> Result<AppendCommit> {
-        Err(StorageError::unsupported(
-            "native append is implemented in a later phase",
-        ))
+    fn append_with_lease(&self, lease: AppendLease, data: &[u8]) -> Result<AppendCommit> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::Append {
+                file_id: self.file_id,
+                lease,
+                bytes: data.to_vec(),
+                durability: crate::api::WriteDurability::Acknowledged,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::Append(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt("unexpected native-append response")),
+        }
     }
 
     fn flush(&self) -> Result<FlushResult> {
-        Err(StorageError::unsupported(
-            "native flush is implemented in a later phase",
-        ))
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::Flush {
+                file_id: self.file_id,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::Flush(flush) => Ok(flush),
+            _ => Err(StorageError::corrupt("unexpected native-flush response")),
+        }
     }
 }
 
@@ -1618,6 +2220,87 @@ fn checksum64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+fn replace_leaf_entries(
+    node: &MetadataNode,
+    replacement_range: crate::api::BlockRange,
+    replacement: Option<LeafEntry>,
+) -> Result<Vec<LeafEntry>> {
+    replacement_range.validate_non_empty()?;
+    if !node.covered_range.contains_range(replacement_range)? {
+        return Err(StorageError::invalid_argument(
+            "replacement range is outside leaf coverage",
+        ));
+    }
+    let MetadataNodeKind::Leaf { entries } = &node.kind else {
+        return Err(StorageError::unsupported(
+            "phase 6 writes require leaf roots; internal tree writes are phase 7",
+        ));
+    };
+
+    let mut out = Vec::with_capacity(entries.len() + usize::from(replacement.is_some()));
+    let replacement_end = replacement_range.end_exclusive()?.raw();
+
+    for entry in entries {
+        let entry_range = entry.logical_range();
+        let entry_end = entry_range.end_exclusive()?.raw();
+        if !entry_range.overlaps(replacement_range)? {
+            out.push(entry.clone());
+            continue;
+        }
+
+        if entry.logical_start.raw() < replacement_range.start.raw() {
+            out.push(LeafEntry {
+                logical_start: entry.logical_start,
+                blocks: BlockCount::from_raw(
+                    replacement_range.start.raw() - entry.logical_start.raw(),
+                ),
+                segment_id: entry.segment_id,
+                segment_offset: entry.segment_offset,
+            });
+        }
+
+        if entry_end > replacement_end {
+            let skipped_blocks = replacement_end - entry.logical_start.raw();
+            out.push(LeafEntry {
+                logical_start: BlockIndex::from_raw(replacement_end),
+                blocks: BlockCount::from_raw(entry_end - replacement_end),
+                segment_id: entry.segment_id,
+                segment_offset: BlockIndex::from_raw(entry.segment_offset.raw() + skipped_blocks),
+            });
+        }
+    }
+
+    if let Some(replacement) = replacement {
+        out.push(replacement);
+    }
+    out.sort_by_key(|entry| entry.logical_start.raw());
+    Ok(out)
+}
+
+fn append_leaf_entry(node: &MetadataNode, entry: LeafEntry) -> Result<Vec<LeafEntry>> {
+    let MetadataNodeKind::Leaf { entries } = &node.kind else {
+        return Err(StorageError::unsupported(
+            "phase 6 appends require leaf roots; internal tree appends are phase 7",
+        ));
+    };
+    if !node.covered_range.contains_range(entry.logical_range())? {
+        return Err(StorageError::invalid_argument(
+            "append range is outside file root coverage",
+        ));
+    }
+
+    let mut out = entries.clone();
+    if let Some(last) = out.last()
+        && last.logical_range().end_exclusive()?.raw() > entry.logical_start.raw()
+    {
+        return Err(StorageError::conflict(
+            "append entry overlaps existing file metadata",
+        ));
+    }
+    out.push(entry);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1763,6 +2446,7 @@ mod tests {
                 updates: vec![RootUpdate::FileRoot {
                     old_root: file.root,
                     new_root: new_root.node_id,
+                    new_size: 0,
                 }],
             })
             .unwrap();
@@ -2087,6 +2771,288 @@ mod tests {
     }
 
     #[test]
+    fn block_writes_and_overwrites_preserve_expected_ranges() {
+        struct Case {
+            name: &'static str,
+            start_block: u64,
+            blocks: u64,
+            byte: u8,
+        }
+
+        let cases = [
+            Case {
+                name: "beginning",
+                start_block: 0,
+                blocks: 2,
+                byte: 2,
+            },
+            Case {
+                name: "middle",
+                start_block: 3,
+                blocks: 2,
+                byte: 3,
+            },
+            Case {
+                name: "end",
+                start_block: 6,
+                blocks: 2,
+                byte: 4,
+            },
+            Case {
+                name: "full-range",
+                start_block: 0,
+                blocks: 8,
+                byte: 5,
+            },
+            Case {
+                name: "same-range",
+                start_block: 2,
+                blocks: 3,
+                byte: 6,
+            },
+            Case {
+                name: "cross-shard",
+                start_block: 3,
+                blocks: 3,
+                byte: 7,
+            },
+        ];
+
+        for case in cases {
+            let store = LocalObjectStore::with_config(LocalStoreConfig {
+                shard_count: 2,
+                ..config()
+            })
+            .unwrap();
+            let device = create_local_device(&store, 8);
+            let initial = repeated_blocks(8, 1);
+            device.write_at(0, &initial).unwrap();
+
+            let overwrite = repeated_blocks(case.blocks, case.byte);
+            device
+                .write_at(case.start_block * 4096, &overwrite)
+                .unwrap();
+
+            let mut actual = vec![0; 8 * 4096];
+            device.read_at(0, &mut actual).unwrap();
+
+            let mut expected = initial;
+            for block in case.start_block..case.start_block + case.blocks {
+                let start = block as usize * 4096;
+                expected[start..start + 4096].fill(case.byte);
+            }
+            assert_eq!(actual, expected, "case {}", case.name);
+        }
+    }
+
+    #[test]
+    fn cross_shard_write_publishes_one_commit_group_and_references_segments_after_sync() {
+        let store = LocalObjectStore::with_config(LocalStoreConfig {
+            shard_count: 2,
+            ..config()
+        })
+        .unwrap();
+        let device = create_local_device(&store, 8);
+        let commit = device.write_at(3 * 4096, &repeated_blocks(3, 9)).unwrap();
+
+        let groups = store
+            .metadata()
+            .commit_groups_for_seq(commit.commit_seq)
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].updates.len(), 2);
+
+        let roots = store
+            .metadata()
+            .get_head(device.device_id())
+            .unwrap()
+            .shard_roots;
+        let mut referenced_segments = Vec::new();
+        for root in roots {
+            let node = store.metadata().get_metadata_node(root).unwrap();
+            let MetadataNodeKind::Leaf { entries } = node.kind else {
+                panic!("phase 6 roots should be leaves");
+            };
+            for entry in entries {
+                referenced_segments.push(entry.segment_id);
+                assert!(store.segment_store().is_synced(entry.segment_id).unwrap());
+                assert_eq!(
+                    store.segment_catalog().state(entry.segment_id).unwrap(),
+                    SegmentLifecycleState::Referenced
+                );
+            }
+        }
+        assert_eq!(referenced_segments.len(), 2);
+        let first_intent = store
+            .segment_catalog()
+            .intent_for_segment(referenced_segments[0])
+            .unwrap()
+            .write_intent;
+        let second_intent = store
+            .segment_catalog()
+            .intent_for_segment(referenced_segments[1])
+            .unwrap()
+            .write_intent;
+        assert_eq!(first_intent, second_intent);
+    }
+
+    #[test]
+    fn discard_removes_mapping_and_write_zeroes_reads_as_zeroes() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 8);
+        device.write_at(0, &repeated_blocks(8, 8)).unwrap();
+        device.discard(2 * 4096, 2 * 4096).unwrap();
+        device.write_zeroes(5 * 4096, 4096).unwrap();
+
+        let mut actual = vec![0; 8 * 4096];
+        device.read_at(0, &mut actual).unwrap();
+        assert_eq!(&actual[0..2 * 4096], repeated_blocks(2, 8).as_slice());
+        assert_eq!(&actual[2 * 4096..4 * 4096], vec![0; 2 * 4096].as_slice());
+        assert_eq!(&actual[4 * 4096..5 * 4096], vec![8; 4096].as_slice());
+        assert_eq!(&actual[5 * 4096..6 * 4096], vec![0; 4096].as_slice());
+        assert_eq!(
+            &actual[6 * 4096..8 * 4096],
+            repeated_blocks(2, 8).as_slice()
+        );
+    }
+
+    #[test]
+    fn failed_publish_after_durable_segment_write_leaves_old_roots_and_orphan() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let head = store.metadata().create_device(device_request()).unwrap();
+        let reservation = store
+            .write_segment_for_owner(
+                MappingOwner::BlockDevice(head.device_id),
+                &repeated_blocks(1, 9),
+            )
+            .unwrap();
+        let old_root = store
+            .metadata()
+            .get_metadata_node(head.shard_roots[0])
+            .unwrap();
+        let node = store
+            .metadata()
+            .allocate_metadata_node(
+                old_root.covered_range,
+                MetadataNodeKind::Leaf {
+                    entries: vec![LeafEntry {
+                        logical_start: old_root.covered_range.start,
+                        blocks: BlockCount::from_raw(1),
+                        segment_id: reservation.segment_id,
+                        segment_offset: BlockIndex::from_raw(0),
+                    }],
+                },
+            )
+            .unwrap();
+        store
+            .metadata()
+            .persist_metadata_node(node.clone())
+            .unwrap();
+
+        let failed = store.metadata().publish_commit_group(CommitGroupIntent {
+            owner: MappingOwner::BlockDevice(head.device_id),
+            fence: MetadataFence::DeviceGeneration(DeviceGeneration::from_raw(99)),
+            updates: vec![RootUpdate::BlockShard(ShardRootUpdate {
+                shard_id: ShardId::from_raw(0),
+                old_root: head.shard_roots[0],
+                new_root: node.node_id,
+            })],
+        });
+
+        assert!(failed.is_err());
+        assert_eq!(store.metadata().get_head(head.device_id).unwrap(), head);
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(reservation.segment_id)
+                .unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+        let mut buf = vec![1; 4096];
+        store
+            .read_device(head.device_id, ByteRange::new(0, 4096), &mut buf)
+            .unwrap();
+        assert_eq!(buf, vec![0; 4096]);
+    }
+
+    #[test]
+    fn native_append_valid_stale_and_stolen_leases_are_deterministic() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalNativeServer::new(store.clone()));
+        let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
+        let file_id = client
+            .create_file(CreateFileRequest {
+                spec: FileSpec { name: None },
+            })
+            .unwrap();
+        let file = client.open_file(file_id).unwrap();
+
+        let first = file.acquire_append().unwrap();
+        let stolen = file.acquire_append().unwrap();
+        let stolen_intent = WriteIntentId::from_raw(stolen.lease_id.raw());
+        assert!(
+            file.append_with_lease(first, &repeated_blocks(1, 1))
+                .is_err()
+        );
+
+        let commit = file
+            .append_with_lease(stolen.clone(), &repeated_blocks(2, 2))
+            .unwrap();
+        assert_eq!(commit.version, FileVersion::from_raw(1));
+        assert_eq!(commit.range, ByteRange::new(0, 2 * 4096));
+        assert!(
+            file.append_with_lease(stolen, &repeated_blocks(1, 3))
+                .is_err()
+        );
+
+        let mut actual = vec![0; 2 * 4096];
+        file.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, repeated_blocks(2, 2));
+
+        let head = store.metadata().get_file_head(file_id).unwrap();
+        let root = store.metadata().get_metadata_node(head.root).unwrap();
+        let MetadataNodeKind::Leaf { entries } = root.kind else {
+            panic!("phase 6 native file root should remain a leaf");
+        };
+        assert_eq!(entries.len(), 1);
+        let intent = store
+            .segment_catalog()
+            .intent_for_segment(entries[0].segment_id)
+            .unwrap();
+        assert_eq!(intent.write_intent, stolen_intent);
+    }
+
+    #[test]
+    fn native_append_publish_failure_leaves_file_version_and_orphan_unchanged() {
+        let store = LocalObjectStore::with_config(LocalStoreConfig {
+            file_root_blocks: 1,
+            ..config()
+        })
+        .unwrap();
+        let server = Arc::new(LocalNativeServer::new(store.clone()));
+        let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
+        let file_id = client
+            .create_file(CreateFileRequest {
+                spec: FileSpec { name: None },
+            })
+            .unwrap();
+        let file = client.open_file(file_id).unwrap();
+        let lease = file.acquire_append().unwrap();
+
+        let failed = file.append_with_lease(lease, &repeated_blocks(2, 4));
+        assert!(failed.is_err());
+        let info = file.info().unwrap();
+        assert_eq!(info.version, FileVersion::from_raw(0));
+        assert_eq!(info.size, 0);
+
+        let reservation = SegmentId::from_raw(1);
+        assert_eq!(
+            store.segment_catalog().state(reservation).unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+    }
+
+    #[test]
     fn deterministic_simulation_checks_roots_after_create_and_read() {
         fn run(seed: u64) -> (Vec<String>, Vec<u8>) {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
@@ -2290,5 +3256,24 @@ mod tests {
         };
 
         assert!(node.validate(&[commit.descriptor]).is_ok());
+    }
+
+    fn create_local_device(store: &LocalObjectStore, logical_blocks: u64) -> LocalBlockDevice {
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let device_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        client.open_device(device_id).unwrap()
+    }
+
+    fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {
+        vec![byte; blocks as usize * 4096]
     }
 }

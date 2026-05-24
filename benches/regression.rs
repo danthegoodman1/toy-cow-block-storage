@@ -1,4 +1,4 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId};
@@ -182,6 +182,68 @@ fn bench_local_empty_device_read(c: &mut Criterion) {
     });
 }
 
+fn bench_local_single_shard_write(c: &mut Criterion) {
+    c.bench_function("local_single_shard_write", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::new();
+                let head = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                (store, head.device_id, vec![3; 4096])
+            },
+            |(store, device_id, bytes)| {
+                store
+                    .write_device(
+                        black_box(device_id),
+                        black_box(0),
+                        black_box(&bytes),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+fn bench_local_native_append(c: &mut Criterion) {
+    c.bench_function("local_native_append", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::new();
+                let head = store
+                    .metadata()
+                    .create_file(toy_cow_block_storage::provider::MetadataCreateFileRequest {
+                        request: toy_cow_block_storage::CreateFileRequest {
+                            spec: toy_cow_block_storage::FileSpec { name: None },
+                        },
+                    })
+                    .unwrap();
+                let lease = store.acquire_append_lease(head.file_id).unwrap();
+                (store, lease, vec![4; 4096])
+            },
+            |(store, lease, bytes)| {
+                store
+                    .append_file(
+                        black_box(lease),
+                        black_box(&bytes),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_native_append_validation(c: &mut Criterion) {
     let file_id = FileId::from_raw(9);
     let request = NativeRequest::Append {
@@ -204,6 +266,6 @@ fn bench_native_append_validation(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_single_shard_write, bench_local_native_append, bench_seeded_rng
 }
 criterion_main!(regression);
