@@ -278,26 +278,26 @@ Exit gate:
 
 ## Phase 7: Metadata Tree Shape
 
-Status: not started.
+Status: complete.
 
 Generalize beyond a single leaf while keeping the tree deterministic.
 
 Deliverables:
 
-- [ ] Fixed fanout or bounded leaf-capacity policy.
-- [ ] Deterministic node split behavior.
-- [ ] Internal node lookup and path-copy logic.
-- [ ] Tree validation utilities.
-- [ ] Small debug renderer for failing traces.
+- [x] Fixed fanout or bounded leaf-capacity policy.
+- [x] Deterministic node split behavior.
+- [x] Internal node lookup and path-copy logic.
+- [x] Tree validation utilities.
+- [x] Small debug renderer for failing traces.
 
 Exit gate:
 
-- [ ] Tree shape is deterministic for a given write trace.
-- [ ] Internal child ranges cover the parent range without overlap.
-- [ ] Root-to-leaf path copy changes only the necessary nodes.
-- [ ] Generated tests compare block tree reads and native file extent reads
+- [x] Tree shape is deterministic for a given write trace.
+- [x] Internal child ranges cover the parent range without overlap.
+- [x] Root-to-leaf path copy changes only the necessary nodes.
+- [x] Generated tests compare block tree reads and native file extent reads
   against simple map models.
-- [ ] Criterion covers write cost versus tree depth.
+- [x] Criterion covers write cost versus tree depth.
 
 ## Phase 8: Forks
 

@@ -346,6 +346,7 @@ fn validate_child_ranges(covered_range: BlockRange, children: &[MetadataChild]) 
     }
 
     let mut previous: Option<BlockRange> = None;
+    let mut next_expected_start = covered_range.start.raw();
 
     for child in children {
         child.range.validate_non_empty()?;
@@ -363,14 +364,32 @@ fn validate_child_ranges(covered_range: BlockRange, children: &[MetadataChild]) 
                 ));
             }
 
-            if child.range.start.raw() < previous.end_exclusive()?.raw() {
+            let previous_end = previous.end_exclusive()?.raw();
+            if child.range.start.raw() < previous_end {
                 return Err(StorageError::invalid_argument(
                     "metadata child ranges must not overlap",
                 ));
             }
+
+            if child.range.start.raw() > previous_end {
+                return Err(StorageError::invalid_argument(
+                    "metadata child ranges must cover the parent without gaps",
+                ));
+            }
+        } else if child.range.start.raw() != next_expected_start {
+            return Err(StorageError::invalid_argument(
+                "first metadata child must start at the parent start",
+            ));
         }
 
+        next_expected_start = child.range.end_exclusive()?.raw();
         previous = Some(child.range);
+    }
+
+    if next_expected_start != covered_range.end_exclusive()?.raw() {
+        return Err(StorageError::invalid_argument(
+            "metadata child ranges must end at the parent end",
+        ));
     }
 
     Ok(())
@@ -651,11 +670,11 @@ mod tests {
             kind: MetadataNodeKind::Internal {
                 children: vec![
                     MetadataChild {
-                        range: range(0, 10),
+                        range: range(0, 50),
                         node_id: MetadataNodeId::from_raw(2),
                     },
                     MetadataChild {
-                        range: range(10, 10),
+                        range: range(50, 50),
                         node_id: MetadataNodeId::from_raw(3),
                     },
                 ],
@@ -675,11 +694,11 @@ mod tests {
             kind: MetadataNodeKind::Internal {
                 children: vec![
                     MetadataChild {
-                        range: range(0, 10),
+                        range: range(0, 60),
                         node_id: MetadataNodeId::from_raw(2),
                     },
                     MetadataChild {
-                        range: range(5, 10),
+                        range: range(50, 50),
                         node_id: MetadataNodeId::from_raw(3),
                     },
                 ],
@@ -687,6 +706,23 @@ mod tests {
             ..valid.clone()
         };
         assert!(overlapping.validate(&[]).is_err());
+
+        let gap = MetadataNode {
+            kind: MetadataNodeKind::Internal {
+                children: vec![
+                    MetadataChild {
+                        range: range(0, 10),
+                        node_id: MetadataNodeId::from_raw(2),
+                    },
+                    MetadataChild {
+                        range: range(20, 80),
+                        node_id: MetadataNodeId::from_raw(3),
+                    },
+                ],
+            },
+            ..valid.clone()
+        };
+        assert!(gap.validate(&[]).is_err());
 
         let out_of_bounds = MetadataNode {
             kind: MetadataNodeKind::Internal {

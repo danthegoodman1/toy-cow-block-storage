@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::api::{
@@ -18,8 +19,8 @@ use crate::id::{
     RequestId, SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CommitGroup, DeviceHead, FileHead, LeafEntry, MappingOwner, MetadataNode,
-    MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardRootUpdate,
+    Checkpoint, CommitGroup, DeviceHead, FileHead, LeafEntry, MappingOwner, MetadataChild,
+    MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
@@ -33,6 +34,8 @@ pub struct LocalStoreConfig {
     pub shard_count: usize,
     pub block_size: u32,
     pub file_root_blocks: u64,
+    pub metadata_fanout: usize,
+    pub metadata_leaf_blocks: u64,
     pub storage_node: StorageNodeId,
 }
 
@@ -42,6 +45,8 @@ impl Default for LocalStoreConfig {
             shard_count: 1,
             block_size: 4096,
             file_root_blocks: 1,
+            metadata_fanout: 4,
+            metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(1),
         }
     }
@@ -70,6 +75,18 @@ impl LocalStoreConfig {
         if self.file_root_blocks == 0 {
             return Err(StorageError::invalid_argument(
                 "file_root_blocks must be greater than zero",
+            ));
+        }
+
+        if self.metadata_fanout < 2 {
+            return Err(StorageError::invalid_argument(
+                "metadata_fanout must be at least two",
+            ));
+        }
+
+        if self.metadata_leaf_blocks == 0 {
+            return Err(StorageError::invalid_argument(
+                "metadata_leaf_blocks must be greater than zero",
             ));
         }
 
@@ -174,30 +191,18 @@ impl LocalObjectStore {
                 self.write_segment_for_owner_with_intent(owner, write_intent, chunk_bytes)?;
             segment_ids.push(reservation.segment_id);
 
-            let old_root = self.metadata.get_metadata_node(chunk.old_root)?;
-            let new_entries = replace_leaf_entries(
-                &old_root,
-                chunk.range,
-                Some(LeafEntry {
-                    logical_start: chunk.range.start,
-                    blocks: chunk.range.blocks,
+            let edit = TreeRangeEdit {
+                range: chunk.range,
+                replacement: Some(SegmentReplacement {
                     segment_id: reservation.segment_id,
-                    segment_offset: BlockIndex::from_raw(0),
+                    segment_base: chunk.range.start,
                 }),
-            )?;
-            let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
-            let new_node = self.metadata.allocate_metadata_node(
-                old_root.covered_range,
-                MetadataNodeKind::Leaf {
-                    entries: new_entries,
-                },
-            )?;
-            new_node.validate(&segment_descriptors)?;
-            self.metadata.persist_metadata_node(new_node.clone())?;
+            };
+            let new_root = self.replace_tree_range(chunk.old_root, edit)?.root;
             updates.push(RootUpdate::BlockShard(ShardRootUpdate {
                 shard_id: chunk.shard_id,
                 old_root: chunk.old_root,
-                new_root: new_node.node_id,
+                new_root,
             }));
         }
 
@@ -255,22 +260,27 @@ impl LocalObjectStore {
         let mut updates = Vec::with_capacity(chunks.len());
 
         for chunk in chunks {
-            let old_root = self.metadata.get_metadata_node(chunk.old_root)?;
-            let new_entries = replace_leaf_entries(&old_root, chunk.range, None)?;
-            let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
-            let new_node = self.metadata.allocate_metadata_node(
-                old_root.covered_range,
-                MetadataNodeKind::Leaf {
-                    entries: new_entries,
-                },
-            )?;
-            new_node.validate(&segment_descriptors)?;
-            self.metadata.persist_metadata_node(new_node.clone())?;
-            updates.push(RootUpdate::BlockShard(ShardRootUpdate {
-                shard_id: chunk.shard_id,
-                old_root: chunk.old_root,
-                new_root: new_node.node_id,
-            }));
+            let edit = TreeRangeEdit {
+                range: chunk.range,
+                replacement: None,
+            };
+            let edit_result = self.replace_tree_range(chunk.old_root, edit)?;
+            if edit_result.changed {
+                updates.push(RootUpdate::BlockShard(ShardRootUpdate {
+                    shard_id: chunk.shard_id,
+                    old_root: chunk.old_root,
+                    new_root: edit_result.root,
+                }));
+            }
+        }
+
+        if updates.is_empty() {
+            return Ok(WriteCommit {
+                device_id,
+                commit_seq: info.latest_commit,
+                range,
+                durability: crate::api::WriteDurability::Acknowledged,
+            });
         }
 
         let current = self.metadata.get_head(device_id)?;
@@ -324,7 +334,6 @@ impl LocalObjectStore {
             WriteIntentId::from_raw(lease.lease_id.raw()),
             data,
         )?;
-        let old_root = self.metadata.get_metadata_node(head.root)?;
         let block_size = u64::from(self.metadata.config.block_size);
         let append_range = crate::api::BlockRange::new(
             BlockIndex::from_raw(head.size / block_size),
@@ -334,24 +343,19 @@ impl LocalObjectStore {
             .size
             .checked_add(data_len)
             .ok_or_else(|| StorageError::invalid_argument("file size overflows u64"))?;
-        let new_entries = append_leaf_entry(
-            &old_root,
-            LeafEntry {
-                logical_start: append_range.start,
-                blocks: append_range.blocks,
+        let edit = TreeRangeEdit {
+            range: append_range,
+            replacement: Some(SegmentReplacement {
                 segment_id: reservation.segment_id,
-                segment_offset: BlockIndex::from_raw(0),
-            },
-        )?;
-        let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
-        let new_node = self.metadata.allocate_metadata_node(
-            old_root.covered_range,
-            MetadataNodeKind::Leaf {
-                entries: new_entries,
-            },
-        )?;
-        new_node.validate(&segment_descriptors)?;
-        self.metadata.persist_metadata_node(new_node.clone())?;
+                segment_base: append_range.start,
+            }),
+        };
+        if self.tree_has_mappings(head.root, append_range)? {
+            return Err(StorageError::conflict(
+                "append range overlaps existing file metadata",
+            ));
+        }
+        let new_root = self.replace_tree_range(head.root, edit)?.root;
 
         self.metadata.publish_commit_group(CommitGroupIntent {
             owner,
@@ -361,7 +365,7 @@ impl LocalObjectStore {
             },
             updates: vec![RootUpdate::FileRoot {
                 old_root: head.root,
-                new_root: new_node.node_id,
+                new_root,
                 new_size,
             }],
         })?;
@@ -480,10 +484,293 @@ impl LocalObjectStore {
         Ok(id)
     }
 
+    fn replace_tree_range(
+        &self,
+        root_id: MetadataNodeId,
+        edit: TreeRangeEdit,
+    ) -> Result<TreeEditResult> {
+        edit.range.validate_non_empty()?;
+        let root = self.metadata.get_metadata_node(root_id)?;
+        if !root.covered_range.contains_range(edit.range)? {
+            return Err(StorageError::invalid_argument(
+                "edit range is outside metadata tree coverage",
+            ));
+        }
+        self.replace_tree_range_at(&root, edit)
+    }
+
+    fn replace_tree_range_at(
+        &self,
+        node: &MetadataNode,
+        edit: TreeRangeEdit,
+    ) -> Result<TreeEditResult> {
+        if !node.covered_range.overlaps(edit.range)? {
+            return Ok(TreeEditResult {
+                root: node.node_id,
+                changed: false,
+            });
+        }
+
+        match &node.kind {
+            MetadataNodeKind::Leaf { entries } => {
+                let Some(overlap) = node.covered_range.intersection(edit.range)? else {
+                    return Ok(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    });
+                };
+                let replacement = edit.replacement.map(|replacement| {
+                    let offset = overlap.start.raw() - replacement.segment_base.raw();
+                    LeafEntry {
+                        logical_start: overlap.start,
+                        blocks: overlap.blocks,
+                        segment_id: replacement.segment_id,
+                        segment_offset: BlockIndex::from_raw(offset),
+                    }
+                });
+                let new_entries =
+                    replace_leaf_entries(entries, node.covered_range, overlap, replacement)?;
+                if new_entries == *entries {
+                    return Ok(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    });
+                }
+                let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
+                let new_node = self.metadata.allocate_metadata_node(
+                    node.covered_range,
+                    MetadataNodeKind::Leaf {
+                        entries: new_entries,
+                    },
+                )?;
+                new_node.validate(&segment_descriptors)?;
+                self.metadata.persist_metadata_node(new_node.clone())?;
+                Ok(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                })
+            }
+            MetadataNodeKind::Internal { children } => {
+                let mut changed = false;
+                let mut new_children = Vec::with_capacity(children.len());
+                for child in children {
+                    if child.range.overlaps(edit.range)? {
+                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                        let child_result = self.replace_tree_range_at(&child_node, edit)?;
+                        changed |= child_result.changed;
+                        new_children.push(MetadataChild {
+                            range: child.range,
+                            node_id: child_result.root,
+                        });
+                    } else {
+                        new_children.push(child.clone());
+                    }
+                }
+
+                if !changed {
+                    return Ok(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    });
+                }
+
+                let new_node = self.metadata.allocate_metadata_node(
+                    node.covered_range,
+                    MetadataNodeKind::Internal {
+                        children: new_children,
+                    },
+                )?;
+                new_node.validate(&[])?;
+                self.metadata.persist_metadata_node(new_node.clone())?;
+                Ok(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                })
+            }
+        }
+    }
+
+    fn tree_has_mappings(
+        &self,
+        root_id: MetadataNodeId,
+        range: crate::api::BlockRange,
+    ) -> Result<bool> {
+        range.validate_non_empty()?;
+        let node = self.metadata.get_metadata_node(root_id)?;
+        self.node_has_mappings(&node, range)
+    }
+
+    fn node_has_mappings(
+        &self,
+        node: &MetadataNode,
+        range: crate::api::BlockRange,
+    ) -> Result<bool> {
+        if !node.covered_range.overlaps(range)? {
+            return Ok(false);
+        }
+
+        match &node.kind {
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    if child.range.overlaps(range)? {
+                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                        if self.node_has_mappings(&child_node, range)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            }
+            MetadataNodeKind::Leaf { entries } => {
+                for entry in entries {
+                    if entry.logical_range().overlaps(range)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    pub fn validate_metadata_tree(&self, root_id: MetadataNodeId) -> Result<MetadataTreeStats> {
+        let mut visited = BTreeSet::new();
+        self.validate_metadata_tree_at(root_id, 1, &mut visited)
+    }
+
+    fn validate_metadata_tree_at(
+        &self,
+        node_id: MetadataNodeId,
+        depth: usize,
+        visited: &mut BTreeSet<MetadataNodeId>,
+    ) -> Result<MetadataTreeStats> {
+        if !visited.insert(node_id) {
+            return Err(StorageError::corrupt(
+                "metadata tree contains a repeated node ID",
+            ));
+        }
+
+        let node = self.metadata.get_metadata_node(node_id)?;
+        match &node.kind {
+            MetadataNodeKind::Leaf { entries } => {
+                if node.covered_range.blocks.raw() > self.metadata.config.metadata_leaf_blocks {
+                    return Err(StorageError::corrupt(
+                        "metadata leaf exceeds configured leaf block span",
+                    ));
+                }
+                let descriptors = self.descriptors_for_entries(entries)?;
+                node.validate(&descriptors)?;
+                Ok(MetadataTreeStats {
+                    nodes: 1,
+                    leaves: 1,
+                    max_depth: depth,
+                })
+            }
+            MetadataNodeKind::Internal { children } => {
+                if children.len() > self.metadata.config.metadata_fanout {
+                    return Err(StorageError::corrupt(
+                        "metadata internal node exceeds configured fanout",
+                    ));
+                }
+                node.validate(&[])?;
+                let mut stats = MetadataTreeStats {
+                    nodes: 1,
+                    leaves: 0,
+                    max_depth: depth,
+                };
+                for child in children {
+                    let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                    if child_node.covered_range != child.range {
+                        return Err(StorageError::corrupt(
+                            "metadata child range does not match child node coverage",
+                        ));
+                    }
+                    let child_stats =
+                        self.validate_metadata_tree_at(child.node_id, depth + 1, visited)?;
+                    stats.nodes += child_stats.nodes;
+                    stats.leaves += child_stats.leaves;
+                    stats.max_depth = stats.max_depth.max(child_stats.max_depth);
+                }
+                Ok(stats)
+            }
+        }
+    }
+
+    pub fn metadata_tree_node_ids(&self, root_id: MetadataNodeId) -> Result<Vec<MetadataNodeId>> {
+        let mut out = Vec::new();
+        self.collect_metadata_tree_node_ids(root_id, &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_metadata_tree_node_ids(
+        &self,
+        node_id: MetadataNodeId,
+        out: &mut Vec<MetadataNodeId>,
+    ) -> Result<()> {
+        out.push(node_id);
+        let node = self.metadata.get_metadata_node(node_id)?;
+        if let MetadataNodeKind::Internal { children } = node.kind {
+            for child in children {
+                self.collect_metadata_tree_node_ids(child.node_id, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn render_metadata_tree(&self, root_id: MetadataNodeId) -> Result<String> {
+        let mut out = String::new();
+        self.render_metadata_tree_at(root_id, 0, &mut out)?;
+        Ok(out)
+    }
+
+    fn render_metadata_tree_at(
+        &self,
+        node_id: MetadataNodeId,
+        depth: usize,
+        out: &mut String,
+    ) -> Result<()> {
+        let node = self.metadata.get_metadata_node(node_id)?;
+        let indent = "  ".repeat(depth);
+        match node.kind {
+            MetadataNodeKind::Internal { children } => {
+                out.push_str(&format!(
+                    "{indent}node {} internal [{}..{}) children={}\n",
+                    node.node_id,
+                    node.covered_range.start.raw(),
+                    node.covered_range.end_exclusive()?.raw(),
+                    children.len()
+                ));
+                for child in children {
+                    self.render_metadata_tree_at(child.node_id, depth + 1, out)?;
+                }
+            }
+            MetadataNodeKind::Leaf { entries } => {
+                out.push_str(&format!(
+                    "{indent}node {} leaf [{}..{}) entries={}\n",
+                    node.node_id,
+                    node.covered_range.start.raw(),
+                    node.covered_range.end_exclusive()?.raw(),
+                    entries.len()
+                ));
+                for entry in entries {
+                    out.push_str(&format!(
+                        "{indent}  [{}..{}) -> segment {}@{}\n",
+                        entry.logical_start.raw(),
+                        entry.logical_range().end_exclusive()?.raw(),
+                        entry.segment_id,
+                        entry.segment_offset.raw()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
         let info = self.metadata.device_info(device_id)?;
         range.validate_for_device(&info.spec)?;
-        if buf.len() as u64 != range.len {
+        let buf_len = u64::try_from(buf.len())
+            .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
+        if buf_len != range.len {
             return Err(StorageError::invalid_argument(
                 "read buffer length must match range length",
             ));
@@ -513,7 +800,9 @@ impl LocalObjectStore {
 
     pub fn read_file(&self, file_id: FileId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
         let head = self.metadata.get_file_head(file_id)?;
-        if buf.len() as u64 != range.len {
+        let buf_len = u64::try_from(buf.len())
+            .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
+        if buf_len != range.len {
             return Err(StorageError::invalid_argument(
                 "read buffer length must match range length",
             ));
@@ -568,20 +857,48 @@ impl LocalObjectStore {
                     let Some(overlap) = entry.logical_range().intersection(requested)? else {
                         continue;
                     };
-                    let segment_offset_blocks = entry.segment_offset.raw() + overlap.start.raw()
-                        - entry.logical_start.raw();
+                    let segment_offset_blocks = entry
+                        .segment_offset
+                        .raw()
+                        .checked_add(overlap.start.raw() - entry.logical_start.raw())
+                        .ok_or_else(|| {
+                            StorageError::invalid_argument("segment read offset overflows")
+                        })?;
                     let segment_range = ByteRange::new(
-                        segment_offset_blocks * block_size,
-                        overlap.blocks.raw() * block_size,
+                        segment_offset_blocks
+                            .checked_mul(block_size)
+                            .ok_or_else(|| {
+                                StorageError::invalid_argument("segment byte offset overflows")
+                            })?,
+                        overlap
+                            .blocks
+                            .raw()
+                            .checked_mul(block_size)
+                            .ok_or_else(|| {
+                                StorageError::invalid_argument("segment byte length overflows")
+                            })?,
                     );
-                    let output_offset =
-                        ((overlap.start.raw() - requested.start.raw()) * block_size) as usize;
-                    let output_len = segment_range.len as usize;
-                    self.segment_store.read_segment(
-                        entry.segment_id,
-                        segment_range,
-                        &mut buf[output_offset..output_offset + output_len],
-                    )?;
+                    let output_offset = usize::try_from(
+                        (overlap.start.raw() - requested.start.raw())
+                            .checked_mul(block_size)
+                            .ok_or_else(|| {
+                                StorageError::invalid_argument("read output offset overflows")
+                            })?,
+                    )
+                    .map_err(|_| {
+                        StorageError::invalid_argument("read output offset overflows usize")
+                    })?;
+                    let output_len = usize::try_from(segment_range.len).map_err(|_| {
+                        StorageError::invalid_argument("read output length overflows usize")
+                    })?;
+                    let output_end = output_offset.checked_add(output_len).ok_or_else(|| {
+                        StorageError::invalid_argument("read output end overflows")
+                    })?;
+                    let output = buf.get_mut(output_offset..output_end).ok_or_else(|| {
+                        StorageError::corrupt("metadata read output range exceeds buffer")
+                    })?;
+                    self.segment_store
+                        .read_segment(entry.segment_id, segment_range, output)?;
                 }
                 Ok(())
             }
@@ -600,6 +917,31 @@ struct DeviceWriteChunk {
     shard_id: crate::id::ShardId,
     old_root: MetadataNodeId,
     range: crate::api::BlockRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentReplacement {
+    segment_id: SegmentId,
+    segment_base: BlockIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TreeRangeEdit {
+    range: crate::api::BlockRange,
+    replacement: Option<SegmentReplacement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TreeEditResult {
+    root: MetadataNodeId,
+    changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataTreeStats {
+    pub nodes: usize,
+    pub leaves: usize,
+    pub max_depth: usize,
 }
 
 #[derive(Debug)]
@@ -784,16 +1126,72 @@ impl InMemoryMetadataPlane {
         }
     }
 
-    fn create_empty_leaf(inner: &mut MetadataInner, range: crate::api::BlockRange) -> MetadataNode {
+    fn create_empty_tree(
+        inner: &mut MetadataInner,
+        config: LocalStoreConfig,
+        range: crate::api::BlockRange,
+    ) -> Result<MetadataNode> {
+        range.validate_non_empty()?;
+        if range.blocks.raw() <= config.metadata_leaf_blocks {
+            let node = MetadataNode {
+                node_id: inner.alloc_metadata_node_id(),
+                covered_range: range,
+                kind: MetadataNodeKind::Leaf {
+                    entries: Vec::new(),
+                },
+            };
+            node.validate(&[])?;
+            inner.metadata_nodes.insert(node.node_id, node.clone());
+            return Ok(node);
+        }
+
+        let child_count = config
+            .metadata_fanout
+            .min(usize::try_from(range.blocks.raw()).map_err(|_| {
+                StorageError::invalid_argument("metadata range block count overflows usize")
+            })?);
+        let range_start = range.start.raw();
+        let range_blocks = range.blocks.raw();
+        let child_count_u64 = u64::try_from(child_count)
+            .map_err(|_| StorageError::invalid_argument("metadata fanout overflows u64"))?;
+        let mut children = Vec::with_capacity(child_count);
+
+        for child_index in 0..child_count {
+            let child_index_u64 = u64::try_from(child_index)
+                .map_err(|_| StorageError::invalid_argument("child index overflows u64"))?;
+            let next_child_index_u64 = u64::try_from(child_index + 1)
+                .map_err(|_| StorageError::invalid_argument("child index overflows u64"))?;
+            let child_start_offset = range_blocks
+                .checked_mul(child_index_u64)
+                .ok_or_else(|| StorageError::invalid_argument("child range start overflows"))?
+                / child_count_u64;
+            let child_end_offset = range_blocks
+                .checked_mul(next_child_index_u64)
+                .ok_or_else(|| StorageError::invalid_argument("child range end overflows"))?
+                / child_count_u64;
+            let child_start = range_start
+                .checked_add(child_start_offset)
+                .ok_or_else(|| StorageError::invalid_argument("child range start overflows"))?;
+            let child_blocks = child_end_offset - child_start_offset;
+            let child_range = crate::api::BlockRange::new(
+                BlockIndex::from_raw(child_start),
+                BlockCount::from_raw(child_blocks),
+            );
+            let child = Self::create_empty_tree(inner, config, child_range)?;
+            children.push(MetadataChild {
+                range: child_range,
+                node_id: child.node_id,
+            });
+        }
+
         let node = MetadataNode {
             node_id: inner.alloc_metadata_node_id(),
             covered_range: range,
-            kind: MetadataNodeKind::Leaf {
-                entries: Vec::new(),
-            },
+            kind: MetadataNodeKind::Internal { children },
         };
+        node.validate(&[])?;
         inner.metadata_nodes.insert(node.node_id, node.clone());
-        node
+        Ok(node)
     }
 
     fn next_generation(generation: DeviceGeneration) -> Result<DeviceGeneration> {
@@ -818,7 +1216,9 @@ impl MetadataPlane for InMemoryMetadataPlane {
         self.config.validate()?;
         request.spec.validate()?;
 
-        if request.spec.logical_blocks < self.config.shard_count as u64 {
+        let shard_count = u64::try_from(self.config.shard_count)
+            .map_err(|_| StorageError::invalid_argument("shard_count overflows u64"))?;
+        if request.spec.logical_blocks < shard_count {
             return Err(StorageError::invalid_argument(
                 "logical_blocks must be at least shard_count",
             ));
@@ -829,16 +1229,28 @@ impl MetadataPlane for InMemoryMetadataPlane {
         let mut shard_roots = Vec::with_capacity(self.config.shard_count);
 
         for shard in 0..self.config.shard_count {
-            let start = request.spec.logical_blocks * shard as u64 / self.config.shard_count as u64;
-            let end =
-                request.spec.logical_blocks * (shard as u64 + 1) / self.config.shard_count as u64;
-            let node = Self::create_empty_leaf(
+            let shard = u64::try_from(shard)
+                .map_err(|_| StorageError::invalid_argument("shard index overflows u64"))?;
+            let start = request
+                .spec
+                .logical_blocks
+                .checked_mul(shard)
+                .ok_or_else(|| StorageError::invalid_argument("shard start overflows"))?
+                / shard_count;
+            let end = request
+                .spec
+                .logical_blocks
+                .checked_mul(shard + 1)
+                .ok_or_else(|| StorageError::invalid_argument("shard end overflows"))?
+                / shard_count;
+            let node = Self::create_empty_tree(
                 &mut inner,
+                self.config,
                 crate::api::BlockRange::new(
                     BlockIndex::from_raw(start),
                     BlockCount::from_raw(end - start),
                 ),
-            );
+            )?;
             shard_roots.push(node.node_id);
         }
 
@@ -859,13 +1271,14 @@ impl MetadataPlane for InMemoryMetadataPlane {
         self.config.validate()?;
         let mut inner = lock(&self.inner)?;
         let file_id = inner.alloc_file_id();
-        let root = Self::create_empty_leaf(
+        let root = Self::create_empty_tree(
             &mut inner,
+            self.config,
             crate::api::BlockRange::new(
                 BlockIndex::from_raw(0),
                 BlockCount::from_raw(self.config.file_root_blocks),
             ),
-        );
+        )?;
         let head = FileHead {
             file_id,
             version: FileVersion::from_raw(0),
@@ -969,7 +1382,8 @@ impl MetadataPlane for InMemoryMetadataPlane {
                             "block device commit cannot include file-root updates",
                         ));
                     };
-                    let shard = update.shard_id.raw() as usize;
+                    let shard = usize::try_from(update.shard_id.raw())
+                        .map_err(|_| StorageError::invalid_argument("shard ID overflows usize"))?;
                     if shard >= next_roots.len() {
                         return Err(StorageError::invalid_argument(
                             "shard update is outside device root set",
@@ -1245,13 +1659,15 @@ impl SegmentStore for InMemorySegmentStore {
             ));
         }
 
-        if reservation.bytes != bytes.len() as u64 {
+        let bytes_len = u64::try_from(bytes.len())
+            .map_err(|_| StorageError::invalid_argument("segment write length overflows u64"))?;
+        if reservation.bytes != bytes_len {
             return Err(StorageError::invalid_argument(
                 "reservation byte count does not match write length",
             ));
         }
 
-        if bytes.len() as u64 % u64::from(self.config.block_size) != 0 {
+        if bytes_len % u64::from(self.config.block_size) != 0 {
             return Err(StorageError::invalid_argument(
                 "segment write length must be block aligned",
             ));
@@ -1308,20 +1724,30 @@ impl SegmentStore for InMemorySegmentStore {
             return Err(StorageError::unavailable("segment is not synced"));
         }
         let end = range.end_exclusive()?;
-        if end > record.bytes.len() as u64 {
+        let record_len = u64::try_from(record.bytes.len())
+            .map_err(|_| StorageError::invalid_argument("segment byte length overflows u64"))?;
+        if end > record_len {
             return Err(StorageError::invalid_argument(
                 "segment read extends past end of segment",
             ));
         }
-        if buf.len() as u64 != range.len {
+        let buf_len = u64::try_from(buf.len())
+            .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
+        if buf_len != range.len {
             return Err(StorageError::invalid_argument(
                 "read buffer length must match range length",
             ));
         }
 
-        let start = range.offset as usize;
-        let end = end as usize;
-        buf.copy_from_slice(&record.bytes[start..end]);
+        let start = usize::try_from(range.offset)
+            .map_err(|_| StorageError::invalid_argument("segment read offset overflows usize"))?;
+        let end = usize::try_from(end)
+            .map_err(|_| StorageError::invalid_argument("segment read end overflows usize"))?;
+        let source = record
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| StorageError::corrupt("segment read range exceeds segment bytes"))?;
+        buf.copy_from_slice(source);
         Ok(())
     }
 
@@ -2223,21 +2649,17 @@ fn checksum64(bytes: &[u8]) -> u64 {
 }
 
 fn replace_leaf_entries(
-    node: &MetadataNode,
+    entries: &[LeafEntry],
+    covered_range: crate::api::BlockRange,
     replacement_range: crate::api::BlockRange,
     replacement: Option<LeafEntry>,
 ) -> Result<Vec<LeafEntry>> {
     replacement_range.validate_non_empty()?;
-    if !node.covered_range.contains_range(replacement_range)? {
+    if !covered_range.contains_range(replacement_range)? {
         return Err(StorageError::invalid_argument(
             "replacement range is outside leaf coverage",
         ));
     }
-    let MetadataNodeKind::Leaf { entries } = &node.kind else {
-        return Err(StorageError::unsupported(
-            "phase 6 writes require leaf roots; internal tree writes are phase 7",
-        ));
-    };
 
     let mut out = Vec::with_capacity(entries.len() + usize::from(replacement.is_some()));
     let replacement_end = replacement_range.end_exclusive()?.raw();
@@ -2263,11 +2685,16 @@ fn replace_leaf_entries(
 
         if entry_end > replacement_end {
             let skipped_blocks = replacement_end - entry.logical_start.raw();
+            let segment_offset = entry
+                .segment_offset
+                .raw()
+                .checked_add(skipped_blocks)
+                .ok_or_else(|| StorageError::invalid_argument("leaf segment offset overflows"))?;
             out.push(LeafEntry {
                 logical_start: BlockIndex::from_raw(replacement_end),
                 blocks: BlockCount::from_raw(entry_end - replacement_end),
                 segment_id: entry.segment_id,
-                segment_offset: BlockIndex::from_raw(entry.segment_offset.raw() + skipped_blocks),
+                segment_offset: BlockIndex::from_raw(segment_offset),
             });
         }
     }
@@ -2276,30 +2703,28 @@ fn replace_leaf_entries(
         out.push(replacement);
     }
     out.sort_by_key(|entry| entry.logical_start.raw());
-    Ok(out)
+    coalesce_leaf_entries(out)
 }
 
-fn append_leaf_entry(node: &MetadataNode, entry: LeafEntry) -> Result<Vec<LeafEntry>> {
-    let MetadataNodeKind::Leaf { entries } = &node.kind else {
-        return Err(StorageError::unsupported(
-            "phase 6 appends require leaf roots; internal tree appends are phase 7",
-        ));
-    };
-    if !node.covered_range.contains_range(entry.logical_range())? {
-        return Err(StorageError::invalid_argument(
-            "append range is outside file root coverage",
-        ));
+fn coalesce_leaf_entries(entries: Vec<LeafEntry>) -> Result<Vec<LeafEntry>> {
+    let mut out: Vec<LeafEntry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(previous) = out.last_mut()
+            && previous.segment_id == entry.segment_id
+            && previous.logical_range().end_exclusive()? == entry.logical_start
+            && previous.segment_end_exclusive()? == entry.segment_offset
+        {
+            previous.blocks = BlockCount::from_raw(
+                previous
+                    .blocks
+                    .raw()
+                    .checked_add(entry.blocks.raw())
+                    .ok_or_else(|| StorageError::invalid_argument("leaf entry size overflows"))?,
+            );
+            continue;
+        }
+        out.push(entry);
     }
-
-    let mut out = entries.clone();
-    if let Some(last) = out.last()
-        && last.logical_range().end_exclusive()?.raw() > entry.logical_start.raw()
-    {
-        return Err(StorageError::conflict(
-            "append entry overlaps existing file metadata",
-        ));
-    }
-    out.push(entry);
     Ok(out)
 }
 
@@ -2316,7 +2741,18 @@ mod tests {
             shard_count: 2,
             block_size: 4096,
             file_root_blocks: 8,
+            metadata_fanout: 2,
+            metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(77),
+        }
+    }
+
+    fn tree_config() -> LocalStoreConfig {
+        LocalStoreConfig {
+            metadata_fanout: 2,
+            metadata_leaf_blocks: 2,
+            file_root_blocks: 32,
+            ..config()
         }
     }
 
@@ -2871,7 +3307,7 @@ mod tests {
         for root in roots {
             let node = store.metadata().get_metadata_node(root).unwrap();
             let MetadataNodeKind::Leaf { entries } = node.kind else {
-                panic!("phase 6 roots should be leaves");
+                panic!("default test roots should be leaves");
             };
             for entry in entries {
                 referenced_segments.push(entry.segment_id);
@@ -2894,6 +3330,161 @@ mod tests {
             .unwrap()
             .write_intent;
         assert_eq!(first_intent, second_intent);
+    }
+
+    #[test]
+    fn metadata_tree_shape_is_deterministic_for_a_write_trace() {
+        fn run_trace() -> String {
+            let store = LocalObjectStore::with_config(LocalStoreConfig {
+                shard_count: 1,
+                ..tree_config()
+            })
+            .unwrap();
+            let device = create_local_device(&store, 16);
+            for (start, blocks, byte) in [(0, 1, 1), (7, 2, 2), (14, 2, 3), (4, 4, 4)] {
+                device
+                    .write_at(start * 4096, &repeated_blocks(blocks, byte))
+                    .unwrap();
+            }
+            let root = store
+                .metadata()
+                .get_head(device.device_id())
+                .unwrap()
+                .shard_roots[0];
+            let stats = store.validate_metadata_tree(root).unwrap();
+            assert!(stats.max_depth > 1);
+            store.render_metadata_tree(root).unwrap()
+        }
+
+        assert_eq!(run_trace(), run_trace());
+    }
+
+    #[test]
+    fn root_to_leaf_path_copy_changes_only_touched_nodes() {
+        let store = LocalObjectStore::with_config(LocalStoreConfig {
+            shard_count: 1,
+            ..tree_config()
+        })
+        .unwrap();
+        let device = create_local_device(&store, 16);
+        let old_root = store
+            .metadata()
+            .get_head(device.device_id())
+            .unwrap()
+            .shard_roots[0];
+        let old_stats = store.validate_metadata_tree(old_root).unwrap();
+        let old_ids: BTreeSet<_> = store
+            .metadata_tree_node_ids(old_root)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        device.write_at(0, &repeated_blocks(1, 9)).unwrap();
+
+        let new_root = store
+            .metadata()
+            .get_head(device.device_id())
+            .unwrap()
+            .shard_roots[0];
+        let new_stats = store.validate_metadata_tree(new_root).unwrap();
+        assert_eq!(old_stats.nodes, new_stats.nodes);
+        assert_eq!(old_stats.max_depth, new_stats.max_depth);
+        let new_ids: BTreeSet<_> = store
+            .metadata_tree_node_ids(new_root)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let new_only = new_ids.difference(&old_ids).count();
+        let shared = old_ids.intersection(&new_ids).count();
+
+        assert_eq!(new_only, old_stats.max_depth);
+        assert_eq!(shared, old_stats.nodes - old_stats.max_depth);
+    }
+
+    #[test]
+    fn generated_block_tree_reads_match_reference_model() {
+        for seed in 0..16 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let store = LocalObjectStore::with_config(LocalStoreConfig {
+                shard_count: 2,
+                ..tree_config()
+            })
+            .unwrap();
+            let device = create_local_device(&store, 32);
+            let mut model = vec![0u8; 32];
+
+            for step in 0..32 {
+                let start = harness.rng.next_u64() % 32;
+                let max_blocks = (32 - start).min(5);
+                let blocks = 1 + harness.rng.next_u64() % max_blocks;
+                let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                harness.trace.record(format!(
+                    "write step={step} start={start} blocks={blocks} byte={byte}"
+                ));
+                device
+                    .write_at(start * 4096, &repeated_blocks(blocks, byte))
+                    .unwrap();
+                for block in start..start + blocks {
+                    model[block as usize] = byte;
+                }
+
+                let mut actual = vec![0; 32 * 4096];
+                device.read_at(0, &mut actual).unwrap();
+                assert_model_blocks(
+                    &actual,
+                    &model,
+                    seed,
+                    harness.trace.events(),
+                    &render_device_roots(&store, device.device_id()),
+                );
+                validate_device_roots(&store, device.device_id());
+            }
+        }
+    }
+
+    #[test]
+    fn generated_native_tree_reads_match_reference_model() {
+        for seed in 0..16 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let store = LocalObjectStore::with_config(tree_config()).unwrap();
+            let server = Arc::new(LocalNativeServer::new(store.clone()));
+            let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
+            let file_id = client
+                .create_file(CreateFileRequest {
+                    spec: FileSpec { name: None },
+                })
+                .unwrap();
+            let file = client.open_file(file_id).unwrap();
+            let mut model = Vec::new();
+
+            for step in 0..16 {
+                let remaining = 32 - model.len() as u64;
+                if remaining == 0 {
+                    break;
+                }
+                let blocks = 1 + harness.rng.next_u64() % remaining.min(4);
+                let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                harness
+                    .trace
+                    .record(format!("append step={step} blocks={blocks} byte={byte}"));
+                let lease = file.acquire_append().unwrap();
+                file.append_with_lease(lease, &repeated_blocks(blocks, byte))
+                    .unwrap();
+                model.extend(std::iter::repeat_n(byte, blocks as usize));
+
+                let mut actual = vec![0; model.len() * 4096];
+                file.read_at(0, &mut actual).unwrap();
+                let root = store.metadata().get_file_head(file_id).unwrap().root;
+                assert_model_blocks(
+                    &actual,
+                    &model,
+                    seed,
+                    harness.trace.events(),
+                    &store.render_metadata_tree(root).unwrap(),
+                );
+                store.validate_metadata_tree(root).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -3012,7 +3603,7 @@ mod tests {
         let head = store.metadata().get_file_head(file_id).unwrap();
         let root = store.metadata().get_metadata_node(head.root).unwrap();
         let MetadataNodeKind::Leaf { entries } = root.kind else {
-            panic!("phase 6 native file root should remain a leaf");
+            panic!("default test native file root should remain a leaf");
         };
         assert_eq!(entries.len(), 1);
         let intent = store
@@ -3275,5 +3866,36 @@ mod tests {
 
     fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {
         vec![byte; blocks as usize * 4096]
+    }
+
+    fn validate_device_roots(store: &LocalObjectStore, device_id: DeviceId) {
+        let head = store.metadata().get_head(device_id).unwrap();
+        for root in head.shard_roots {
+            store.validate_metadata_tree(root).unwrap();
+        }
+    }
+
+    fn render_device_roots(store: &LocalObjectStore, device_id: DeviceId) -> String {
+        let head = store.metadata().get_head(device_id).unwrap();
+        let mut out = String::new();
+        for (shard, root) in head.shard_roots.iter().enumerate() {
+            out.push_str(&format!("shard {shard}\n"));
+            out.push_str(&store.render_metadata_tree(*root).unwrap());
+        }
+        out
+    }
+
+    fn assert_model_blocks(actual: &[u8], model: &[u8], seed: u64, trace: &[String], tree: &str) {
+        assert_eq!(actual.len(), model.len() * 4096);
+        for (block, expected) in model.iter().copied().enumerate() {
+            let start = block * 4096;
+            let end = start + 4096;
+            if actual[start..end].iter().any(|byte| *byte != expected) {
+                panic!(
+                    "seed {seed} block {block} expected byte {expected}\ntrace:\n{}\ntree:\n{tree}",
+                    trace.join("\n")
+                );
+            }
+        }
     }
 }

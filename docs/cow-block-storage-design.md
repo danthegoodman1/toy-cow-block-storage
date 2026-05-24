@@ -171,6 +171,24 @@ Segment {
 
 A segment slice is valid when `segment_offset + length <= block_count`.
 
+### V1 Metadata Tree Policy
+
+The local v1 metadata tree uses deterministic range partitioning rather than
+adaptive balancing. Each tree has a fixed fanout and a fixed maximum leaf span
+in logical blocks. When an empty device shard or native file root is created,
+the implementation recursively splits the covered range into contiguous child
+ranges until each leaf covers at most the configured leaf span.
+
+Writes do not rebalance the tree. A write walks only the child ranges that
+overlap the edited logical range, copies the changed root-to-leaf paths, and
+reuses untouched child node IDs. This means tree shape is a pure function of
+the configured fanout, leaf span, and root coverage; the written entries inside
+leaves are a pure function of the committed write trace.
+
+Internal child ranges must cover their parent range exactly, in sorted order,
+with no gaps and no overlaps. This invariant makes lookup, validation, PITR
+replay, and GC traversal deterministic.
+
 ## 5. Deterministic Core Boundary
 
 The storage core should be written as a deterministic state machine. It receives
