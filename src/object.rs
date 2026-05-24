@@ -316,6 +316,22 @@ pub struct ForkRecord {
     pub shard_roots: Vec<MetadataNodeId>,
 }
 
+/// Append-only block-device shard-root timeline record.
+///
+/// A multi-shard public write creates one `ShardCommit` per changed shard, all
+/// sharing the same commit sequence and commit-group identity. PITR replay
+/// starts from a checkpoint and applies these records in commit order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardCommit {
+    pub commit_seq: CommitSeq,
+    pub commit_group: CommitGroupId,
+    pub time: LogicalTime,
+    pub device_id: DeviceId,
+    pub shard_id: ShardId,
+    pub old_root: MetadataNodeId,
+    pub new_root: MetadataNodeId,
+}
+
 /// Durable PITR checkpoint.
 ///
 /// Checkpoints summarize owner roots at a commit sequence so restore can replay

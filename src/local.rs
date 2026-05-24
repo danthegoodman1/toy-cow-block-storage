@@ -20,7 +20,8 @@ use crate::id::{
 };
 use crate::object::{
     Checkpoint, CommitGroup, DeviceHead, FileHead, ForkRecord, LeafEntry, MappingOwner,
-    MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardRootUpdate,
+    MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardCommit,
+    ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
@@ -388,6 +389,11 @@ impl LocalObjectStore {
             target: request.target,
             name: request.name,
         })?;
+        Ok(head.device_id)
+    }
+
+    pub fn restore_device(&self, source: DeviceId, point: RestorePoint) -> Result<DeviceId> {
+        let head = self.metadata.restore_device(source, point)?;
         Ok(head.device_id)
     }
 
@@ -968,6 +974,7 @@ struct MetadataInner {
     file_writer_epochs: BTreeMap<FileId, WriterEpoch>,
     metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
+    shard_commits: Vec<ShardCommit>,
     fork_records: BTreeMap<CommitSeq, ForkRecord>,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
 }
@@ -988,6 +995,7 @@ impl MetadataInner {
             file_writer_epochs: BTreeMap::new(),
             metadata_nodes: BTreeMap::new(),
             commit_groups: BTreeMap::new(),
+            shard_commits: Vec::new(),
             fork_records: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
         }
@@ -1040,6 +1048,24 @@ impl MetadataInner {
         let id = CheckpointId::from_raw(self.next_checkpoint_id);
         self.next_checkpoint_id += 1;
         id
+    }
+
+    fn insert_checkpoint(
+        &mut self,
+        owner: MappingOwner,
+        commit_seq: CommitSeq,
+        shard_roots: Vec<MetadataNodeId>,
+    ) -> CheckpointId {
+        let checkpoint_id = self.alloc_checkpoint_id();
+        let checkpoint = Checkpoint {
+            checkpoint_id,
+            commit_seq,
+            time: LogicalTime::from_raw(commit_seq.raw()),
+            owner,
+            shard_roots,
+        };
+        self.checkpoints.insert(checkpoint_id, checkpoint);
+        checkpoint_id
     }
 }
 
@@ -1118,6 +1144,53 @@ impl InMemoryMetadataPlane {
             .get(&commit_seq)
             .cloned()
             .ok_or_else(|| StorageError::not_found("fork_record", commit_seq.to_string()))
+    }
+
+    pub fn shard_commits_for_device(&self, device_id: DeviceId) -> Result<Vec<ShardCommit>> {
+        let inner = lock(&self.inner)?;
+        Ok(Self::shard_commits_for_device_locked(&inner, device_id))
+    }
+
+    pub fn replay_device_roots(
+        &self,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+    ) -> Result<Vec<MetadataNodeId>> {
+        let inner = lock(&self.inner)?;
+        Self::replay_device_roots_locked(&inner, device_id, commit_seq, None)
+    }
+
+    pub fn validate_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()> {
+        let inner = lock(&self.inner)?;
+        let MappingOwner::BlockDevice(device_id) = checkpoint.owner else {
+            return Err(StorageError::unsupported(
+                "phase 9 checkpoint validation supports block-device checkpoints",
+            ));
+        };
+        let replayed = match Self::replay_device_roots_locked(
+            &inner,
+            device_id,
+            checkpoint.commit_seq,
+            Some(checkpoint.checkpoint_id),
+        ) {
+            Ok(replayed) => replayed,
+            Err(_) if checkpoint.commit_seq.raw() == 0 => {
+                Self::validate_checkpoint_root_shape_locked(
+                    &inner,
+                    device_id,
+                    &checkpoint.shard_roots,
+                    self.config.shard_count,
+                )?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if replayed != checkpoint.shard_roots {
+            return Err(StorageError::corrupt(
+                "checkpoint roots do not match replayed timeline",
+            ));
+        }
+        Ok(())
     }
 
     pub fn metadata_node_count(&self) -> Result<usize> {
@@ -1255,6 +1328,160 @@ impl InMemoryMetadataPlane {
             .map(FileVersion::from_raw)
             .ok_or_else(|| StorageError::conflict("file version overflow"))
     }
+
+    fn shard_commits_for_device_locked(
+        inner: &MetadataInner,
+        device_id: DeviceId,
+    ) -> Vec<ShardCommit> {
+        let mut commits: Vec<_> = inner
+            .shard_commits
+            .iter()
+            .filter(|commit| commit.device_id == device_id)
+            .cloned()
+            .collect();
+        commits.sort_by_key(|commit| (commit.commit_seq.raw(), commit.shard_id.raw()));
+        commits
+    }
+
+    fn latest_device_checkpoint_at_or_before_locked(
+        inner: &MetadataInner,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+        excluded_checkpoint: Option<CheckpointId>,
+    ) -> Option<Checkpoint> {
+        inner
+            .checkpoints
+            .values()
+            .filter(|checkpoint| {
+                checkpoint.owner == MappingOwner::BlockDevice(device_id)
+                    && checkpoint.commit_seq.raw() <= commit_seq.raw()
+                    && Some(checkpoint.checkpoint_id) != excluded_checkpoint
+            })
+            .max_by_key(|checkpoint| checkpoint.commit_seq.raw())
+            .cloned()
+    }
+
+    fn replay_device_roots_locked(
+        inner: &MetadataInner,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+        excluded_checkpoint: Option<CheckpointId>,
+    ) -> Result<Vec<MetadataNodeId>> {
+        let checkpoint = Self::latest_device_checkpoint_at_or_before_locked(
+            inner,
+            device_id,
+            commit_seq,
+            excluded_checkpoint,
+        )
+        .ok_or_else(|| StorageError::not_found("checkpoint", device_id.to_string()))?;
+        let mut roots = checkpoint.shard_roots;
+
+        for commit in Self::shard_commits_for_device_locked(inner, device_id)
+            .into_iter()
+            .filter(|commit| {
+                commit.commit_seq.raw() > checkpoint.commit_seq.raw()
+                    && commit.commit_seq.raw() <= commit_seq.raw()
+            })
+        {
+            let shard = usize::try_from(commit.shard_id.raw())
+                .map_err(|_| StorageError::invalid_argument("shard ID overflows usize"))?;
+            if shard >= roots.len() {
+                return Err(StorageError::corrupt(
+                    "shard commit references shard outside root set",
+                ));
+            }
+            if roots[shard] != commit.old_root {
+                return Err(StorageError::corrupt(
+                    "shard commit old_root does not match replay state",
+                ));
+            }
+            roots[shard] = commit.new_root;
+        }
+
+        Ok(roots)
+    }
+
+    fn validate_checkpoint_root_shape_locked(
+        inner: &MetadataInner,
+        device_id: DeviceId,
+        shard_roots: &[MetadataNodeId],
+        expected_shard_count: usize,
+    ) -> Result<()> {
+        if !inner.device_specs.contains_key(&device_id) {
+            return Err(StorageError::not_found("device", device_id.to_string()));
+        }
+        if shard_roots.len() != expected_shard_count {
+            return Err(StorageError::corrupt(
+                "checkpoint shard root count does not match device layout",
+            ));
+        }
+        for root in shard_roots {
+            if !inner.metadata_nodes.contains_key(root) {
+                return Err(StorageError::not_found("metadata_node", root.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn target_commit_for_restore_locked(
+        inner: &MetadataInner,
+        device_id: DeviceId,
+        point: RestorePoint,
+    ) -> Result<CommitSeq> {
+        match point {
+            RestorePoint::Commit(commit_seq) => {
+                if Self::device_timeline_contains_commit_locked(inner, device_id, commit_seq) {
+                    Ok(commit_seq)
+                } else {
+                    Err(StorageError::not_found("commit", commit_seq.to_string()))
+                }
+            }
+            RestorePoint::Checkpoint(checkpoint_id) => {
+                let checkpoint = inner.checkpoints.get(&checkpoint_id).ok_or_else(|| {
+                    StorageError::not_found("checkpoint", checkpoint_id.to_string())
+                })?;
+                if checkpoint.owner != MappingOwner::BlockDevice(device_id) {
+                    return Err(StorageError::invalid_argument(
+                        "checkpoint does not belong to source device",
+                    ));
+                }
+                Ok(checkpoint.commit_seq)
+            }
+            RestorePoint::Time(time) => {
+                let mut candidates: Vec<CommitSeq> = inner
+                    .checkpoints
+                    .values()
+                    .filter_map(|checkpoint| {
+                        (checkpoint.owner == MappingOwner::BlockDevice(device_id)
+                            && checkpoint.time.raw() <= time.raw())
+                        .then_some(checkpoint.commit_seq)
+                    })
+                    .collect();
+                candidates.extend(inner.shard_commits.iter().filter_map(|commit| {
+                    (commit.device_id == device_id && commit.time.raw() <= time.raw())
+                        .then_some(commit.commit_seq)
+                }));
+                candidates
+                    .into_iter()
+                    .max_by_key(|seq| seq.raw())
+                    .ok_or_else(|| StorageError::not_found("restore_time", time.to_string()))
+            }
+        }
+    }
+
+    fn device_timeline_contains_commit_locked(
+        inner: &MetadataInner,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        inner.checkpoints.values().any(|checkpoint| {
+            checkpoint.owner == MappingOwner::BlockDevice(device_id)
+                && checkpoint.commit_seq == commit_seq
+        }) || inner
+            .shard_commits
+            .iter()
+            .any(|commit| commit.device_id == device_id && commit.commit_seq == commit_seq)
+    }
 }
 
 impl MetadataPlane for InMemoryMetadataPlane {
@@ -1310,6 +1537,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
 
         inner.device_specs.insert(device_id, request.spec);
         inner.device_heads.insert(device_id, head.clone());
+        inner.insert_checkpoint(
+            MappingOwner::BlockDevice(device_id),
+            head.latest_commit,
+            head.shard_roots.clone(),
+        );
         Ok(head)
     }
 
@@ -1422,6 +1654,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 }
 
                 let mut next_roots = current.shard_roots.clone();
+                let mut shard_commits = Vec::with_capacity(intent.updates.len());
                 for update in &intent.updates {
                     let RootUpdate::BlockShard(update) = update else {
                         return Err(StorageError::invalid_argument(
@@ -1444,16 +1677,29 @@ impl MetadataPlane for InMemoryMetadataPlane {
                             update.new_root.to_string(),
                         ));
                     }
+                    shard_commits.push((update.shard_id, update.old_root, update.new_root));
                     next_roots[shard] = update.new_root;
                 }
 
                 let commit_seq = inner.alloc_commit_seq()?;
+                let commit_group_id = inner.alloc_commit_group_id();
                 let commit_group = CommitGroup {
-                    commit_group: inner.alloc_commit_group_id(),
+                    commit_group: commit_group_id,
                     commit_seq,
                     owner: intent.owner,
                     updates: intent.updates,
                 };
+                for (shard_id, old_root, new_root) in shard_commits {
+                    inner.shard_commits.push(ShardCommit {
+                        commit_seq,
+                        commit_group: commit_group_id,
+                        time: LogicalTime::from_raw(commit_seq.raw()),
+                        device_id,
+                        shard_id,
+                        old_root,
+                        new_root,
+                    });
+                }
                 let mut next_head = current.clone();
                 next_head.generation = Self::next_generation(next_head.generation)?;
                 next_head.latest_commit = commit_seq;
@@ -1599,17 +1845,44 @@ impl MetadataPlane for InMemoryMetadataPlane {
         inner.device_specs.insert(target, source_spec);
         inner.device_heads.insert(target, head.clone());
         inner.fork_records.insert(latest_commit, record);
+        inner.insert_checkpoint(
+            MappingOwner::BlockDevice(target),
+            latest_commit,
+            head.shard_roots.clone(),
+        );
         Ok(head)
     }
 
     fn restore_device(
         &self,
-        _source: DeviceId,
-        _point: crate::api::RestorePoint,
+        source: DeviceId,
+        point: crate::api::RestorePoint,
     ) -> Result<DeviceHead> {
-        Err(StorageError::unsupported(
-            "point-in-time restore is implemented in a later phase",
-        ))
+        let mut inner = lock(&self.inner)?;
+        let source_spec = inner
+            .device_specs
+            .get(&source)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("device", source.to_string()))?;
+        let target_commit = Self::target_commit_for_restore_locked(&inner, source, point)?;
+        let shard_roots = Self::replay_device_roots_locked(&inner, source, target_commit, None)?;
+        let target = inner.alloc_device_id();
+        let latest_commit = inner.alloc_commit_seq()?;
+        let head = DeviceHead {
+            device_id: target,
+            generation: DeviceGeneration::from_raw(0),
+            shard_roots,
+            latest_commit,
+        };
+        head.validate(self.config.shard_count)?;
+        inner.device_specs.insert(target, source_spec);
+        inner.device_heads.insert(target, head.clone());
+        inner.insert_checkpoint(
+            MappingOwner::BlockDevice(target),
+            latest_commit,
+            head.shard_roots.clone(),
+        );
+        Ok(head)
     }
 
     fn checkpoint(&self, device_id: DeviceId) -> Result<CheckpointId> {
@@ -1619,16 +1892,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .get(&device_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
-        let checkpoint_id = inner.alloc_checkpoint_id();
-        let checkpoint = Checkpoint {
-            checkpoint_id,
-            commit_seq: head.latest_commit,
-            time: LogicalTime::from_raw(head.latest_commit.raw()),
-            owner: MappingOwner::BlockDevice(device_id),
-            shard_roots: head.shard_roots,
-        };
-        inner.checkpoints.insert(checkpoint_id, checkpoint);
-        Ok(checkpoint_id)
+        Ok(inner.insert_checkpoint(
+            MappingOwner::BlockDevice(device_id),
+            head.latest_commit,
+            head.shard_roots,
+        ))
     }
 
     fn get_checkpoint(&self, checkpoint_id: CheckpointId) -> Result<Checkpoint> {
@@ -2166,9 +2434,12 @@ impl BlockServer for LocalBlockServer {
             BlockRequest::Fork { source, request } => {
                 BlockResponse::Forked(self.store.fork_device(source, request)?)
             }
-            BlockRequest::Restore { .. } | BlockRequest::Delete { .. } => {
+            BlockRequest::Restore { source, point } => {
+                BlockResponse::Restored(self.store.restore_device(source, point)?)
+            }
+            BlockRequest::Delete { .. } => {
                 return Err(StorageError::unsupported(
-                    "restore and delete are implemented in later phases",
+                    "delete is implemented in a later phase",
                 ));
             }
         };
@@ -2494,10 +2765,20 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn restore(&self, _point: RestorePoint) -> Result<DeviceId> {
-        Err(StorageError::unsupported(
-            "block restore is implemented in a later phase",
-        ))
+    fn restore(&self, point: RestorePoint) -> Result<DeviceId> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Restore {
+                source: self.device_id,
+                point,
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Restored(device_id) => Ok(device_id),
+            _ => Err(StorageError::corrupt("unexpected restore response")),
+        }
     }
 
     fn delete(&self) -> Result<DeleteResult> {
@@ -3716,6 +3997,226 @@ mod tests {
                     );
                     validate_device_roots(&store, *device_id);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn pitr_replays_roots_and_restores_to_commit_checkpoint_and_time() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let device_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 8,
+                    block_size: 4096,
+                },
+                name: Some("pitr".to_string()),
+            })
+            .unwrap();
+        let device = client.open_device(device_id).unwrap();
+
+        let commit1 = device.write_at(0, &repeated_blocks(8, 1)).unwrap();
+        let checkpoint1 = store.metadata().checkpoint(device_id).unwrap();
+        let commit2 = device.write_at(3 * 4096, &repeated_blocks(3, 2)).unwrap();
+        let checkpoint2 = store.metadata().checkpoint(device_id).unwrap();
+
+        let head = store.metadata().get_head(device_id).unwrap();
+        assert_eq!(
+            store
+                .metadata()
+                .replay_device_roots(device_id, commit2.commit_seq)
+                .unwrap(),
+            head.shard_roots
+        );
+        assert_eq!(
+            store
+                .metadata()
+                .replay_device_roots(device_id, commit1.commit_seq)
+                .unwrap(),
+            store
+                .metadata()
+                .get_checkpoint(checkpoint1)
+                .unwrap()
+                .shard_roots
+        );
+
+        let shard_commits = store
+            .metadata()
+            .shard_commits_for_device(device_id)
+            .unwrap();
+        let commit2_group_ids: BTreeSet<_> = shard_commits
+            .iter()
+            .filter(|commit| commit.commit_seq == commit2.commit_seq)
+            .map(|commit| commit.commit_group)
+            .collect();
+        assert_eq!(commit2_group_ids.len(), 1);
+
+        let restored_from_commit = device
+            .restore(RestorePoint::Commit(commit1.commit_seq))
+            .unwrap();
+        let restored_from_checkpoint = device
+            .restore(RestorePoint::Checkpoint(checkpoint1))
+            .unwrap();
+        let restored_from_time = device
+            .restore(RestorePoint::Time(LogicalTime::from_raw(
+                commit2.commit_seq.raw(),
+            )))
+            .unwrap();
+
+        assert_eq!(
+            read_device_bytes(&client.open_device(restored_from_commit).unwrap(), 8),
+            repeated_blocks(8, 1)
+        );
+        assert_eq!(
+            read_device_bytes(&client.open_device(restored_from_checkpoint).unwrap(), 8),
+            repeated_blocks(8, 1)
+        );
+
+        let mut expected2 = repeated_blocks(8, 1);
+        expected2[3 * 4096..6 * 4096].fill(2);
+        assert_eq!(
+            read_device_bytes(&client.open_device(restored_from_time).unwrap(), 8),
+            expected2
+        );
+
+        assert!(
+            store
+                .metadata()
+                .validate_checkpoint(&store.metadata().get_checkpoint(checkpoint2).unwrap())
+                .is_ok()
+        );
+        assert!(
+            device
+                .restore(RestorePoint::Commit(CommitSeq::from_raw(999)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_validation_detects_mismatched_roots() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 8);
+        let initial_roots = store
+            .metadata()
+            .get_head(device.device_id())
+            .unwrap()
+            .shard_roots;
+        device.write_at(0, &repeated_blocks(8, 1)).unwrap();
+        let checkpoint_id = store.metadata().checkpoint(device.device_id()).unwrap();
+        let checkpoint = store.metadata().get_checkpoint(checkpoint_id).unwrap();
+        assert!(store.metadata().validate_checkpoint(&checkpoint).is_ok());
+
+        let mut corrupted = checkpoint;
+        corrupted.shard_roots[0] = initial_roots[0];
+        assert!(store.metadata().validate_checkpoint(&corrupted).is_err());
+    }
+
+    #[test]
+    fn pitr_restore_interacts_with_forks_without_mutating_sources() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let parent_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 8,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        let parent = client.open_device(parent_id).unwrap();
+        let parent_commit = parent.write_at(0, &repeated_blocks(8, 4)).unwrap();
+        let child_id = parent
+            .fork(ForkRequest {
+                target: None,
+                name: Some("child".to_string()),
+            })
+            .unwrap();
+        let child = client.open_device(child_id).unwrap();
+        let child_base = store.metadata().get_head(child_id).unwrap().latest_commit;
+        child.write_at(7 * 4096, &repeated_blocks(1, 9)).unwrap();
+
+        let parent_restore = parent
+            .restore(RestorePoint::Commit(parent_commit.commit_seq))
+            .unwrap();
+        let child_restore = child.restore(RestorePoint::Commit(child_base)).unwrap();
+
+        assert_eq!(
+            read_device_bytes(&client.open_device(parent_restore).unwrap(), 8),
+            repeated_blocks(8, 4)
+        );
+        assert_eq!(
+            read_device_bytes(&client.open_device(child_restore).unwrap(), 8),
+            repeated_blocks(8, 4)
+        );
+        assert_eq!(
+            &read_device_bytes(&child, 8)[7 * 4096..8 * 4096],
+            vec![9; 4096]
+        );
+        assert_eq!(read_device_bytes(&parent, 8), repeated_blocks(8, 4));
+    }
+
+    #[test]
+    fn generated_pitr_restores_match_historical_model() {
+        for seed in 0..12 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let store = LocalObjectStore::with_config(LocalStoreConfig {
+                shard_count: 2,
+                ..tree_config()
+            })
+            .unwrap();
+            let server = Arc::new(LocalBlockServer::new(store.clone()));
+            let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+            let device_id = client
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 32,
+                        block_size: 4096,
+                    },
+                    name: None,
+                })
+                .unwrap();
+            let device = client.open_device(device_id).unwrap();
+            let mut model = vec![0u8; 32];
+            let mut history = vec![(CommitSeq::from_raw(0), model.clone())];
+
+            for step in 0..24 {
+                let start = harness.rng.next_u64() % 32;
+                let max_blocks = (32 - start).min(5);
+                let blocks = 1 + harness.rng.next_u64() % max_blocks;
+                let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                harness.trace.record(format!(
+                    "write step={step} start={start} blocks={blocks} byte={byte}"
+                ));
+                let commit = device
+                    .write_at(start * 4096, &repeated_blocks(blocks, byte))
+                    .unwrap();
+                for block in start..start + blocks {
+                    model[block as usize] = byte;
+                }
+                history.push((commit.commit_seq, model.clone()));
+                if harness.rng.next_u64() % 4 == 0 {
+                    store.metadata().checkpoint(device_id).unwrap();
+                }
+            }
+
+            for _ in 0..8 {
+                let index = harness.rng.choose_index(history.len()).unwrap();
+                let (commit_seq, expected) = &history[index];
+                let restored = device.restore(RestorePoint::Commit(*commit_seq)).unwrap();
+                let restored_device = client.open_device(restored).unwrap();
+                let mut actual = vec![0; 32 * 4096];
+                restored_device.read_at(0, &mut actual).unwrap();
+                assert_model_blocks(
+                    &actual,
+                    expected,
+                    seed,
+                    harness.trace.events(),
+                    &render_device_roots(&store, restored),
+                );
             }
         }
     }

@@ -325,26 +325,26 @@ Exit gate:
 
 ## Phase 9: Point-In-Time Recovery
 
-Status: not started.
+Status: complete.
 
 Implement shard commit replay and checkpoints.
 
 Deliverables:
 
-- [ ] Append-only `ShardCommit` records.
-- [ ] Periodic `Checkpoint` records.
-- [ ] Restore algorithm from checkpoint plus commits.
-- [ ] Public restore request that creates a new device.
-- [ ] Timeline validation.
-- [ ] Tests for create, write, fork, delete, and restore interactions.
+- [x] Append-only `ShardCommit` records.
+- [x] Periodic `Checkpoint` records.
+- [x] Restore algorithm from checkpoint plus commits.
+- [x] Public restore request that creates a new device.
+- [x] Timeline validation.
+- [x] Tests for create, write, fork, and restore interactions.
 
 Exit gate:
 
-- [ ] Replayed roots match live roots at tested commit sequences.
-- [ ] Restore to selected times returns expected device contents.
-- [ ] Checkpoint corruption or mismatch is detected by validation.
-- [ ] Generated traces compare PITR reads against a simple historical model.
-- [ ] Criterion covers checkpoint restore.
+- [x] Replayed roots match live roots at tested commit sequences.
+- [x] Restore to selected times returns expected device contents.
+- [x] Checkpoint corruption or mismatch is detected by validation.
+- [x] Generated traces compare PITR reads against a simple historical model.
+- [x] Criterion covers checkpoint restore.
 
 ## Phase 10: Device Deletion and Retention Roots
 
@@ -358,6 +358,7 @@ Deliverables:
 - [ ] Device catalog state for live and deleted devices.
 - [ ] PITR retention policy model.
 - [ ] Root enumerator for live devices plus retained PITR state.
+- [ ] Delete interaction tests for retained PITR checkpoints and timelines.
 
 Exit gate:
 

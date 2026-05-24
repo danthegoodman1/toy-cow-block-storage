@@ -12,7 +12,8 @@ use toy_cow_block_storage::provider::{
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
     AppendLease, AppendLeaseId, BlockClient, BlockDevice, BlockRequest, ByteRange, DeviceId,
-    DeviceSpec, FileId, FileVersion, ForkRequest, NativeRequest, WriteDurability, WriterEpoch,
+    DeviceSpec, FileId, FileVersion, ForkRequest, NativeRequest, RestorePoint, WriteDurability,
+    WriterEpoch,
 };
 
 fn bench_byte_range_validation(c: &mut Criterion) {
@@ -343,6 +344,54 @@ fn bench_local_fork_vs_device_size(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_local_checkpoint_restore(c: &mut Criterion) {
+    c.bench_function("local_checkpoint_restore", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                    shard_count: 4,
+                    block_size: 4096,
+                    file_root_blocks: 1024,
+                    metadata_fanout: 4,
+                    metadata_leaf_blocks: 16,
+                    storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                })
+                .unwrap();
+                let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(
+                    store.clone(),
+                ));
+                let client = toy_cow_block_storage::LocalBlockClient::new(
+                    toy_cow_block_storage::InProcessBlockTransport::new(server),
+                );
+                let device_id = client
+                    .create_device(toy_cow_block_storage::CreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                let device = client.open_device(device_id).unwrap();
+                for block in (0..128).step_by(8) {
+                    device.write_at(block * 4096, &[7; 8 * 4096]).unwrap();
+                }
+                let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+                for block in (256..384).step_by(8) {
+                    device.write_at(block * 4096, &[9; 8 * 4096]).unwrap();
+                }
+                (device, checkpoint)
+            },
+            |(device, checkpoint)| {
+                device
+                    .restore(black_box(RestorePoint::Checkpoint(checkpoint)))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_native_append_validation(c: &mut Criterion) {
     let file_id = FileId::from_raw(9);
     let request = NativeRequest::Append {
@@ -365,6 +414,6 @@ fn bench_native_append_validation(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_native_append, bench_local_fork_vs_device_size, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_native_append, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_seeded_rng
 }
 criterion_main!(regression);

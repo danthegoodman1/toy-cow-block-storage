@@ -690,6 +690,13 @@ Restore an owner to time `T`:
 2. Replay root commits for that owner after the checkpoint and up to `T`.
 3. Return a reconstructed `DeviceHead` or `FileHead`.
 
+The local v1 block restore API creates a new device from the reconstructed root
+set. The restored device starts a new lineage with its own `device_id`,
+generation zero, and a baseline checkpoint at the restore commit. It does not
+mutate the source device or historical roots. Device creation and fork creation
+also write baseline checkpoints so replay always has a deterministic starting
+root set.
+
 Invariants:
 
 - `commit_seq` is total ordered within the timeline provider.
@@ -697,6 +704,9 @@ Invariants:
 - Native file commits record old and new file versions.
 - Replaying checkpoint plus commits is deterministic.
 - Checkpoint roots must match replayed state at the checkpoint sequence.
+- Restoring to a named commit requires that commit to exist in the selected
+  owner timeline; restoring to a time selects the latest retained point at or
+  before that time.
 - PITR retention policy is part of GC root selection.
 
 ## 11. Garbage Collection
