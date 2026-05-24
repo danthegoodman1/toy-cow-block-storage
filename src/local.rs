@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::api::{
-    BlockRequest, BlockRequestEnvelope, BlockResponse, BlockResponseEnvelope, BlockServer,
-    BlockTransport, ByteRange, DeviceInfo,
+    BlockClient, BlockDevice, BlockRequest, BlockRequestEnvelope, BlockResponse,
+    BlockResponseEnvelope, BlockServer, BlockTransport, ByteRange, CreateDeviceRequest,
+    DeleteResult, DeviceInfo, FlushResult, ForkRequest, ReadResponse, RestorePoint, WriteCommit,
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
-    FileInfo, NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope,
-    NativeServer, NativeTransport,
+    AppendCommit, AppendLease, CreateFileRequest, FileInfo, NativeFile, NativeFileClient,
+    NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer,
+    NativeTransport,
 };
 use crate::id::{
     BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq, DeviceGeneration, DeviceId,
@@ -107,6 +109,114 @@ impl LocalObjectStore {
 
     pub fn segment_catalog(&self) -> Arc<InMemoryLocalSegmentCatalog> {
         Arc::clone(&self.segment_catalog)
+    }
+
+    pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+        let info = self.metadata.device_info(device_id)?;
+        range.validate_for_device(&info.spec)?;
+        if buf.len() as u64 != range.len {
+            return Err(StorageError::invalid_argument(
+                "read buffer length must match range length",
+            ));
+        }
+
+        buf.fill(0);
+        if range.len == 0 {
+            return Ok(());
+        }
+
+        let block_size = u64::from(info.spec.block_size);
+        let requested = crate::api::BlockRange::new(
+            BlockIndex::from_raw(range.offset / block_size),
+            BlockCount::from_raw(range.len / block_size),
+        );
+        let head = self.metadata.get_head(device_id)?;
+
+        for root in head.shard_roots {
+            let node = self.metadata.get_metadata_node(root)?;
+            if node.covered_range.overlaps(requested)? {
+                self.read_metadata_node(&node, requested, block_size, buf)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn read_file(&self, file_id: FileId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+        let head = self.metadata.get_file_head(file_id)?;
+        if buf.len() as u64 != range.len {
+            return Err(StorageError::invalid_argument(
+                "read buffer length must match range length",
+            ));
+        }
+        let end = range.end_exclusive()?;
+        if end > head.size {
+            return Err(StorageError::invalid_argument(
+                "native file read extends past end of file",
+            ));
+        }
+
+        buf.fill(0);
+        if range.len == 0 {
+            let _ = self.metadata.get_metadata_node(head.root)?;
+            return Ok(());
+        }
+
+        if !range.is_aligned_to(self.metadata.config.block_size) {
+            return Err(StorageError::unsupported(
+                "non-empty native file reads require block alignment in this phase",
+            ));
+        }
+
+        let block_size = u64::from(self.metadata.config.block_size);
+        let requested = crate::api::BlockRange::new(
+            BlockIndex::from_raw(range.offset / block_size),
+            BlockCount::from_raw(range.len / block_size),
+        );
+        let root = self.metadata.get_metadata_node(head.root)?;
+        self.read_metadata_node(&root, requested, block_size, buf)
+    }
+
+    fn read_metadata_node(
+        &self,
+        node: &MetadataNode,
+        requested: crate::api::BlockRange,
+        block_size: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        match &node.kind {
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    if child.range.overlaps(requested)? {
+                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                        self.read_metadata_node(&child_node, requested, block_size, buf)?;
+                    }
+                }
+                Ok(())
+            }
+            MetadataNodeKind::Leaf { entries } => {
+                for entry in entries {
+                    let Some(overlap) = entry.logical_range().intersection(requested)? else {
+                        continue;
+                    };
+                    let segment_offset_blocks = entry.segment_offset.raw() + overlap.start.raw()
+                        - entry.logical_start.raw();
+                    let segment_range = ByteRange::new(
+                        segment_offset_blocks * block_size,
+                        overlap.blocks.raw() * block_size,
+                    );
+                    let output_offset =
+                        ((overlap.start.raw() - requested.start.raw()) * block_size) as usize;
+                    let output_len = segment_range.len as usize;
+                    self.segment_store.read_segment(
+                        entry.segment_id,
+                        segment_range,
+                        &mut buf[output_offset..output_offset + output_len],
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1056,10 +1166,13 @@ impl BlockServer for LocalBlockServer {
             BlockRequest::Info { device_id } => {
                 BlockResponse::Info(self.store.metadata.device_info(device_id)?)
             }
-            BlockRequest::Read { .. } => {
-                return Err(StorageError::unsupported(
-                    "block reads are implemented in a later phase",
-                ));
+            BlockRequest::Read { device_id, range } => {
+                let len = usize::try_from(range.len).map_err(|_| {
+                    StorageError::invalid_argument("read byte length overflows usize")
+                })?;
+                let mut bytes = vec![0; len];
+                self.store.read_device(device_id, range, &mut bytes)?;
+                BlockResponse::Read(ReadResponse { bytes })
             }
             BlockRequest::Write { .. }
             | BlockRequest::Flush { .. }
@@ -1114,10 +1227,13 @@ impl NativeServer for LocalNativeServer {
             NativeRequest::FileInfo { file_id } => {
                 NativeResponse::FileInfo(self.store.metadata.get_file_info(file_id)?)
             }
-            NativeRequest::Read { .. } => {
-                return Err(StorageError::unsupported(
-                    "native file reads are implemented in a later phase",
-                ));
+            NativeRequest::Read { file_id, range } => {
+                let len = usize::try_from(range.len).map_err(|_| {
+                    StorageError::invalid_argument("read byte length overflows usize")
+                })?;
+                let mut bytes = vec![0; len];
+                self.store.read_file(file_id, range, &mut bytes)?;
+                NativeResponse::Read(ReadResponse { bytes })
             }
             NativeRequest::AcquireAppend { .. }
             | NativeRequest::Append { .. }
@@ -1170,10 +1286,329 @@ impl NativeTransport for InProcessNativeTransport {
     }
 }
 
+/// Local `BlockClient` backed by a block transport.
+#[derive(Clone)]
+pub struct LocalBlockClient {
+    transport: InProcessBlockTransport,
+    client_epoch: crate::id::ClientEpoch,
+    next_request_id: Arc<Mutex<u128>>,
+}
+
+impl LocalBlockClient {
+    pub fn new(transport: InProcessBlockTransport) -> Self {
+        Self {
+            transport,
+            client_epoch: crate::id::ClientEpoch::from_raw(1),
+            next_request_id: Arc::new(Mutex::new(1)),
+        }
+    }
+
+    pub fn open_device(&self, device_id: DeviceId) -> Result<LocalBlockDevice> {
+        self.device_info(device_id)?;
+        Ok(LocalBlockDevice {
+            device_id,
+            transport: self.transport.clone(),
+            client_epoch: self.client_epoch,
+            next_request_id: Arc::clone(&self.next_request_id),
+        })
+    }
+
+    fn next_request_id(&self) -> Result<RequestId> {
+        next_request_id(&self.next_request_id)
+    }
+}
+
+impl BlockClient for LocalBlockClient {
+    fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Create { request },
+        ))?;
+        match response.response {
+            BlockResponse::Created(device_id) => Ok(device_id),
+            _ => Err(StorageError::corrupt("unexpected create-device response")),
+        }
+    }
+
+    fn device_info(&self, device_id: DeviceId) -> Result<DeviceInfo> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Info { device_id },
+        ))?;
+        match response.response {
+            BlockResponse::Info(info) => Ok(info),
+            _ => Err(StorageError::corrupt("unexpected device-info response")),
+        }
+    }
+}
+
+/// Local `BlockDevice` handle backed by a block transport.
+#[derive(Clone)]
+pub struct LocalBlockDevice {
+    device_id: DeviceId,
+    transport: InProcessBlockTransport,
+    client_epoch: crate::id::ClientEpoch,
+    next_request_id: Arc<Mutex<u128>>,
+}
+
+impl LocalBlockDevice {
+    fn next_request_id(&self) -> Result<RequestId> {
+        next_request_id(&self.next_request_id)
+    }
+}
+
+impl BlockDevice for LocalBlockDevice {
+    fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    fn info(&self) -> Result<DeviceInfo> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Info {
+                device_id: self.device_id,
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Info(info) => Ok(info),
+            _ => Err(StorageError::corrupt("unexpected device-info response")),
+        }
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let len = u64::try_from(buf.len())
+            .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Read {
+                device_id: self.device_id,
+                range: ByteRange::new(offset, len),
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Read(read) => {
+                if read.bytes.len() != buf.len() {
+                    return Err(StorageError::corrupt(
+                        "read response length does not match request",
+                    ));
+                }
+                buf.copy_from_slice(&read.bytes);
+                Ok(())
+            }
+            _ => Err(StorageError::corrupt("unexpected block-read response")),
+        }
+    }
+
+    fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<WriteCommit> {
+        Err(StorageError::unsupported(
+            "block writes are implemented in a later phase",
+        ))
+    }
+
+    fn flush(&self) -> Result<FlushResult> {
+        Err(StorageError::unsupported(
+            "block flush is implemented in a later phase",
+        ))
+    }
+
+    fn write_zeroes(&self, _offset: u64, _len: u64) -> Result<WriteCommit> {
+        Err(StorageError::unsupported(
+            "write-zeroes is implemented in a later phase",
+        ))
+    }
+
+    fn discard(&self, _offset: u64, _len: u64) -> Result<WriteCommit> {
+        Err(StorageError::unsupported(
+            "discard is implemented in a later phase",
+        ))
+    }
+
+    fn fork(&self, _request: ForkRequest) -> Result<DeviceId> {
+        Err(StorageError::unsupported(
+            "block fork is implemented in a later phase",
+        ))
+    }
+
+    fn restore(&self, _point: RestorePoint) -> Result<DeviceId> {
+        Err(StorageError::unsupported(
+            "block restore is implemented in a later phase",
+        ))
+    }
+
+    fn delete(&self) -> Result<DeleteResult> {
+        Err(StorageError::unsupported(
+            "block delete is implemented in a later phase",
+        ))
+    }
+}
+
+/// Local `NativeFileClient` backed by a native-file transport.
+#[derive(Clone)]
+pub struct LocalNativeFileClient {
+    transport: InProcessNativeTransport,
+    client_epoch: crate::id::ClientEpoch,
+    next_request_id: Arc<Mutex<u128>>,
+}
+
+impl LocalNativeFileClient {
+    pub fn new(transport: InProcessNativeTransport) -> Self {
+        Self {
+            transport,
+            client_epoch: crate::id::ClientEpoch::from_raw(1),
+            next_request_id: Arc::new(Mutex::new(1)),
+        }
+    }
+
+    pub fn open_file(&self, file_id: FileId) -> Result<LocalNativeFile> {
+        self.file_info(file_id)?;
+        Ok(LocalNativeFile {
+            file_id,
+            transport: self.transport.clone(),
+            client_epoch: self.client_epoch,
+            next_request_id: Arc::clone(&self.next_request_id),
+        })
+    }
+
+    fn next_request_id(&self) -> Result<RequestId> {
+        next_request_id(&self.next_request_id)
+    }
+}
+
+impl NativeFileClient for LocalNativeFileClient {
+    fn create_file(&self, request: CreateFileRequest) -> Result<FileId> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::CreateFile { request },
+        ))?;
+        match response.response {
+            NativeResponse::FileCreated(file_id) => Ok(file_id),
+            _ => Err(StorageError::corrupt("unexpected create-file response")),
+        }
+    }
+
+    fn file_info(&self, file_id: FileId) -> Result<FileInfo> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::FileInfo { file_id },
+        ))?;
+        match response.response {
+            NativeResponse::FileInfo(info) => Ok(info),
+            _ => Err(StorageError::corrupt("unexpected file-info response")),
+        }
+    }
+
+    fn acquire_append(&self, _file_id: FileId) -> Result<AppendLease> {
+        Err(StorageError::unsupported(
+            "native append leases are implemented in a later phase",
+        ))
+    }
+}
+
+/// Local `NativeFile` handle backed by a native-file transport.
+#[derive(Clone)]
+pub struct LocalNativeFile {
+    file_id: FileId,
+    transport: InProcessNativeTransport,
+    client_epoch: crate::id::ClientEpoch,
+    next_request_id: Arc<Mutex<u128>>,
+}
+
+impl LocalNativeFile {
+    fn next_request_id(&self) -> Result<RequestId> {
+        next_request_id(&self.next_request_id)
+    }
+}
+
+impl NativeFile for LocalNativeFile {
+    fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    fn info(&self) -> Result<FileInfo> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::FileInfo {
+                file_id: self.file_id,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::FileInfo(info) => Ok(info),
+            _ => Err(StorageError::corrupt("unexpected file-info response")),
+        }
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let len = u64::try_from(buf.len())
+            .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::Read {
+                file_id: self.file_id,
+                range: ByteRange::new(offset, len),
+            },
+        ))?;
+        match response.response {
+            NativeResponse::Read(read) => {
+                if read.bytes.len() != buf.len() {
+                    return Err(StorageError::corrupt(
+                        "read response length does not match request",
+                    ));
+                }
+                buf.copy_from_slice(&read.bytes);
+                Ok(())
+            }
+            _ => Err(StorageError::corrupt("unexpected native-read response")),
+        }
+    }
+
+    fn acquire_append(&self) -> Result<AppendLease> {
+        Err(StorageError::unsupported(
+            "native append leases are implemented in a later phase",
+        ))
+    }
+
+    fn append_with_lease(&self, _lease: AppendLease, _data: &[u8]) -> Result<AppendCommit> {
+        Err(StorageError::unsupported(
+            "native append is implemented in a later phase",
+        ))
+    }
+
+    fn flush(&self) -> Result<FlushResult> {
+        Err(StorageError::unsupported(
+            "native flush is implemented in a later phase",
+        ))
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
     mutex
         .lock()
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
+}
+
+fn next_request_id(next: &Mutex<u128>) -> Result<RequestId> {
+    let mut next = lock(next)?;
+    let request_id = RequestId::from_raw(*next);
+    *next = next
+        .checked_add(1)
+        .ok_or_else(|| StorageError::conflict("request id overflow"))?;
+    Ok(request_id)
 }
 
 fn checksum64(bytes: &[u8]) -> u64 {
@@ -1523,6 +1958,172 @@ mod tests {
             native_server.request_log().unwrap(),
             vec![RequestId::from_raw(3)]
         );
+    }
+
+    #[test]
+    fn local_block_client_creates_opens_and_reads_empty_device_across_shards() {
+        let cfg = LocalStoreConfig {
+            shard_count: 4,
+            ..config()
+        };
+        let store = LocalObjectStore::with_config(cfg).unwrap();
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let device_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: Some("empty".to_string()),
+            })
+            .unwrap();
+
+        let device = client.open_device(device_id).unwrap();
+        assert_eq!(device.device_id(), device_id);
+        assert_eq!(device.info().unwrap().spec.logical_blocks, 16);
+
+        let head = store.metadata().get_head(device_id).unwrap();
+        assert_eq!(head.shard_roots.len(), cfg.shard_count);
+        for root in &head.shard_roots {
+            store.metadata().get_metadata_node(*root).unwrap();
+        }
+
+        let mut buf = vec![99; 6 * 4096];
+        device.read_at(3 * 4096, &mut buf).unwrap();
+        assert_eq!(buf, vec![0; 6 * 4096]);
+
+        let mut empty = Vec::new();
+        device.read_at(16 * 4096, &mut empty).unwrap();
+        assert!(device.read_at(1, &mut [0; 4096]).is_err());
+    }
+
+    #[test]
+    fn sparse_block_reads_overlay_segment_entries_on_zeroes() {
+        let cfg = LocalStoreConfig {
+            shard_count: 1,
+            ..config()
+        };
+        let store = LocalObjectStore::with_config(cfg).unwrap();
+        let head = store.metadata().create_device(device_request()).unwrap();
+        let reservation = SegmentReservation {
+            segment_id: SegmentId::from_raw(500),
+            bytes: 4096,
+        };
+        store
+            .segment_store()
+            .write_segment(&reservation, &[7; 4096])
+            .unwrap();
+        store
+            .segment_store()
+            .sync_segment(reservation.segment_id)
+            .unwrap();
+
+        let node = MetadataNode {
+            node_id: MetadataNodeId::from_raw(500),
+            covered_range: crate::api::BlockRange::new(
+                BlockIndex::from_raw(0),
+                BlockCount::from_raw(16),
+            ),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![LeafEntry {
+                    logical_start: BlockIndex::from_raw(2),
+                    blocks: BlockCount::from_raw(1),
+                    segment_id: reservation.segment_id,
+                    segment_offset: BlockIndex::from_raw(0),
+                }],
+            },
+        };
+        store
+            .metadata()
+            .persist_metadata_node(node.clone())
+            .unwrap();
+        store
+            .metadata()
+            .publish_commit_group(CommitGroupIntent {
+                owner: MappingOwner::BlockDevice(head.device_id),
+                fence: MetadataFence::DeviceGeneration(head.generation),
+                updates: vec![RootUpdate::BlockShard(ShardRootUpdate {
+                    shard_id: ShardId::from_raw(0),
+                    old_root: head.shard_roots[0],
+                    new_root: node.node_id,
+                })],
+            })
+            .unwrap();
+
+        let mut buf = vec![0; 4 * 4096];
+        store
+            .read_device(head.device_id, ByteRange::new(0, 4 * 4096), &mut buf)
+            .unwrap();
+
+        assert_eq!(&buf[0..4096], vec![0; 4096].as_slice());
+        assert_eq!(&buf[4096..8192], vec![0; 4096].as_slice());
+        assert_eq!(&buf[8192..12288], vec![7; 4096].as_slice());
+        assert_eq!(&buf[12288..16384], vec![0; 4096].as_slice());
+    }
+
+    #[test]
+    fn local_native_file_client_creates_opens_and_reads_empty_file() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalNativeServer::new(store));
+        let client = LocalNativeFileClient::new(InProcessNativeTransport::new(server));
+        let file_id = client
+            .create_file(CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("empty".to_string()),
+                },
+            })
+            .unwrap();
+
+        let file = client.open_file(file_id).unwrap();
+        assert_eq!(file.file_id(), file_id);
+        let info = file.info().unwrap();
+        assert_eq!(info.size, 0);
+        assert_eq!(info.version, FileVersion::from_raw(0));
+
+        let mut empty = Vec::new();
+        file.read_at(0, &mut empty).unwrap();
+        assert!(file.read_at(0, &mut [0]).is_err());
+    }
+
+    #[test]
+    fn deterministic_simulation_checks_roots_after_create_and_read() {
+        fn run(seed: u64) -> (Vec<String>, Vec<u8>) {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let cfg = LocalStoreConfig {
+                shard_count: 4,
+                ..config()
+            };
+            let store = LocalObjectStore::with_config(cfg).unwrap();
+            let server = Arc::new(LocalBlockServer::new(store.clone()));
+            let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+            let device_id = client
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 16,
+                        block_size: 4096,
+                    },
+                    name: None,
+                })
+                .unwrap();
+            harness.trace.record(format!("created={device_id}"));
+            let head = store.metadata().get_head(device_id).unwrap();
+            for root in &head.shard_roots {
+                store.metadata().get_metadata_node(*root).unwrap();
+                harness.trace.record(format!("root={root}"));
+            }
+
+            let device = client.open_device(device_id).unwrap();
+            let mut buf = vec![1; 4096 * 2];
+            device.read_at(4 * 4096, &mut buf).unwrap();
+            for root in &store.metadata().get_head(device_id).unwrap().shard_roots {
+                store.metadata().get_metadata_node(*root).unwrap();
+            }
+            harness.trace.record("read=ok");
+            (harness.trace.into_events(), buf)
+        }
+
+        assert_eq!(run(99), run(99));
     }
 
     #[test]

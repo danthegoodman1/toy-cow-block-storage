@@ -201,30 +201,30 @@ Exit gate:
 
 ## Phase 5: Empty Devices and Sparse Reads
 
-Status: not started.
+Status: complete.
 
 Implement block device creation/reads from empty shard trees and native file
 creation/reads from empty file roots through the public APIs and local servers.
 
 Deliverables:
 
-- [ ] Configurable public block size and logical block count.
-- [ ] Internal layout config for shard count and blocks-per-shard.
-- [ ] Empty metadata tree creation for every shard.
-- [ ] Public create/open path.
-- [ ] `Read` request over empty and sparse ranges.
-- [ ] Zero-filled sparse block behavior.
-- [ ] Native file create/info/open path.
-- [ ] Native file read over empty files.
+- [x] Configurable public block size and logical block count.
+- [x] Internal layout config for shard count and blocks-per-shard.
+- [x] Empty metadata tree creation for every shard.
+- [x] Public create/open path.
+- [x] `Read` request over empty and sparse ranges.
+- [x] Zero-filled sparse block behavior.
+- [x] Native file create/info/open path.
+- [x] Native file read over empty files.
 
 Exit gate:
 
-- [ ] Created devices have exactly one committed root per shard.
-- [ ] Reads from empty devices return zero-filled blocks.
-- [ ] Reads spanning shard boundaries return bytes in logical order.
-- [ ] Empty native files report size zero and return empty reads.
-- [ ] Simulation checks root existence after every create/read command.
-- [ ] Criterion has a baseline read benchmark.
+- [x] Created devices have exactly one committed root per shard.
+- [x] Reads from empty devices return zero-filled blocks.
+- [x] Reads spanning shard boundaries return bytes in logical order.
+- [x] Empty native files report size zero and return empty reads.
+- [x] Simulation checks root existence after every create/read command.
+- [x] Criterion has a baseline read benchmark.
 
 ## Phase 6: Atomic Writes and Commit Groups
 

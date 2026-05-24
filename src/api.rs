@@ -169,6 +169,22 @@ impl BlockRange {
         Ok(self.start.raw() < other_end && other.start.raw() < self_end)
     }
 
+    pub fn intersection(self, other: Self) -> Result<Option<Self>> {
+        if !self.overlaps(other)? {
+            return Ok(None);
+        }
+
+        let start = self.start.raw().max(other.start.raw());
+        let end = self
+            .end_exclusive()?
+            .raw()
+            .min(other.end_exclusive()?.raw());
+        Ok(Some(Self::new(
+            BlockIndex::from_raw(start),
+            BlockCount::from_raw(end - start),
+        )))
+    }
+
     pub fn is_adjacent_to(self, other: Self) -> Result<bool> {
         let self_end = self.end_exclusive()?.raw();
         let other_end = other.end_exclusive()?.raw();
@@ -681,6 +697,27 @@ mod tests {
                     BlockCount::from_raw(4),
                 ))
                 .unwrap()
+        );
+        assert_eq!(
+            range
+                .intersection(BlockRange::new(
+                    BlockIndex::from_raw(14),
+                    BlockCount::from_raw(4),
+                ))
+                .unwrap(),
+            Some(BlockRange::new(
+                BlockIndex::from_raw(14),
+                BlockCount::from_raw(1),
+            ))
+        );
+        assert_eq!(
+            range
+                .intersection(BlockRange::new(
+                    BlockIndex::from_raw(20),
+                    BlockCount::from_raw(4),
+                ))
+                .unwrap(),
+            None
         );
         assert!(
             range

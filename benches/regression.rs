@@ -2,9 +2,13 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId};
-use toy_cow_block_storage::local::{InMemoryMetadataPlane, InMemorySegmentStore, LocalStoreConfig};
+use toy_cow_block_storage::local::{
+    InMemoryMetadataPlane, InMemorySegmentStore, LocalObjectStore, LocalStoreConfig,
+};
 use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
-use toy_cow_block_storage::provider::{MetadataPlane, SegmentReservation, SegmentStore};
+use toy_cow_block_storage::provider::{
+    MetadataCreateDeviceRequest, MetadataPlane, SegmentReservation, SegmentStore,
+};
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
     AppendLease, AppendLeaseId, BlockRequest, ByteRange, DeviceId, DeviceSpec, FileId, FileVersion,
@@ -150,6 +154,34 @@ fn bench_in_memory_segment_read(c: &mut Criterion) {
     });
 }
 
+fn bench_local_empty_device_read(c: &mut Criterion) {
+    let store = LocalObjectStore::new();
+    let head = store
+        .metadata()
+        .create_device(MetadataCreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024 * 1024,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let mut buf = vec![0; 64 * 4096];
+
+    c.bench_function("local_empty_device_read", |b| {
+        b.iter(|| {
+            store
+                .read_device(
+                    black_box(head.device_id),
+                    black_box(ByteRange::new(128 * 4096, 64 * 4096)),
+                    black_box(&mut buf),
+                )
+                .unwrap();
+            black_box(buf[0])
+        })
+    });
+}
+
 fn bench_native_append_validation(c: &mut Criterion) {
     let file_id = FileId::from_raw(9);
     let request = NativeRequest::Append {
@@ -172,6 +204,6 @@ fn bench_native_append_validation(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_seeded_rng
 }
 criterion_main!(regression);
