@@ -25,8 +25,8 @@ Deliverables:
 
 - [x] Library crate entry point for reusable modules.
 - [x] Thin binary entry point that does not own core logic.
-- [x] Module skeletons for API contracts, core state, object model, providers,
-  and simulator.
+- [x] Module skeletons for block API contracts, native extent/file API
+  contracts, core state, object model, providers, and simulator.
 - [x] Shared deterministic test utilities for fake time, seeded randomness, and
   trace recording.
 - [x] Criterion benchmark dependency and starter regression benchmark suite.
@@ -46,7 +46,8 @@ Exit gate:
 Status: complete.
 
 Define the external contracts before implementing storage behavior. The expected
-block-device API is a first-class design constraint; shards, metadata nodes,
+block-device API is a first-class compatibility constraint, and the native
+extent/file API is a first-class performance constraint. Shards, metadata nodes,
 segments, and local-vs-remote placement are implementation details.
 
 Deliverables:
@@ -54,22 +55,38 @@ Deliverables:
 - [x] Public `BlockClient` trait for create and device info lookup.
 - [x] Public `BlockDevice` trait for aligned reads, writes, flush, zeroing,
   discard, fork, restore, delete, and info.
+- [x] Public `NativeFileClient` trait for native file create/info/append-lease
+  lookup.
+- [x] Public `NativeFile` trait for native file reads, append leases, leased
+  appends, flush, and info.
 - [x] `BlockServer` actor boundary.
 - [x] `BlockTransport` request/response boundary.
+- [x] `NativeServer` actor boundary.
+- [x] `NativeTransport` request/response boundary.
 - [x] Typed request and response envelopes with request ID, client epoch, and
   optional logical deadline.
 - [x] Public device spec limited to logical device size and block size.
 - [x] `MetadataPlane` contract for device heads, metadata nodes, commit groups,
-  PITR, checkpoints, forks, restores, and GC roots.
-- [x] `SegmentStore` contract for immutable segment bytes.
-- [x] `LocalSegmentCatalog` contract for per-server segment placement.
+  native file heads, file versions, PITR, checkpoints, forks, restores, and GC
+  roots.
+- [x] `SegmentStore` contract for immutable segment bytes on one storage
+  endpoint.
+- [x] `LocalSegmentCatalog` contract for per-storage-node replica placement.
+- [x] Segment placement records model one local replica, so a future replicated
+  coordinator can collect multiple replica commits for one logical `SegmentId`.
+- [x] Implementor-focused rustdoc for every public service/provider trait and
+  method, including success visibility, failure atomicity, durability, fencing,
+  and implementation-private details.
 - [x] Opaque IDs for devices, requests, client epochs, commits, commit groups,
-  checkpoints, shards, segments, and metadata nodes.
+  checkpoints, shards, segments, metadata nodes, files, file versions, append
+  leases, writer epochs, extents, storage nodes, and write intents.
 - [x] Basic API validation for device specs, aligned byte ranges, zero-length
   no-ops, and overflow cases.
 - [x] Separate validation paths for create requests and existing-device
   requests.
 - [x] Public create request/response envelope.
+- [x] Native create/info/append/lease request and response envelopes.
+- [x] Native append validation for append payloads and lease/file matching.
 - [x] Public service traits require `Send + Sync` so local and remote adapters
   can share the same contract.
 
@@ -77,13 +94,22 @@ Exit gate:
 
 - [x] Public block requests do not expose shard IDs, segment IDs, metadata node
   IDs, shard counts, or commit assembly details.
+- [x] Native file requests do not flow through or depend on block-device logical
+  range metadata.
 - [x] The documented public contract treats successful writes as atomic at
   request granularity.
+- [x] The documented native contract treats successful append commits as atomic
+  at file-version granularity and fenced by append lease/writer epoch.
+- [x] Provider contracts state the minimal guarantees an in-memory, local
+  durable, or remote implementation must preserve.
+- [x] Public clients are not responsible for replica fan-out or storage-node
+  selection.
 - [x] Service boundaries can be implemented locally now and remotely later
-  without changing the public block API.
+  without changing the public block or native APIs.
 - [x] Contract tests cover device spec validation, range alignment, request
   targeting, request kind/range extraction, create-vs-existing-device
-  validation, deterministic trace replay, and the starter benchmark harness.
+  validation, native lease/file matching, deterministic trace replay, and the
+  starter benchmark harness.
 
 ## Phase 2: Core Types and Invariants
 
@@ -95,6 +121,7 @@ operations.
 Deliverables:
 
 - [ ] `DeviceHead` validation with fixed `shard_roots`.
+- [ ] `FileHead` validation with current file root and monotonic file version.
 - [ ] `MetadataNode` validation for internal and leaf variants.
 - [ ] `LeafEntry` validation for range-to-segment mappings.
 - [ ] Range helpers for split, overlap, adjacency, and bounds checks.
@@ -106,6 +133,8 @@ Exit gate:
 - [ ] Leaf validation rejects overlaps, unsorted entries, zero-length entries,
   and out-of-bounds segment slices.
 - [ ] Device-head validation requires exactly the configured shard count.
+- [ ] File-head validation rejects regressing versions and out-of-bounds file
+  sizes.
 - [ ] Core object types do not perform I/O or read wall-clock time.
 
 ## Phase 3: Deterministic Core Contract
@@ -122,8 +151,9 @@ Deliverables:
 - [ ] `StorageState::step(command) -> Vec<StorageEffect>`.
 - [ ] Explicit effects for write-intent creation, segment reservations, segment
   writes, segment syncs, durable-pending-metadata catalog commits, referenced
-  catalog commits, metadata writes, device-head publishes, commit-group
-  publishes, timeline appends, checkpoints, custodian scans, and GC deletes.
+  catalog commits, metadata writes, device-head publishes, file-head publishes,
+  commit-group publishes, timeline appends, checkpoints, custodian scans, and GC
+  deletes.
 
 Exit gate:
 
@@ -142,7 +172,9 @@ Build local implementations of the service boundaries without durable storage.
 Deliverables:
 
 - [ ] Local `BlockServer` implementation.
+- [ ] Local `NativeServer` implementation.
 - [ ] Local in-process `BlockTransport`.
+- [ ] Local in-process `NativeTransport`.
 - [ ] In-memory `MetadataPlane`.
 - [ ] In-memory `SegmentStore`.
 - [ ] In-memory `LocalSegmentCatalog`.
@@ -158,6 +190,8 @@ Exit gate:
   documented rule.
 - [ ] Duplicate writes with different content cannot mutate the original object.
 - [ ] Local services preserve request identity and deterministic ordering.
+- [ ] Block and native services share segment lifecycle and write-intent
+  machinery instead of duplicating it.
 - [ ] Local segment catalog transitions reject invalid state jumps.
 - [ ] Expired reservations and failed writes can be reconciled without metadata
   changes.
@@ -167,8 +201,8 @@ Exit gate:
 
 Status: not started.
 
-Implement device creation and reads from empty shard trees through the public API
-and local server.
+Implement block device creation/reads from empty shard trees and native file
+creation/reads from empty file roots through the public APIs and local servers.
 
 Deliverables:
 
@@ -178,12 +212,15 @@ Deliverables:
 - [ ] Public create/open path.
 - [ ] `Read` request over empty and sparse ranges.
 - [ ] Zero-filled sparse block behavior.
+- [ ] Native file create/info/open path.
+- [ ] Native file read over empty files.
 
 Exit gate:
 
 - [ ] Created devices have exactly one committed root per shard.
 - [ ] Reads from empty devices return zero-filled blocks.
 - [ ] Reads spanning shard boundaries return bytes in logical order.
+- [ ] Empty native files report size zero and return empty reads.
 - [ ] Simulation checks root existence after every create/read command.
 - [ ] Criterion has a baseline read benchmark.
 
@@ -191,13 +228,14 @@ Exit gate:
 
 Status: not started.
 
-Implement the write path with public request-granularity atomicity, including
-writes that span shards.
+Implement the block write path with public request-granularity atomicity and the
+native append path with file-version atomicity.
 
 Deliverables:
 
 - [ ] Range splitter from public byte writes to shard-local chunks.
 - [ ] Stable write-intent identity for each public write or commit group.
+- [ ] Stable write-intent identity tied to each native append lease.
 - [ ] Block-server selection and local segment reservation.
 - [ ] Segment creation for written bytes.
 - [ ] Segment sync before metadata references are created.
@@ -208,7 +246,9 @@ Deliverables:
 - [ ] Leaf insertion, replacement, and splitting for overwrites.
 - [ ] Root-to-leaf path copy for each affected shard.
 - [ ] Commit-group prepare/publish model for multi-shard writes.
+- [ ] Native append commit model with file-version and writer-epoch fencing.
 - [ ] Per-shard commit records linked by commit-group identity.
+- [ ] Native file extent commit records linked by commit-group identity.
 - [ ] Orphan segment records when durable segment writes outlive failed metadata
   publish attempts.
 - [ ] Retry policy for publish conflicts.
@@ -224,9 +264,14 @@ Exit gate:
   catalog commit.
 - [ ] Public writes spanning shards expose either the old mapping or the complete
   new mapping, never a partial update.
+- [ ] Native appends expose either the old file version or the complete new file
+  version, never a partial extent update.
+- [ ] Stale native append leases are rejected deterministically.
 - [ ] Conflicting writes to the same shard resolve deterministically.
 - [ ] Table-driven tests cover beginning, middle, end, full-range, same-range,
   and cross-shard overwrites.
+- [ ] Table-driven tests cover valid append, stale lease rejection, lease
+  stealing, and append publish failure orphan cleanup.
 - [ ] Criterion has baseline write benchmarks.
 
 ## Phase 7: Metadata Tree Shape
@@ -248,7 +293,8 @@ Exit gate:
 - [ ] Tree shape is deterministic for a given write trace.
 - [ ] Internal child ranges cover the parent range without overlap.
 - [ ] Root-to-leaf path copy changes only the necessary nodes.
-- [ ] Generated tests compare tree reads against a simple map model.
+- [ ] Generated tests compare block tree reads and native file extent reads
+  against simple map models.
 - [ ] Criterion covers write cost versus tree depth.
 
 ## Phase 8: Forks
@@ -261,6 +307,8 @@ Deliverables:
 
 - [ ] Public fork request through `BlockDevice` and `BlockServer`.
 - [ ] Child device-head creation by copying shard roots.
+- [ ] Native file snapshot/fork decision documented before adding it to the
+  native API.
 - [ ] Fork timeline/catalog record.
 - [ ] Tests that prove no metadata walk occurs during fork.
 
@@ -328,9 +376,9 @@ Deliverables:
 - [ ] `last_mark_epoch` tracking.
 - [ ] Sweep candidate selection.
 - [ ] Delete effects for unreachable metadata nodes.
-- [ ] Segment release evidence for block-server custodians.
+- [ ] Segment release evidence for storage-node custodians.
 - [ ] Metadata custodian that publishes safe reachability epochs.
-- [ ] Block-server custodian that frees expired reservations, failed writes,
+- [ ] Storage-node custodian that frees expired reservations, failed writes,
   orphan durable segments, released segments, and missed async frees.
 - [ ] GC simulator hooks for interleaving writes, forks, deletes, PITR changes,
   write-intent expiry, orphan cleanup, missed frees, and sweeps.
@@ -343,7 +391,7 @@ Exit gate:
   no longer commit.
 - [ ] `DurablePendingMetadata` segments are not freed while their write intent
   may still publish.
-- [ ] Missed asynchronous frees are corrected by periodic block-server
+- [ ] Missed asynchronous frees are corrected by periodic storage-node
   reconciliation.
 - [ ] Mark and sweep can be paused and resumed deterministically.
 - [ ] Generated tests inject GC at adversarial points in operation traces.
@@ -357,7 +405,8 @@ Prove the storage model under generated operation traces.
 
 Deliverables:
 
-- [ ] Simple reference model for logical device contents and history.
+- [ ] Simple reference model for logical device contents, native file contents,
+  append leases, writer epochs, and history.
 - [ ] Operation generator for create, write, read, fork, delete, restore, and GC.
 - [ ] Fault injector for publish conflicts, duplicate effects, delayed effects,
   missing objects, write-intent expiry, orphan segments, missed async frees, and
@@ -372,7 +421,7 @@ Exit gate:
 - [ ] Failing seeds can be replayed exactly.
 - [ ] The simulator covers fork divergence, shard contention, PITR replay,
   commit-group atomicity, data-before-metadata ordering, orphan cleanup,
-  custodian reconciliation, and GC safety.
+  native append fencing, custodian reconciliation, and GC safety.
 
 ## Phase 13: Performance Baselines
 
@@ -385,6 +434,7 @@ Deliverables:
 - [ ] Benchmarks for fork cost versus device size.
 - [ ] Benchmarks for single-shard write cost versus tree depth.
 - [ ] Benchmarks for multi-shard atomic write cost.
+- [ ] Benchmarks for native append with valid leases and stale-lease rejection.
 - [ ] Benchmarks for read lookup cost and read amplification.
 - [ ] Benchmarks for checkpoint restore and GC traversal.
 
@@ -422,8 +472,8 @@ Exit gate:
 
 Status: not started.
 
-Replace the local transport with a remote-capable implementation without
-changing the public block API.
+Replace the local transports with remote-capable implementations without
+changing the public block or native APIs.
 
 Deliverables:
 
@@ -434,12 +484,47 @@ Deliverables:
 
 Exit gate:
 
-- [ ] `BlockDevice` callers do not change when transport changes.
+- [ ] `BlockDevice` and `NativeFile` callers do not change when transport
+  changes.
 - [ ] Request identity and client epoch fence duplicate or stale responses.
 - [ ] Deterministic transport simulation covers delay, duplication, drop, and
   reorder faults.
 
-## Phase 16: Optional ublk Adapter
+## Phase 16: Storage Replication
+
+Status: not started.
+
+Add replicated segment storage only after the local and durable providers pass
+the same conformance suite and remote transport behavior is deterministic.
+
+Deliverables:
+
+- [ ] Placement coordinator that chooses replica sets for logical segments.
+- [ ] Replica write path that reserves, writes, syncs, and records one local
+  replica commit per selected storage endpoint.
+- [ ] Metadata publish waits for the requested replica durability before making
+  the logical segment visible.
+- [ ] Repair path that can add missing background replicas after metadata
+  publish without changing public block or native APIs.
+- [ ] Custodian reconciliation for failed replica writes, orphan replicas, and
+  stale local catalog state.
+- [ ] Fault simulation for replica delay, loss, duplication, stale writes,
+  partial quorum success, and repair races.
+
+Exit gate:
+
+- [ ] `BlockDevice` and `NativeFile` callers do not coordinate replicas.
+- [ ] Metadata leaves still reference logical `SegmentId`s, not physical
+  replica placements.
+- [ ] A write is acknowledged only after the configured replica durability and
+  metadata publish both succeed.
+- [ ] Failed metadata publish after durable replica writes leaves only
+  reclaimable orphan replicas.
+- [ ] Repair never makes uncommitted data visible.
+- [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
+  suite as single-replica providers.
+
+## Phase 17: Optional ublk Adapter
 
 Status: not started.
 

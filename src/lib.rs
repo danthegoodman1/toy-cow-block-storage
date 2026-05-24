@@ -10,6 +10,7 @@
 pub mod api;
 pub mod core;
 pub mod error;
+pub mod extent;
 pub mod id;
 pub mod object;
 pub mod provider;
@@ -22,7 +23,13 @@ pub use api::{
     ForkRequest, ReadResponse, RestorePoint, WriteCommit, WriteDurability,
 };
 pub use error::{Result, StorageError};
+pub use extent::{
+    AppendCommit, AppendLease, CreateFileRequest, FileInfo, FileSpec, NativeFile, NativeFileClient,
+    NativeOperation, NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope,
+    NativeServer, NativeTransport,
+};
 pub use id::{
-    BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration, DeviceId,
-    LogicalDeadline, LogicalTime, RequestId,
+    AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,
+    DeviceId, ExtentId, FileId, FileVersion, LogicalDeadline, LogicalTime, RequestId,
+    StorageNodeId, WriteIntentId, WriterEpoch,
 };

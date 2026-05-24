@@ -10,6 +10,12 @@ testable enough to exhaustively simulate, not by adding distributed machinery,
 compatibility scaffolding, or clever allocation policies before a simple model
 proves they are necessary.
 
+The block device is the first compatibility mapping layer, not the whole storage
+system. Native extent/file APIs should develop beside the block API over the
+same segment substrate whenever shared write-intent, segment lifecycle,
+metadata, or custodian behavior changes. Do not force file-level append leases,
+writer epochs, or stale-writer fencing through block writes.
+
 This project also follows a "no tombstones" principle. Because this is a toy
 system with no promised external compatibility yet, internal formats and APIs
 should evolve cleanly. Do not leave deprecated paths, compatibility wrappers,
@@ -48,11 +54,20 @@ before adding code.
 - Keep reclamation explicit: GC traces from committed roots and sweeps only
   unreachable objects.
 - Treat PITR as append-only shard-root history plus checkpoints.
+- Keep native file/extent semantics as a sibling mapping layer over the shared
+  substrate, not as a wrapper around `BlockDevice`.
+- Keep replication below the public block/native APIs. Clients may request
+  durability policy later, but they must not fan out replica writes or choose
+  storage nodes.
 - Preserve scalability through simplicity: prefer sharded roots, immutable
   objects, append-only records, and deterministic replay over clever
   coordination.
 - Add abstractions only when a deterministic test, conformance suite, or real
   duplication demonstrates the need.
+- Public traits and provider interfaces must document their minimal
+  implementor guarantees. Each method should say what success makes durable or
+  visible, what failure must not expose, and which details remain
+  implementation-private.
 
 ## Module Exit Criteria
 
@@ -94,6 +109,9 @@ A module is not done until it has:
 - Do not introduce production adapters before their deterministic model and
   provider conformance tests exist.
 - Do not add provider-specific behavior to metadata tree logic.
+- Do not make shared segment lifecycle, write-intent, custodian, or commit-group
+  changes only for block storage while leaving the native extent/file path
+  unmodeled.
 - Do not add a second cross-shard atomicity mechanism beyond commit groups,
   online shard splitting, segment compaction, deduplication, compression,
   encryption, or durable providers unless the design spec is updated with a

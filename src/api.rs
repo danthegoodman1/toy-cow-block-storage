@@ -173,21 +173,101 @@ pub enum RestorePoint {
     Time(LogicalTime),
 }
 
+/// User-facing block-device handle.
+///
+/// Minimal implementor guarantees:
+///
+/// - Public reads and writes are block-aligned and bounded by the device spec.
+/// - A successful write, zero write, discard, restore, or delete is atomic at
+///   method-call granularity from the caller's perspective.
+/// - Reads on the same device observe the latest successful committed mapping.
+/// - Sparse committed ranges read as zero-filled bytes.
+/// - Failed mutating operations leave the previous committed mapping readable.
+/// - Segment bytes are made durable before metadata publishes reference them
+///   when the selected durability level requires it.
+/// - Shards, segment IDs, metadata node IDs, write intents, and commit groups
+///   remain implementation details.
 pub trait BlockDevice: Send + Sync {
+    /// Return the stable ID of this device handle.
+    ///
+    /// The ID must not change for the lifetime of the handle.
     fn device_id(&self) -> DeviceId;
+
+    /// Return committed device information.
+    ///
+    /// The returned generation and latest commit must describe committed state,
+    /// not an in-flight write or partially published commit group.
     fn info(&self) -> Result<DeviceInfo>;
+
+    /// Read bytes at a block-aligned offset.
+    ///
+    /// The implementation must fill the whole buffer or return an error. A
+    /// zero-length buffer is a no-op. Reads must reject unaligned or
+    /// out-of-bounds ranges before exposing data.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+
+    /// Write bytes at a block-aligned offset.
+    ///
+    /// Success means the whole request is committed atomically from the caller's
+    /// perspective. A failed write must not expose a partial mapping, even if
+    /// segment bytes were already written and later need custodian cleanup. A
+    /// zero-length write is a no-op and must not allocate segment data.
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<WriteCommit>;
+
+    /// Flush previously acknowledged writes for this device.
+    ///
+    /// Success means every acknowledged commit through `durable_through` has
+    /// reached the durability level promised by the implementation.
     fn flush(&self) -> Result<FlushResult>;
+
+    /// Commit a block-aligned zero-filled range.
+    ///
+    /// Success must make future reads of the range return zeroes without
+    /// exposing a partially updated mapping.
     fn write_zeroes(&self, offset: u64, len: u64) -> Result<WriteCommit>;
+
+    /// Discard a block-aligned range.
+    ///
+    /// Discard changes logical mappings but does not promise immediate physical
+    /// reclamation. Future reads of a discarded sparse range must return
+    /// zeroes unless a later write covers it.
     fn discard(&self, offset: u64, len: u64) -> Result<WriteCommit>;
+
+    /// Create a new device head that initially shares this device's roots.
+    ///
+    /// Fork must be O(1) with respect to logical size and metadata tree size:
+    /// it copies root pointers and must not walk leaves or bump deep segment
+    /// references.
     fn fork(&self, request: ForkRequest) -> Result<DeviceId>;
+
+    /// Restore this device to a retained point in time as a new device.
+    ///
+    /// Restore must not mutate historical roots. Missing or expired restore
+    /// points must fail without changing the source device.
     fn restore(&self, point: RestorePoint) -> Result<DeviceId>;
+
+    /// Remove this live device from the catalog.
+    ///
+    /// Deletion must stop new operations from observing the live device head,
+    /// but it does not synchronously free segment bytes.
     fn delete(&self) -> Result<DeleteResult>;
 }
 
+/// Public block-device control surface.
+///
+/// Implementors create/open devices without exposing internal shard layout or
+/// provider placement. A later local or remote implementation should be able to
+/// satisfy this trait without changing caller-facing semantics.
 pub trait BlockClient: Send + Sync {
+    /// Create a block device with user-visible shape from `request`.
+    ///
+    /// Success means the initial empty roots are committed and subsequent info
+    /// or read calls can observe the device.
     fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId>;
+
+    /// Return committed information for a device.
+    ///
+    /// The returned information must come from the latest committed device head.
     fn device_info(&self, device_id: DeviceId) -> Result<DeviceInfo>;
 }
 
@@ -345,9 +425,13 @@ pub enum BlockResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockRequestEnvelope {
+    /// Caller-chosen request identity used to match responses and retries.
     pub request_id: RequestId,
+    /// Monotonic client incarnation used to reject stale retry streams.
     pub client_epoch: ClientEpoch,
+    /// Optional deterministic deadline supplied by the caller.
     pub deadline: Option<LogicalDeadline>,
+    /// Public block operation being requested.
     pub request: BlockRequest,
 }
 
@@ -380,11 +464,43 @@ pub struct BlockResponseEnvelope {
     pub response: BlockResponse,
 }
 
+/// Actor boundary for block requests.
+///
+/// `BlockServer` is a request coordinator for block-device semantics, not the
+/// public name for a segment replica host. Future storage replication should be
+/// coordinated below this API and above individual `SegmentStore` endpoints.
+///
+/// Minimal implementor guarantees:
+///
+/// - Preserve request identity in the response envelope.
+/// - Validate public request shape before mutating provider state.
+/// - Serialize or fence conflicting operations so callers never observe partial
+///   commit groups.
+/// - Translate block operations into shared substrate operations without
+///   leaking shard, segment, or metadata-node details to callers.
+/// - Keep retries idempotent or reject them deterministically by request ID and
+///   client epoch.
 pub trait BlockServer: Send + Sync {
+    /// Handle one block request envelope.
+    ///
+    /// Success returns exactly one response for the supplied request ID.
+    /// Failure must not leave caller-visible partial state.
     fn handle(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope>;
 }
 
+/// Transport boundary for block requests.
+///
+/// Minimal implementor guarantees:
+///
+/// - The transport may be local or remote, but it must not change storage
+///   semantics.
+/// - Responses must match the submitted request ID.
+/// - Duplicate, delayed, reordered, or stale responses must be rejected or
+///   surfaced as errors rather than silently applied to the wrong request.
+/// - Transport failure does not imply storage failure; callers may need to
+///   retry with the same request identity.
 pub trait BlockTransport: Send + Sync {
+    /// Send one block request and return the matching response envelope.
     fn call(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope>;
 }
 
@@ -587,5 +703,6 @@ mod tests {
     fn opaque_ids_are_displayable_for_diagnostics() {
         assert_eq!(DeviceId::from_raw(42).to_string(), "42");
         assert_eq!(CommitSeq::from_raw(9).to_string(), "9");
+        assert_eq!(crate::id::StorageNodeId::from_raw(7).to_string(), "7");
     }
 }

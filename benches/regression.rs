@@ -1,7 +1,10 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use toy_cow_block_storage::sim::SeededRng;
-use toy_cow_block_storage::{BlockRequest, ByteRange, DeviceId, DeviceSpec, WriteDurability};
+use toy_cow_block_storage::{
+    AppendLease, AppendLeaseId, BlockRequest, ByteRange, DeviceId, DeviceSpec, FileId, FileVersion,
+    NativeRequest, WriteDurability, WriterEpoch,
+};
 
 fn bench_byte_range_validation(c: &mut Criterion) {
     let spec = DeviceSpec {
@@ -45,9 +48,28 @@ fn bench_seeded_rng(c: &mut Criterion) {
     });
 }
 
+fn bench_native_append_validation(c: &mut Criterion) {
+    let file_id = FileId::from_raw(9);
+    let request = NativeRequest::Append {
+        file_id,
+        lease: AppendLease {
+            file_id,
+            lease_id: AppendLeaseId::from_raw(7),
+            writer_epoch: WriterEpoch::from_raw(3),
+            base_version: FileVersion::from_raw(2),
+        },
+        bytes: vec![0; 64 * 4096],
+        durability: WriteDurability::Acknowledged,
+    };
+
+    c.bench_function("native_append_validation", |b| {
+        b.iter(|| black_box(&request).validate_for_existing_file())
+    });
+}
+
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_seeded_rng
 }
 criterion_main!(regression);

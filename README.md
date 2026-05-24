@@ -1,7 +1,9 @@
 # toy-cow-block-storage
 
-Deterministic toy copy-on-write block storage built in small,
-correctness-gated phases.
+Deterministic toy copy-on-write storage built in small, correctness-gated
+phases. The block device API is the compatibility surface; a native extent/file
+API develops beside it over the same segment substrate for append-heavy custom
+filesystem work.
 
 ## Phase Gates
 

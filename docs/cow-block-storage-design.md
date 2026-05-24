@@ -1,13 +1,18 @@
-# CoW Block Storage Design Spec
+# CoW Storage Design Spec
 
 Status: draft  
 Project: `toy-cow-block-storage`
 
 ## 1. Summary
 
-This project is a toy copy-on-write block device built around immutable data
-segments and immutable sharded metadata trees. A block device is represented by
-a small device head:
+This project is a toy copy-on-write storage system built around immutable data
+segments and immutable metadata roots. The first compatibility surface is a
+block device, but the block layer is only one mapping layer over a shared
+segment substrate. A native extent/file API should develop alongside it for
+workloads that need file-level append leases, writer fencing, and lower metadata
+amplification than a generic block interface can provide.
+
+A block device is represented by a small device head:
 
 ```text
 device_head {
@@ -22,6 +27,13 @@ segment slices:
 
 ```text
 logical_start, length -> segment_id, segment_offset
+```
+
+The native extent/file API uses the same segment substrate and commit/fencing
+rules, but publishes file extents instead of logical block ranges:
+
+```text
+file_id, file_version, file_extent -> segment_id, segment_offset
 ```
 
 Data is never overwritten in place. Writes append data to fresh immutable
@@ -41,6 +53,11 @@ reachability-based garbage collection.
 
 - Implement a toy block device with logical block reads, writes, forks,
   deletion, point-in-time restore, and garbage collection.
+- Keep block storage as the compatibility mapping layer, not the whole storage
+  system.
+- Develop a native extent/file API beside the block API for append-heavy custom
+  filesystems and direct users that need writer epochs, append leases, and stale
+  writer rejection.
 - Make fork O(1) by copying shard-root pointers only.
 - Make writes copy only the changed shard's root-to-leaf metadata path.
 - Preserve snapshot and fork safety by making metadata nodes and data segments
@@ -56,12 +73,15 @@ reachability-based garbage collection.
 - Build in phases with deterministic simulation tests and clear exit gates.
 - Prefer simple data structures until tests or benchmarks prove they are
   insufficient.
+- Share segment storage, write intents, commit groups, fencing, and custodians
+  across block and native extent/file mapping layers.
 
 ### Priority Order
 
 1. Correctness: reads observe the latest committed mapping for their device and
-   logical range; forks remain isolated after either side writes; GC never
-   reclaims reachable data.
+   logical range, and native file reads observe the latest committed file
+   extents; forks remain isolated after either side writes; GC never reclaims
+   reachable data.
 2. Determinism: the same initial state, seed, and ordered operation trace
    produce the same object graph, effects, and query results.
 3. Simplicity: use explicit immutable objects, explicit commits, and explicit
@@ -81,6 +101,8 @@ reachability-based garbage collection.
 - Perfect segment compaction in the first version.
 - Provider-specific storage behavior leaking into metadata-tree logic.
 - Optimizations that cannot be represented in the deterministic simulator.
+- Forcing native file/extent semantics through the block API when that loses
+  append ownership, file versioning, or stale-writer fencing information.
 
 ## 4. Core Model
 
@@ -98,6 +120,21 @@ The generation is a fencing identity for publishing device-head updates. The
 number of shards is fixed for a device lineage in v1. A later format may change
 that, but only by updating this spec and the deterministic tests in the same
 change.
+
+The logical state of a live native file is:
+
+```text
+file_head {
+  file_id
+  file_version
+  root
+  size
+}
+```
+
+`file_version` is the fencing identity for file extent commits. Append leases
+also carry writer epochs, so a stolen lease can reject stale writers even when
+they durably wrote segment bytes before attempting metadata commit.
 
 Each shard root points to a persistent immutable tree:
 
@@ -161,24 +198,54 @@ Time enters as command data. Random choices, if any, use an injected seed owned
 by the deterministic test harness. Given the same initial state, seed, and
 ordered command trace, the core must produce the same effects.
 
-## 6. Public API and Service Planes
+## 6. Public APIs and Service Planes
 
-The public API should model the behavior expected from a block device. Shards,
-metadata-tree paths, segment placement, and provider topology are implementation
-details. A caller should be able to treat a write request as one committed block
-operation, even when the implementation splits it across shards.
+The public APIs are sibling mapping layers over the same segment substrate. The
+block API should model the behavior expected from a block device. The native
+extent/file API should preserve file-level intent for custom filesystems and
+append-heavy users. Neither API should own the shared segment lifecycle,
+write-intent machinery, commit-group machinery, or custodian logic.
+
+Shards, metadata-tree paths, segment placement, and provider topology are
+implementation details. A block caller should be able to treat a write request
+as one committed block operation, even when the implementation splits it across
+shards. A native file caller should be able to treat an append commit as one
+file-version transition, even when it writes one or more segment slices.
 
 The first implementation runs locally in one process, but the service
 boundaries should be real from the beginning:
 
 ```text
-BlockClient / BlockDevice API
+BlockClient / BlockDevice API       NativeFileClient / NativeFile API
   -> BlockTransport
-     -> BlockServer actor
-        -> MetadataPlane
-        -> SegmentStore
-        -> LocalSegmentCatalog
+     -> BlockServer actor           -> NativeTransport
+                                      -> NativeServer actor
+        \                              /
+         +------ shared substrate -----+
+                -> MetadataPlane
+                -> SegmentStore
+                -> LocalSegmentCatalog
 ```
+
+Every public trait and provider interface should document the minimum
+guarantees an implementation must preserve. Method documentation should name
+what a successful call makes durable or visible, what a failed call must not
+expose, how stale or duplicate calls are fenced, and which details remain
+implementation-private. This is part of the API contract, not commentary.
+
+### Shared Segment Substrate
+
+The shared substrate owns concerns that must stay identical for block and native
+extent/file users:
+
+- segment reservation, write, sync, and local catalog lifecycle
+- write-intent identity and expiry
+- data-before-metadata ordering
+- commit groups and fencing tokens
+- metadata node durability
+- reachability roots and custodian reconciliation
+
+Block storage is the first mapping layer, not the whole storage system.
 
 ### `BlockClient`
 
@@ -207,6 +274,32 @@ Public guarantees:
 - `delete` removes the live device but does not imply immediate physical
   reclamation.
 
+### `NativeFileClient` and `NativeFile`
+
+`NativeFileClient` and `NativeFile` are the native extent/file-facing API. This
+API is for custom filesystems or direct users that want to preserve append
+ownership, file versions, and stale-writer fencing instead of encoding those
+semantics into ordinary block writes.
+
+The native API publishes mappings shaped like:
+
+```text
+file_id, file_version, file_range -> segment_id, segment_offset
+```
+
+Public native guarantees:
+
+- File appends are fenced by append leases with writer epochs.
+- The metadata plane rejects stale append commits whose file version or writer
+  epoch no longer matches.
+- A successful append commit advances the file version atomically.
+- Segment bytes are durable before file extent metadata references them.
+- Failed or stale append commits leave only orphan segment data that custodians
+  can reclaim.
+
+The native API must not be implemented on top of the block API. Both APIs share
+the lower substrate; they do not stack on each other.
+
 ### `BlockServer`
 
 `BlockServer` is an actor boundary. The local v1 server may be a simple
@@ -214,6 +307,12 @@ single-threaded mailbox or direct deterministic actor, but its interface should
 look like a server request/response protocol. It owns request ordering,
 backpressure, commit assembly, and the translation from public requests to core
 commands and provider effects.
+
+In this spec, `BlockServer` means the request coordinator for block-device
+semantics. Segment bytes live behind `SegmentStore` endpoints and
+`LocalSegmentCatalog`s. A future replicated implementation should add placement
+coordination between the request coordinator and those storage endpoints, not
+turn the public client into a replica coordinator.
 
 ### `BlockTransport`
 
@@ -230,9 +329,13 @@ deterministically.
 `MetadataPlane` owns globally meaningful metadata durability:
 
 - device catalog records
+- native file catalog records
 - current device heads
+- current file heads and file versions
 - shard-root publish and compare-and-swap
+- native file root publish with file-version and writer-epoch fencing
 - commit groups for multi-shard atomic public writes
+- commit groups for native append/file extent commits
 - PITR shard commits and checkpoints
 - metadata node durability
 - retained roots for GC
@@ -240,16 +343,42 @@ deterministically.
 
 ### `SegmentStore` and `LocalSegmentCatalog`
 
-`SegmentStore` reads and writes immutable segment bytes. It may be memory-backed,
-file-backed, or remote later.
+`SegmentStore` reads and writes immutable segment bytes for one storage endpoint
+or placement domain. It may be memory-backed, file-backed, or remote later.
 
-`LocalSegmentCatalog` is local to a block server or storage node. It maps
-segment IDs to local disk placement, tracks checksums and write-complete state,
-and exposes deletion eligibility from that server's perspective.
+`LocalSegmentCatalog` is local to a storage node. It maps segment IDs to local
+replica placement, tracks checksums and write-complete state, and exposes
+deletion eligibility from that node's perspective.
 
 The local v1 implementation may keep both in memory, but the distinction matters:
-global metadata says which segment is logically referenced; local segment
-metadata says where that segment's bytes live on a particular server.
+global metadata says which logical segment is referenced; local segment metadata
+says where that segment's bytes live on a particular storage node. A logical
+segment may have one local replica in v1 and multiple replicas later.
+
+### Future Storage Replication
+
+Replication belongs below the public block/native APIs and above individual
+`SegmentStore` implementations. Public clients may eventually request a
+durability or replication class, but they should not fan out writes to replicas
+or choose storage nodes.
+
+The block and native servers remain request coordinators. A later placement
+coordinator can choose a replica set for a segment, issue one reservation and
+write per storage endpoint, wait for the requested replica durability, then
+publish metadata that references the logical `SegmentId`. Metadata leaf entries
+continue to reference logical segments, not replica placements.
+
+This preserves the write linearization rule:
+
+```text
+replica bytes durable enough -> metadata publish -> user-visible data
+```
+
+If enough replicas become durable but metadata publish fails, the replicas are
+orphaned and reclaimed by custodians. If metadata publish succeeds with fewer
+than the desired background replica count but enough for the requested
+durability, repair can add missing replicas later without changing the public
+block or native API.
 
 ### Write Ordering Contract
 
@@ -257,26 +386,32 @@ Writes use a data-before-metadata commit discipline. Metadata must never publish
 a reference to segment bytes that have not reached the requested durability
 level.
 
-For a public write request, the block server:
+For any public write request, whether block or native extent/file, the handling
+server:
 
-1. Selects the local or remote block server that will hold the new segment
-   bytes.
-2. Creates a stable write-intent identity for the request or commit group.
-3. Reserves segment space in that server's `LocalSegmentCatalog` under that
-   write intent.
-4. Writes bytes through `SegmentStore`.
-5. Flushes or syncs those bytes according to the requested durability level.
-6. Commits the local segment catalog entry as durable-pending-metadata.
+1. Selects the local storage endpoint in v1, or a replica set in a later
+   replicated implementation, that will hold the new segment bytes.
+2. Creates a stable write-intent identity for the request or commit group. For
+   native appends, this write intent is tied to the append lease and writer
+   epoch.
+3. Reserves segment space in each selected storage endpoint's
+   `LocalSegmentCatalog` under that write intent.
+4. Writes bytes through each selected `SegmentStore`.
+5. Flushes or syncs those bytes until the requested durability level is met.
+6. Commits each durable local replica catalog entry as
+   durable-pending-metadata.
 7. Persists the new immutable metadata nodes that reference the durable segment
    slices.
-8. Publishes the device metadata update through a metadata commit group.
-9. Marks the local segment catalog entry as referenced by the successful commit.
+8. Publishes the block or native file metadata update through a metadata commit
+   group.
+9. Marks durable local replica catalog entries as referenced by the successful
+   commit.
 10. Acknowledges the public write only after the metadata commit group succeeds.
 
 If steps 1-6 succeed but metadata publish fails, the segment is an orphan. It is
-durable local data but not reachable from any committed device root. Orphans are
-not user-visible and must be reclaimed by custodian work after their write intent
-can no longer commit.
+durable local replica data but not reachable from any committed device or file
+root. Orphans are not user-visible and must be reclaimed by custodian work after
+their write intent can no longer commit.
 
 ## 7. Operations
 
@@ -379,6 +514,50 @@ Invariants:
 - PITR policy decides whether older checkpoint/timeline entries can still make
   deleted device state reachable.
 
+### Native File Create
+
+Creating a native file initializes an empty file metadata root and a file version
+of zero. File metadata roots are GC roots while the file is live or retained by
+PITR policy.
+
+Invariants:
+
+- Empty native files read as empty.
+- The file version changes only through committed metadata updates.
+- The file root is separate from block device shard roots.
+
+### Acquire Append Lease
+
+A native append lease grants one writer the right to attempt appends against a
+specific file version and writer epoch. The metadata plane may steal the lease by
+issuing a newer writer epoch.
+
+Invariants:
+
+- Append leases carry `file_id`, `base_version`, and `writer_epoch`.
+- A stale lease cannot publish file metadata.
+- Lease stealing does not delete durable data; failed old writers leave orphans
+  if their segment writes already became durable.
+
+### Native Append Commit
+
+A native append commit:
+
+1. Validates the append lease against the current file version and writer epoch.
+2. Creates a write intent tied to that lease.
+3. Reserves and writes durable segment bytes.
+4. Builds file extent metadata for the append range.
+5. Publishes the new file root with file-version and writer-epoch fencing.
+6. Marks local segment catalog entries as referenced.
+7. Returns the new file version.
+
+Invariants:
+
+- A successful append advances the file version atomically.
+- Stale writers are rejected by metadata fencing.
+- Failed or stale append commits never become readable file data.
+- Durable segment data from failed append commits is reclaimed as orphan data.
+
 ## 8. Sharding
 
 Without sharding, every write contends on a single `device.root`. With sharding:
@@ -428,7 +607,8 @@ The first implementation should prefer correctness over clever packing:
 ## 10. Point-In-Time Recovery
 
 PITR is a timeline of root changes. The system should not rewrite a full device
-manifest on every write. Instead, it appends per-shard commit records:
+or file manifest on every write. For block devices, it appends per-shard commit
+records:
 
 ```text
 ShardCommit {
@@ -442,28 +622,44 @@ ShardCommit {
 }
 ```
 
+For native files, it appends file-root commit records:
+
+```text
+FileCommit {
+  commit_seq
+  commit_group
+  time
+  file_id
+  old_version
+  new_version
+  old_root
+  new_root
+  size
+}
+```
+
 Periodically, it writes checkpoint manifests:
 
 ```text
 Checkpoint {
   commit_seq
   time
-  device_id
-  shard_roots[]
+  owner
+  roots[]
 }
 ```
 
-Restore to time `T`:
+Restore an owner to time `T`:
 
-1. Load the latest checkpoint for the device at or before `T`.
-2. Replay shard-root commits for that device after the checkpoint and up to
-   `T`.
-3. Return a reconstructed `DeviceHead`.
+1. Load the latest checkpoint for the device or file at or before `T`.
+2. Replay root commits for that owner after the checkpoint and up to `T`.
+3. Return a reconstructed `DeviceHead` or `FileHead`.
 
 Invariants:
 
 - `commit_seq` is total ordered within the timeline provider.
 - All shard commits in a public multi-shard write share a commit-group identity.
+- Native file commits record old and new file versions.
 - Replaying checkpoint plus commits is deterministic.
 - Checkpoint roots must match replayed state at the checkpoint sequence.
 - PITR retention policy is part of GC root selection.
@@ -475,12 +671,12 @@ being O(1), and every snapshot would require walking metadata.
 
 Use tracing GC:
 
-1. Start from all live device shard roots and retained PITR checkpoint/timeline
-   roots.
+1. Start from all live device shard roots, live native file roots, and retained
+   PITR checkpoint/timeline roots.
 2. Mark reachable metadata nodes.
 3. Mark segment IDs referenced by reachable leaf entries.
 4. Sweep unmarked metadata nodes after the mark epoch is safe.
-5. Publish release evidence for unmarked segment IDs so block-server custodians
+5. Publish release evidence for unmarked segment IDs so storage-node custodians
    can reclaim local physical bytes.
 
 Each object may store:
@@ -490,7 +686,7 @@ last_mark_epoch
 ```
 
 The metadata sweeper deletes metadata objects not marked in the latest safe
-sweep. Segment bytes are freed by block-server custodians after they receive
+sweep. Segment bytes are freed by storage-node custodians after they receive
 release evidence. The exact safe sweep rule depends on the provider, but the
 deterministic model must prove that objects reachable from any live root or
 retained PITR root are never deleted.
@@ -499,19 +695,19 @@ Invariants:
 
 - Mark traversal starts only from committed roots.
 - Sweep never deletes an object marked in the latest safe epoch.
-- Device deletion and PITR retention changes affect only root selection, not
-  object mutability.
+- Device/file deletion and PITR retention changes affect only root selection,
+  not object mutability.
 
 ## 12. Custodians and Orphan Reclamation
 
 Garbage collection determines logical reachability, but physical reclamation is
-split between metadata and block-server custodians.
+split between metadata and storage-node custodians.
 
 ### Metadata Custodian
 
 The metadata custodian owns global reachability. It periodically:
 
-1. Enumerates all live device heads.
+1. Enumerates all live device heads and native file heads.
 2. Adds retained PITR checkpoint and timeline roots.
 3. Traverses reachable metadata nodes.
 4. Records segment IDs referenced by reachable leaf entries.
@@ -523,9 +719,9 @@ The metadata custodian does not delete local segment bytes directly. It produces
 evidence that a segment is no longer referenced by committed metadata or retained
 PITR roots.
 
-### Block-Server Custodian
+### Storage-Node Custodian
 
-Each block server owns its local physical segment catalog. It periodically:
+Each storage node owns its local physical segment catalog. It periodically:
 
 1. Frees expired reservations that never reached durable write.
 2. Frees failed writes that never reached durable segment state.
@@ -535,7 +731,7 @@ Each block server owns its local physical segment catalog. It periodically:
 5. Reconciles missed asynchronous frees by comparing local catalog state with
    the latest safe reachability epoch.
 
-The block-server custodian is the only component that frees local physical
+The storage-node custodian is the only component that frees local physical
 segment space.
 
 ### Segment Lifecycle
@@ -571,9 +767,9 @@ Invariants:
 
 - Metadata never references a segment that is not durably committed in the local
   segment catalog.
-- The block-server custodian never frees a segment that is reachable from a live
+- The storage-node custodian never frees a segment that is reachable from a live
   device or retained PITR root.
-- The block-server custodian never frees `DurablePendingMetadata` while its
+- The storage-node custodian never frees `DurablePendingMetadata` while its
   write intent may still commit.
 - Orphan durable segments are eventually freed after their write intent can no
   longer commit.
@@ -590,12 +786,18 @@ Provider and service boundaries:
 - `BlockClient`: public control handle for create and device lookup.
 - `BlockServer`: actor boundary that handles block requests.
 - `BlockTransport`: typed request/response transport.
+- `NativeFile`: public native file handle with append leases and file-version
+  commits.
+- `NativeFileClient`: public native file control handle.
+- `NativeServer`: actor boundary that handles native file requests.
+- `NativeTransport`: typed request/response transport for native file requests.
 - `MetadataPlane`: device catalog, metadata nodes, commit groups, PITR, and GC
-  roots.
+  roots for both block and native file metadata.
 - `SegmentStore`: write and read immutable segment bytes.
-- `LocalSegmentCatalog`: per-server segment placement and local segment state.
+- `LocalSegmentCatalog`: per-storage-node replica placement and local segment
+  state.
 - `MetadataCustodian`: global metadata and segment-reference reachability.
-- `BlockServerCustodian`: local reservation, orphan, release, and free
+- `StorageNodeCustodian`: local reservation, orphan, release, and free
   reconciliation.
 
 The in-memory provider is the first implementation and the source of provider
@@ -608,6 +810,7 @@ The simulator and tests should check these invariants after every delivered
 command:
 
 - Every live device has exactly `N` shard roots.
+- Every live native file has one current file root and monotonic file version.
 - Every committed shard root points to an existing metadata node.
 - Every metadata child pointer points to an existing metadata node.
 - Every leaf segment reference points to an existing segment.
@@ -617,12 +820,15 @@ command:
   publish.
 - Reads after writes return the latest committed bytes for the target device.
 - Public writes spanning shards are atomic at request granularity.
+- Native append commits are atomic at file-version granularity.
+- Stale native append leases cannot publish file metadata.
 - Forked devices initially read identically to their parent.
 - After divergence, writes to one fork do not change reads from the other fork.
 - A failed publish does not expose partially written metadata.
 - A failed publish after durable segment write leaves only reclaimable orphan
   segment data.
-- Replaying PITR checkpoint plus commits reconstructs the same device head.
+- Replaying PITR checkpoint plus commits reconstructs the same device or file
+  head.
 - GC never deletes an object reachable from live or retained PITR roots.
 - Custodians eventually reclaim expired reservations, failed writes, orphan
   segments, and missed async frees without deleting reachable data.
@@ -635,6 +841,8 @@ V1 uses:
 
 - Fixed block size per device.
 - Fixed shard count per device lineage.
+- A native extent/file API developed beside the block API.
+- File-version and writer-epoch fencing for native appends.
 - Immutable segment objects.
 - Immutable metadata nodes.
 - A deterministic tree shape.
@@ -645,13 +853,14 @@ V1 uses:
 - Append-only shard commit records.
 - Periodic full device checkpoints.
 - Tracing GC.
-- Metadata and block-server custodians.
+- Metadata and storage-node custodians.
 - In-memory provider first.
 
 V1 does not use:
 
 - Kernel integration.
 - Cross-machine replication.
+- A full POSIX filesystem implementation.
 - Compression, encryption, or deduplication.
 - Segment compaction.
 - Online shard splitting.
