@@ -775,7 +775,13 @@ Invariants:
 - Restoring to a named commit requires that commit to exist in the selected
   owner timeline; restoring to a time selects the latest retained point at or
   before that time.
-- PITR retention policy is part of GC root selection.
+- PITR retention policy is part of GC root selection. Local v1 uses a
+  deterministic commit-age window: a restore point is retained while
+  `current_commit - restore_commit < pitr_grace_commits`.
+- Because replay starts from a checkpoint and then applies shard commits, GC must
+  also retain the latest checkpoint at or before the window floor as a replay
+  anchor, plus the shard-commit roots needed after that anchor. Checkpoint
+  cadence bounds any extra history retained by this anchor.
 
 ## 11. Garbage Collection
 
@@ -811,12 +817,15 @@ custodian may also expire that deleted device's retained PITR catalog state.
 After that point a later policy change cannot resurrect roots that have already
 become unreachable and eligible for sweep.
 
-The local retention policy supports three deterministic modes: retain deleted
-device roots indefinitely, expire them immediately after a safe GC proves them
-unreachable, or retain them until a configured number of commit sequence
-advancements has elapsed since the delete commit. Commit-age retention is the
-v1 stand-in for a production TTL; later wall-clock-facing policies must be
-implemented through injected logical time so generated tests can replay them.
+The local retention policy supports deterministic commit-age retention for both
+deleted-device roots and PITR roots. Deleted device roots may be retained
+indefinitely, expired immediately after a safe GC proves them unreachable, or
+retained until a configured number of commit sequence advancements has elapsed
+since the delete commit. PITR roots may be retained for a configured number of
+commit sequence advancements, with one older checkpoint retained when needed as
+a replay anchor. Commit-age retention is the v1 stand-in for production TTLs;
+later wall-clock-facing policies must be implemented through injected logical
+time so generated tests can replay them.
 
 Invariants:
 
@@ -826,6 +835,8 @@ Invariants:
   not object mutability.
 - Expiring retention is one-way for the expired roots; restore must fail
   cleanly after their metadata has been swept.
+- PITR GC must not delete metadata or segments needed to restore any point
+  inside the configured commit-age window.
 
 ## 12. Custodians and Orphan Reclamation
 
@@ -996,7 +1007,7 @@ V1 uses:
   referenced, released, and freed.
 - Append-only shard commit records.
 - Periodic full device checkpoints.
-- Deterministic commit-age retention for deleted-device roots.
+- Deterministic commit-age retention for deleted-device and PITR roots.
 - Tracing GC.
 - Metadata and storage-node custodians.
 - In-memory provider first.

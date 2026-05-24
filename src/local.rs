@@ -1664,15 +1664,27 @@ impl InMemoryMetadataPlane {
         for checkpoint in inner.checkpoints.values() {
             match checkpoint.owner {
                 MappingOwner::BlockDevice(device_id) => {
-                    if inner.device_heads.contains_key(&device_id)
-                        || Self::retain_deleted_device_locked(inner, &policy, device_id)
+                    if Self::owner_has_retained_pitr_locked(
+                        inner,
+                        &policy,
+                        MappingOwner::BlockDevice(device_id),
+                    ) && Self::retain_checkpoint_for_pitr_locked(inner, &policy, checkpoint)
                     {
                         roots.extend(checkpoint.shard_roots.iter().copied());
                     }
                 }
                 MappingOwner::NativeFile(_) => {
-                    roots.extend(checkpoint.shard_roots.iter().copied());
+                    if Self::owner_has_retained_pitr_locked(inner, &policy, checkpoint.owner)
+                        && Self::retain_checkpoint_for_pitr_locked(inner, &policy, checkpoint)
+                    {
+                        roots.extend(checkpoint.shard_roots.iter().copied());
+                    }
                 }
+            }
+        }
+        for commit in &inner.shard_commits {
+            if Self::retain_shard_commit_for_pitr_locked(inner, &policy, commit) {
+                roots.push(commit.new_root);
             }
         }
         for (device_id, head) in &inner.deleted_device_heads {
@@ -1692,6 +1704,98 @@ impl InMemoryMetadataPlane {
 
     fn current_commit_seq_locked(inner: &MetadataInner) -> CommitSeq {
         CommitSeq::from_raw(inner.next_commit_seq.saturating_sub(1))
+    }
+
+    fn pitr_retention_floor_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+    ) -> Option<CommitSeq> {
+        (policy.pitr_grace_commits > 0).then(|| {
+            let current = Self::current_commit_seq_locked(inner).raw();
+            let retained_span = policy.pitr_grace_commits.saturating_sub(1);
+            CommitSeq::from_raw(current.saturating_sub(retained_span))
+        })
+    }
+
+    fn retain_pitr_commit_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        policy.pitr_grace_commits > 0
+            && Self::current_commit_seq_locked(inner)
+                .raw()
+                .saturating_sub(commit_seq.raw())
+                < policy.pitr_grace_commits
+    }
+
+    fn owner_has_retained_pitr_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+        owner: MappingOwner,
+    ) -> bool {
+        if policy.pitr_grace_commits == 0 {
+            return false;
+        }
+
+        match owner {
+            MappingOwner::BlockDevice(device_id) => {
+                inner.device_heads.contains_key(&device_id)
+                    || Self::retain_deleted_device_locked(inner, policy, device_id)
+            }
+            MappingOwner::NativeFile(file_id) => inner.file_heads.contains_key(&file_id),
+        }
+    }
+
+    fn latest_checkpoint_at_or_before_floor_locked(
+        inner: &MetadataInner,
+        owner: MappingOwner,
+        floor: CommitSeq,
+    ) -> Option<CheckpointId> {
+        inner
+            .checkpoints
+            .values()
+            .filter(|checkpoint| {
+                checkpoint.owner == owner && checkpoint.commit_seq.raw() <= floor.raw()
+            })
+            .max_by_key(|checkpoint| checkpoint.commit_seq.raw())
+            .map(|checkpoint| checkpoint.checkpoint_id)
+    }
+
+    fn retained_pitr_anchor_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+        owner: MappingOwner,
+    ) -> Option<Checkpoint> {
+        let floor = Self::pitr_retention_floor_locked(inner, policy)?;
+        let checkpoint_id = Self::latest_checkpoint_at_or_before_floor_locked(inner, owner, floor)?;
+        inner.checkpoints.get(&checkpoint_id).cloned()
+    }
+
+    fn retain_checkpoint_for_pitr_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+        checkpoint: &Checkpoint,
+    ) -> bool {
+        Self::retain_pitr_commit_locked(inner, policy, checkpoint.commit_seq)
+            || Self::retained_pitr_anchor_locked(inner, policy, checkpoint.owner)
+                .is_some_and(|anchor| anchor.checkpoint_id == checkpoint.checkpoint_id)
+    }
+
+    fn retain_shard_commit_for_pitr_locked(
+        inner: &MetadataInner,
+        policy: &RetentionPolicy,
+        commit: &ShardCommit,
+    ) -> bool {
+        let owner = MappingOwner::BlockDevice(commit.device_id);
+        if !Self::owner_has_retained_pitr_locked(inner, policy, owner) {
+            return false;
+        }
+        let Some(anchor) = Self::retained_pitr_anchor_locked(inner, policy, owner) else {
+            return Self::retain_pitr_commit_locked(inner, policy, commit.commit_seq);
+        };
+        commit.commit_seq.raw() > anchor.commit_seq.raw()
+            || Self::retain_pitr_commit_locked(inner, policy, commit.commit_seq)
     }
 
     fn retain_deleted_device_locked(
@@ -2269,6 +2373,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::not_found("device", source.to_string()))?;
         let target_commit = Self::target_commit_for_restore_locked(&inner, source, point)?;
         let shard_roots = Self::replay_device_roots_locked(&inner, source, target_commit, None)?;
+        for root in &shard_roots {
+            if !inner.metadata_nodes.contains_key(root) {
+                return Err(StorageError::not_found("metadata_node", root.to_string()));
+            }
+        }
         let target = inner.alloc_device_id();
         let latest_commit = inner.alloc_commit_seq()?;
         let head = DeviceHead {
@@ -3792,11 +3901,19 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(with_retention, sorted);
-        for root in checkpoint.shard_roots {
-            assert!(with_retention.contains(&root));
+        for root in &delete_record.shard_roots {
+            assert!(with_retention.contains(root));
         }
-        for root in delete_record.shard_roots {
-            assert!(with_retention.contains(&root));
+
+        let with_pitr_retention = store
+            .metadata()
+            .roots_for_gc(RetentionPolicy::retain_everything())
+            .unwrap();
+        for root in &checkpoint.shard_roots {
+            assert!(with_pitr_retention.contains(root));
+        }
+        for root in &delete_record.shard_roots {
+            assert!(with_pitr_retention.contains(root));
         }
     }
 
@@ -3807,16 +3924,19 @@ mod tests {
             deleted_roots: &BTreeMap<DeviceId, Vec<MetadataNodeId>>,
             checkpoint_roots: &[(DeviceId, Vec<MetadataNodeId>)],
             retain_deleted: bool,
+            retain_pitr: bool,
         ) -> Vec<MetadataNodeId> {
             let mut roots = Vec::new();
             for roots_for_device in live_roots.values() {
                 roots.extend(roots_for_device.iter().copied());
             }
-            for (device_id, roots_for_checkpoint) in checkpoint_roots {
-                if live_roots.contains_key(device_id)
-                    || retain_deleted && deleted_roots.contains_key(device_id)
-                {
-                    roots.extend(roots_for_checkpoint.iter().copied());
+            if retain_pitr {
+                for (device_id, roots_for_checkpoint) in checkpoint_roots {
+                    if live_roots.contains_key(device_id)
+                        || retain_deleted && deleted_roots.contains_key(device_id)
+                    {
+                        roots.extend(roots_for_checkpoint.iter().copied());
+                    }
                 }
             }
             if retain_deleted {
@@ -3954,7 +4074,7 @@ mod tests {
                         .metadata()
                         .roots_for_gc(RetentionPolicy::expire_deleted_immediately())
                         .unwrap(),
-                    expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, false),
+                    expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, false, false),
                     "seed={seed} trace={:?}",
                     harness.trace.events()
                 );
@@ -3963,7 +4083,7 @@ mod tests {
                         .metadata()
                         .roots_for_gc(RetentionPolicy::retain_deleted_devices())
                         .unwrap(),
-                    expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, true),
+                    expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, true, false),
                     "seed={seed} trace={:?}",
                     harness.trace.events()
                 );
@@ -4192,7 +4312,9 @@ mod tests {
         let first_sweep = store
             .sweep_metadata_after_mark(RetentionPolicy::expire_deleted_immediately(), mark.epoch)
             .unwrap();
-        assert!(first_sweep.deleted_metadata_nodes.is_empty());
+        for node in &mark.metadata_nodes {
+            assert!(store.metadata().get_metadata_node(*node).is_ok());
+        }
         assert!(first_sweep.released_segments.is_empty());
         assert_eq!(
             store
@@ -5663,6 +5785,79 @@ mod tests {
         assert!(
             device
                 .restore(RestorePoint::Commit(CommitSeq::from_raw(999)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pitr_gc_releases_history_older_than_commit_window() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let device_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 8,
+                    block_size: 4096,
+                },
+                name: Some("pitr-window".to_string()),
+            })
+            .unwrap();
+        let device = client.open_device(device_id).unwrap();
+
+        let commit1 = device.write_at(0, &[1; 4096]).unwrap();
+        let checkpoint1 = store.metadata().checkpoint(device_id).unwrap();
+        let _commit2 = device.write_at(0, &[2; 4096]).unwrap();
+        let checkpoint2 = store.metadata().checkpoint(device_id).unwrap();
+        let _commit3 = device.write_at(0, &[3; 4096]).unwrap();
+
+        let report = store
+            .run_metadata_custodian(
+                RetentionPolicy::expire_deleted_immediately().with_pitr_grace_commits(2),
+            )
+            .unwrap();
+
+        assert_eq!(report.sweep.released_segments, vec![SegmentId::from_raw(1)]);
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Released
+        );
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(2))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(3))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+
+        let restored = device
+            .restore(RestorePoint::Checkpoint(checkpoint2))
+            .unwrap();
+        assert_eq!(
+            read_device_bytes(&client.open_device(restored).unwrap(), 8),
+            repeated_blocks(1, 2)
+                .into_iter()
+                .chain(vec![0; 7 * 4096])
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            device
+                .restore(RestorePoint::Commit(commit1.commit_seq))
+                .is_err()
+        );
+        assert!(
+            device
+                .restore(RestorePoint::Checkpoint(checkpoint1))
                 .is_err()
         );
     }

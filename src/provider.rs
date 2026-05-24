@@ -91,6 +91,16 @@ pub struct RetentionPolicy {
     /// A value of zero makes deleted-device roots eligible immediately. A value
     /// of `N` keeps roots while `current_commit - delete_commit < N`.
     pub deleted_device_grace_commits: u64,
+    /// Retain point-in-time restore roots for this many commit-sequence
+    /// advancements.
+    ///
+    /// A value of zero retains no historical PITR roots beyond current live
+    /// heads and separately retained deleted roots. A value of `N` keeps restore
+    /// points while `current_commit - restore_commit < N`.
+    ///
+    /// Implementations may also retain one older checkpoint as a replay anchor
+    /// for commits inside the window.
+    pub pitr_grace_commits: u64,
 }
 
 impl RetentionPolicy {
@@ -99,6 +109,16 @@ impl RetentionPolicy {
         Self {
             retain_deleted_devices: true,
             deleted_device_grace_commits: 0,
+            pitr_grace_commits: 0,
+        }
+    }
+
+    /// Retain deleted devices and PITR history indefinitely.
+    pub const fn retain_everything() -> Self {
+        Self {
+            retain_deleted_devices: true,
+            deleted_device_grace_commits: 0,
+            pitr_grace_commits: u64::MAX,
         }
     }
 
@@ -108,6 +128,7 @@ impl RetentionPolicy {
         Self {
             retain_deleted_devices: false,
             deleted_device_grace_commits: 0,
+            pitr_grace_commits: 0,
         }
     }
 
@@ -116,7 +137,14 @@ impl RetentionPolicy {
         Self {
             retain_deleted_devices: false,
             deleted_device_grace_commits: commits,
+            pitr_grace_commits: 0,
         }
+    }
+
+    /// Return this policy with a deterministic PITR commit-age window.
+    pub const fn with_pitr_grace_commits(mut self, commits: u64) -> Self {
+        self.pitr_grace_commits = commits;
+        self
     }
 }
 

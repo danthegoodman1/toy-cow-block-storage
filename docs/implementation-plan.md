@@ -334,6 +334,8 @@ Deliverables:
 - [x] Append-only `ShardCommit` records.
 - [x] Periodic `Checkpoint` records.
 - [x] Restore algorithm from checkpoint plus commits.
+- [x] Deterministic PITR commit-age retention window with replay-anchor
+  checkpoint handling.
 - [x] Public restore request that creates a new device.
 - [x] Timeline validation.
 - [x] Tests for create, write, fork, and restore interactions.
@@ -344,6 +346,8 @@ Exit gate:
 - [x] Restore to selected times returns expected device contents.
 - [x] Checkpoint corruption or mismatch is detected by validation.
 - [x] Generated traces compare PITR reads against a simple historical model.
+- [x] Restore fails cleanly if GC has swept metadata needed by an expired restore
+  point.
 - [x] Criterion covers checkpoint restore.
 
 ## Phase 10: Device Deletion and Retention Roots
@@ -385,12 +389,16 @@ Deliverables:
 - [x] Metadata custodian that publishes safe reachability epochs.
 - [x] Storage-node custodian that frees expired reservations, failed writes,
   orphan durable segments, released segments, and missed async frees.
+- [x] GC roots include retained PITR checkpoints, timeline roots, and any older
+  checkpoint anchor needed to replay points inside the PITR commit-age window.
 - [x] GC simulator hooks for interleaving writes, forks, deletes, PITR changes,
   write-intent expiry, orphan cleanup, missed frees, and sweeps.
 
 Exit gate:
 
 - [x] GC never deletes objects reachable from live or retained PITR roots.
+- [x] GC may release overwritten segment data after it falls outside the PITR
+  commit-age window and is not part of the replay anchor.
 - [x] Unreachable objects are eventually selected for deletion.
 - [x] Orphan durable segments are eventually freed after their write intent can
   no longer commit.
