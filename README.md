@@ -75,7 +75,7 @@ fn block_device_flow() -> toy_cow_block_storage::Result<()> {
 
     let device = block_client.open_device(device_id)?;
 
-    device.write_at(0, &[7; 4096])?;
+    let first_write = device.write_at(0, &[7; 4096])?;
 
     let mut block = vec![0; 4096];
     device.read_at(0, &mut block)?;
@@ -89,9 +89,14 @@ fn block_device_flow() -> toy_cow_block_storage::Result<()> {
 
     fork.write_zeroes(0, 4096)?;
 
-    let restored_id = device.restore(RestorePoint::Commit(device.info()?.latest_commit))?;
+    device.write_at(0, &[9; 4096])?;
+    device.read_at(0, &mut block)?;
+    assert_eq!(block[0], 9);
+
+    let restored_id = device.restore(RestorePoint::Commit(first_write.commit_seq))?;
     let restored = block_client.open_device(restored_id)?;
     restored.read_at(0, &mut block)?;
+    assert_eq!(block[0], 7);
 
     Ok(())
 }
