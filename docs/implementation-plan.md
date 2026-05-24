@@ -464,13 +464,15 @@ The completed local phases prove the state transitions in one process. The
 following local shortcuts are intentional, but each must become a durable,
 remote, replayable, or concurrent boundary in the owning future phase:
 
-- Phase 14 owns real durability for segment sync, metadata WAL/transaction
+- Phase 14 owns native file PITR and snapshot semantics over the shared segment
+  substrate, including file-root commit records and restore/snapshot API shape.
+- Phase 15 owns real durability for segment sync, metadata WAL/transaction
   sync, commit-group replay, write-intent recovery, native append lease/session
   records, checkpoint/timeline persistence, and cache coherence after restart.
-- Phase 15 owns remote transport serialization, retry/deduplication, stale
+- Phase 16 owns remote transport serialization, retry/deduplication, stale
   response rejection, server incarnation fencing, deadlines, mailbox semantics,
   backpressure, and concurrency rules for non-conflicting requests.
-- Phase 16 owns placement, replica-set selection, replica reference evidence,
+- Phase 17 owns placement, replica-set selection, replica reference evidence,
   release evidence logs or per-node queues, storage-node cursors, repair
   records, orphan replica reconciliation, stale placement handling, and physical
   free reconciliation across storage nodes.
@@ -480,7 +482,46 @@ distributed boundary is done. A later phase is complete only when the handoff is
 durable or replayable, idempotent under retries, and covered by deterministic
 delay, duplication, reorder, failure, and restart tests.
 
-## Phase 14: Durable Provider
+## Phase 14: Native File PITR and Snapshots
+
+Status: not started.
+
+Add point-in-time history for native files without routing native operations
+through block-device mappings. This phase proves that file-root timelines,
+append-lease fencing, and GC retention work for the native API before durable or
+remote providers have to persist those records.
+
+Deliverables:
+
+- [ ] Public native restore/snapshot API shape documented in the spec.
+- [ ] Append-only `FileCommit` records with old/new file roots, old/new file
+  versions, size, commit sequence, commit group, and logical time.
+- [ ] Native file checkpoint records or shared owner checkpoints that can
+  reconstruct a `FileHead`.
+- [ ] Restore algorithm from checkpoint plus file commits.
+- [ ] Native snapshot or restore operation that creates a new file lineage
+  without mutating the source file.
+- [ ] PITR retention and replay-anchor materialization for native file roots.
+- [ ] GC roots include retained native PITR checkpoints and file-root timeline
+  records.
+- [ ] Generated traces compare native file restores against a simple historical
+  file model.
+
+Exit gate:
+
+- [ ] Native restore to selected commits and times returns expected file bytes,
+  size, and file version.
+- [ ] Stale append leases cannot publish across a restore or snapshot lineage
+  boundary.
+- [ ] Native PITR GC never deletes metadata or segments needed by retained
+  native restore points.
+- [ ] Expired native restore points fail cleanly after GC sweeps the needed
+  roots.
+- [ ] Block PITR behavior remains unchanged; native PITR shares the lower
+  substrate but not block-device logical mappings.
+- [ ] Criterion covers native checkpoint restore.
+
+## Phase 15: Durable Provider
 
 Status: not started.
 
@@ -521,7 +562,7 @@ Exit gate:
   older than the accepted fence/version.
 - [ ] No provider-specific behavior leaks into core metadata logic.
 
-## Phase 15: Remote Transport
+## Phase 16: Remote Transport
 
 Status: not started.
 
@@ -555,7 +596,7 @@ Exit gate:
 - [ ] Deterministic transport simulation covers delay, duplication, drop, and
   reorder faults.
 
-## Phase 16: Storage Replication
+## Phase 17: Storage Replication
 
 Status: not started.
 
@@ -610,7 +651,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 17: Optional ublk Adapter
+## Phase 18: Optional ublk Adapter
 
 Status: not started.
 
