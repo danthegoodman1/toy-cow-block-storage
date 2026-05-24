@@ -41,3 +41,6 @@ pub use local::{
     LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
     SegmentLifecycleState, StorageNodeCustodianReport,
 };
+pub use sim::{
+    FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,
+};

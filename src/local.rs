@@ -4316,6 +4316,369 @@ mod tests {
     }
 
     #[test]
+    fn generated_end_to_end_simulator_is_replayable_across_operations_and_faults() {
+        fn graph_summary(
+            store: &LocalObjectStore,
+            native_file_count: usize,
+        ) -> crate::sim::ObjectGraphSummary {
+            let entries = store.segment_catalog().entries().unwrap();
+            crate::sim::ObjectGraphSummary {
+                live_devices: store.metadata().list_live_devices().unwrap().len(),
+                deleted_devices: store.metadata().list_deleted_devices().unwrap().len(),
+                native_files: native_file_count,
+                metadata_nodes: store.metadata().metadata_node_count().unwrap(),
+                gc_roots: store
+                    .metadata()
+                    .roots_for_gc(RetentionPolicy {
+                        retain_deleted_devices: true,
+                    })
+                    .unwrap()
+                    .len(),
+                referenced_segments: entries
+                    .iter()
+                    .filter(|(_, state, _)| *state == SegmentLifecycleState::Referenced)
+                    .count(),
+                released_segments: entries
+                    .iter()
+                    .filter(|(_, state, _)| *state == SegmentLifecycleState::Released)
+                    .count(),
+                freed_segments: entries
+                    .iter()
+                    .filter(|(_, state, _)| *state == SegmentLifecycleState::Freed)
+                    .count(),
+            }
+        }
+
+        fn validate_live_devices(
+            store: &LocalObjectStore,
+            client: &LocalBlockClient,
+            seed: u64,
+            trace: &[String],
+            models: &BTreeMap<DeviceId, Vec<u8>>,
+        ) {
+            for (device_id, model) in models {
+                let device = client.open_device(*device_id).unwrap();
+                let mut actual = vec![0; model.len() * 4096];
+                device.read_at(0, &mut actual).unwrap();
+                assert_model_blocks(
+                    &actual,
+                    model,
+                    seed,
+                    trace,
+                    &render_device_roots(store, *device_id),
+                );
+            }
+        }
+
+        fn run(seed: u64) -> crate::sim::FailureArtifact {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let faults = crate::sim::FaultInjector::new(seed ^ 0x0051_ab1e);
+            let store = LocalObjectStore::with_config(LocalStoreConfig {
+                shard_count: 2,
+                ..tree_config()
+            })
+            .unwrap();
+            let block_server = Arc::new(LocalBlockServer::new(store.clone()));
+            let block_client = LocalBlockClient::new(InProcessBlockTransport::new(block_server));
+            let native_server = Arc::new(LocalNativeServer::new(store.clone()));
+            let native_client =
+                LocalNativeFileClient::new(InProcessNativeTransport::new(native_server));
+            let mut device_models: BTreeMap<DeviceId, Vec<u8>> = BTreeMap::new();
+            let mut deleted_devices = BTreeSet::new();
+            let mut checkpoints: Vec<(DeviceId, CheckpointId, Vec<u8>)> = Vec::new();
+            let mut file_models: BTreeMap<FileId, Vec<u8>> = BTreeMap::new();
+            let mut expired_intents = BTreeSet::new();
+
+            for step in 0..48 {
+                let fault_kind = match step % 8 {
+                    0 => crate::sim::FaultKind::PublishConflict,
+                    1 => crate::sim::FaultKind::DuplicateEffect,
+                    2 => crate::sim::FaultKind::DelayedEffect,
+                    3 => crate::sim::FaultKind::MissingObject,
+                    4 => crate::sim::FaultKind::WriteIntentExpiry,
+                    5 => crate::sim::FaultKind::OrphanSegment,
+                    6 => crate::sim::FaultKind::MissedAsyncFree,
+                    _ => crate::sim::FaultKind::CrashReplayBoundary,
+                };
+                if step < 8 || faults.should_inject(step, fault_kind) {
+                    match fault_kind {
+                        crate::sim::FaultKind::PublishConflict => {
+                            let file_id = if let Some(file_id) = file_models.keys().next().copied()
+                            {
+                                file_id
+                            } else {
+                                let file_id = native_client
+                                    .create_file(CreateFileRequest {
+                                        spec: FileSpec { name: None },
+                                    })
+                                    .unwrap();
+                                file_models.insert(file_id, Vec::new());
+                                file_id
+                            };
+                            let file = native_client.open_file(file_id).unwrap();
+                            let stale = file.acquire_append().unwrap();
+                            let fresh = file.acquire_append().unwrap();
+                            assert!(
+                                file.append_with_lease(stale, &repeated_blocks(1, 1))
+                                    .is_err()
+                            );
+                            file.append_with_lease(fresh, &repeated_blocks(1, 2))
+                                .unwrap();
+                            file_models.get_mut(&file_id).unwrap().push(2);
+                            harness
+                                .trace
+                                .record(format!("fault publish_conflict step={step}"));
+                        }
+                        crate::sim::FaultKind::DuplicateEffect => {
+                            let reservation = SegmentReservation {
+                                segment_id: SegmentId::from_raw(90_000 + u128::from(step)),
+                                bytes: 4096,
+                            };
+                            let first = store
+                                .segment_store()
+                                .write_segment(&reservation, &[8; 4096])
+                                .unwrap();
+                            let second = store
+                                .segment_store()
+                                .write_segment(&reservation, &[8; 4096])
+                                .unwrap();
+                            assert_eq!(first, second);
+                            harness
+                                .trace
+                                .record(format!("fault duplicate_effect step={step}"));
+                        }
+                        crate::sim::FaultKind::DelayedEffect => {
+                            let policy = RetentionPolicy {
+                                retain_deleted_devices: harness.rng.next_u64() % 2 == 0,
+                            };
+                            let mark = store.mark_reachable_for_gc(policy.clone()).unwrap();
+                            harness.trace.record(format!(
+                                "fault delayed_mark step={step} epoch={}",
+                                mark.epoch
+                            ));
+                            store.sweep_metadata_after_mark(policy, mark.epoch).unwrap();
+                        }
+                        crate::sim::FaultKind::MissingObject => {
+                            assert!(
+                                store
+                                    .metadata()
+                                    .get_metadata_node(MetadataNodeId::from_raw(999_999))
+                                    .is_err()
+                            );
+                            harness
+                                .trace
+                                .record(format!("fault missing_object step={step}"));
+                        }
+                        crate::sim::FaultKind::WriteIntentExpiry => {
+                            store.run_storage_node_custodian(&expired_intents).unwrap();
+                            harness
+                                .trace
+                                .record(format!("fault write_intent_expiry step={step}"));
+                        }
+                        crate::sim::FaultKind::OrphanSegment => {
+                            let owner = device_models
+                                .keys()
+                                .next()
+                                .copied()
+                                .map(MappingOwner::BlockDevice)
+                                .unwrap_or_else(|| {
+                                    MappingOwner::BlockDevice(DeviceId::from_raw(1))
+                                });
+                            let reservation =
+                                store.write_segment_for_owner(owner, &[6; 4096]).unwrap();
+                            let intent = store
+                                .segment_catalog()
+                                .intent_for_segment(reservation.segment_id)
+                                .unwrap()
+                                .write_intent;
+                            expired_intents.insert(intent);
+                            harness.trace.record(format!(
+                                "fault orphan_segment step={step} segment={}",
+                                reservation.segment_id
+                            ));
+                        }
+                        crate::sim::FaultKind::MissedAsyncFree => {
+                            store
+                                .run_metadata_custodian(RetentionPolicy {
+                                    retain_deleted_devices: false,
+                                })
+                                .unwrap();
+                            store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+                            harness
+                                .trace
+                                .record(format!("fault missed_async_free step={step}"));
+                        }
+                        crate::sim::FaultKind::CrashReplayBoundary => {
+                            validate_live_devices(
+                                &store,
+                                &block_client,
+                                seed,
+                                harness.trace.events(),
+                                &device_models,
+                            );
+                            harness
+                                .trace
+                                .record(format!("fault crash_replay_boundary step={step}"));
+                        }
+                    }
+                }
+
+                match harness.rng.next_u64() % 8 {
+                    0 | 1 if device_models.is_empty() => {
+                        let device_id = block_client
+                            .create_device(CreateDeviceRequest {
+                                spec: DeviceSpec {
+                                    logical_blocks: 16,
+                                    block_size: 4096,
+                                },
+                                name: Some(format!("sim-{seed}-{step}")),
+                            })
+                            .unwrap();
+                        device_models.insert(device_id, vec![0; 16]);
+                        harness
+                            .trace
+                            .record(format!("create step={step} device={device_id}"));
+                    }
+                    0 => {
+                        let device_id = *device_models.keys().next().unwrap();
+                        let block = harness.rng.next_u64() % 16;
+                        let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                        block_client
+                            .open_device(device_id)
+                            .unwrap()
+                            .write_at(block * 4096, &[byte; 4096])
+                            .unwrap();
+                        device_models.get_mut(&device_id).unwrap()[block as usize] = byte;
+                        harness.trace.record(format!(
+                            "write step={step} device={device_id} block={block} byte={byte}"
+                        ));
+                    }
+                    1 if device_models.len() < 6 => {
+                        let source = *device_models.keys().next().unwrap();
+                        let child = block_client
+                            .open_device(source)
+                            .unwrap()
+                            .fork(ForkRequest {
+                                target: None,
+                                name: Some(format!("sim-child-{seed}-{step}")),
+                            })
+                            .unwrap();
+                        device_models.insert(child, device_models.get(&source).unwrap().clone());
+                        harness
+                            .trace
+                            .record(format!("fork step={step} source={source} child={child}"));
+                    }
+                    2 if !device_models.is_empty() => {
+                        let device_id = *device_models.keys().next().unwrap();
+                        let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+                        checkpoints.push((
+                            device_id,
+                            checkpoint,
+                            device_models.get(&device_id).unwrap().clone(),
+                        ));
+                        harness
+                            .trace
+                            .record(format!("checkpoint step={step} device={device_id}"));
+                    }
+                    3 if !checkpoints.is_empty() => {
+                        let index = harness.rng.choose_index(checkpoints.len()).unwrap();
+                        let (source, checkpoint, model) = checkpoints[index].clone();
+                        if let Ok(restored) =
+                            store.restore_device(source, RestorePoint::Checkpoint(checkpoint))
+                        {
+                            device_models.insert(restored, model);
+                            harness.trace.record(format!(
+                                "restore step={step} source={source} restored={restored}"
+                            ));
+                        } else {
+                            harness
+                                .trace
+                                .record(format!("restore_expired step={step} source={source}"));
+                        }
+                    }
+                    4 if !device_models.is_empty() => {
+                        let device_id = *device_models.keys().next().unwrap();
+                        block_client
+                            .open_device(device_id)
+                            .unwrap()
+                            .delete()
+                            .unwrap();
+                        device_models.remove(&device_id);
+                        deleted_devices.insert(device_id);
+                        harness
+                            .trace
+                            .record(format!("delete step={step} device={device_id}"));
+                    }
+                    5 => {
+                        let file_id = native_client
+                            .create_file(CreateFileRequest {
+                                spec: FileSpec { name: None },
+                            })
+                            .unwrap();
+                        file_models.insert(file_id, Vec::new());
+                        harness
+                            .trace
+                            .record(format!("create_file step={step} file={file_id}"));
+                    }
+                    6 if !file_models.is_empty() => {
+                        let file_id = *file_models.keys().next().unwrap();
+                        let file = native_client.open_file(file_id).unwrap();
+                        let lease = file.acquire_append().unwrap();
+                        let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                        file.append_with_lease(lease, &[byte; 4096]).unwrap();
+                        file_models.get_mut(&file_id).unwrap().push(byte);
+                        harness
+                            .trace
+                            .record(format!("append step={step} file={file_id} byte={byte}"));
+                    }
+                    _ => {
+                        store
+                            .run_metadata_custodian(RetentionPolicy {
+                                retain_deleted_devices: harness.rng.next_u64() % 2 == 0,
+                            })
+                            .unwrap();
+                        store.run_storage_node_custodian(&expired_intents).unwrap();
+                        harness.trace.record(format!("gc step={step}"));
+                    }
+                }
+
+                validate_live_devices(
+                    &store,
+                    &block_client,
+                    seed,
+                    harness.trace.events(),
+                    &device_models,
+                );
+                for (file_id, model) in &file_models {
+                    let file = native_client.open_file(*file_id).unwrap();
+                    let mut actual = vec![0; model.len() * 4096];
+                    file.read_at(0, &mut actual).unwrap();
+                    assert_model_blocks(
+                        &actual,
+                        model,
+                        seed,
+                        harness.trace.events(),
+                        "native file",
+                    );
+                }
+                for device_id in &deleted_devices {
+                    assert!(store.metadata().get_head(*device_id).is_err());
+                }
+            }
+
+            crate::sim::FailureArtifact::new(
+                seed,
+                harness.trace.events(),
+                graph_summary(&store, file_models.len()),
+            )
+        }
+
+        for seed in 0..10 {
+            assert_eq!(run(seed), run(seed));
+        }
+    }
+
+    #[test]
     fn storage_node_custodian_reclaims_expired_failed_orphan_and_released_segments() {
         let store = LocalObjectStore::with_config(config()).unwrap();
         let reserved = store

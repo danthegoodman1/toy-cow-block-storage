@@ -897,6 +897,13 @@ command:
 - Custodians eventually reclaim expired reservations, failed writes, orphan
   segments, and missed async frees without deleting reachable data.
 
+Generated end-to-end traces must be replayable by seed. When a generated trace
+fails, the harness should report the seed, ordered operation trace, a compact
+suffix suitable for quick reproduction, and an object-graph summary with live
+owners, metadata node count, GC root count, and segment lifecycle counts. When a
+replay predicate is available, the harness should shrink traces with a
+deterministic deletion-based minimizer.
+
 ## 15. Simplicity Guardrails
 
 V1 should stay intentionally small.

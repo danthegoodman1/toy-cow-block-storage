@@ -1,5 +1,91 @@
 use crate::id::LogicalTime;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FaultKind {
+    PublishConflict,
+    DuplicateEffect,
+    DelayedEffect,
+    MissingObject,
+    WriteIntentExpiry,
+    OrphanSegment,
+    MissedAsyncFree,
+    CrashReplayBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultInjector {
+    seed: u64,
+}
+
+impl FaultInjector {
+    pub const fn new(seed: u64) -> Self {
+        Self { seed }
+    }
+
+    pub fn should_inject(&self, step: u64, kind: FaultKind) -> bool {
+        let kind = kind as u64;
+        let mut value = self.seed ^ step.rotate_left(17) ^ kind.wrapping_mul(0x9e37_79b9);
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        value % 11 == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectGraphSummary {
+    pub live_devices: usize,
+    pub deleted_devices: usize,
+    pub native_files: usize,
+    pub metadata_nodes: usize,
+    pub gc_roots: usize,
+    pub referenced_segments: usize,
+    pub released_segments: usize,
+    pub freed_segments: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureArtifact {
+    pub seed: u64,
+    pub trace: Vec<String>,
+    pub minimized_trace: Vec<String>,
+    pub object_graph: ObjectGraphSummary,
+}
+
+impl FailureArtifact {
+    pub fn new(seed: u64, trace: &[String], object_graph: ObjectGraphSummary) -> Self {
+        Self {
+            seed,
+            trace: trace.to_vec(),
+            minimized_trace: minimized_trace_suffix(trace, 32),
+            object_graph,
+        }
+    }
+}
+
+fn minimized_trace_suffix(trace: &[String], max_events: usize) -> Vec<String> {
+    let start = trace.len().saturating_sub(max_events);
+    trace[start..].to_vec()
+}
+
+pub fn minimize_trace_by_deletion<T: Clone>(
+    trace: &[T],
+    mut still_reproduces: impl FnMut(&[T]) -> bool,
+) -> Vec<T> {
+    let mut candidate = trace.to_vec();
+    let mut index = 0;
+    while index < candidate.len() {
+        let mut attempt = candidate.clone();
+        attempt.remove(index);
+        if still_reproduces(&attempt) {
+            candidate = attempt;
+        } else {
+            index += 1;
+        }
+    }
+    candidate
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeClock {
     now: LogicalTime,
@@ -93,6 +179,63 @@ impl DeterministicHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fault_injector_is_replayable_and_bounded() {
+        let first = FaultInjector::new(123);
+        let second = FaultInjector::new(123);
+
+        for step in 0..64 {
+            for kind in [
+                FaultKind::PublishConflict,
+                FaultKind::DuplicateEffect,
+                FaultKind::DelayedEffect,
+                FaultKind::MissingObject,
+                FaultKind::WriteIntentExpiry,
+                FaultKind::OrphanSegment,
+                FaultKind::MissedAsyncFree,
+                FaultKind::CrashReplayBoundary,
+            ] {
+                assert_eq!(
+                    first.should_inject(step, kind),
+                    second.should_inject(step, kind)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failure_artifact_records_seed_trace_suffix_and_graph_summary() {
+        let trace: Vec<_> = (0..40).map(|index| format!("step={index}")).collect();
+        let summary = ObjectGraphSummary {
+            live_devices: 1,
+            deleted_devices: 2,
+            native_files: 3,
+            metadata_nodes: 4,
+            gc_roots: 5,
+            referenced_segments: 6,
+            released_segments: 7,
+            freed_segments: 8,
+        };
+
+        let artifact = FailureArtifact::new(9, &trace, summary.clone());
+
+        assert_eq!(artifact.seed, 9);
+        assert_eq!(artifact.trace, trace);
+        assert_eq!(artifact.minimized_trace.len(), 32);
+        assert_eq!(artifact.minimized_trace[0], "step=8");
+        assert_eq!(artifact.object_graph, summary);
+    }
+
+    #[test]
+    fn trace_minimizer_removes_events_while_reproduction_still_holds() {
+        let trace = vec![1, 2, 3, 4, 5, 6];
+        let minimized = minimize_trace_by_deletion(&trace, |candidate| {
+            candidate.contains(&2) && candidate.contains(&5)
+        });
+
+        assert_eq!(minimized, vec![2, 5]);
+    }
 
     #[test]
     fn seeded_rng_replays_exactly() {

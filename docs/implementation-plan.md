@@ -402,27 +402,27 @@ Exit gate:
 
 ## Phase 12: Deterministic End-to-End Simulator
 
-Status: not started.
+Status: complete.
 
 Prove the storage model under generated operation traces.
 
 Deliverables:
 
-- [ ] Simple reference model for logical device contents, native file contents,
+- [x] Simple reference model for logical device contents, native file contents,
   append leases, writer epochs, and history.
-- [ ] Operation generator for create, write, read, fork, delete, restore, and GC.
-- [ ] Fault injector for publish conflicts, duplicate effects, delayed effects,
+- [x] Operation generator for create, write, read, fork, delete, restore, and GC.
+- [x] Fault injector for publish conflicts, duplicate effects, delayed effects,
   missing objects, write-intent expiry, orphan segments, missed async frees, and
   crash/replay boundaries.
-- [ ] Reproducible failure output with seed, minimized trace, and object graph
+- [x] Reproducible failure output with seed, minimized trace, and object graph
   summary.
 
 Exit gate:
 
-- [ ] Normal CI runs a meaningful seed count for the simulator.
-- [ ] Every generated trace checks core invariants after each delivered command.
-- [ ] Failing seeds can be replayed exactly.
-- [ ] The simulator covers fork divergence, shard contention, PITR replay,
+- [x] Normal CI runs a meaningful seed count for the simulator.
+- [x] Every generated trace checks core invariants after each delivered command.
+- [x] Failing seeds can be replayed exactly.
+- [x] The simulator covers fork divergence, shard contention, PITR replay,
   commit-group atomicity, data-before-metadata ordering, orphan cleanup,
   native append fencing, custodian reconciliation, and GC safety.
 
