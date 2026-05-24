@@ -348,24 +348,24 @@ Exit gate:
 
 ## Phase 10: Device Deletion and Retention Roots
 
-Status: not started.
+Status: complete.
 
 Implement deletion without synchronous reclamation.
 
 Deliverables:
 
-- [ ] Public delete request through `BlockDevice` and `BlockServer`.
-- [ ] Device catalog state for live and deleted devices.
-- [ ] PITR retention policy model.
-- [ ] Root enumerator for live devices plus retained PITR state.
-- [ ] Delete interaction tests for retained PITR checkpoints and timelines.
+- [x] Public delete request through `BlockDevice` and `BlockServer`.
+- [x] Device catalog state for live and deleted devices.
+- [x] PITR retention policy model.
+- [x] Root enumerator for live devices plus retained PITR state.
+- [x] Delete interaction tests for retained PITR checkpoints and timelines.
 
 Exit gate:
 
-- [ ] Deleted devices are absent from live listings.
-- [ ] Deleted device objects remain readable only through retained PITR roots.
-- [ ] Root enumeration is deterministic and independently testable.
-- [ ] Deletion never directly deletes metadata nodes or segments.
+- [x] Deleted devices are absent from live listings.
+- [x] Deleted device objects remain readable only through retained PITR roots.
+- [x] Root enumeration is deterministic and independently testable.
+- [x] Deletion never directly deletes metadata nodes or segments.
 
 ## Phase 11: Tracing Garbage Collection
 

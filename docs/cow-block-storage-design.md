@@ -540,14 +540,24 @@ Invariants:
 ### Delete Device
 
 Deleting a device removes it from the live device-head set and appends a
-timeline record. It does not synchronously delete metadata nodes or segments.
-Reclamation belongs to GC.
+timeline record containing the roots that were live at the deletion point. It
+does not synchronously delete metadata nodes or segments. Reclamation belongs to
+GC.
 
 Invariants:
 
-- Deleted devices are not GC roots after the delete commit becomes visible.
-- PITR policy decides whether older checkpoint/timeline entries can still make
-  deleted device state reachable.
+- Deleted devices are absent from live device listings and live device-head
+  lookups after the delete commit becomes visible.
+- Deleted devices are not current live GC roots after the delete commit becomes
+  visible.
+- PITR retention policy decides whether older checkpoints, shard-root commits,
+  and delete records can still make deleted device state reachable for restore
+  and GC.
+- Restoring a deleted source is valid only to a retained point before deletion,
+  such as a checkpoint or commit before the delete record. Time-based restore at
+  or after the delete record observes the deletion and fails cleanly.
+- Deletion never directly frees metadata nodes, segment bytes, or local segment
+  catalog entries.
 
 ### Native File Create
 

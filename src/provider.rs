@@ -1,13 +1,13 @@
-use crate::api::{ByteRange, CreateDeviceRequest, DeviceSpec, RestorePoint};
+use crate::api::{ByteRange, CreateDeviceRequest, DeleteResult, DeviceSpec, RestorePoint};
 use crate::error::Result;
 use crate::extent::{CreateFileRequest, FileInfo};
 use crate::id::{
-    CheckpointId, DeviceGeneration, DeviceId, FileId, FileVersion, MetadataNodeId, SegmentId,
-    StorageNodeId, WriteIntentId, WriterEpoch,
+    CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion, MetadataNodeId,
+    SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CommitGroup, DeviceHead, FileHead, MappingOwner, MetadataNode, RootUpdate,
-    SegmentDescriptor,
+    Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, MappingOwner, MetadataNode,
+    RootUpdate, SegmentDescriptor,
 };
 
 /// A metadata-root publish request.
@@ -114,8 +114,24 @@ pub trait MetadataPlane: Send + Sync {
 
     /// Return the latest committed block device head.
     ///
-    /// Must not synthesize uncommitted or partially published state.
+    /// Must not synthesize uncommitted or partially published state. Deleted
+    /// devices are absent from this live-head lookup.
     fn get_head(&self, device_id: DeviceId) -> Result<DeviceHead>;
+
+    /// List live block devices in deterministic ID order.
+    ///
+    /// Success returns only devices with currently visible live heads. Deleted
+    /// devices must not appear, even if their retained PITR roots remain GC
+    /// roots under the active retention policy.
+    fn list_live_devices(&self) -> Result<Vec<DeviceId>>;
+
+    /// List deleted block devices in deterministic ID order.
+    ///
+    /// Success returns devices removed from the live catalog whose metadata
+    /// history may still be retained by PITR policy. This is catalog evidence
+    /// for custodians; it must not make the device readable through live block
+    /// APIs.
+    fn list_deleted_devices(&self) -> Result<Vec<DeviceId>>;
 
     /// Return the latest committed native file head.
     ///
@@ -153,6 +169,20 @@ pub trait MetadataPlane: Send + Sync {
     /// Restore creates a new committed head rather than mutating historical
     /// state. Missing or expired restore points must fail cleanly.
     fn restore_device(&self, source: DeviceId, point: RestorePoint) -> Result<DeviceHead>;
+
+    /// Remove a block device from the live catalog and append deletion evidence.
+    ///
+    /// Success means `get_head`, live listings, and public block operations no
+    /// longer observe the device as live. It must not synchronously delete
+    /// metadata nodes or segment bytes; retained PITR roots and later GC decide
+    /// reachability and physical release.
+    fn delete_device(&self, device_id: DeviceId) -> Result<DeleteResult>;
+
+    /// Fetch a durable device deletion record by commit sequence.
+    ///
+    /// The record is append-only evidence for retention and GC. Missing records
+    /// must fail cleanly rather than inventing deletion state.
+    fn get_delete_record(&self, commit_seq: CommitSeq) -> Result<DeleteRecord>;
 
     /// Write a durable checkpoint for a block device.
     ///

@@ -19,9 +19,9 @@ use crate::id::{
     RequestId, SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CommitGroup, DeviceHead, FileHead, ForkRecord, LeafEntry, MappingOwner,
-    MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardCommit,
-    ShardRootUpdate,
+    Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, ForkRecord, LeafEntry,
+    MappingOwner, MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor,
+    ShardCommit, ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
@@ -395,6 +395,10 @@ impl LocalObjectStore {
     pub fn restore_device(&self, source: DeviceId, point: RestorePoint) -> Result<DeviceId> {
         let head = self.metadata.restore_device(source, point)?;
         Ok(head.device_id)
+    }
+
+    pub fn delete_device(&self, device_id: DeviceId) -> Result<DeleteResult> {
+        self.metadata.delete_device(device_id)
     }
 
     fn split_device_range(
@@ -968,6 +972,7 @@ struct MetadataInner {
     next_commit_seq: u64,
     next_checkpoint_id: u128,
     device_heads: BTreeMap<DeviceId, DeviceHead>,
+    deleted_device_heads: BTreeMap<DeviceId, DeviceHead>,
     device_specs: BTreeMap<DeviceId, crate::api::DeviceSpec>,
     file_heads: BTreeMap<FileId, FileHead>,
     file_specs: BTreeMap<FileId, crate::extent::FileSpec>,
@@ -976,6 +981,7 @@ struct MetadataInner {
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
     shard_commits: Vec<ShardCommit>,
     fork_records: BTreeMap<CommitSeq, ForkRecord>,
+    delete_records: BTreeMap<CommitSeq, DeleteRecord>,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
 }
 
@@ -989,6 +995,7 @@ impl MetadataInner {
             next_commit_seq: 1,
             next_checkpoint_id: 1,
             device_heads: BTreeMap::new(),
+            deleted_device_heads: BTreeMap::new(),
             device_specs: BTreeMap::new(),
             file_heads: BTreeMap::new(),
             file_specs: BTreeMap::new(),
@@ -997,6 +1004,7 @@ impl MetadataInner {
             commit_groups: BTreeMap::new(),
             shard_commits: Vec::new(),
             fork_records: BTreeMap::new(),
+            delete_records: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
         }
     }
@@ -1146,6 +1154,25 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::not_found("fork_record", commit_seq.to_string()))
     }
 
+    pub fn delete_record(&self, commit_seq: CommitSeq) -> Result<DeleteRecord> {
+        let inner = lock(&self.inner)?;
+        inner
+            .delete_records
+            .get(&commit_seq)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("delete_record", commit_seq.to_string()))
+    }
+
+    pub fn live_device_ids(&self) -> Result<Vec<DeviceId>> {
+        let inner = lock(&self.inner)?;
+        Ok(inner.device_heads.keys().copied().collect())
+    }
+
+    pub fn deleted_device_ids(&self) -> Result<Vec<DeviceId>> {
+        let inner = lock(&self.inner)?;
+        Ok(inner.deleted_device_heads.keys().copied().collect())
+    }
+
     pub fn shard_commits_for_device(&self, device_id: DeviceId) -> Result<Vec<ShardCommit>> {
         let inner = lock(&self.inner)?;
         Ok(Self::shard_commits_for_device_locked(&inner, device_id))
@@ -1195,6 +1222,12 @@ impl InMemoryMetadataPlane {
 
     pub fn metadata_node_count(&self) -> Result<usize> {
         Ok(lock(&self.inner)?.metadata_nodes.len())
+    }
+
+    #[cfg(test)]
+    fn set_next_commit_seq_for_test(&self, next_commit_seq: u64) -> Result<()> {
+        lock(&self.inner)?.next_commit_seq = next_commit_seq;
+        Ok(())
     }
 
     pub fn allocate_metadata_node(
@@ -1448,23 +1481,34 @@ impl InMemoryMetadataPlane {
                 Ok(checkpoint.commit_seq)
             }
             RestorePoint::Time(time) => {
-                let mut candidates: Vec<CommitSeq> = inner
+                let mut candidates: Vec<(CommitSeq, bool)> = inner
                     .checkpoints
                     .values()
                     .filter_map(|checkpoint| {
                         (checkpoint.owner == MappingOwner::BlockDevice(device_id)
                             && checkpoint.time.raw() <= time.raw())
-                        .then_some(checkpoint.commit_seq)
+                        .then_some((checkpoint.commit_seq, false))
                     })
                     .collect();
                 candidates.extend(inner.shard_commits.iter().filter_map(|commit| {
                     (commit.device_id == device_id && commit.time.raw() <= time.raw())
-                        .then_some(commit.commit_seq)
+                        .then_some((commit.commit_seq, false))
                 }));
-                candidates
+                candidates.extend(inner.delete_records.values().filter_map(|record| {
+                    (record.device_id == device_id && record.time.raw() <= time.raw())
+                        .then_some((record.commit_seq, true))
+                }));
+                let (commit_seq, is_delete) = candidates
                     .into_iter()
-                    .max_by_key(|seq| seq.raw())
-                    .ok_or_else(|| StorageError::not_found("restore_time", time.to_string()))
+                    .max_by_key(|(seq, is_delete)| (seq.raw(), *is_delete))
+                    .ok_or_else(|| StorageError::not_found("restore_time", time.to_string()))?;
+                if is_delete {
+                    return Err(StorageError::not_found(
+                        "restore_time",
+                        format!("{time} is after device deletion"),
+                    ));
+                }
+                Ok(commit_seq)
             }
         }
     }
@@ -1581,6 +1625,14 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .get(&device_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))
+    }
+
+    fn list_live_devices(&self) -> Result<Vec<DeviceId>> {
+        self.live_device_ids()
+    }
+
+    fn list_deleted_devices(&self) -> Result<Vec<DeviceId>> {
+        self.deleted_device_ids()
     }
 
     fn get_file_head(&self, file_id: FileId) -> Result<FileHead> {
@@ -1819,7 +1871,9 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::corrupt("source device head exists without spec"))?;
         let target = match request.target {
             Some(target) => {
-                if inner.device_heads.contains_key(&target) {
+                if inner.device_heads.contains_key(&target)
+                    || inner.deleted_device_heads.contains_key(&target)
+                {
                     return Err(StorageError::conflict("target device already exists"));
                 }
                 inner.reserve_device_id_at_least_after(target)?;
@@ -1885,6 +1939,34 @@ impl MetadataPlane for InMemoryMetadataPlane {
         Ok(head)
     }
 
+    fn delete_device(&self, device_id: DeviceId) -> Result<DeleteResult> {
+        let mut inner = lock(&self.inner)?;
+        let mut head = inner
+            .device_heads
+            .get(&device_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
+        let commit_seq = inner.alloc_commit_seq()?;
+        inner.device_heads.remove(&device_id);
+        head.latest_commit = commit_seq;
+        let record = DeleteRecord {
+            commit_seq,
+            time: LogicalTime::from_raw(commit_seq.raw()),
+            device_id,
+            shard_roots: head.shard_roots.clone(),
+        };
+        inner.deleted_device_heads.insert(device_id, head);
+        inner.delete_records.insert(commit_seq, record);
+        Ok(DeleteResult {
+            device_id,
+            commit_seq,
+        })
+    }
+
+    fn get_delete_record(&self, commit_seq: CommitSeq) -> Result<DeleteRecord> {
+        self.delete_record(commit_seq)
+    }
+
     fn checkpoint(&self, device_id: DeviceId) -> Result<CheckpointId> {
         let mut inner = lock(&self.inner)?;
         let head = inner
@@ -1908,7 +1990,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::not_found("checkpoint", checkpoint_id.to_string()))
     }
 
-    fn roots_for_gc(&self, _policy: RetentionPolicy) -> Result<Vec<MetadataNodeId>> {
+    fn roots_for_gc(&self, policy: RetentionPolicy) -> Result<Vec<MetadataNodeId>> {
         let inner = lock(&self.inner)?;
         let mut roots = Vec::new();
         for head in inner.device_heads.values() {
@@ -1918,7 +2000,27 @@ impl MetadataPlane for InMemoryMetadataPlane {
             roots.push(head.root);
         }
         for checkpoint in inner.checkpoints.values() {
-            roots.extend(checkpoint.shard_roots.iter().copied());
+            match checkpoint.owner {
+                MappingOwner::BlockDevice(device_id) => {
+                    if inner.device_heads.contains_key(&device_id)
+                        || policy.retain_deleted_devices
+                            && inner.deleted_device_heads.contains_key(&device_id)
+                    {
+                        roots.extend(checkpoint.shard_roots.iter().copied());
+                    }
+                }
+                MappingOwner::NativeFile(_) => {
+                    roots.extend(checkpoint.shard_roots.iter().copied());
+                }
+            }
+        }
+        if policy.retain_deleted_devices {
+            for head in inner.deleted_device_heads.values() {
+                roots.extend(head.shard_roots.iter().copied());
+            }
+            for record in inner.delete_records.values() {
+                roots.extend(record.shard_roots.iter().copied());
+            }
         }
         roots.sort();
         roots.dedup();
@@ -2437,10 +2539,8 @@ impl BlockServer for LocalBlockServer {
             BlockRequest::Restore { source, point } => {
                 BlockResponse::Restored(self.store.restore_device(source, point)?)
             }
-            BlockRequest::Delete { .. } => {
-                return Err(StorageError::unsupported(
-                    "delete is implemented in a later phase",
-                ));
+            BlockRequest::Delete { device_id } => {
+                BlockResponse::Deleted(self.store.delete_device(device_id)?)
             }
         };
         Ok(BlockResponseEnvelope {
@@ -2782,9 +2882,18 @@ impl BlockDevice for LocalBlockDevice {
     }
 
     fn delete(&self) -> Result<DeleteResult> {
-        Err(StorageError::unsupported(
-            "block delete is implemented in a later phase",
-        ))
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::Delete {
+                device_id: self.device_id,
+            },
+        ))?;
+        match response.response {
+            BlockResponse::Deleted(delete) => Ok(delete),
+            _ => Err(StorageError::corrupt("unexpected block-delete response")),
+        }
     }
 }
 
@@ -3244,6 +3353,321 @@ mod tests {
             })
             .unwrap();
         assert!(roots.contains(&new_root.node_id));
+    }
+
+    #[test]
+    fn delete_moves_device_out_of_live_catalog_without_deleting_objects() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 16);
+        let device_id = device.device_id();
+        device.write_at(0, &[7; 4096]).unwrap();
+        let head_before_delete = store.metadata().get_head(device_id).unwrap();
+        let node_count_before_delete = store.metadata().metadata_node_count().unwrap();
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+
+        let delete = device.delete().unwrap();
+
+        assert_eq!(delete.device_id, device_id);
+        assert!(delete.commit_seq.raw() > head_before_delete.latest_commit.raw());
+        assert_eq!(store.metadata().list_live_devices().unwrap(), Vec::new());
+        assert_eq!(
+            store.metadata().list_deleted_devices().unwrap(),
+            vec![device_id]
+        );
+        assert!(store.metadata().get_head(device_id).is_err());
+        assert!(device.info().is_err());
+        assert!(device.read_at(0, &mut [0; 4096]).is_err());
+        assert!(device.write_at(0, &[8; 4096]).is_err());
+        assert!(device.delete().is_err());
+        assert_eq!(
+            store
+                .metadata()
+                .delete_record(delete.commit_seq)
+                .unwrap()
+                .shard_roots,
+            head_before_delete.shard_roots
+        );
+        assert_eq!(
+            store.metadata().metadata_node_count().unwrap(),
+            node_count_before_delete
+        );
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+    }
+
+    #[test]
+    fn failed_delete_publish_preserves_live_head() {
+        let metadata = InMemoryMetadataPlane::new(config()).unwrap();
+        let head = metadata.create_device(device_request()).unwrap();
+        metadata.set_next_commit_seq_for_test(u64::MAX).unwrap();
+
+        assert!(metadata.delete_device(head.device_id).is_err());
+        assert_eq!(metadata.get_head(head.device_id).unwrap(), head);
+        assert_eq!(metadata.list_live_devices().unwrap(), vec![head.device_id]);
+        assert_eq!(metadata.list_deleted_devices().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn roots_for_gc_respects_deleted_device_retention_policy() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let device = create_local_device(&store, 16);
+        let device_id = device.device_id();
+        device.write_at(0, &[7; 4096]).unwrap();
+        let checkpoint_id = store.metadata().checkpoint(device_id).unwrap();
+        device.write_at(4096, &[8; 4096]).unwrap();
+        let delete = device.delete().unwrap();
+        let checkpoint = store.metadata().get_checkpoint(checkpoint_id).unwrap();
+        let delete_record = store.metadata().delete_record(delete.commit_seq).unwrap();
+
+        let without_retention = store
+            .metadata()
+            .roots_for_gc(RetentionPolicy {
+                retain_deleted_devices: false,
+            })
+            .unwrap();
+        assert!(without_retention.is_empty());
+
+        let with_retention = store
+            .metadata()
+            .roots_for_gc(RetentionPolicy {
+                retain_deleted_devices: true,
+            })
+            .unwrap();
+        let mut sorted = with_retention.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(with_retention, sorted);
+        for root in checkpoint.shard_roots {
+            assert!(with_retention.contains(&root));
+        }
+        for root in delete_record.shard_roots {
+            assert!(with_retention.contains(&root));
+        }
+    }
+
+    #[test]
+    fn generated_delete_retention_roots_match_reference_model() {
+        fn expected_roots(
+            live_roots: &BTreeMap<DeviceId, Vec<MetadataNodeId>>,
+            deleted_roots: &BTreeMap<DeviceId, Vec<MetadataNodeId>>,
+            checkpoint_roots: &[(DeviceId, Vec<MetadataNodeId>)],
+            retain_deleted: bool,
+        ) -> Vec<MetadataNodeId> {
+            let mut roots = Vec::new();
+            for roots_for_device in live_roots.values() {
+                roots.extend(roots_for_device.iter().copied());
+            }
+            for (device_id, roots_for_checkpoint) in checkpoint_roots {
+                if live_roots.contains_key(device_id)
+                    || retain_deleted && deleted_roots.contains_key(device_id)
+                {
+                    roots.extend(roots_for_checkpoint.iter().copied());
+                }
+            }
+            if retain_deleted {
+                for roots_for_device in deleted_roots.values() {
+                    roots.extend(roots_for_device.iter().copied());
+                }
+            }
+            roots.sort();
+            roots.dedup();
+            roots
+        }
+
+        for seed in 0..10 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let store = LocalObjectStore::with_config(config()).unwrap();
+            let server = Arc::new(LocalBlockServer::new(store.clone()));
+            let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+            let mut live_roots: BTreeMap<DeviceId, Vec<MetadataNodeId>> = BTreeMap::new();
+            let mut deleted_roots: BTreeMap<DeviceId, Vec<MetadataNodeId>> = BTreeMap::new();
+            let mut checkpoint_roots: Vec<(DeviceId, Vec<MetadataNodeId>)> = Vec::new();
+
+            for create_index in 0..3 {
+                let device_id = client
+                    .create_device(CreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 16,
+                            block_size: 4096,
+                        },
+                        name: Some(format!("seed-{seed}-{create_index}")),
+                    })
+                    .unwrap();
+                let roots = store.metadata().get_head(device_id).unwrap().shard_roots;
+                live_roots.insert(device_id, roots.clone());
+                checkpoint_roots.push((device_id, roots));
+            }
+
+            for step in 0..30 {
+                if live_roots.is_empty() {
+                    let device_id = client
+                        .create_device(CreateDeviceRequest {
+                            spec: DeviceSpec {
+                                logical_blocks: 16,
+                                block_size: 4096,
+                            },
+                            name: Some(format!("seed-{seed}-recreate-{step}")),
+                        })
+                        .unwrap();
+                    let roots = store.metadata().get_head(device_id).unwrap().shard_roots;
+                    harness
+                        .trace
+                        .record(format!("create step={step} device={device_id}"));
+                    live_roots.insert(device_id, roots.clone());
+                    checkpoint_roots.push((device_id, roots));
+                }
+
+                let live_ids: Vec<_> = live_roots.keys().copied().collect();
+                let device_id = live_ids[harness.rng.choose_index(live_ids.len()).unwrap()];
+                match harness.rng.next_u64() % 4 {
+                    0 => {
+                        let block = harness.rng.next_u64() % 16;
+                        let byte = (1 + harness.rng.next_u64() % 254) as u8;
+                        harness.trace.record(format!(
+                            "write step={step} device={device_id} block={block} byte={byte}"
+                        ));
+                        client
+                            .open_device(device_id)
+                            .unwrap()
+                            .write_at(block * 4096, &[byte; 4096])
+                            .unwrap();
+                        let roots = store.metadata().get_head(device_id).unwrap().shard_roots;
+                        live_roots.insert(device_id, roots);
+                    }
+                    1 => {
+                        harness
+                            .trace
+                            .record(format!("checkpoint step={step} device={device_id}"));
+                        let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+                        checkpoint_roots.push((
+                            device_id,
+                            store
+                                .metadata()
+                                .get_checkpoint(checkpoint)
+                                .unwrap()
+                                .shard_roots,
+                        ));
+                    }
+                    2 if live_roots.len() + deleted_roots.len() < 8 => {
+                        harness
+                            .trace
+                            .record(format!("fork step={step} source={device_id}"));
+                        let child = client
+                            .open_device(device_id)
+                            .unwrap()
+                            .fork(ForkRequest {
+                                target: None,
+                                name: Some(format!("fork-{seed}-{step}")),
+                            })
+                            .unwrap();
+                        let roots = store.metadata().get_head(child).unwrap().shard_roots;
+                        live_roots.insert(child, roots.clone());
+                        checkpoint_roots.push((child, roots));
+                    }
+                    _ => {
+                        harness
+                            .trace
+                            .record(format!("delete step={step} device={device_id}"));
+                        let roots = live_roots.remove(&device_id).unwrap();
+                        let delete = client.open_device(device_id).unwrap().delete().unwrap();
+                        assert_eq!(
+                            store
+                                .metadata()
+                                .delete_record(delete.commit_seq)
+                                .unwrap()
+                                .shard_roots,
+                            roots
+                        );
+                        deleted_roots.insert(device_id, roots);
+                    }
+                }
+
+                assert_eq!(
+                    store.metadata().list_live_devices().unwrap(),
+                    live_roots.keys().copied().collect::<Vec<_>>(),
+                    "seed={seed} trace={:?}",
+                    harness.trace.events()
+                );
+                assert_eq!(
+                    store.metadata().list_deleted_devices().unwrap(),
+                    deleted_roots.keys().copied().collect::<Vec<_>>(),
+                    "seed={seed} trace={:?}",
+                    harness.trace.events()
+                );
+                assert_eq!(
+                    store
+                        .metadata()
+                        .roots_for_gc(RetentionPolicy {
+                            retain_deleted_devices: false,
+                        })
+                        .unwrap(),
+                    expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, false),
+                    "seed={seed} trace={:?}",
+                    harness.trace.events()
+                );
+                assert_eq!(
+                    store
+                        .metadata()
+                        .roots_for_gc(RetentionPolicy {
+                            retain_deleted_devices: true,
+                        })
+                        .unwrap(),
+                    expected_roots(&live_roots, &deleted_roots, &checkpoint_roots, true),
+                    "seed={seed} trace={:?}",
+                    harness.trace.events()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deleted_device_can_restore_from_retained_checkpoint_but_not_after_delete_time() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let server = Arc::new(LocalBlockServer::new(store.clone()));
+        let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
+        let device_id = client
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        let device = client.open_device(device_id).unwrap();
+        device.write_at(0, &[3; 4096]).unwrap();
+        let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+        device.write_at(0, &[4; 4096]).unwrap();
+        let delete = device.delete().unwrap();
+
+        let restored_id = device
+            .restore(RestorePoint::Checkpoint(checkpoint))
+            .expect("checkpoint roots are retained before GC");
+        let restored = client.open_device(restored_id).unwrap();
+        let mut bytes = [0; 4096];
+        restored.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [3; 4096]);
+
+        assert!(
+            store
+                .metadata()
+                .restore_device(
+                    device_id,
+                    RestorePoint::Time(LogicalTime::from_raw(delete.commit_seq.raw()))
+                )
+                .is_err()
+        );
     }
 
     #[test]

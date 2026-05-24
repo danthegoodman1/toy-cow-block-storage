@@ -332,6 +332,19 @@ pub struct ShardCommit {
     pub new_root: MetadataNodeId,
 }
 
+/// Append-only device deletion timeline record.
+///
+/// Deleting a device removes it from the live catalog but records the roots
+/// that were live at the deletion point. GC policy decides whether those roots
+/// remain retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRecord {
+    pub commit_seq: CommitSeq,
+    pub time: LogicalTime,
+    pub device_id: DeviceId,
+    pub shard_roots: Vec<MetadataNodeId>,
+}
+
 /// Durable PITR checkpoint.
 ///
 /// Checkpoints summarize owner roots at a commit sequence so restore can replay
