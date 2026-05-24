@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("toy-cow-block-storage is primarily a library crate");
 }
