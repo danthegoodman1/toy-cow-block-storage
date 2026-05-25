@@ -26,9 +26,9 @@ pub use api::{
 pub use error::{Result, StorageError};
 pub use extent::{
     AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, FileSpec,
-    KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeOperation, NativeRequest,
-    NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer, NativeTransport,
-    SnapshotKeyspaceRequest,
+    FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeOperation,
+    NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer,
+    NativeTransport, SnapshotKeyspaceRequest,
 };
 pub use id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,

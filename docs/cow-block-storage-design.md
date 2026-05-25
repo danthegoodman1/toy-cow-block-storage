@@ -296,8 +296,8 @@ Public guarantees:
 
 `NativeKeyspaceClient` and `NativeFile` are the native keyspace/file-facing API.
 This API is for custom filesystems or direct users that want filesystem-level
-snapshots, append ownership, file versions, and stale-writer fencing instead of
-encoding those semantics into ordinary block writes.
+snapshots, byte writes, append ownership, file versions, and stale-writer
+fencing instead of encoding those semantics into ordinary block writes.
 
 The snapshot and restore boundary is the native keyspace, not an individual
 file. A keyspace is a filesystem-like namespace whose committed head points to
@@ -333,13 +333,15 @@ keyspace_id, file_id, file_version, file_range -> segment_id, segment_offset
 Public native guarantees:
 
 - Keyspace snapshots and restores are atomic namespace-level operations.
-- File appends are fenced by append leases with writer epochs.
-- Native file reads and appends are byte-oriented; block alignment is an
+- File writes are ordinary byte-offset mutations fenced by the committed file
+  version.
+- File appends are separately fenced by append leases with writer epochs.
+- Native file reads, writes, and appends are byte-oriented; block alignment is an
   implementation-private segment detail.
 - The metadata plane rejects stale append commits whose file version or writer
   epoch no longer matches the keyspace-scoped file.
-- A successful append commit advances the file version and keyspace catalog root
-  atomically.
+- A successful mutating write or append commit advances the file version and
+  keyspace catalog root atomically.
 - Segment bytes are durable before file extent metadata references them.
 - Failed or stale append commits leave only orphan segment data that custodians
   can reclaim.
@@ -383,7 +385,7 @@ deterministically.
 - native keyspace catalog-root publish with file-version and writer-epoch
   fencing
 - commit groups for multi-shard atomic public writes
-- commit groups for native append/file extent commits
+- commit groups for native file write/append extent commits
 - PITR shard commits, keyspace commits, and checkpoints
 - metadata node durability
 - retained roots for GC
@@ -659,6 +661,24 @@ Invariants:
 - Empty native files read as empty.
 - The file version changes only through committed metadata updates.
 - The file root is separate from block device shard roots.
+
+### Native File Write
+
+A native file write is a byte-offset mutation against one file inside a
+keyspace. It can overwrite existing bytes or extend the file from the current
+end, but v1 rejects sparse writes beyond EOF. The local segment store remains
+block-aligned internally; unaligned file writes are implemented by copying the
+affected logical blocks into a fresh immutable segment and publishing a new file
+root.
+
+Invariants:
+
+- A successful write advances the file version atomically with the containing
+  keyspace catalog root.
+- Writes are fenced by the committed file version observed by the metadata
+  plane.
+- Failed writes leave the previous file version readable.
+- Segment/block alignment is not exposed to native callers.
 
 ### Acquire Append Lease
 
@@ -988,8 +1008,8 @@ Provider and service boundaries:
 - `BlockServer`: actor boundary that handles block requests.
 - `BlockTransport`: typed request/response transport.
 - `NativeKeyspaceClient`: public native keyspace control handle.
-- `NativeFile`: public native file handle with append leases and file-version
-  commits.
+- `NativeFile`: public native file handle with byte writes, append leases, and
+  file-version commits.
 - `NativeServer`: actor boundary that handles native keyspace/file requests.
 - `NativeTransport`: typed request/response transport for native keyspace/file
   requests.

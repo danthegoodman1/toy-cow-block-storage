@@ -9,9 +9,9 @@ use crate::api::{
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
-    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, KeyspaceInfo,
-    NativeFile, NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope, NativeResponse,
-    NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
+    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, FileWriteCommit,
+    KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope,
+    NativeResponse, NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
 };
 use crate::id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
@@ -440,6 +440,121 @@ impl LocalObjectStore {
             file_id: lease.file_id,
             extent_id: self.next_extent_id()?,
             range: ByteRange::new(head.size, data_len),
+            version: committed.version,
+            commit_seq: committed.latest_commit,
+            durability,
+        })
+    }
+
+    pub fn write_file_at(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+    ) -> Result<FileWriteCommit> {
+        let data_len = u64::try_from(data.len())
+            .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
+        let range = ByteRange::new(offset, data_len);
+        let end = range.end_exclusive()?;
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+
+        if offset > head.size {
+            return Err(StorageError::invalid_argument(
+                "native file write cannot create a sparse gap",
+            ));
+        }
+
+        if data.is_empty() {
+            return Ok(FileWriteCommit {
+                keyspace_id,
+                file_id,
+                range,
+                version: head.version,
+                commit_seq: head.latest_commit,
+                durability,
+            });
+        }
+
+        let owner = MappingOwner::NativeKeyspace(keyspace_id);
+        let block_size = u64::from(self.metadata.config.block_size);
+        let first_block = offset / block_size;
+        let requested_start = first_block
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("native write range overflows"))?;
+        let segment_blocks = blocks_for_bytes(end - requested_start, block_size)?;
+        let write_range = crate::api::BlockRange::new(
+            BlockIndex::from_raw(first_block),
+            BlockCount::from_raw(segment_blocks),
+        );
+        let root = self.metadata.get_metadata_node(head.root)?;
+        if !root.covered_range.contains_range(write_range)? {
+            return Err(StorageError::invalid_argument(
+                "native file write exceeds file root coverage",
+            ));
+        }
+
+        let segment_len = segment_blocks.checked_mul(block_size).ok_or_else(|| {
+            StorageError::invalid_argument("native write segment length overflows")
+        })?;
+        let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
+            StorageError::invalid_argument("native write segment length overflows usize")
+        })?;
+        let segment_bytes = if offset % block_size == 0 && data_len % block_size == 0 {
+            data.to_vec()
+        } else {
+            let mut bytes = vec![0; segment_len_usize];
+            self.read_metadata_node(&root, write_range, block_size, &mut bytes)?;
+            let write_offset = usize::try_from(offset - requested_start).map_err(|_| {
+                StorageError::invalid_argument("native write segment offset overflows usize")
+            })?;
+            let write_len = usize::try_from(data_len).map_err(|_| {
+                StorageError::invalid_argument("native write length overflows usize")
+            })?;
+            let write_end = write_offset
+                .checked_add(write_len)
+                .ok_or_else(|| StorageError::invalid_argument("native write end overflows"))?;
+            let target = bytes.get_mut(write_offset..write_end).ok_or_else(|| {
+                StorageError::corrupt("native write segment range does not cover payload")
+            })?;
+            target.copy_from_slice(data);
+            bytes
+        };
+
+        let reservation = self.write_segment_for_owner_with_intent(
+            owner,
+            self.next_write_intent()?,
+            &segment_bytes,
+        )?;
+        let edit = TreeRangeEdit {
+            range: write_range,
+            replacement: Some(SegmentReplacement {
+                segment_id: reservation.segment_id,
+                segment_base: write_range.start,
+            }),
+        };
+        let new_root = self.replace_tree_range(head.root, edit)?.root;
+        let new_size = head.size.max(end);
+
+        self.metadata.publish_commit_group(CommitGroupIntent {
+            owner,
+            fence: MetadataFence::FileVersion(head.version),
+            updates: vec![RootUpdate::FileRoot {
+                file_id,
+                old_root: head.root,
+                new_root,
+                new_size,
+            }],
+        })?;
+        self.segment_catalog
+            .mark_segment_referenced(reservation.segment_id)?;
+        let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
+
+        Ok(FileWriteCommit {
+            keyspace_id,
+            file_id,
+            range,
             version: committed.version,
             commit_seq: committed.latest_commit,
             durability,
@@ -3990,6 +4105,19 @@ impl NativeServer for LocalNativeServer {
                         .read_file(keyspace_id, file_id, range, &mut bytes)?;
                     Ok(NativeResponse::Read(ReadResponse { bytes }))
                 }
+                NativeRequest::Write {
+                    keyspace_id,
+                    file_id,
+                    offset,
+                    bytes,
+                    durability,
+                } => Ok(NativeResponse::Write(self.store.write_file_at(
+                    keyspace_id,
+                    file_id,
+                    offset,
+                    &bytes,
+                    durability,
+                )?)),
                 NativeRequest::AcquireAppend {
                     keyspace_id,
                     file_id,
@@ -4551,6 +4679,25 @@ impl NativeFile for LocalNativeFile {
                 Ok(())
             }
             _ => Err(StorageError::corrupt("unexpected native-read response")),
+        }
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<FileWriteCommit> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::Write {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                offset,
+                bytes: data.to_vec(),
+                durability: crate::api::WriteDurability::Acknowledged,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::Write(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt("unexpected native-write response")),
         }
     }
 
@@ -6664,30 +6811,48 @@ mod tests {
             let keyspace_id = create_local_keyspace(&client);
             let (file_id, file) = create_local_file(&client, keyspace_id);
             let mut model = Vec::new();
+            let capacity = 32 * 4096;
 
             for step in 0..16 {
-                let remaining = 32 - model.len() as u64;
-                if remaining == 0 {
+                if model.len() == capacity {
                     break;
                 }
-                let blocks = 1 + harness.rng.next_u64() % remaining.min(4);
                 let byte = (1 + harness.rng.next_u64() % 254) as u8;
-                harness
-                    .trace
-                    .record(format!("append step={step} blocks={blocks} byte={byte}"));
-                let lease = file.acquire_append().unwrap();
-                file.append_with_lease(lease, &repeated_blocks(blocks, byte))
-                    .unwrap();
-                model.extend(std::iter::repeat_n(byte, blocks as usize));
+                let expected_version = if model.is_empty() || harness.rng.next_u64() % 2 == 0 {
+                    let remaining = capacity - model.len();
+                    let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
+                    harness
+                        .trace
+                        .record(format!("append step={step} len={len} byte={byte}"));
+                    let lease = file.acquire_append().unwrap();
+                    let payload = vec![byte; len];
+                    let commit = file.append_with_lease(lease, &payload).unwrap();
+                    model.extend_from_slice(&payload);
+                    commit.version
+                } else {
+                    let offset = harness.rng.next_u64() as usize % (model.len() + 1);
+                    let remaining = capacity - offset;
+                    let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
+                    let payload = vec![byte; len];
+                    harness.trace.record(format!(
+                        "write step={step} offset={offset} len={len} byte={byte}"
+                    ));
+                    let commit = file.write_at(offset as u64, &payload).unwrap();
+                    apply_model_write(&mut model, offset, &payload);
+                    commit.version
+                };
 
-                let mut actual = vec![0; model.len() * 4096];
+                let info = file.info().unwrap();
+                assert_eq!(info.size, model.len() as u64);
+                assert_eq!(info.version, expected_version);
+                let mut actual = vec![0; model.len()];
                 file.read_at(0, &mut actual).unwrap();
                 let root = store
                     .metadata()
                     .get_file_head(keyspace_id, file_id)
                     .unwrap()
                     .root;
-                assert_model_blocks(
+                assert_model_bytes(
                     &actual,
                     &model,
                     seed,
@@ -7376,6 +7541,102 @@ mod tests {
     }
 
     #[test]
+    fn native_file_write_at_is_first_class_and_snapshot_isolated() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, file) = create_local_file(&client, keyspace_id);
+
+        let first = file.write_at(0, b"hello world").unwrap();
+        assert_eq!(first.range, ByteRange::new(0, 11));
+        assert_eq!(first.version, FileVersion::from_raw(1));
+        assert_eq!(file.info().unwrap().size, 11);
+
+        let snapshot_keyspace = client
+            .snapshot_keyspace(
+                keyspace_id,
+                SnapshotKeyspaceRequest {
+                    target: None,
+                    name: Some("before-overwrite".to_string()),
+                },
+            )
+            .unwrap();
+
+        let overwrite = file.write_at(0, b"goodbye!!!!").unwrap();
+        assert_eq!(overwrite.range, ByteRange::new(0, 11));
+        assert_eq!(overwrite.version, FileVersion::from_raw(2));
+
+        let zero = file.write_at(11, &[]).unwrap();
+        assert_eq!(zero.version, overwrite.version);
+        assert_eq!(zero.commit_seq, overwrite.commit_seq);
+        assert!(file.write_at(12, b"x").is_err());
+
+        let mut source = vec![0; 11];
+        file.read_at(0, &mut source).unwrap();
+        assert_eq!(source.as_slice(), b"goodbye!!!!");
+
+        let snapshot_file = client.open_file(snapshot_keyspace, file_id).unwrap();
+        let mut snapshot = vec![0; 11];
+        snapshot_file.read_at(0, &mut snapshot).unwrap();
+        assert_eq!(snapshot.as_slice(), b"hello world");
+    }
+
+    #[test]
+    fn native_file_write_at_preserves_unmodified_bytes_and_rejects_sparse_gaps() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+
+        let mut expected = vec![1; 4093];
+        file.write_at(0, &expected).unwrap();
+
+        file.write_at(4093, &[2u8; 8]).unwrap();
+        expected.extend_from_slice(&[2u8; 8]);
+
+        file.write_at(4090, &[3u8; 8]).unwrap();
+        expected[4090..4098].fill(3);
+
+        let info = file.info().unwrap();
+        assert_eq!(info.size, expected.len() as u64);
+        let mut actual = vec![0; expected.len()];
+        file.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+
+        let segment_entries = store.segment_catalog().entries().unwrap().len();
+        let metadata_nodes = store.metadata().metadata_node_count().unwrap();
+        let latest_commit = store
+            .metadata()
+            .get_file_head(keyspace_id, file.file_id())
+            .unwrap()
+            .latest_commit;
+        let zero = file.write_at(info.size, &[]).unwrap();
+        assert_eq!(zero.version, info.version);
+        assert_eq!(zero.commit_seq, latest_commit);
+        assert_eq!(
+            store
+                .metadata()
+                .get_file_head(keyspace_id, file.file_id())
+                .unwrap()
+                .latest_commit,
+            latest_commit
+        );
+        assert_eq!(
+            store.segment_catalog().entries().unwrap().len(),
+            segment_entries
+        );
+        assert_eq!(
+            store.metadata().metadata_node_count().unwrap(),
+            metadata_nodes
+        );
+
+        assert!(file.write_at(info.size + 1, b"x").is_err());
+        let mut after_failed_sparse_write = vec![0; expected.len()];
+        file.read_at(0, &mut after_failed_sparse_write).unwrap();
+        assert_eq!(after_failed_sparse_write, expected);
+    }
+
+    #[test]
     fn native_keyspace_snapshot_and_restore_are_filesystem_level() {
         let store = LocalObjectStore::with_config(config()).unwrap();
         let client = create_native_client(&store);
@@ -7677,12 +7938,15 @@ mod tests {
             let keyspace_id = create_local_keyspace(&client);
             let (file_a, handle_a) = create_local_file(&client, keyspace_id);
             let (file_b, handle_b) = create_local_file(&client, keyspace_id);
-            let mut model: BTreeMap<FileId, Vec<u8>> =
-                BTreeMap::from([(file_a, Vec::new()), (file_b, Vec::new())]);
+            let mut model: BTreeMap<FileId, NativeFileReference> = BTreeMap::from([
+                (file_a, NativeFileReference::empty()),
+                (file_b, NativeFileReference::empty()),
+            ]);
             let mut history = vec![(
                 client.keyspace_info(keyspace_id).unwrap().latest_commit,
                 model.clone(),
             )];
+            let capacity = 32 * 4096;
 
             for step in 0..18 {
                 let (file_id, handle) = if harness.rng.next_u64() % 2 == 0 {
@@ -7691,14 +7955,41 @@ mod tests {
                     (file_b, &handle_b)
                 };
                 let byte = (1 + harness.rng.next_u64() % 254) as u8;
-                harness
-                    .trace
-                    .record(format!("append step={step} file={file_id} byte={byte}"));
-                let commit = handle
-                    .append_with_lease(handle.acquire_append().unwrap(), &[byte; 4096])
-                    .unwrap();
-                model.get_mut(&file_id).unwrap().push(byte);
-                history.push((commit.commit_seq, model.clone()));
+                let file_model = model.get_mut(&file_id).unwrap();
+                let commit_seq = if file_model.bytes.is_empty()
+                    || (file_model.bytes.len() < capacity && harness.rng.next_u64() % 2 == 0)
+                {
+                    let remaining = capacity - file_model.bytes.len();
+                    let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
+                    let payload = vec![byte; len];
+                    harness.trace.record(format!(
+                        "append step={step} file={file_id} len={len} byte={byte}"
+                    ));
+                    let commit = handle
+                        .append_with_lease(handle.acquire_append().unwrap(), &payload)
+                        .unwrap();
+                    file_model.bytes.extend_from_slice(&payload);
+                    file_model.version = commit.version;
+                    commit.commit_seq
+                } else {
+                    let max_offset = if file_model.bytes.len() == capacity {
+                        capacity - 1
+                    } else {
+                        file_model.bytes.len()
+                    };
+                    let offset = harness.rng.next_u64() as usize % (max_offset + 1);
+                    let remaining = capacity - offset;
+                    let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
+                    let payload = vec![byte; len];
+                    harness.trace.record(format!(
+                        "write step={step} file={file_id} offset={offset} len={len} byte={byte}"
+                    ));
+                    let commit = handle.write_at(offset as u64, &payload).unwrap();
+                    apply_model_write(&mut file_model.bytes, offset, &payload);
+                    file_model.version = commit.version;
+                    commit.commit_seq
+                };
+                history.push((commit_seq, model.clone()));
                 if harness.rng.next_u64() % 4 == 0 {
                     client.checkpoint_keyspace(keyspace_id).unwrap();
                 }
@@ -7710,13 +8001,16 @@ mod tests {
                 let restored = client
                     .restore_keyspace(keyspace_id, RestorePoint::Commit(*commit_seq))
                     .unwrap();
-                for (file_id, expected_blocks) in expected {
+                for (file_id, expected_file) in expected {
                     let restored_file = client.open_file(restored, *file_id).unwrap();
-                    let mut actual = vec![0; expected_blocks.len() * 4096];
+                    let info = restored_file.info().unwrap();
+                    assert_eq!(info.size, expected_file.bytes.len() as u64);
+                    assert_eq!(info.version, expected_file.version);
+                    let mut actual = vec![0; expected_file.bytes.len()];
                     restored_file.read_at(0, &mut actual).unwrap();
-                    assert_model_blocks(
+                    assert_model_bytes(
                         &actual,
-                        expected_blocks,
+                        &expected_file.bytes,
                         seed,
                         harness.trace.events(),
                         "native keyspace restore",
@@ -7991,6 +8285,29 @@ mod tests {
         out
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct NativeFileReference {
+        bytes: Vec<u8>,
+        version: FileVersion,
+    }
+
+    impl NativeFileReference {
+        fn empty() -> Self {
+            Self {
+                bytes: Vec::new(),
+                version: FileVersion::from_raw(0),
+            }
+        }
+    }
+
+    fn apply_model_write(model: &mut Vec<u8>, offset: usize, payload: &[u8]) {
+        let end = offset + payload.len();
+        if end > model.len() {
+            model.resize(end, 0);
+        }
+        model[offset..end].copy_from_slice(payload);
+    }
+
     fn validate_device_roots(store: &LocalObjectStore, device_id: DeviceId) {
         let head = store.metadata().get_head(device_id).unwrap();
         for root in head.shard_roots {
@@ -8020,5 +8337,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn assert_model_bytes(actual: &[u8], model: &[u8], seed: u64, trace: &[String], tree: &str) {
+        if actual == model {
+            return;
+        }
+        let mismatch = actual
+            .iter()
+            .zip(model.iter())
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or_else(|| actual.len().min(model.len()));
+        let actual_byte = actual.get(mismatch).copied();
+        let expected_byte = model.get(mismatch).copied();
+        panic!(
+            "seed {seed} byte {mismatch} expected {expected_byte:?} actual {actual_byte:?} expected_len={} actual_len={}\ntrace:\n{}\ntree:\n{tree}",
+            model.len(),
+            actual.len(),
+            trace.join("\n")
+        );
     }
 }

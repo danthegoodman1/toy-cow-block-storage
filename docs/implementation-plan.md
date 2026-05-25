@@ -58,8 +58,8 @@ Deliverables:
 - [x] Public `NativeKeyspaceClient` trait for native keyspace create/info,
   file create/info/append-lease lookup, keyspace checkpoint, snapshot, and
   restore.
-- [x] Public `NativeFile` trait for native file reads, append leases, leased
-  appends, flush, and info.
+- [x] Public `NativeFile` trait for native file reads, byte writes, append
+  leases, leased appends, flush, and info.
 - [x] `BlockServer` actor boundary.
 - [x] `BlockTransport` request/response boundary.
 - [x] `NativeServer` actor boundary.
@@ -448,7 +448,8 @@ Deliverables:
 - [x] Benchmarks for fork cost versus device size.
 - [x] Benchmarks for single-shard write cost versus tree depth.
 - [x] Benchmarks for multi-shard atomic write cost.
-- [x] Benchmarks for native append with valid leases and stale-lease rejection.
+- [x] Benchmarks for native write, native append with valid leases, and
+  stale-lease rejection.
 - [x] Benchmarks for read lookup cost and read amplification.
 - [x] Benchmarks for checkpoint restore and GC traversal.
 
@@ -503,8 +504,8 @@ produce coherent filesystem-level restore points.
 Deliverables:
 
 - [x] Public native keyspace restore/snapshot API shape documented in the spec.
-- [x] Native file append/read semantics are byte-oriented while local segment
-  storage remains block-aligned internally.
+- [x] Native file read/write/append semantics are byte-oriented while local
+  segment storage remains block-aligned internally.
 - [x] Append-only `KeyspaceCommit` records with old/new keyspace catalog roots,
   commit sequence, commit group, and logical time.
 - [x] Append-only `FileCommit` records with old/new file roots, old/new file
@@ -529,8 +530,8 @@ Exit gate:
 - [x] Snapshot and restore reuse the retained `KeyspaceRoot` pointer and do not
   allocate file metadata-tree nodes.
 - [x] Native checkpoint validation rejects mismatched keyspace roots.
-- [x] Unaligned native appends and reads across a block boundary preserve exact
-  file bytes and size.
+- [x] Unaligned native writes, appends, and reads across a block boundary
+  preserve exact file bytes and size.
 - [x] Stale append leases cannot publish across a restore or snapshot lineage
   boundary.
 - [x] Native PITR GC never deletes metadata or segments needed by retained
@@ -561,13 +562,13 @@ catalog roots.
 
 Deliverables:
 
-- [ ] Criterion benchmarks for native file create, info, append, read,
+- [ ] Criterion benchmarks for native file create, info, write, append, read,
   checkpoint, snapshot, restore, and stale-lease rejection at keyspace sizes
   `1`, `1k`, `100k`, and the largest practical local stress size.
-- [ ] Benchmarks for concurrent native appends across independent files and,
-  separately, conflicting append attempts against one file.
-- [ ] Benchmarks for aligned append/read versus unaligned append/read,
-  including the partial-tail-block COW path.
+- [ ] Benchmarks for concurrent native writes/appends across independent files
+  and, separately, conflicting write/append attempts against one file.
+- [ ] Benchmarks for aligned write/append/read versus unaligned
+  write/append/read, including the partial-tail-block COW path.
 - [ ] Benchmarks that assert keyspace snapshot and restore stay O(1) in file
   metadata-tree nodes and do not walk file contents.
 - [ ] Regression thresholds or documented baseline ranges for native hot paths

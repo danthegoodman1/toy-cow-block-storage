@@ -62,6 +62,16 @@ pub struct AppendCommit {
     pub durability: WriteDurability,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWriteCommit {
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
+    pub range: ByteRange,
+    pub version: FileVersion,
+    pub commit_seq: CommitSeq,
+    pub durability: WriteDurability,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeOperation {
     CreateKeyspace,
@@ -69,6 +79,7 @@ pub enum NativeOperation {
     CreateFile,
     FileInfo,
     Read,
+    Write,
     AcquireAppend,
     Append,
     Flush,
@@ -80,19 +91,19 @@ pub enum NativeOperation {
 /// User-facing native file handle.
 ///
 /// This API is a sibling of the block API over the shared segment substrate. It
-/// preserves file-level intent such as append leases and writer epochs while
-/// keeping snapshots at the keyspace/filesystem boundary.
+/// preserves file-level intent such as byte writes, append leases, and writer
+/// epochs while keeping snapshots at the keyspace/filesystem boundary.
 ///
 /// Minimal implementor guarantees:
 ///
-/// - Successful appends are atomic file-version transitions inside one
-///   keyspace catalog commit.
+/// - Successful writes and appends are atomic file-version transitions inside
+///   one keyspace catalog commit.
 /// - Stale append leases and stale writer epochs fail without exposing partial
 ///   file contents.
 /// - Reads observe the latest committed file root/version in this file's
 ///   keyspace.
-/// - Failed appends leave the previous committed file version readable, even
-///   when durable segment bytes later need custodian cleanup.
+/// - Failed writes and appends leave the previous committed file version
+///   readable, even when durable segment bytes later need custodian cleanup.
 /// - Native file operations share write-intent, segment lifecycle, metadata,
 ///   and custodian machinery with the block mapping layer instead of being
 ///   implemented as ordinary block writes.
@@ -116,6 +127,15 @@ pub trait NativeFile: Send + Sync {
     /// implementation detail. A zero-length buffer is a no-op. Reads past the
     /// committed file size must fail rather than synthesize data.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+
+    /// Write bytes at an arbitrary file offset.
+    ///
+    /// Success means the byte payload is durable and committed as one
+    /// file-version transition. Writes may overwrite existing bytes or extend
+    /// the file from its current end; sparse writes beyond the current end must
+    /// fail. Segment/block alignment is an implementation detail. A zero-length
+    /// write is a no-op and must not allocate segment data.
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<FileWriteCommit>;
 
     /// Acquire an append lease for this file.
     ///
@@ -203,6 +223,13 @@ pub enum NativeRequest {
         file_id: FileId,
         range: ByteRange,
     },
+    Write {
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        offset: u64,
+        bytes: Vec<u8>,
+        durability: WriteDurability,
+    },
     AcquireAppend {
         keyspace_id: KeyspaceId,
         file_id: FileId,
@@ -239,6 +266,7 @@ impl NativeRequest {
             Self::CreateFile { .. } => NativeOperation::CreateFile,
             Self::FileInfo { .. } => NativeOperation::FileInfo,
             Self::Read { .. } => NativeOperation::Read,
+            Self::Write { .. } => NativeOperation::Write,
             Self::AcquireAppend { .. } => NativeOperation::AcquireAppend,
             Self::Append { .. } => NativeOperation::Append,
             Self::Flush { .. } => NativeOperation::Flush,
@@ -254,6 +282,7 @@ impl NativeRequest {
             | Self::CreateFile { keyspace_id, .. }
             | Self::FileInfo { keyspace_id, .. }
             | Self::Read { keyspace_id, .. }
+            | Self::Write { keyspace_id, .. }
             | Self::AcquireAppend { keyspace_id, .. }
             | Self::Append { keyspace_id, .. }
             | Self::Flush { keyspace_id, .. }
@@ -269,6 +298,7 @@ impl NativeRequest {
         match self {
             Self::FileInfo { file_id, .. }
             | Self::Read { file_id, .. }
+            | Self::Write { file_id, .. }
             | Self::AcquireAppend { file_id, .. }
             | Self::Append { file_id, .. }
             | Self::Flush { file_id, .. } => Some(*file_id),
@@ -284,6 +314,12 @@ impl NativeRequest {
     pub fn byte_range(&self) -> Result<Option<ByteRange>> {
         match self {
             Self::Read { range, .. } => Ok(Some(*range)),
+            Self::Write { offset, bytes, .. } => {
+                let len = u64::try_from(bytes.len()).map_err(|_| {
+                    StorageError::invalid_argument("write byte length overflows u64")
+                })?;
+                Ok(Some(ByteRange::new(*offset, len)))
+            }
             Self::Append { bytes, .. } => {
                 let len = u64::try_from(bytes.len()).map_err(|_| {
                     StorageError::invalid_argument("append byte length overflows u64")
@@ -318,6 +354,7 @@ impl NativeRequest {
             | Self::KeyspaceInfo { .. }
             | Self::FileInfo { .. }
             | Self::Read { .. }
+            | Self::Write { .. }
             | Self::AcquireAppend { .. }
             | Self::Append { .. }
             | Self::Flush { .. }
@@ -334,6 +371,13 @@ impl NativeRequest {
             Self::CreateFile { .. } => Err(StorageError::invalid_argument(
                 "create-file request does not target an existing file",
             )),
+            Self::Write { offset, bytes, .. } => {
+                let len = u64::try_from(bytes.len()).map_err(|_| {
+                    StorageError::invalid_argument("write byte length overflows u64")
+                })?;
+                ByteRange::new(*offset, len).end_exclusive()?;
+                Ok(())
+            }
             Self::Append {
                 keyspace_id,
                 file_id,
@@ -375,6 +419,7 @@ pub enum NativeResponse {
     FileCreated(FileId),
     FileInfo(FileInfo),
     Read(ReadResponse),
+    Write(FileWriteCommit),
     Append(AppendCommit),
     AppendLease(AppendLease),
     Flush(FlushResult),
@@ -490,6 +535,17 @@ mod tests {
         assert_eq!(request.operation(), NativeOperation::AcquireAppend);
         assert_eq!(request.target_keyspace_id(), Some(keyspace_id));
         assert_eq!(request.target_file_id(), Some(file_id));
+        let write = NativeRequest::Write {
+            keyspace_id,
+            file_id,
+            offset: 16,
+            bytes: vec![1, 2, 3],
+            durability: WriteDurability::Acknowledged,
+        };
+        assert_eq!(write.operation(), NativeOperation::Write);
+        assert_eq!(write.target_keyspace_id(), Some(keyspace_id));
+        assert_eq!(write.target_file_id(), Some(file_id));
+        assert_eq!(write.byte_range().unwrap(), Some(ByteRange::new(16, 3)));
         assert_eq!(
             NativeRequest::CreateKeyspace {
                 request: CreateKeyspaceRequest { name: None },
@@ -558,6 +614,29 @@ mod tests {
             durability: WriteDurability::Acknowledged,
         };
         assert!(mismatched.validate_for_existing_file().is_err());
+    }
+
+    #[test]
+    fn write_validation_allows_empty_noop_and_rejects_overflow() {
+        let keyspace_id = KeyspaceId::from_raw(5);
+        let file_id = FileId::from_raw(7);
+        let empty = NativeRequest::Write {
+            keyspace_id,
+            file_id,
+            offset: 9,
+            bytes: Vec::new(),
+            durability: WriteDurability::Acknowledged,
+        };
+        assert!(empty.validate_for_existing_file().is_ok());
+
+        let overflowing = NativeRequest::Write {
+            keyspace_id,
+            file_id,
+            offset: u64::MAX,
+            bytes: vec![1],
+            durability: WriteDurability::Acknowledged,
+        };
+        assert!(overflowing.validate_for_existing_file().is_err());
     }
 
     #[test]

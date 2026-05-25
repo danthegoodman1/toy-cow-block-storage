@@ -385,6 +385,46 @@ fn bench_local_native_append(c: &mut Criterion) {
     });
 }
 
+fn bench_local_native_write_at(c: &mut Criterion) {
+    c.bench_function("local_native_write_at", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::new();
+                let keyspace = store
+                    .metadata()
+                    .create_keyspace(
+                        toy_cow_block_storage::provider::MetadataCreateKeyspaceRequest {
+                            request: toy_cow_block_storage::CreateKeyspaceRequest { name: None },
+                        },
+                    )
+                    .unwrap();
+                let head = store
+                    .metadata()
+                    .create_file(toy_cow_block_storage::provider::MetadataCreateFileRequest {
+                        keyspace_id: keyspace.keyspace_id,
+                        request: toy_cow_block_storage::CreateFileRequest {
+                            spec: toy_cow_block_storage::FileSpec { name: None },
+                        },
+                    })
+                    .unwrap();
+                (store, keyspace.keyspace_id, head.file_id, vec![4; 4096])
+            },
+            |(store, keyspace_id, file_id, bytes)| {
+                store
+                    .write_file_at(
+                        black_box(keyspace_id),
+                        black_box(file_id),
+                        black_box(0),
+                        black_box(&bytes),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_local_native_stale_lease_rejection(c: &mut Criterion) {
     let store = LocalObjectStore::new();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(store));
@@ -686,9 +726,23 @@ fn bench_native_append_validation(c: &mut Criterion) {
     });
 }
 
+fn bench_native_write_validation(c: &mut Criterion) {
+    let request = NativeRequest::Write {
+        keyspace_id: KeyspaceId::from_raw(5),
+        file_id: FileId::from_raw(9),
+        offset: 128,
+        bytes: vec![0; 64 * 4096],
+        durability: WriteDurability::Acknowledged,
+    };
+
+    c.bench_function("native_write_validation", |b| {
+        b.iter(|| black_box(&request).validate_for_existing_file())
+    });
+}
+
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng
 }
 criterion_main!(regression);

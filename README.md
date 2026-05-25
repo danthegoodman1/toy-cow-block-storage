@@ -114,8 +114,10 @@ Block API guarantees to care about:
 ### Native Keyspace/File Flow
 
 Use the native API when the caller wants file/keyspace intent preserved by the
-storage layer: append leases, stale-writer rejection, byte-oriented appends, and
-filesystem-level snapshots.
+storage layer: byte-oriented writes, append leases, stale-writer rejection, and
+filesystem-level snapshots. A keyspace snapshot is the native API's fork-like
+operation: it creates a new keyspace lineage that initially shares immutable
+catalog and file roots.
 
 ```rust
 use std::sync::Arc;
@@ -146,8 +148,7 @@ fn native_keyspace_flow() -> toy_cow_block_storage::Result<()> {
     )?;
 
     let file = native_client.open_file(keyspace_id, file_id)?;
-    let lease = file.acquire_append()?;
-    file.append_with_lease(lease, b"hello world")?;
+    file.write_at(0, b"hello world")?;
 
     let mut bytes = vec![0; 11];
     file.read_at(0, &mut bytes)?;
@@ -155,25 +156,29 @@ fn native_keyspace_flow() -> toy_cow_block_storage::Result<()> {
 
     let checkpoint = native_client.checkpoint_keyspace(keyspace_id)?;
 
-    file.append_with_lease(file.acquire_append()?, b"!")?;
-
     let snapshot_id = native_client.snapshot_keyspace(
         keyspace_id,
         SnapshotKeyspaceRequest {
             target: None,
-            name: Some("after-bang".to_string()),
+            name: Some("before-overwrite".to_string()),
         },
     )?;
+
+    file.write_at(0, b"goodbye!!!!")?;
+
+    file.read_at(0, &mut bytes)?;
+    assert_eq!(bytes.as_slice(), b"goodbye!!!!");
+
+    // The snapshot keyspace still sees the original file bytes.
+    let snapshot_file = native_client.open_file(snapshot_id, file_id)?;
+    let mut snapshot_bytes = vec![0; 11];
+    snapshot_file.read_at(0, &mut snapshot_bytes)?;
+    assert_eq!(snapshot_bytes.as_slice(), b"hello world");
 
     let restored_id = native_client.restore_keyspace(
         keyspace_id,
         RestorePoint::Checkpoint(checkpoint),
     )?;
-
-    let snapshot_file = native_client.open_file(snapshot_id, file_id)?;
-    let mut snapshot_bytes = vec![0; 12];
-    snapshot_file.read_at(0, &mut snapshot_bytes)?;
-    assert_eq!(snapshot_bytes.as_slice(), b"hello world!");
 
     let restored_file = native_client.open_file(restored_id, file_id)?;
     let mut restored_bytes = vec![0; 11];
@@ -188,10 +193,12 @@ Native API guarantees to care about:
 
 - Keyspaces are the snapshot and restore boundary.
 - File IDs are scoped by keyspace.
-- Appends are byte-oriented and committed as file-version transitions.
+- Writes and appends are byte-oriented and committed as file-version
+  transitions.
 - Append leases carry writer epochs so stale writers fail without partial file
   visibility.
-- A successful append publishes a new immutable keyspace catalog root.
+- A successful non-empty file write publishes a new immutable keyspace catalog
+  root.
 - Snapshot and restore copy retained keyspace-root pointers rather than walking
   file contents.
 
