@@ -217,6 +217,70 @@ Native API guarantees to care about:
 - Snapshot and restore copy retained keyspace-root pointers rather than walking
   file contents.
 
+## Durable Maintenance
+
+The durable local provider stores segment bytes in node-scoped rolled data logs
+and keeps metadata in SQLite. Maintenance is explicit by default: callers can
+observe dirty/reclaimable bytes, ask the deterministic scheduler for a plan,
+and run one bounded tick.
+
+```rust
+use toy_cow_block_storage::{
+    DurableObjectStore, MaintenanceMode, MaintenancePolicy, WriteAdmission,
+};
+
+let store = DurableObjectStore::open_with_maintenance_policy(
+    "/tmp/toy-cow",
+    Default::default(),
+    MaintenancePolicy::default(), // Manual mode by default.
+)?;
+
+let observation = store.observe_maintenance()?;
+let plan = store.plan_maintenance()?;
+if matches!(plan.admission, WriteAdmission::AcceptAndSchedule) {
+    store.run_maintenance_tick()?;
+}
+```
+
+For a long-running local process, opt into automatic bounded compaction by
+using `AlwaysOn`. The worker only runs after writes or custodian work wake it,
+and each tick is still limited by the policy:
+
+```rust
+let mut policy = MaintenancePolicy::default();
+policy.mode = MaintenanceMode::AlwaysOn;
+policy.write_backpressure_enabled = true;
+policy.dirty_low_watermark_bytes = 64 * 1024 * 1024;
+policy.dirty_high_watermark_bytes = 256 * 1024 * 1024;
+policy.compaction_copy_budget_per_tick = 32 * 1024 * 1024;
+
+let store = DurableObjectStore::open_with_maintenance_policy(
+    "/tmp/toy-cow",
+    Default::default(),
+    policy,
+)?;
+```
+
+When picking settings, think in plain storage terms:
+
+- Use `Manual` for deterministic tests and tools that want to schedule their
+  own maintenance. Use `AlwaysOn` for services that should steadily clean up in
+  the background. `Opportunistic` is the middle ground: writes can run one
+  bounded maintenance tick before they proceed.
+- Larger data logs are better for sequential write throughput and fewer files;
+  smaller data logs make reclaim work more granular.
+- The low dirty watermark says "start cleaning soon"; the high watermark says
+  "slow callers down" when `write_backpressure_enabled` is true.
+- Keep the copy budget small enough that one tick has predictable latency, and
+  large enough that debt can actually fall during normal traffic.
+- PITR retention and custodian release timing decide what is truly reclaimable.
+  Compaction will not delete bytes still protected by retained history.
+
+If write backpressure is enabled and pressure crosses a configured hard
+maintenance limit, durable writes return `StorageError::Unavailable` with a
+stable reason. Reads, forks, snapshots, restores, and flush semantics do not
+change.
+
 ## Phase Gates
 
 Run these before advancing past the project harness and public contract phases:

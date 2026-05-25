@@ -567,9 +567,11 @@ store/
   metadata.sqlite-wal
   metadata.sqlite-shm
   data/
-    data-000001.log
-    data-000002.log
-    data-000003.log
+    node-1/
+      data-000001.log
+      data-000002.log
+    node-2/
+      data-000001.log
   tmp/
 ```
 
@@ -605,9 +607,10 @@ transaction. Plain data-log files own large immutable segment bytes. This keeps
 compaction focused on selected data files instead of rewriting every live byte
 on a storage node.
 
-Data records live in rolled data-log files. The v1 SQLite schema has
-row-native metadata tables plus `segment_placements` and `data_logs`.
-`segment_placements` maps logical segments to current data-log records;
+Data records live in rolled data-log files scoped by storage node. The v1
+SQLite schema has row-native metadata tables plus `segment_placements` and
+node-scoped `data_logs` keyed by `(storage_node, log_id)`.
+`segment_placements` maps logical segments to current node/log records;
 `data_logs` tracks active, sealed, and deleted log files plus live/dead byte
 estimates. Reopen reconstructs the local object store from these rows and
 rejects missing heads, missing immutable object payloads, stale placements,
@@ -676,12 +679,20 @@ live relocated payloads. It must not be proportional to total live bytes on the
 storage node.
 
 Background compaction is a runtime policy layer, not hidden core behavior. The
-deterministic core exposes data-log accounting and an explicit compaction call;
-a later maintenance scheduler observes dirty bytes, sealed-log count, WAL size,
-PITR retention horizon, and custodian release evidence, then emits bounded
-compaction commands plus explicit write admission/backpressure decisions. Tests
-must be able to run the same policy by stepping a deterministic observation
-trace without wall-clock reads, sleeps, or process-global randomness.
+deterministic core exposes node-scoped data-log accounting and explicit
+maintenance ticks. The maintenance scheduler observes dirty bytes, sealed-log
+count, WAL size, PITR retention horizon, custodian release evidence, and a
+compaction cursor, then emits bounded compaction commands plus explicit write
+admission/backpressure decisions. Tests can run the same policy by stepping a
+deterministic observation trace without wall-clock reads, sleeps, or
+process-global randomness. Manual maintenance is the default; opportunistic and
+always-on local runtime modes are provider options below the public block/native
+APIs. The compaction cursor is persisted with the durable provider so fair log
+selection survives reopen. Opportunistic maintenance runs before the admitted
+write; a maintenance failure cannot make an already-published write report
+failure. Write backpressure is explicitly enabled by policy so the default
+manual maintenance configuration can observe and run ticks without adding a
+SQLite observation query to every hot write.
 
 SQLite maintenance is separate from data compaction. WAL checkpointing,
 integrity checks, and optional vacuum/incremental vacuum manage metadata file

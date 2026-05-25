@@ -936,9 +936,11 @@ store/
   metadata.sqlite-wal
   metadata.sqlite-shm
   data/
-    data-000001.log
-    data-000002.log
-    data-000003.log
+    node-1/
+      data-000001.log
+      data-000002.log
+    node-2/
+      data-000001.log
   tmp/
 ```
 
@@ -1248,7 +1250,7 @@ host/filesystem dependent.
 
 ## Phase 24: Background Compaction Scheduling and Backpressure Policy
 
-Status: not started.
+Status: complete.
 
 Turn Phase 21's explicit manual compaction hook into a deterministic maintenance
 actor and policy surface. The core still must not hide background work inside
@@ -1269,59 +1271,73 @@ Non-goals:
 
 Deliverables:
 
-- [ ] `MaintenanceScheduler` or equivalent deterministic policy object with a
+- [x] `MaintenanceScheduler` or equivalent deterministic policy object with a
   pure transition shape such as `step(observation) -> maintenance_commands,
   admission_decision`.
-- [ ] Explicit observation model for per-node active/sealed data logs,
+- [x] Explicit observation model for per-node active/sealed data logs,
   live/dead/reclaimable bytes, dirty-log count, active-log size, SQLite WAL
   size, pending custodian releases, PITR retention horizon, compaction cursor,
   and recent write/flush pressure.
-- [ ] Configured policy knobs for target data-log size, low/high dirty-byte
+- [x] Configured policy knobs for target data-log size, low/high dirty-byte
   watermarks, maximum sealed-log count, maximum reclaimable-debt bytes,
   compaction copy budget per tick, maximum SQLite WAL bytes, maximum concurrent
-  compaction jobs, and whether the runtime uses manual, opportunistic, or
-  always-on maintenance.
-- [ ] Explicit write admission decisions: accept, accept-and-schedule, throttle
+  compaction jobs, explicit write-backpressure enablement, and whether the
+  runtime uses manual, opportunistic, or always-on maintenance.
+- [x] Explicit write admission decisions: accept, accept-and-schedule, throttle
   with a documented reason, or reject because durable capacity/invariants would
   be violated. Runtime adapters may translate throttle into waiting; the core
   decision must remain observable and testable.
-- [ ] Background runtime loop for the local durable provider that executes
+- [x] Background runtime loop for the local durable provider that executes
   scheduler commands with bounded work per tick and clean shutdown semantics.
   The loop must be optional and replaceable by manual stepping in tests.
-- [ ] Backpressure integration for block and native file writes that does not
+- [x] Backpressure integration for block and native file writes that does not
   change public read, write, append, fork, snapshot, restore, or flush
   semantics.
-- [ ] Deterministic simulation covering writes racing compaction, PITR horizon
+- [x] Deterministic simulation covering writes racing compaction, PITR horizon
   changes, deletes, GC release evidence, active-log rolling, repeated scheduler
   ticks, low/high watermark crossings, and per-node maintenance fairness.
-- [ ] Fault tests for compaction job interruption, duplicated scheduler
+- [x] Fault tests for compaction job interruption, duplicated scheduler
   commands, delayed custodian release evidence, stale observations, shutdown
   during a tick, and restart with pending compaction debt.
-- [ ] Metrics/diagnostics that expose dirty bytes, reclaimable bytes, selected
+- [x] Metrics/diagnostics that expose dirty bytes, reclaimable bytes, selected
   logs, skipped logs with reasons, throttle decisions, bytes copied/deleted,
   and scheduler tick outcomes.
-- [ ] Benchmarks for steady-state writes with background maintenance disabled,
+- [x] Benchmarks for steady-state writes with background maintenance disabled,
   enabled-but-idle, and actively compacting; tail latency under high dirty-log
   pressure; and throughput under explicit throttling.
 
 Exit gate:
 
-- [ ] Manual compaction and background-scheduled compaction produce the same
+- [x] Manual compaction and background-scheduled compaction produce the same
   final reachable bytes under the deterministic conformance suite.
-- [ ] Scheduler output is deterministic for a given observation trace.
-- [ ] Bounded maintenance work prevents one tick from rewriting or scanning an
+- [x] Scheduler output is deterministic for a given observation trace.
+- [x] Bounded maintenance work prevents one tick from rewriting or scanning an
   unbounded amount of node data.
-- [ ] Backpressure cannot silently drop acknowledged writes or weaken flushed
+- [x] Backpressure cannot silently drop acknowledged writes or weaken flushed
   durability.
-- [ ] PITR-retained segments are never selected for deletion, even under high
+- [x] PITR-retained segments are never selected for deletion, even under high
   dirty-byte pressure.
-- [ ] The runtime can shut down after finishing or aborting a bounded tick and
+- [x] The runtime can shut down after finishing or aborting a bounded tick and
   reopen to a valid placement set.
-- [ ] With background maintenance enabled but no reclaimable debt, one-node hot
+- [x] With background maintenance enabled but no reclaimable debt, one-node hot
   read/write paths do not regress beyond an implementation-plan-recorded
   threshold.
-- [ ] The scheduler remains below the block/native public APIs and does not ask
+- [x] The scheduler remains below the block/native public APIs and does not ask
   clients to choose storage nodes, compact logs, or fan out writes.
+
+Implementation note: Phase 24 also made durable data logs node-scoped as
+`(storage_node, log_id)`. The previous non-node-scoped shape is gone; there is
+no compatibility reader or migration layer for old internal stores. The
+maintenance cursor is persisted in SQLite maintenance state, and opportunistic
+maintenance runs before the admitted write so a failed maintenance tick cannot
+retroactively report a successful write as failed.
+
+Short-run Phase 24 Criterion smoke numbers on this host: idle maintenance
+observation measured about 37 us, an idle manual maintenance tick about 40 us,
+an always-on idle 4 KiB flushed write about 11.4 ms, a manual tick compacting
+the 32-write debt fixture about 5.1 ms, and an explicitly throttled write
+decision about 74 us. Treat these as regression smoke baselines; durable write
+latency on this host is dominated by the fsync path.
 
 ## Phase 25: Storage Replication
 

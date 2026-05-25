@@ -11,7 +11,7 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -1628,13 +1628,436 @@ impl DurableDataLogPolicy {
     }
 }
 
+/// Durable data-log identity within a storage node.
+///
+/// The pair is provider-owned diagnostic state. Public block and native callers
+/// can observe it in maintenance reports, but they must not choose log IDs or
+/// infer physical offsets from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DurableDataLogRef {
+    /// Storage node that owns the log.
+    pub storage_node: StorageNodeId,
+    /// Node-local monotonically increasing log identifier.
+    pub log_id: u64,
+}
+
+/// Summary of data-log compaction work completed by a maintenance tick.
+///
+/// A successful report means all listed relocations and deletions were
+/// published durably in SQLite before any old log file was removed. Failure may
+/// leave already-completed maintenance work in place, but must not make
+/// acknowledged segment data unreadable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableCompactionReport {
-    pub deleted_logs: Vec<u64>,
-    pub relocated_logs: Vec<u64>,
+    /// Sealed logs that contained no live placements and were removed.
+    pub deleted_logs: Vec<DurableDataLogRef>,
+    /// Sealed logs whose live placements were copied elsewhere before removal.
+    pub relocated_logs: Vec<DurableDataLogRef>,
+    /// Segment IDs whose current placement moved during compaction.
     pub relocated_segments: Vec<SegmentId>,
+    /// Live payload bytes copied into replacement logs.
     pub bytes_copied: u64,
+    /// Total old log bytes removed from disk.
     pub bytes_deleted: u64,
+}
+
+/// Runtime mode for durable maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceMode {
+    /// No background work. Callers explicitly observe, plan, and run ticks.
+    Manual,
+    /// A write may run one bounded maintenance tick before it is admitted.
+    Opportunistic,
+    /// A local worker runs bounded ticks after writes or custodian work notify it.
+    AlwaysOn,
+}
+
+impl Default for MaintenanceMode {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
+/// Policy knobs for deterministic durable maintenance and write admission.
+///
+/// The policy lives below the public block/native APIs. It may throttle or
+/// reject writes with `StorageError::Unavailable`, but it must not change read,
+/// fork, snapshot, restore, or flush semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenancePolicy {
+    /// How maintenance is driven at runtime.
+    pub mode: MaintenanceMode,
+    /// Data-log rolling and compaction thresholds.
+    pub data_log_policy: DurableDataLogPolicy,
+    /// Whether writes consult admission thresholds before they run.
+    pub write_backpressure_enabled: bool,
+    /// Dirty bytes at or above this value schedule maintenance.
+    pub dirty_low_watermark_bytes: u64,
+    /// Dirty bytes at or above this value throttle admitted writes.
+    pub dirty_high_watermark_bytes: u64,
+    /// Sealed-log count above this value throttles admitted writes.
+    pub max_sealed_logs: usize,
+    /// Reclaimable debt above this value rejects admitted writes.
+    pub max_reclaimable_debt_bytes: u64,
+    /// Maximum live bytes a maintenance tick may copy.
+    pub compaction_copy_budget_per_tick: u64,
+    /// SQLite WAL size above this value throttles admitted writes.
+    pub max_sqlite_wal_bytes: u64,
+    /// Maximum logs considered by one scheduler tick.
+    pub max_logs_scanned_per_tick: usize,
+    /// Local v1 supports exactly one executor.
+    pub max_concurrent_compaction_jobs: usize,
+}
+
+impl Default for MaintenancePolicy {
+    fn default() -> Self {
+        Self {
+            mode: MaintenanceMode::Manual,
+            data_log_policy: DurableDataLogPolicy::default(),
+            write_backpressure_enabled: false,
+            dirty_low_watermark_bytes: 16 * 1024 * 1024,
+            dirty_high_watermark_bytes: 128 * 1024 * 1024,
+            max_sealed_logs: 128,
+            max_reclaimable_debt_bytes: 512 * 1024 * 1024,
+            compaction_copy_budget_per_tick: 32 * 1024 * 1024,
+            max_sqlite_wal_bytes: 128 * 1024 * 1024,
+            max_logs_scanned_per_tick: 16,
+            max_concurrent_compaction_jobs: 1,
+        }
+    }
+}
+
+impl MaintenancePolicy {
+    /// Build the default manual policy with a specific data-log policy.
+    pub fn manual(data_log_policy: DurableDataLogPolicy) -> Self {
+        Self {
+            data_log_policy,
+            ..Self::default()
+        }
+    }
+
+    /// Validate that the policy is supported by the local durable provider.
+    ///
+    /// Success means the scheduler can evaluate this policy deterministically.
+    /// It does not reserve disk space or start any background worker.
+    pub fn validate(self) -> Result<()> {
+        self.data_log_policy.validate()?;
+        if self.dirty_low_watermark_bytes > self.dirty_high_watermark_bytes {
+            return Err(StorageError::invalid_argument(
+                "dirty_low_watermark_bytes must be <= dirty_high_watermark_bytes",
+            ));
+        }
+        if self.max_sealed_logs == 0 {
+            return Err(StorageError::invalid_argument(
+                "max_sealed_logs must be greater than zero",
+            ));
+        }
+        if self.max_reclaimable_debt_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "max_reclaimable_debt_bytes must be greater than zero",
+            ));
+        }
+        if self.compaction_copy_budget_per_tick == 0 {
+            return Err(StorageError::invalid_argument(
+                "compaction_copy_budget_per_tick must be greater than zero",
+            ));
+        }
+        if self.max_sqlite_wal_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "max_sqlite_wal_bytes must be greater than zero",
+            ));
+        }
+        if self.max_logs_scanned_per_tick == 0 {
+            return Err(StorageError::invalid_argument(
+                "max_logs_scanned_per_tick must be greater than zero",
+            ));
+        }
+        if self.max_concurrent_compaction_jobs != 1 {
+            return Err(StorageError::unsupported(
+                "local maintenance supports exactly one compaction executor",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic admission decision for a write.
+///
+/// `Throttle` and `Reject` are both surfaced as `StorageError::Unavailable` by
+/// the local durable provider. Adapters above this layer may retry, sleep, or
+/// fail their own request, but the core never hides a wait in this decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAdmission {
+    /// Run the write without maintenance pressure.
+    Accept,
+    /// Run the write and schedule or perform bounded maintenance according to mode.
+    AcceptAndSchedule,
+    /// Temporarily refuse the write with a stable reason.
+    Throttle { reason: &'static str },
+    /// Refuse the write until maintenance or capacity state changes.
+    Reject { reason: &'static str },
+}
+
+impl WriteAdmission {
+    fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Throttle { reason } | Self::Reject { reason } => Some(reason),
+            Self::Accept | Self::AcceptAndSchedule => None,
+        }
+    }
+}
+
+/// Point-in-time scheduler input derived from durable provider state.
+///
+/// Observations are snapshots for planning only. They do not lock data logs or
+/// reserve future writes; stale observations must lead to idempotent maintenance
+/// commands or skipped work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceObservation {
+    /// Per-storage-node log pressure.
+    pub nodes: Vec<MaintenanceNodeObservation>,
+    /// Current SQLite WAL bytes, or zero when unavailable.
+    pub sqlite_wal_bytes: u64,
+    /// Count of queued release records not yet reflected in log debt.
+    pub pending_custodian_releases: usize,
+    /// Oldest commit still protected by PITR retention, if known.
+    pub pitr_retention_floor: Option<CommitSeq>,
+    /// Bytes in the write being admitted, if any.
+    pub recent_write_bytes: u64,
+    /// Flushed bytes in the write being admitted, if any.
+    pub recent_flushed_write_bytes: u64,
+    /// Last persisted fairness cursor for log selection.
+    pub compaction_cursor: Option<DurableDataLogRef>,
+}
+
+/// Maintenance pressure for one storage node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceNodeObservation {
+    /// Node this observation describes.
+    pub storage_node: StorageNodeId,
+    /// Bytes in active logs that are not compaction candidates.
+    pub active_log_bytes: u64,
+    /// Count of sealed logs on this node.
+    pub sealed_log_count: usize,
+    /// Bytes that make sealed logs dirty.
+    pub dirty_bytes: u64,
+    /// Bytes currently eligible for reclamation.
+    pub reclaimable_bytes: u64,
+    /// Sealed log details available for bounded scheduling.
+    pub logs: Vec<MaintenanceDataLogObservation>,
+}
+
+/// Scheduler-visible state for one sealed data log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceDataLogObservation {
+    /// Node-local log identity.
+    pub log_ref: DurableDataLogRef,
+    /// Total durable bytes in the log.
+    pub total_bytes: u64,
+    /// Bytes that must be copied before the log can be deleted.
+    pub live_bytes: u64,
+    /// Bytes no longer referenced by published metadata.
+    pub dead_bytes: u64,
+    /// Dead bytes past retention and eligible for reclamation.
+    pub reclaimable_bytes: u64,
+}
+
+/// Bounded maintenance command emitted by the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceCommand {
+    /// Compact these logs if they are still sealed and eligible.
+    CompactDataLogs { logs: Vec<DurableDataLogRef> },
+}
+
+/// Deterministic output of one scheduler step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceTickPlan {
+    /// Write admission decision for the associated observation.
+    pub admission: WriteAdmission,
+    /// Bounded commands to run, if any.
+    pub commands: Vec<MaintenanceCommand>,
+    /// Human-readable counters and skip reasons for tests and operators.
+    pub diagnostics: MaintenanceDiagnostics,
+    /// Cursor to persist after the tick finishes or is skipped.
+    pub next_cursor: Option<DurableDataLogRef>,
+}
+
+/// Scheduler counters and explanations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MaintenanceDiagnostics {
+    /// Total dirty sealed-log bytes observed.
+    pub dirty_bytes: u64,
+    /// Total reclaimable sealed-log bytes observed.
+    pub reclaimable_bytes: u64,
+    /// Total sealed logs observed.
+    pub sealed_log_count: usize,
+    /// SQLite WAL bytes observed.
+    pub sqlite_wal_bytes: u64,
+    /// Logs selected for compaction.
+    pub selected_logs: Vec<DurableDataLogRef>,
+    /// Logs considered but not selected.
+    pub skipped_logs: Vec<MaintenanceSkippedLog>,
+    /// Stable throttle/reject reason, when admission refused the write.
+    pub throttle_reason: Option<&'static str>,
+}
+
+/// Explanation for a log skipped by the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceSkippedLog {
+    /// Skipped log.
+    pub log_ref: DurableDataLogRef,
+    /// Stable diagnostic reason.
+    pub reason: &'static str,
+}
+
+/// Result of running one bounded maintenance tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceTickReport {
+    /// The plan that was executed.
+    pub plan: MaintenanceTickPlan,
+    /// Durable compaction work completed by this tick.
+    pub compaction: DurableCompactionReport,
+}
+
+/// Pure deterministic scheduler for durable maintenance.
+///
+/// The scheduler performs no I/O and owns no background state. Identical policy
+/// plus identical observation must produce identical plans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceScheduler {
+    policy: MaintenancePolicy,
+}
+
+impl MaintenanceScheduler {
+    /// Create a scheduler after validating the policy.
+    pub fn new(policy: MaintenancePolicy) -> Result<Self> {
+        policy.validate()?;
+        Ok(Self { policy })
+    }
+
+    /// Return the validated policy used by this scheduler.
+    pub fn policy(&self) -> MaintenancePolicy {
+        self.policy
+    }
+
+    /// Plan one deterministic maintenance/admission step.
+    ///
+    /// Success never mutates provider state. The returned commands are
+    /// provider-private and must be revalidated by the executor because the
+    /// observation may already be stale.
+    pub fn step(&self, observation: &MaintenanceObservation) -> MaintenanceTickPlan {
+        let mut diagnostics = MaintenanceDiagnostics {
+            sqlite_wal_bytes: observation.sqlite_wal_bytes,
+            ..MaintenanceDiagnostics::default()
+        };
+        let mut candidate_logs = Vec::new();
+        for node in &observation.nodes {
+            diagnostics.dirty_bytes = diagnostics.dirty_bytes.saturating_add(node.dirty_bytes);
+            diagnostics.reclaimable_bytes = diagnostics
+                .reclaimable_bytes
+                .saturating_add(node.reclaimable_bytes);
+            diagnostics.sealed_log_count = diagnostics
+                .sealed_log_count
+                .saturating_add(node.sealed_log_count);
+            for log in &node.logs {
+                if !self.log_is_compaction_candidate(log) {
+                    diagnostics.skipped_logs.push(MaintenanceSkippedLog {
+                        log_ref: log.log_ref,
+                        reason: "below_reclaim_threshold",
+                    });
+                    continue;
+                }
+                candidate_logs.push(*log);
+            }
+        }
+        candidate_logs.sort_by_key(|log| log.log_ref);
+        if let Some(cursor) = observation.compaction_cursor
+            && let Some(index) = candidate_logs.iter().position(|log| log.log_ref > cursor)
+        {
+            candidate_logs.rotate_left(index);
+        }
+
+        let admission = self.admission(&diagnostics);
+        diagnostics.throttle_reason = admission.unavailable_reason();
+
+        let mut copy_budget = self.policy.compaction_copy_budget_per_tick;
+        let mut selected = Vec::new();
+        for log in candidate_logs
+            .into_iter()
+            .take(self.policy.max_logs_scanned_per_tick)
+        {
+            if log.live_bytes > copy_budget {
+                diagnostics.skipped_logs.push(MaintenanceSkippedLog {
+                    log_ref: log.log_ref,
+                    reason: "copy_budget_exhausted",
+                });
+                continue;
+            }
+            selected.push(log.log_ref);
+            copy_budget = copy_budget.saturating_sub(log.live_bytes);
+        }
+        diagnostics.selected_logs = selected.clone();
+        let next_cursor = selected.last().copied().or(observation.compaction_cursor);
+        let commands = if selected.is_empty() {
+            Vec::new()
+        } else {
+            vec![MaintenanceCommand::CompactDataLogs { logs: selected }]
+        };
+
+        MaintenanceTickPlan {
+            admission: if matches!(admission, WriteAdmission::Accept) && !commands.is_empty() {
+                WriteAdmission::AcceptAndSchedule
+            } else {
+                admission
+            },
+            commands,
+            diagnostics,
+            next_cursor,
+        }
+    }
+
+    fn admission(&self, diagnostics: &MaintenanceDiagnostics) -> WriteAdmission {
+        if diagnostics.reclaimable_bytes > self.policy.max_reclaimable_debt_bytes {
+            return WriteAdmission::Reject {
+                reason: "maintenance reclaimable debt exceeds hard limit",
+            };
+        }
+        if diagnostics.dirty_bytes >= self.policy.dirty_high_watermark_bytes {
+            return WriteAdmission::Throttle {
+                reason: "maintenance dirty bytes above high watermark",
+            };
+        }
+        if diagnostics.sealed_log_count > self.policy.max_sealed_logs {
+            return WriteAdmission::Throttle {
+                reason: "maintenance sealed log count above limit",
+            };
+        }
+        if diagnostics.sqlite_wal_bytes > self.policy.max_sqlite_wal_bytes {
+            return WriteAdmission::Throttle {
+                reason: "maintenance SQLite WAL above limit",
+            };
+        }
+        if diagnostics.dirty_bytes >= self.policy.dirty_low_watermark_bytes {
+            return WriteAdmission::AcceptAndSchedule;
+        }
+        WriteAdmission::Accept
+    }
+
+    fn log_is_compaction_candidate(&self, log: &MaintenanceDataLogObservation) -> bool {
+        if log.total_bytes == 0 {
+            return false;
+        }
+        if log.live_bytes == 0 && log.dead_bytes != 0 {
+            return true;
+        }
+        let reclaimable_ratio = log
+            .dead_bytes
+            .saturating_mul(1_000_000)
+            .checked_div(log.total_bytes)
+            .unwrap_or(0);
+        log.dead_bytes >= self.policy.data_log_policy.min_reclaimable_bytes
+            && reclaimable_ratio >= u64::from(self.policy.data_log_policy.min_reclaimable_ratio_ppm)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1658,6 +2081,7 @@ struct SegmentPlacementRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DataLogRow {
+    storage_node: StorageNodeId,
     log_id: u64,
     total_bytes: u64,
     live_bytes: u64,
@@ -1754,12 +2178,23 @@ impl DurableSqliteStore {
               next_segment_id TEXT NOT NULL,
               next_placement_index INTEGER NOT NULL CHECK (next_placement_index >= 0)
             );
+            CREATE TABLE IF NOT EXISTS maintenance_state (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              cursor_storage_node TEXT,
+              cursor_log_id INTEGER CHECK (cursor_log_id IS NULL OR cursor_log_id >= 0),
+              CHECK (
+                (cursor_storage_node IS NULL AND cursor_log_id IS NULL) OR
+                (cursor_storage_node IS NOT NULL AND cursor_log_id IS NOT NULL)
+              )
+            );
             CREATE TABLE IF NOT EXISTS data_logs (
-              log_id INTEGER PRIMARY KEY,
+              storage_node TEXT NOT NULL,
+              log_id INTEGER NOT NULL,
               state TEXT NOT NULL CHECK (state IN ('active', 'sealed', 'deleted')),
               total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
               live_bytes INTEGER NOT NULL CHECK (live_bytes >= 0),
-              dead_bytes INTEGER NOT NULL CHECK (dead_bytes >= 0)
+              dead_bytes INTEGER NOT NULL CHECK (dead_bytes >= 0),
+              PRIMARY KEY(storage_node, log_id)
             );
             CREATE TABLE IF NOT EXISTS segment_placements (
               segment_id TEXT PRIMARY KEY,
@@ -1771,12 +2206,12 @@ impl DurableSqliteStore {
               payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
               checksum TEXT NOT NULL,
               current INTEGER NOT NULL CHECK (current IN (0, 1)),
-              FOREIGN KEY(data_log_id) REFERENCES data_logs(log_id)
+              FOREIGN KEY(storage_node, data_log_id) REFERENCES data_logs(storage_node, log_id)
             );
             CREATE INDEX IF NOT EXISTS idx_segment_placements_log_current
-              ON segment_placements(data_log_id, current);
+              ON segment_placements(storage_node, data_log_id, current);
             CREATE INDEX IF NOT EXISTS idx_data_logs_state_dead
-              ON data_logs(state, dead_bytes);
+              ON data_logs(storage_node, state, dead_bytes);
             CREATE TABLE IF NOT EXISTS storage_nodes (
               storage_node TEXT PRIMARY KEY,
               ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
@@ -2002,12 +2437,13 @@ impl DurableSqliteStore {
         let tx = conn.transaction().map_err(sqlite_error)?;
         for log in appended.logs.into_values() {
             tx.execute(
-                "INSERT INTO data_logs(log_id, state, total_bytes, live_bytes, dead_bytes)
-                 VALUES (?1, ?2, ?3, 0, 0)
-                 ON CONFLICT(log_id) DO UPDATE SET
+                "INSERT INTO data_logs(storage_node, log_id, state, total_bytes, live_bytes, dead_bytes)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0)
+                 ON CONFLICT(storage_node, log_id) DO UPDATE SET
                    state = excluded.state,
                    total_bytes = MAX(data_logs.total_bytes, excluded.total_bytes)",
                 params![
+                    storage_node_key(log.storage_node),
                     u64_to_i64(log.log_id)?,
                     log.state,
                     u64_to_i64(log.total_bytes)?
@@ -2015,10 +2451,14 @@ impl DurableSqliteStore {
             )
             .map_err(sqlite_error)?;
         }
-        for log_id in &appended.sealed_logs {
+        for log_ref in &appended.sealed_logs {
             tx.execute(
-                "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
-                params![u64_to_i64(*log_id)?],
+                "UPDATE data_logs SET state = 'sealed'
+                 WHERE storage_node = ?1 AND log_id = ?2 AND state != 'deleted'",
+                params![
+                    storage_node_key(log_ref.storage_node),
+                    u64_to_i64(log_ref.log_id)?
+                ],
             )
             .map_err(sqlite_error)?;
         }
@@ -2047,9 +2487,10 @@ impl DurableSqliteStore {
             )
             .map_err(sqlite_error)?;
             tx.execute(
-                "UPDATE data_logs SET live_bytes = live_bytes + ?2
-                 WHERE log_id = ?1",
+                "UPDATE data_logs SET live_bytes = live_bytes + ?3
+                 WHERE storage_node = ?1 AND log_id = ?2",
                 params![
+                    storage_node_key(placement.storage_node),
                     u64_to_i64(placement.data_log_id)?,
                     u64_to_i64(placement.payload_bytes)?
                 ],
@@ -2072,10 +2513,16 @@ impl DurableSqliteStore {
             return Ok(append);
         }
 
-        let mut active = active_data_log(conn, &self.paths.data_dir)?;
-        let mut open_log: Option<(u64, File)> = None;
-        let mut created_log_file = false;
+        let mut active_logs = BTreeMap::new();
+        let mut open_log: Option<(DurableDataLogRef, File)> = None;
+        let mut synced_dirs = BTreeSet::new();
         for (segment_id, storage_node, bytes) in segments {
+            let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+            let active = active_logs.entry(storage_node).or_insert(active_data_log(
+                conn,
+                &self.paths.data_dir,
+                storage_node,
+            )?);
             let record = encode_data_log_record(segment_id, &bytes)?;
             let record_len = u64::try_from(record.len()).map_err(|_| {
                 StorageError::invalid_argument("data-log record length overflows u64")
@@ -2087,13 +2534,25 @@ impl DurableSqliteStore {
                     .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
                     > self.policy.target_data_log_bytes
             {
-                append.sealed_logs.push(active.log_id);
-                active = next_data_log(conn, &self.paths.data_dir, active.log_id)?;
+                append.sealed_logs.push(DurableDataLogRef {
+                    storage_node,
+                    log_id: active.log_id,
+                });
+                *active = next_data_log(conn, &self.paths.data_dir, storage_node, active.log_id)?;
             }
 
-            if open_log.as_ref().map(|(log_id, _)| *log_id) != Some(active.log_id) {
+            let log_ref = DurableDataLogRef {
+                storage_node,
+                log_id: active.log_id,
+            };
+            if open_log.as_ref().map(|(log_ref, _)| *log_ref) != Some(log_ref) {
                 sync_open_data_log(&mut open_log)?;
-                let path = data_log_path(&self.paths.data_dir, active.log_id);
+                let data_dir_existed = data_dir.exists();
+                fs::create_dir_all(&data_dir).map_err(fs_error)?;
+                if !data_dir_existed {
+                    sync_dir(&self.paths.data_dir)?;
+                }
+                let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
                 let existed = path.exists();
                 let file = OpenOptions::new()
                     .create(true)
@@ -2103,8 +2562,10 @@ impl DurableSqliteStore {
                     .map_err(fs_error)?;
                 let file_len = file.metadata().map_err(fs_error)?.len();
                 active.total_bytes = active.total_bytes.max(file_len);
-                created_log_file |= !existed;
-                open_log = Some((active.log_id, file));
+                if !existed {
+                    synced_dirs.insert(storage_node);
+                }
+                open_log = Some((log_ref, file));
             }
 
             let offset = active.total_bytes;
@@ -2122,8 +2583,9 @@ impl DurableSqliteStore {
                 .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
             active.total_bytes = new_total;
             append.logs.insert(
-                active.log_id,
+                log_ref,
                 PendingDataLogManifest {
+                    storage_node,
                     log_id: active.log_id,
                     state: "active",
                     total_bytes: new_total,
@@ -2141,14 +2603,19 @@ impl DurableSqliteStore {
             });
         }
         sync_open_data_log(&mut open_log)?;
-        if created_log_file {
-            sync_dir(&self.paths.data_dir)?;
+        for storage_node in synced_dirs {
+            let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+            sync_dir(&data_dir)?;
         }
         Ok(append)
     }
 
     fn read_segment_payload(&self, placement: &SegmentPlacementRow) -> Result<Vec<u8>> {
-        let path = data_log_path(&self.paths.data_dir, placement.data_log_id);
+        let path = data_log_path(
+            &self.paths.data_dir,
+            placement.storage_node,
+            placement.data_log_id,
+        );
         let mut file = File::open(&path).map_err(fs_error)?;
         file.seek(SeekFrom::Start(placement.record_offset))
             .map_err(fs_error)?;
@@ -2190,6 +2657,131 @@ impl DurableSqliteStore {
         policy: DurableDataLogPolicy,
     ) -> Result<DurableCompactionReport> {
         policy.validate()?;
+        let mut conn = lock(&self.conn)?;
+        let candidates = compaction_candidates(&conn, policy)?;
+        self.compact_data_log_rows(&mut conn, policy, candidates)
+    }
+
+    fn compact_data_log_refs(
+        &self,
+        policy: DurableDataLogPolicy,
+        logs: &[DurableDataLogRef],
+    ) -> Result<DurableCompactionReport> {
+        policy.validate()?;
+        let mut conn = lock(&self.conn)?;
+        let candidates = compaction_candidates_for_refs(&conn, policy, logs)?;
+        self.compact_data_log_rows(&mut conn, policy, candidates)
+    }
+
+    fn maintenance_observation(
+        &self,
+        compaction_cursor: Option<DurableDataLogRef>,
+        recent_write_bytes: u64,
+        recent_flushed_write_bytes: u64,
+    ) -> Result<MaintenanceObservation> {
+        let conn = lock(&self.conn)?;
+        let mut node_logs: BTreeMap<StorageNodeId, Vec<(DataLogRow, String)>> = BTreeMap::new();
+        for row in load_storage_node_rows(&conn)? {
+            node_logs.entry(row.storage_node).or_default();
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT storage_node, log_id, state, total_bytes, live_bytes, dead_bytes
+                 FROM data_logs
+                 WHERE state != 'deleted'
+                 ORDER BY storage_node, log_id",
+            )
+            .map_err(sqlite_error)?;
+        let mut rows = stmt.query([]).map_err(sqlite_error)?;
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let storage_node_raw: String = row.get(0).map_err(sqlite_error)?;
+            let storage_node =
+                StorageNodeId::from_raw(parse_u128_key(&storage_node_raw).map_err(sqlite_error)?);
+            let state: String = row.get(2).map_err(sqlite_error)?;
+            node_logs.entry(storage_node).or_default().push((
+                DataLogRow {
+                    storage_node,
+                    log_id: i64_to_u64(row.get(1).map_err(sqlite_error)?).map_err(sqlite_error)?,
+                    total_bytes: i64_to_u64(row.get(3).map_err(sqlite_error)?)
+                        .map_err(sqlite_error)?,
+                    live_bytes: i64_to_u64(row.get(4).map_err(sqlite_error)?)
+                        .map_err(sqlite_error)?,
+                    dead_bytes: i64_to_u64(row.get(5).map_err(sqlite_error)?)
+                        .map_err(sqlite_error)?,
+                },
+                state,
+            ));
+        }
+
+        let mut nodes = Vec::new();
+        for (storage_node, logs) in node_logs {
+            let mut active_log_bytes = 0u64;
+            let mut sealed_log_count = 0usize;
+            let mut dirty_bytes = 0u64;
+            let mut reclaimable_bytes = 0u64;
+            let mut observed_logs = Vec::new();
+            for (row, state) in logs {
+                if state == "active" {
+                    active_log_bytes = active_log_bytes.saturating_add(row.total_bytes);
+                    continue;
+                }
+                if state != "sealed" {
+                    continue;
+                }
+                sealed_log_count = sealed_log_count.saturating_add(1);
+                dirty_bytes = dirty_bytes.saturating_add(row.dead_bytes);
+                reclaimable_bytes = reclaimable_bytes.saturating_add(row.dead_bytes);
+                observed_logs.push(MaintenanceDataLogObservation {
+                    log_ref: DurableDataLogRef {
+                        storage_node,
+                        log_id: row.log_id,
+                    },
+                    total_bytes: row.total_bytes,
+                    live_bytes: row.live_bytes,
+                    dead_bytes: row.dead_bytes,
+                    reclaimable_bytes: row.dead_bytes,
+                });
+            }
+            nodes.push(MaintenanceNodeObservation {
+                storage_node,
+                active_log_bytes,
+                sealed_log_count,
+                dirty_bytes,
+                reclaimable_bytes,
+                logs: observed_logs,
+            });
+        }
+
+        Ok(MaintenanceObservation {
+            nodes,
+            sqlite_wal_bytes: sqlite_wal_bytes(&self.paths.metadata)?,
+            pending_custodian_releases: 0,
+            pitr_retention_floor: None,
+            recent_write_bytes,
+            recent_flushed_write_bytes,
+            compaction_cursor,
+        })
+    }
+
+    fn load_maintenance_cursor(&self) -> Result<Option<DurableDataLogRef>> {
+        let conn = lock(&self.conn)?;
+        load_maintenance_cursor(&conn)
+    }
+
+    fn persist_maintenance_cursor(&self, cursor: Option<DurableDataLogRef>) -> Result<()> {
+        let mut conn = lock(&self.conn)?;
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        persist_maintenance_cursor(&tx, cursor)?;
+        tx.commit().map_err(sqlite_error)
+    }
+
+    fn compact_data_log_rows(
+        &self,
+        conn: &mut Connection,
+        policy: DurableDataLogPolicy,
+        candidates: Vec<DataLogRow>,
+    ) -> Result<DurableCompactionReport> {
         let mut report = DurableCompactionReport {
             deleted_logs: Vec::new(),
             relocated_logs: Vec::new(),
@@ -2197,23 +2789,26 @@ impl DurableSqliteStore {
             bytes_copied: 0,
             bytes_deleted: 0,
         };
-        let mut conn = lock(&self.conn)?;
-        let candidates = compaction_candidates(&conn, policy)?;
         for log in candidates {
+            let log_ref = DurableDataLogRef {
+                storage_node: log.storage_node,
+                log_id: log.log_id,
+            };
             if log.live_bytes == 0 {
                 let tx = conn.transaction().map_err(sqlite_error)?;
                 tx.execute(
-                    "UPDATE data_logs SET state = 'deleted' WHERE log_id = ?1",
-                    params![u64_to_i64(log.log_id)?],
+                    "UPDATE data_logs SET state = 'deleted'
+                     WHERE storage_node = ?1 AND log_id = ?2",
+                    params![storage_node_key(log.storage_node), u64_to_i64(log.log_id)?],
                 )
                 .map_err(sqlite_error)?;
                 tx.commit().map_err(sqlite_error)?;
-                delete_data_log(&self.paths.data_dir, log.log_id)?;
+                delete_data_log(&self.paths.data_dir, log_ref)?;
                 report.bytes_deleted = report
                     .bytes_deleted
                     .checked_add(log.total_bytes)
                     .ok_or_else(|| StorageError::conflict("compaction byte count overflow"))?;
-                report.deleted_logs.push(log.log_id);
+                report.deleted_logs.push(log_ref);
                 continue;
             }
 
@@ -2226,7 +2821,7 @@ impl DurableSqliteStore {
                 continue;
             }
 
-            let placements = current_placements_for_log(&conn, log.log_id)?;
+            let placements = current_placements_for_log(conn, log_ref)?;
             let mut payloads = Vec::new();
             for placement in &placements {
                 payloads.push((
@@ -2235,16 +2830,17 @@ impl DurableSqliteStore {
                     self.read_segment_payload(placement)?,
                 ));
             }
-            let appended = self.append_segments(&conn, payloads)?;
+            let appended = self.append_segments(conn, payloads)?;
             let tx = conn.transaction().map_err(sqlite_error)?;
             for manifest in appended.logs.into_values() {
                 tx.execute(
-                    "INSERT INTO data_logs(log_id, state, total_bytes, live_bytes, dead_bytes)
-                     VALUES (?1, ?2, ?3, 0, 0)
-                     ON CONFLICT(log_id) DO UPDATE SET
+                    "INSERT INTO data_logs(storage_node, log_id, state, total_bytes, live_bytes, dead_bytes)
+                     VALUES (?1, ?2, ?3, ?4, 0, 0)
+                     ON CONFLICT(storage_node, log_id) DO UPDATE SET
                        state = excluded.state,
                        total_bytes = MAX(data_logs.total_bytes, excluded.total_bytes)",
                     params![
+                        storage_node_key(manifest.storage_node),
                         u64_to_i64(manifest.log_id)?,
                         manifest.state,
                         u64_to_i64(manifest.total_bytes)?
@@ -2252,10 +2848,14 @@ impl DurableSqliteStore {
                 )
                 .map_err(sqlite_error)?;
             }
-            for log_id in &appended.sealed_logs {
+            for sealed_ref in &appended.sealed_logs {
                 tx.execute(
-                    "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
-                    params![u64_to_i64(*log_id)?],
+                    "UPDATE data_logs SET state = 'sealed'
+                     WHERE storage_node = ?1 AND log_id = ?2 AND state != 'deleted'",
+                    params![
+                        storage_node_key(sealed_ref.storage_node),
+                        u64_to_i64(sealed_ref.log_id)?
+                    ],
                 )
                 .map_err(sqlite_error)?;
             }
@@ -2290,9 +2890,10 @@ impl DurableSqliteStore {
                 )
                 .map_err(sqlite_error)?;
                 tx.execute(
-                    "UPDATE data_logs SET live_bytes = live_bytes + ?2
-                     WHERE log_id = ?1",
+                    "UPDATE data_logs SET live_bytes = live_bytes + ?3
+                     WHERE storage_node = ?1 AND log_id = ?2",
                     params![
+                        storage_node_key(placement.storage_node),
                         u64_to_i64(placement.data_log_id)?,
                         u64_to_i64(placement.payload_bytes)?
                     ],
@@ -2307,17 +2908,17 @@ impl DurableSqliteStore {
             tx.execute(
                 "UPDATE data_logs SET state = 'deleted', live_bytes = 0,
                    dead_bytes = total_bytes
-                 WHERE log_id = ?1",
-                params![u64_to_i64(log.log_id)?],
+                 WHERE storage_node = ?1 AND log_id = ?2",
+                params![storage_node_key(log.storage_node), u64_to_i64(log.log_id)?],
             )
             .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)?;
-            delete_data_log(&self.paths.data_dir, log.log_id)?;
+            delete_data_log(&self.paths.data_dir, log_ref)?;
             report.bytes_deleted = report
                 .bytes_deleted
                 .checked_add(log.total_bytes)
                 .ok_or_else(|| StorageError::conflict("compaction byte count overflow"))?;
-            report.relocated_logs.push(log.log_id);
+            report.relocated_logs.push(log_ref);
         }
         Ok(report)
     }
@@ -2329,23 +2930,32 @@ impl DurableSqliteStore {
     }
 
     #[cfg(test)]
-    fn data_log_states_for_test(&self) -> Result<Vec<(u64, String)>> {
+    fn data_log_states_for_test(&self) -> Result<Vec<(DurableDataLogRef, String)>> {
         let conn = lock(&self.conn)?;
         let mut stmt = conn
             .prepare(
-                "SELECT log_id, state
+                "SELECT storage_node, log_id, state
                  FROM data_logs
                  WHERE state != 'deleted'
-                 ORDER BY log_id",
+                 ORDER BY storage_node, log_id",
             )
             .map_err(sqlite_error)?;
         let mut rows = stmt.query([]).map_err(sqlite_error)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(sqlite_error)? {
-            let raw_log_id: i64 = row.get(0).map_err(sqlite_error)?;
+            let raw_storage_node: String = row.get(0).map_err(sqlite_error)?;
+            let raw_log_id: i64 = row.get(1).map_err(sqlite_error)?;
             let log_id = i64_to_u64(raw_log_id).map_err(sqlite_error)?;
-            let state: String = row.get(1).map_err(sqlite_error)?;
-            out.push((log_id, state));
+            let state: String = row.get(2).map_err(sqlite_error)?;
+            out.push((
+                DurableDataLogRef {
+                    storage_node: StorageNodeId::from_raw(
+                        parse_u128_key(&raw_storage_node).map_err(sqlite_error)?,
+                    ),
+                    log_id,
+                },
+                state,
+            ));
         }
         Ok(out)
     }
@@ -2360,12 +2970,13 @@ impl DurableSqliteStore {
 #[derive(Debug, Default)]
 struct PendingDataLogAppend {
     placements: Vec<SegmentPlacementRow>,
-    logs: BTreeMap<u64, PendingDataLogManifest>,
-    sealed_logs: Vec<u64>,
+    logs: BTreeMap<DurableDataLogRef, PendingDataLogManifest>,
+    sealed_logs: Vec<DurableDataLogRef>,
 }
 
 #[derive(Debug)]
 struct PendingDataLogManifest {
+    storage_node: StorageNodeId,
     log_id: u64,
     state: &'static str,
     total_bytes: u64,
@@ -2470,6 +3081,39 @@ fn load_export_cursor(conn: &Connection) -> Result<Option<DurableExportCursor>> 
         next_segment_id: parse_u128_key(&next_segment_id).map_err(sqlite_error)?,
         next_placement_index: i64_to_u64(next_placement_index).map_err(sqlite_error)?,
     }))
+}
+
+fn load_maintenance_cursor(conn: &Connection) -> Result<Option<DurableDataLogRef>> {
+    let row = conn
+        .query_row(
+            "SELECT cursor_storage_node, cursor_log_id
+             FROM maintenance_state
+             WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((storage_node, log_id)) = row else {
+        return Ok(None);
+    };
+    match (storage_node, log_id) {
+        (Some(storage_node), Some(log_id)) => Ok(Some(DurableDataLogRef {
+            storage_node: StorageNodeId::from_raw(
+                parse_u128_key(&storage_node).map_err(sqlite_error)?,
+            ),
+            log_id: i64_to_u64(log_id).map_err(sqlite_error)?,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(StorageError::corrupt(
+            "maintenance cursor row is partially populated",
+        )),
+    }
 }
 
 fn reject_legacy_current_state_if_present(conn: &Connection) -> Result<()> {
@@ -2795,6 +3439,40 @@ fn persist_export_cursor(
         ],
     )
     .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn persist_maintenance_cursor(
+    tx: &rusqlite::Transaction<'_>,
+    cursor: Option<DurableDataLogRef>,
+) -> Result<()> {
+    match cursor {
+        Some(cursor) => {
+            tx.execute(
+                "INSERT INTO maintenance_state(id, cursor_storage_node, cursor_log_id)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                   cursor_storage_node = excluded.cursor_storage_node,
+                   cursor_log_id = excluded.cursor_log_id",
+                params![
+                    storage_node_key(cursor.storage_node),
+                    u64_to_i64(cursor.log_id)?
+                ],
+            )
+            .map_err(sqlite_error)?;
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO maintenance_state(id, cursor_storage_node, cursor_log_id)
+                 VALUES (1, NULL, NULL)
+                 ON CONFLICT(id) DO UPDATE SET
+                   cursor_storage_node = NULL,
+                   cursor_log_id = NULL",
+                [],
+            )
+            .map_err(sqlite_error)?;
+        }
+    }
     Ok(())
 }
 
@@ -4045,20 +4723,24 @@ fn file_writer_key(keyspace_id: KeyspaceId, file_id: FileId) -> String {
     format!("{}:{}", keyspace_id.raw(), file_id.raw())
 }
 
-fn data_log_path(data_dir: &Path, log_id: u64) -> PathBuf {
-    data_dir.join(format!("data-{log_id:06}.log"))
+fn node_data_log_dir(data_dir: &Path, storage_node: StorageNodeId) -> PathBuf {
+    data_dir.join(format!("node-{}", storage_node.raw()))
 }
 
-fn delete_data_log(data_dir: &Path, log_id: u64) -> Result<()> {
-    let path = data_log_path(data_dir, log_id);
+fn data_log_path(data_dir: &Path, storage_node: StorageNodeId, log_id: u64) -> PathBuf {
+    node_data_log_dir(data_dir, storage_node).join(format!("data-{log_id:06}.log"))
+}
+
+fn delete_data_log(data_dir: &Path, log_ref: DurableDataLogRef) -> Result<()> {
+    let path = data_log_path(data_dir, log_ref.storage_node, log_ref.log_id);
     match fs::remove_file(path) {
-        Ok(()) => sync_dir(data_dir),
+        Ok(()) => sync_dir(&node_data_log_dir(data_dir, log_ref.storage_node)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(fs_error(error)),
     }
 }
 
-fn sync_open_data_log(open_log: &mut Option<(u64, File)>) -> Result<()> {
+fn sync_open_data_log(open_log: &mut Option<(DurableDataLogRef, File)>) -> Result<()> {
     if let Some((_, file)) = open_log.take() {
         file.sync_data().map_err(fs_error)?;
     }
@@ -4070,6 +4752,20 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| StorageError::invalid_argument("path has no parent directory"))?;
     sync_dir(parent)
+}
+
+fn sqlite_wal_bytes(metadata_path: &Path) -> Result<u64> {
+    let Some(file_name) = metadata_path.file_name().and_then(|name| name.to_str()) else {
+        return Err(StorageError::invalid_argument(
+            "metadata path has no valid file name",
+        ));
+    };
+    let wal_path = metadata_path.with_file_name(format!("{file_name}-wal"));
+    match wal_path.metadata() {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(fs_error(error)),
+    }
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
@@ -4141,18 +4837,24 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
     Ok(DataLogSegmentData { segment_id, bytes })
 }
 
-fn current_placements_for_log(conn: &Connection, log_id: u64) -> Result<Vec<SegmentPlacementRow>> {
+fn current_placements_for_log(
+    conn: &Connection,
+    log_ref: DurableDataLogRef,
+) -> Result<Vec<SegmentPlacementRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT segment_id, storage_node, data_log_id, record_offset, record_bytes,
                     payload_offset, payload_bytes, checksum
              FROM segment_placements
-             WHERE data_log_id = ?1 AND current = 1
+             WHERE storage_node = ?1 AND data_log_id = ?2 AND current = 1
              ORDER BY record_offset",
         )
         .map_err(sqlite_error)?;
     let mut rows = stmt
-        .query(params![u64_to_i64(log_id)?])
+        .query(params![
+            storage_node_key(log_ref.storage_node),
+            u64_to_i64(log_ref.log_id)?
+        ])
         .map_err(sqlite_error)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(sqlite_error)? {
@@ -4177,21 +4879,25 @@ fn decode_placement_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentPlac
     })
 }
 
-fn active_data_log(conn: &Connection, data_dir: &Path) -> Result<DataLogRow> {
+fn active_data_log(
+    conn: &Connection,
+    data_dir: &Path,
+    storage_node: StorageNodeId,
+) -> Result<DataLogRow> {
     if let Some(row) = conn
         .query_row(
-            "SELECT log_id, total_bytes, live_bytes, dead_bytes
+            "SELECT storage_node, log_id, total_bytes, live_bytes, dead_bytes
              FROM data_logs
-             WHERE state = 'active'
+             WHERE storage_node = ?1 AND state = 'active'
              ORDER BY log_id DESC
              LIMIT 1",
-            [],
+            params![storage_node_key(storage_node)],
             decode_data_log_row,
         )
         .optional()
         .map_err(sqlite_error)?
     {
-        let path = data_log_path(data_dir, row.log_id);
+        let path = data_log_path(data_dir, row.storage_node, row.log_id);
         let total_bytes = path
             .metadata()
             .map(|metadata| metadata.len().max(row.total_bytes))
@@ -4199,7 +4905,8 @@ fn active_data_log(conn: &Connection, data_dir: &Path) -> Result<DataLogRow> {
         Ok(DataLogRow { total_bytes, ..row })
     } else {
         Ok(DataLogRow {
-            log_id: next_data_log_id(conn, data_dir, 0)?,
+            storage_node,
+            log_id: next_data_log_id(conn, data_dir, storage_node, 0)?,
             total_bytes: 0,
             live_bytes: 0,
             dead_bytes: 0,
@@ -4207,25 +4914,36 @@ fn active_data_log(conn: &Connection, data_dir: &Path) -> Result<DataLogRow> {
     }
 }
 
-fn next_data_log(conn: &Connection, data_dir: &Path, previous: u64) -> Result<DataLogRow> {
+fn next_data_log(
+    conn: &Connection,
+    data_dir: &Path,
+    storage_node: StorageNodeId,
+    previous: u64,
+) -> Result<DataLogRow> {
     Ok(DataLogRow {
-        log_id: next_data_log_id(conn, data_dir, previous)?,
+        storage_node,
+        log_id: next_data_log_id(conn, data_dir, storage_node, previous)?,
         total_bytes: 0,
         live_bytes: 0,
         dead_bytes: 0,
     })
 }
 
-fn next_data_log_id(conn: &Connection, data_dir: &Path, floor: u64) -> Result<u64> {
+fn next_data_log_id(
+    conn: &Connection,
+    data_dir: &Path,
+    storage_node: StorageNodeId,
+    floor: u64,
+) -> Result<u64> {
     let db_max = conn
         .query_row(
-            "SELECT COALESCE(MAX(log_id), 0) FROM data_logs",
-            [],
+            "SELECT COALESCE(MAX(log_id), 0) FROM data_logs WHERE storage_node = ?1",
+            params![storage_node_key(storage_node)],
             |row| row.get::<_, i64>(0),
         )
         .map_err(sqlite_error)
         .and_then(|value| i64_to_u64(value).map_err(sqlite_error))?;
-    let fs_max = fs_data_log_max_id(data_dir)?;
+    let fs_max = fs_data_log_max_id(&node_data_log_dir(data_dir, storage_node))?;
     db_max
         .max(fs_max)
         .max(floor)
@@ -4260,10 +4978,10 @@ fn fs_data_log_max_id(data_dir: &Path) -> Result<u64> {
 fn data_log_rows(conn: &Connection) -> Result<Vec<DataLogRow>> {
     let mut stmt = conn
         .prepare(
-            "SELECT log_id, total_bytes, live_bytes, dead_bytes
+            "SELECT storage_node, log_id, total_bytes, live_bytes, dead_bytes
              FROM data_logs
              WHERE state != 'deleted'
-             ORDER BY log_id",
+             ORDER BY storage_node, log_id",
         )
         .map_err(sqlite_error)?;
     let mut rows = stmt.query([]).map_err(sqlite_error)?;
@@ -4280,10 +4998,10 @@ fn compaction_candidates(
 ) -> Result<Vec<DataLogRow>> {
     let mut stmt = conn
         .prepare(
-            "SELECT log_id, total_bytes, live_bytes, dead_bytes
+            "SELECT storage_node, log_id, total_bytes, live_bytes, dead_bytes
              FROM data_logs
              WHERE state = 'sealed'
-             ORDER BY dead_bytes DESC, log_id",
+             ORDER BY dead_bytes DESC, storage_node, log_id",
         )
         .map_err(sqlite_error)?;
     let mut rows = stmt.query([]).map_err(sqlite_error)?;
@@ -4307,12 +5025,55 @@ fn compaction_candidates(
     Ok(out)
 }
 
+fn compaction_candidates_for_refs(
+    conn: &Connection,
+    policy: DurableDataLogPolicy,
+    logs: &[DurableDataLogRef],
+) -> Result<Vec<DataLogRow>> {
+    let mut out = Vec::new();
+    for log_ref in logs {
+        let row = conn
+            .query_row(
+                "SELECT storage_node, log_id, total_bytes, live_bytes, dead_bytes
+                 FROM data_logs
+                 WHERE storage_node = ?1 AND log_id = ?2 AND state = 'sealed'",
+                params![
+                    storage_node_key(log_ref.storage_node),
+                    u64_to_i64(log_ref.log_id)?
+                ],
+                decode_data_log_row,
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some(row) = row else {
+            continue;
+        };
+        if row.total_bytes == 0 {
+            continue;
+        }
+        let reclaimable_ratio = row
+            .dead_bytes
+            .saturating_mul(1_000_000)
+            .checked_div(row.total_bytes)
+            .unwrap_or(0);
+        if row.live_bytes == 0
+            || (row.dead_bytes >= policy.min_reclaimable_bytes
+                && reclaimable_ratio >= u64::from(policy.min_reclaimable_ratio_ppm))
+        {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 fn decode_data_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DataLogRow> {
+    let storage_node: String = row.get(0)?;
     Ok(DataLogRow {
-        log_id: i64_to_u64(row.get(0)?)?,
-        total_bytes: i64_to_u64(row.get(1)?)?,
-        live_bytes: i64_to_u64(row.get(2)?)?,
-        dead_bytes: i64_to_u64(row.get(3)?)?,
+        storage_node: StorageNodeId::from_raw(parse_u128_key(&storage_node)?),
+        log_id: i64_to_u64(row.get(1)?)?,
+        total_bytes: i64_to_u64(row.get(2)?)?,
+        live_bytes: i64_to_u64(row.get(3)?)?,
+        dead_bytes: i64_to_u64(row.get(4)?)?,
     })
 }
 
@@ -4327,10 +5088,11 @@ fn mark_placement_dead(
     .map_err(sqlite_error)?;
     tx.execute(
         "UPDATE data_logs
-         SET live_bytes = MAX(live_bytes - ?2, 0),
-             dead_bytes = dead_bytes + ?2
-         WHERE log_id = ?1",
+         SET live_bytes = MAX(live_bytes - ?3, 0),
+             dead_bytes = dead_bytes + ?3
+         WHERE storage_node = ?1 AND log_id = ?2",
         params![
+            storage_node_key(placement.storage_node),
             u64_to_i64(placement.data_log_id)?,
             u64_to_i64(placement.payload_bytes)?
         ],
@@ -4394,6 +5156,186 @@ fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
     })
 }
 
+#[derive(Clone)]
+struct DurableMaintenanceParts {
+    local: LocalObjectStore,
+    durable: DurableSqliteStore,
+    persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
+    persist_lock: Arc<Mutex<()>>,
+    maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
+    maintenance_policy: MaintenancePolicy,
+}
+
+#[derive(Debug)]
+struct MaintenanceWorkerState {
+    shutdown: bool,
+    notified: bool,
+}
+
+struct MaintenanceWorker {
+    state: Arc<(Mutex<MaintenanceWorkerState>, Condvar)>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for MaintenanceWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintenanceWorker").finish_non_exhaustive()
+    }
+}
+
+impl MaintenanceWorker {
+    fn start(parts: DurableMaintenanceParts) -> Result<Arc<Self>> {
+        let state = Arc::new((
+            Mutex::new(MaintenanceWorkerState {
+                shutdown: false,
+                notified: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let handle = thread::Builder::new()
+            .name("toy-cow-maintenance".to_string())
+            .spawn(move || maintenance_worker_loop(parts, worker_state))
+            .map_err(|error| {
+                StorageError::unavailable(format!("failed to start maintenance worker: {error}"))
+            })?;
+        Ok(Arc::new(Self {
+            state,
+            handle: Mutex::new(Some(handle)),
+        }))
+    }
+
+    fn notify(&self) {
+        let (lock_state, cvar) = &*self.state;
+        if let Ok(mut state) = lock_state.lock() {
+            state.notified = true;
+            cvar.notify_one();
+        }
+    }
+
+    fn shutdown(&self) {
+        let (lock_state, cvar) = &*self.state;
+        if let Ok(mut state) = lock_state.lock() {
+            state.shutdown = true;
+            state.notified = true;
+            cvar.notify_one();
+        }
+        if let Ok(mut handle) = self.handle.lock()
+            && let Some(handle) = handle.take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for MaintenanceWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn maintenance_worker_loop(
+    parts: DurableMaintenanceParts,
+    state: Arc<(Mutex<MaintenanceWorkerState>, Condvar)>,
+) {
+    loop {
+        let (lock_state, cvar) = &*state;
+        let mut guard = match lock_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        while !guard.shutdown && !guard.notified {
+            guard = match cvar.wait(guard) {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+        }
+        if guard.shutdown {
+            return;
+        }
+        guard.notified = false;
+        drop(guard);
+
+        loop {
+            let Ok(report) = run_maintenance_tick_parts(&parts, 0, 0) else {
+                break;
+            };
+            if report.plan.commands.is_empty() {
+                break;
+            }
+        }
+    }
+}
+
+fn empty_compaction_report() -> DurableCompactionReport {
+    DurableCompactionReport {
+        deleted_logs: Vec::new(),
+        relocated_logs: Vec::new(),
+        relocated_segments: Vec::new(),
+        bytes_copied: 0,
+        bytes_deleted: 0,
+    }
+}
+
+fn maintenance_tick_data_log_policy(policy: MaintenancePolicy) -> DurableDataLogPolicy {
+    let mut data_log_policy = policy.data_log_policy;
+    data_log_policy.max_compaction_copy_bytes = data_log_policy
+        .max_compaction_copy_bytes
+        .min(policy.compaction_copy_budget_per_tick);
+    data_log_policy
+}
+
+fn run_maintenance_tick_parts(
+    parts: &DurableMaintenanceParts,
+    recent_write_bytes: u64,
+    recent_flushed_write_bytes: u64,
+) -> Result<MaintenanceTickReport> {
+    let scheduler = MaintenanceScheduler::new(parts.maintenance_policy)?;
+    let cursor = *lock(&parts.maintenance_cursor)?;
+    let observation = parts.durable.maintenance_observation(
+        cursor,
+        recent_write_bytes,
+        recent_flushed_write_bytes,
+    )?;
+    let plan = scheduler.step(&observation);
+    let mut compaction = empty_compaction_report();
+    if !plan.commands.is_empty() {
+        let _persist_guard = lock(&parts.persist_lock)?;
+        for command in &plan.commands {
+            match command {
+                MaintenanceCommand::CompactDataLogs { logs } => {
+                    let report = parts.durable.compact_data_log_refs(
+                        maintenance_tick_data_log_policy(parts.maintenance_policy),
+                        logs,
+                    )?;
+                    compaction.deleted_logs.extend(report.deleted_logs);
+                    compaction.relocated_logs.extend(report.relocated_logs);
+                    compaction
+                        .relocated_segments
+                        .extend(report.relocated_segments);
+                    compaction.bytes_copied = compaction
+                        .bytes_copied
+                        .checked_add(report.bytes_copied)
+                        .ok_or_else(|| {
+                            StorageError::conflict("maintenance bytes_copied overflow")
+                        })?;
+                    compaction.bytes_deleted = compaction
+                        .bytes_deleted
+                        .checked_add(report.bytes_deleted)
+                        .ok_or_else(|| {
+                            StorageError::conflict("maintenance bytes_deleted overflow")
+                        })?;
+                }
+            }
+        }
+        let image = parts.local.state_image()?;
+        *lock(&parts.persisted_segments)? = image.storage_nodes.segment_ids();
+    }
+    parts.durable.persist_maintenance_cursor(plan.next_cursor)?;
+    *lock(&parts.maintenance_cursor)? = plan.next_cursor;
+    Ok(MaintenanceTickReport { plan, compaction })
+}
+
 /// Local durable provider bundle using SQLite metadata and rolled data logs.
 #[derive(Debug, Clone)]
 pub struct DurableObjectStore {
@@ -4401,6 +5343,9 @@ pub struct DurableObjectStore {
     durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     persist_lock: Arc<Mutex<()>>,
+    maintenance_policy: MaintenancePolicy,
+    maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
+    maintenance_worker: Option<Arc<MaintenanceWorker>>,
 }
 
 impl DurableObjectStore {
@@ -4427,22 +5372,173 @@ impl DurableObjectStore {
         storage_nodes: Vec<StorageNodeId>,
         policy: DurableDataLogPolicy,
     ) -> Result<Self> {
+        Self::open_with_storage_nodes_and_maintenance_policy(
+            root,
+            config,
+            storage_nodes,
+            MaintenancePolicy::manual(policy),
+        )
+    }
+
+    /// Open a one-node durable store with an explicit maintenance policy.
+    ///
+    /// Manual mode starts no background worker. Opportunistic and always-on
+    /// modes remain implementation details below the block/native APIs; callers
+    /// still observe the same read/write/fork/snapshot/restore semantics.
+    pub fn open_with_maintenance_policy(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        policy: MaintenancePolicy,
+    ) -> Result<Self> {
+        Self::open_with_storage_nodes_and_maintenance_policy(
+            root,
+            config,
+            vec![config.storage_node],
+            policy,
+        )
+    }
+
+    /// Open a durable store with provider-private storage-node placement.
+    ///
+    /// The supplied node list seeds a new store. Reopen reconstructs the
+    /// registry from SQLite and verifies row-native metadata plus data-log
+    /// placements before returning.
+    pub fn open_with_storage_nodes_and_maintenance_policy(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        maintenance_policy: MaintenancePolicy,
+    ) -> Result<Self> {
         config.validate()?;
+        maintenance_policy.validate()?;
         let paths = DurableStorePaths::new(root, config.storage_node)?;
-        let durable = DurableSqliteStore::open(paths, policy)?;
+        let durable = DurableSqliteStore::open(paths, maintenance_policy.data_log_policy)?;
 
         let local = durable
             .load(config)?
             .unwrap_or(LocalObjectStore::with_storage_nodes(config, storage_nodes)?);
         let persisted_segments = local.state_image()?.storage_nodes.segment_ids();
+        let maintenance_cursor = Arc::new(Mutex::new(durable.load_maintenance_cursor()?));
 
-        let store = Self {
+        let mut store = Self {
             local,
             durable,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             persist_lock: Arc::new(Mutex::new(())),
+            maintenance_policy,
+            maintenance_cursor,
+            maintenance_worker: None,
         };
+        store.start_maintenance_worker_if_needed()?;
         Ok(store)
+    }
+
+    fn start_maintenance_worker_if_needed(&mut self) -> Result<()> {
+        if matches!(self.maintenance_policy.mode, MaintenanceMode::AlwaysOn) {
+            let worker = MaintenanceWorker::start(DurableMaintenanceParts {
+                local: self.local.clone(),
+                durable: self.durable.clone(),
+                persisted_segments: Arc::clone(&self.persisted_segments),
+                persist_lock: Arc::clone(&self.persist_lock),
+                maintenance_cursor: Arc::clone(&self.maintenance_cursor),
+                maintenance_policy: self.maintenance_policy,
+            })?;
+            worker.notify();
+            self.maintenance_worker = Some(worker);
+        }
+        Ok(())
+    }
+
+    fn maintenance_parts(&self) -> DurableMaintenanceParts {
+        DurableMaintenanceParts {
+            local: self.local.clone(),
+            durable: self.durable.clone(),
+            persisted_segments: Arc::clone(&self.persisted_segments),
+            persist_lock: Arc::clone(&self.persist_lock),
+            maintenance_cursor: Arc::clone(&self.maintenance_cursor),
+            maintenance_policy: self.maintenance_policy,
+        }
+    }
+
+    /// Return the maintenance policy configured for this store.
+    pub fn maintenance_policy(&self) -> MaintenancePolicy {
+        self.maintenance_policy
+    }
+
+    /// Observe current durable maintenance pressure without mutating state.
+    ///
+    /// The observation is suitable for diagnostics or deterministic planning.
+    /// It is not a lock or lease: executors must tolerate the state changing
+    /// before a plan is run.
+    pub fn observe_maintenance(&self) -> Result<MaintenanceObservation> {
+        let cursor = *lock(&self.maintenance_cursor)?;
+        self.durable.maintenance_observation(cursor, 0, 0)
+    }
+
+    /// Plan one maintenance tick from the current observation.
+    ///
+    /// This performs SQLite reads only. It does not compact logs, update the
+    /// fairness cursor, throttle a write, or start background work.
+    pub fn plan_maintenance(&self) -> Result<MaintenanceTickPlan> {
+        let scheduler = MaintenanceScheduler::new(self.maintenance_policy)?;
+        let observation = self.observe_maintenance()?;
+        Ok(scheduler.step(&observation))
+    }
+
+    /// Run one bounded maintenance tick synchronously.
+    ///
+    /// Success means completed compaction work and the fairness cursor were
+    /// durably published. If the tick fails, already committed maintenance work
+    /// remains valid, and acknowledged user data must remain readable.
+    pub fn run_maintenance_tick(&self) -> Result<MaintenanceTickReport> {
+        run_maintenance_tick_parts(&self.maintenance_parts(), 0, 0)
+    }
+
+    /// Stop the optional always-on maintenance worker.
+    ///
+    /// Manual and opportunistic stores have no worker, so this is a no-op. For
+    /// always-on stores, the call waits for an in-flight bounded tick to finish
+    /// before returning.
+    pub fn shutdown_maintenance(&self) {
+        if let Some(worker) = &self.maintenance_worker {
+            worker.shutdown();
+        }
+    }
+
+    fn admit_write(&self, bytes: u64, flushed: bool) -> Result<WriteAdmission> {
+        let should_observe = self.maintenance_policy.write_backpressure_enabled
+            || matches!(self.maintenance_policy.mode, MaintenanceMode::Opportunistic);
+        if !should_observe {
+            return Ok(WriteAdmission::Accept);
+        }
+        let cursor = *lock(&self.maintenance_cursor)?;
+        let observation =
+            self.durable
+                .maintenance_observation(cursor, bytes, if flushed { bytes } else { 0 })?;
+        let plan = MaintenanceScheduler::new(self.maintenance_policy)?.step(&observation);
+        if self.maintenance_policy.write_backpressure_enabled
+            && let Some(reason) = plan.admission.unavailable_reason()
+        {
+            return Err(StorageError::unavailable(reason));
+        }
+        if matches!(self.maintenance_policy.mode, MaintenanceMode::Opportunistic)
+            && !plan.commands.is_empty()
+        {
+            self.run_maintenance_tick()?;
+            return Ok(WriteAdmission::AcceptAndSchedule);
+        }
+        if plan.commands.is_empty() {
+            Ok(WriteAdmission::Accept)
+        } else {
+            Ok(WriteAdmission::AcceptAndSchedule)
+        }
+    }
+
+    fn after_successful_write(&self, _admission: WriteAdmission) {
+        match self.maintenance_policy.mode {
+            MaintenanceMode::Manual | MaintenanceMode::Opportunistic => {}
+            MaintenanceMode::AlwaysOn => self.notify_background_maintenance(),
+        }
     }
 
     pub fn metadata(&self) -> Arc<InMemoryMetadataPlane> {
@@ -4549,10 +5645,19 @@ impl DurableObjectStore {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<WriteCommit> {
-        self.run_and_maybe_persist(
+        let admission = self.admit_write(
+            u64::try_from(data.len())
+                .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
+            matches!(durability, crate::api::WriteDurability::Flushed),
+        )?;
+        let result = self.run_and_maybe_persist(
             matches!(durability, crate::api::WriteDurability::Flushed),
             |local| local.write_device(device_id, offset, data, durability),
-        )
+        );
+        if result.is_ok() {
+            self.after_successful_write(admission);
+        }
+        result
     }
 
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
@@ -4560,7 +5665,12 @@ impl DurableObjectStore {
     }
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
-        self.run_and_persist(|local| local.write_zeroes(device_id, offset, len))
+        let admission = self.admit_write(len, true)?;
+        let result = self.run_and_persist(|local| local.write_zeroes(device_id, offset, len));
+        if result.is_ok() {
+            self.after_successful_write(admission);
+        }
+        result
     }
 
     pub fn discard_device(
@@ -4569,7 +5679,12 @@ impl DurableObjectStore {
         offset: u64,
         len: u64,
     ) -> Result<WriteCommit> {
-        self.run_and_persist(|local| local.discard_device(device_id, offset, len))
+        let admission = self.admit_write(len, true)?;
+        let result = self.run_and_persist(|local| local.discard_device(device_id, offset, len));
+        if result.is_ok() {
+            self.after_successful_write(admission);
+        }
+        result
     }
 
     pub fn write_file_at(
@@ -4580,10 +5695,19 @@ impl DurableObjectStore {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<FileWriteCommit> {
-        self.run_and_maybe_persist(
+        let admission = self.admit_write(
+            u64::try_from(data.len())
+                .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
+            matches!(durability, crate::api::WriteDurability::Flushed),
+        )?;
+        let result = self.run_and_maybe_persist(
             matches!(durability, crate::api::WriteDurability::Flushed),
             |local| local.write_file_at(keyspace_id, file_id, offset, data, durability),
-        )
+        );
+        if result.is_ok() {
+            self.after_successful_write(admission);
+        }
+        result
     }
 
     pub fn append_file(
@@ -4592,10 +5716,19 @@ impl DurableObjectStore {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<AppendCommit> {
-        self.run_and_maybe_persist(
+        let admission = self.admit_write(
+            u64::try_from(data.len())
+                .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?,
+            matches!(durability, crate::api::WriteDurability::Flushed),
+        )?;
+        let result = self.run_and_maybe_persist(
             matches!(durability, crate::api::WriteDurability::Flushed),
             |local| local.append_file(lease, data, durability),
-        )
+        );
+        if result.is_ok() {
+            self.after_successful_write(admission);
+        }
+        result
     }
 
     pub fn read_file(
@@ -4653,14 +5786,27 @@ impl DurableObjectStore {
         &self,
         policy: RetentionPolicy,
     ) -> Result<MetadataCustodianReport> {
-        self.run_and_persist(|local| local.run_metadata_custodian(policy))
+        let report = self.run_and_persist(|local| local.run_metadata_custodian(policy))?;
+        self.notify_background_maintenance();
+        Ok(report)
     }
 
     pub fn run_storage_node_custodian(
         &self,
         expired_write_intents: &BTreeSet<WriteIntentId>,
     ) -> Result<StorageNodeCustodianReport> {
-        self.run_and_persist(|local| local.run_storage_node_custodian(expired_write_intents))
+        let report =
+            self.run_and_persist(|local| local.run_storage_node_custodian(expired_write_intents))?;
+        self.notify_background_maintenance();
+        Ok(report)
+    }
+
+    fn notify_background_maintenance(&self) {
+        if matches!(self.maintenance_policy.mode, MaintenanceMode::AlwaysOn)
+            && let Some(worker) = &self.maintenance_worker
+        {
+            worker.notify();
+        }
     }
 
     fn run_and_persist<T>(&self, op: impl FnOnce(&LocalObjectStore) -> Result<T>) -> Result<T> {
@@ -9268,6 +10414,9 @@ impl TcpRemoteWireServer {
             while !thread_shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         let response = read_tcp_frame(&mut stream, max_frame_bytes)
                             .and_then(|request| endpoint.call_wire(request));
                         if let Ok(response) = response {
@@ -14286,7 +15435,7 @@ mod tests {
             )
             .unwrap();
         assert!(root.join("metadata.sqlite").exists());
-        assert!(root.join("data").join("data-000001.log").exists());
+        assert!(data_log_path(&root.join("data"), cfg.storage_node, 1).exists());
 
         drop(store);
         let reopened = DurableObjectStore::open(&root, cfg).unwrap();
@@ -15043,7 +16192,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let data_log = root.join("data").join("data-000001.log");
+        let data_log = data_log_path(&root.join("data"), cfg.storage_node, 1);
         OpenOptions::new()
             .append(true)
             .open(&data_log)
@@ -15096,9 +16245,11 @@ mod tests {
         let placement = store.durable.placement_for_test(segment_id).unwrap();
         drop(store);
 
-        let path = root
-            .join("data")
-            .join(format!("data-{:06}.log", placement.data_log_id));
+        let path = data_log_path(
+            &root.join("data"),
+            placement.storage_node,
+            placement.data_log_id,
+        );
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -15137,9 +16288,11 @@ mod tests {
         let placement = store.durable.placement_for_test(segment_id).unwrap();
         drop(store);
 
-        let path = root
-            .join("data")
-            .join(format!("data-{:06}.log", placement.data_log_id));
+        let path = data_log_path(
+            &root.join("data"),
+            placement.storage_node,
+            placement.data_log_id,
+        );
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -15181,7 +16334,7 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        fs::remove_file(root.join("data").join("data-000001.log")).unwrap();
+        fs::remove_file(data_log_path(&root.join("data"), cfg.storage_node, 1)).unwrap();
         assert!(DurableObjectStore::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -15252,8 +16405,12 @@ mod tests {
         let report = store
             .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
             .unwrap();
-        assert!(report.relocated_logs.contains(&1));
-        assert!(!root.join("data").join("data-000001.log").exists());
+        let first_log = DurableDataLogRef {
+            storage_node: cfg.storage_node,
+            log_id: 1,
+        };
+        assert!(report.relocated_logs.contains(&first_log));
+        assert!(!data_log_path(&root.join("data"), cfg.storage_node, first_log.log_id).exists());
 
         drop(store);
         let reopened = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
@@ -15312,12 +16469,12 @@ mod tests {
         let retained_report = store
             .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
             .unwrap();
-        assert!(
-            !retained_report
-                .deleted_logs
-                .contains(&old_placement.data_log_id)
-        );
-        assert!(data_log_path(&root.join("data"), old_placement.data_log_id).exists());
+        let old_log = DurableDataLogRef {
+            storage_node: old_placement.storage_node,
+            log_id: old_placement.data_log_id,
+        };
+        assert!(!retained_report.deleted_logs.contains(&old_log));
+        assert!(data_log_path(&root.join("data"), old_log.storage_node, old_log.log_id).exists());
         assert!(store.durable.placement_for_test(old_segment_id).is_ok());
 
         store
@@ -15327,14 +16484,683 @@ mod tests {
         let expired_report = store
             .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
             .unwrap();
-        assert!(
-            expired_report
-                .deleted_logs
-                .contains(&old_placement.data_log_id)
-        );
-        assert!(!data_log_path(&root.join("data"), old_placement.data_log_id).exists());
+        assert!(expired_report.deleted_logs.contains(&old_log));
+        assert!(!data_log_path(&root.join("data"), old_log.storage_node, old_log.log_id).exists());
         assert!(store.durable.placement_for_test(old_segment_id).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintenance_scheduler_is_deterministic_and_bounded() {
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::Manual,
+            data_log_policy: DurableDataLogPolicy::compact_everything_for_test(),
+            write_backpressure_enabled: true,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: 1024 * 1024,
+            max_sealed_logs: 16,
+            max_reclaimable_debt_bytes: 1024 * 1024,
+            compaction_copy_budget_per_tick: 4096,
+            max_sqlite_wal_bytes: 1024 * 1024,
+            max_logs_scanned_per_tick: 2,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let scheduler = MaintenanceScheduler::new(policy).unwrap();
+        let node = StorageNodeId::from_raw(7);
+        let observation = MaintenanceObservation {
+            nodes: vec![MaintenanceNodeObservation {
+                storage_node: node,
+                active_log_bytes: 4096,
+                sealed_log_count: 3,
+                dirty_bytes: 12_288,
+                reclaimable_bytes: 12_288,
+                logs: (1..=3)
+                    .map(|log_id| MaintenanceDataLogObservation {
+                        log_ref: DurableDataLogRef {
+                            storage_node: node,
+                            log_id,
+                        },
+                        total_bytes: 8192,
+                        live_bytes: 2048,
+                        dead_bytes: 6144,
+                        reclaimable_bytes: 6144,
+                    })
+                    .collect(),
+            }],
+            sqlite_wal_bytes: 0,
+            pending_custodian_releases: 0,
+            pitr_retention_floor: None,
+            recent_write_bytes: 4096,
+            recent_flushed_write_bytes: 4096,
+            compaction_cursor: Some(DurableDataLogRef {
+                storage_node: node,
+                log_id: 1,
+            }),
+        };
+
+        let first = scheduler.step(&observation);
+        let second = scheduler.step(&observation);
+        assert_eq!(first, second);
+        assert!(matches!(first.admission, WriteAdmission::AcceptAndSchedule));
+        assert_eq!(first.diagnostics.selected_logs.len(), 2);
+        assert_eq!(
+            first.diagnostics.selected_logs[0],
+            DurableDataLogRef {
+                storage_node: node,
+                log_id: 2
+            }
+        );
+    }
+
+    #[test]
+    fn durable_data_logs_are_scoped_to_storage_nodes_and_reopen() {
+        let root = durable_temp_dir("node-scoped-data-logs");
+        let mut cfg = config();
+        cfg.storage_node = StorageNodeId::from_raw(1);
+        let nodes = vec![
+            StorageNodeId::from_raw(1),
+            StorageNodeId::from_raw(2),
+            StorageNodeId::from_raw(3),
+        ];
+        let store = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+            &root,
+            cfg,
+            nodes.clone(),
+            DurableDataLogPolicy {
+                target_data_log_bytes: 1024 * 1024,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 3,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        for block in 0..3 {
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, (block + 1) as u8),
+                    WriteDurability::Flushed,
+                )
+                .unwrap();
+        }
+
+        let rows = store.durable.data_log_rows_for_test().unwrap();
+        let row_nodes: BTreeSet<_> = rows.iter().map(|row| row.storage_node).collect();
+        assert_eq!(row_nodes.len(), 3);
+        for node in &nodes {
+            assert!(node_data_log_dir(&root.join("data"), *node).exists());
+            assert!(data_log_path(&root.join("data"), *node, 1).exists());
+        }
+
+        drop(store);
+        let reopened = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+            &root,
+            cfg,
+            nodes,
+            DurableDataLogPolicy::default(),
+        )
+        .unwrap();
+        let mut bytes = vec![0; 3 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes[0..4096], repeated_blocks(1, 1).as_slice());
+        assert_eq!(&bytes[4096..8192], repeated_blocks(1, 2).as_slice());
+        assert_eq!(&bytes[8192..12288], repeated_blocks(1, 3).as_slice());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintenance_throttles_writes_until_manual_tick_reclaims_debt() {
+        let root = durable_temp_dir("maintenance-throttle");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::Manual,
+            data_log_policy: DurableDataLogPolicy {
+                target_data_log_bytes: 4096,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+            write_backpressure_enabled: true,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: 1,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: u64::MAX,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 64,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 4,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 1),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 2),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+
+        let throttled = store
+            .write_device(
+                device_id,
+                4096,
+                &repeated_blocks(1, 3),
+                WriteDurability::Flushed,
+            )
+            .unwrap_err();
+        assert_eq!(
+            throttled,
+            StorageError::unavailable("maintenance dirty bytes above high watermark")
+        );
+
+        let report = store.run_maintenance_tick().unwrap();
+        assert!(!report.plan.commands.is_empty());
+        assert!(report.compaction.bytes_deleted > 0);
+        store
+            .write_device(
+                device_id,
+                4096,
+                &repeated_blocks(1, 3),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scheduled_compaction_matches_manual_compaction() {
+        fn prepare(root: &Path) -> (DurableObjectStore, DeviceId) {
+            let cfg = config();
+            let store = DurableObjectStore::open_with_maintenance_policy(
+                root,
+                cfg,
+                MaintenancePolicy {
+                    mode: MaintenanceMode::Manual,
+                    data_log_policy: DurableDataLogPolicy {
+                        target_data_log_bytes: 4096,
+                        min_reclaimable_ratio_ppm: 1,
+                        min_reclaimable_bytes: 1,
+                        max_compaction_copy_bytes: u64::MAX,
+                    },
+                    write_backpressure_enabled: true,
+                    dirty_low_watermark_bytes: 1,
+                    dirty_high_watermark_bytes: u64::MAX,
+                    max_sealed_logs: 64,
+                    max_reclaimable_debt_bytes: u64::MAX,
+                    compaction_copy_budget_per_tick: u64::MAX,
+                    max_sqlite_wal_bytes: u64::MAX,
+                    max_logs_scanned_per_tick: 64,
+                    max_concurrent_compaction_jobs: 1,
+                },
+            )
+            .unwrap();
+            let device_id = store
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 4,
+                        block_size: 4096,
+                    },
+                    name: None,
+                })
+                .unwrap();
+            for block in 0..4 {
+                store
+                    .write_device(
+                        device_id,
+                        block * 4096,
+                        &repeated_blocks(1, (block + 1) as u8),
+                        WriteDurability::Flushed,
+                    )
+                    .unwrap();
+            }
+            store
+                .write_device(
+                    device_id,
+                    0,
+                    &repeated_blocks(1, 9),
+                    WriteDurability::Flushed,
+                )
+                .unwrap();
+            store
+                .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+                .unwrap();
+            store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+            (store, device_id)
+        }
+
+        let manual_root = durable_temp_dir("manual-compaction-equivalence");
+        let scheduled_root = durable_temp_dir("scheduled-compaction-equivalence");
+        let (manual, manual_device) = prepare(&manual_root);
+        let (scheduled, scheduled_device) = prepare(&scheduled_root);
+
+        manual
+            .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
+            .unwrap();
+        scheduled.run_maintenance_tick().unwrap();
+
+        let mut manual_bytes = vec![0; 4 * 4096];
+        let mut scheduled_bytes = vec![0; 4 * 4096];
+        manual
+            .read_device(
+                manual_device,
+                ByteRange::new(0, 4 * 4096),
+                &mut manual_bytes,
+            )
+            .unwrap();
+        scheduled
+            .read_device(
+                scheduled_device,
+                ByteRange::new(0, 4 * 4096),
+                &mut scheduled_bytes,
+            )
+            .unwrap();
+        assert_eq!(manual_bytes, scheduled_bytes);
+
+        let manual_dead: u64 = manual
+            .durable
+            .data_log_rows_for_test()
+            .unwrap()
+            .iter()
+            .map(|row| row.dead_bytes)
+            .sum();
+        let scheduled_dead: u64 = scheduled
+            .durable
+            .data_log_rows_for_test()
+            .unwrap()
+            .iter()
+            .map(|row| row.dead_bytes)
+            .sum();
+        assert_eq!(manual_dead, scheduled_dead);
+        assert_eq!(scheduled_dead, 0);
+        let _ = fs::remove_dir_all(manual_root);
+        let _ = fs::remove_dir_all(scheduled_root);
+    }
+
+    #[test]
+    fn repeated_maintenance_ticks_are_idempotent_and_restart_safe() {
+        let root = durable_temp_dir("maintenance-idempotent-restart");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::Manual,
+            data_log_policy: DurableDataLogPolicy {
+                target_data_log_bytes: 4096,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+            write_backpressure_enabled: true,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: u64::MAX,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: u64::MAX,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 64,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 4,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 1),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 2),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+
+        let first = store.run_maintenance_tick().unwrap();
+        let second = store.run_maintenance_tick().unwrap();
+        assert!(first.compaction.bytes_deleted > 0);
+        assert!(second.compaction.bytes_deleted <= first.compaction.bytes_deleted);
+        store.shutdown_maintenance();
+        drop(store);
+
+        let reopened =
+            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 2));
+        reopened.shutdown_maintenance();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintenance_cursor_persists_across_reopen() {
+        let root = durable_temp_dir("maintenance-cursor-restart");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::Manual,
+            data_log_policy: DurableDataLogPolicy {
+                target_data_log_bytes: 4096,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+            write_backpressure_enabled: true,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: u64::MAX,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: 1,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 1,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 4,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        for block in 0..3 {
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, (block + 1) as u8),
+                    WriteDurability::Flushed,
+                )
+                .unwrap();
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, (block + 5) as u8),
+                    WriteDurability::Flushed,
+                )
+                .unwrap();
+        }
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+
+        let first = store.run_maintenance_tick().unwrap();
+        let cursor = first.plan.next_cursor.unwrap();
+        assert_eq!(first.plan.diagnostics.selected_logs.len(), 1);
+        drop(store);
+
+        let reopened =
+            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        assert_eq!(
+            reopened.observe_maintenance().unwrap().compaction_cursor,
+            Some(cursor)
+        );
+        let next = reopened.plan_maintenance().unwrap();
+        assert_eq!(next.diagnostics.selected_logs.len(), 1);
+        assert!(next.diagnostics.selected_logs[0] > cursor);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opportunistic_maintenance_runs_before_the_admitted_write() {
+        let root = durable_temp_dir("opportunistic-maintenance");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::Opportunistic,
+            data_log_policy: DurableDataLogPolicy {
+                target_data_log_bytes: 4096,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+            write_backpressure_enabled: false,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: u64::MAX,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: u64::MAX,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 64,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 4,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 1),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 2),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        assert!(store.observe_maintenance().unwrap().nodes[0].dirty_bytes > 0);
+
+        store
+            .write_device(
+                device_id,
+                4096,
+                &repeated_blocks(1, 3),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        assert_eq!(store.observe_maintenance().unwrap().nodes[0].dirty_bytes, 0);
+        let mut bytes = vec![0; 2 * 4096];
+        store
+            .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes[0..4096], repeated_blocks(1, 2).as_slice());
+        assert_eq!(&bytes[4096..8192], repeated_blocks(1, 3).as_slice());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn always_on_maintenance_worker_shuts_down_and_reopens_cleanly() {
+        let root = durable_temp_dir("always-on-maintenance-shutdown");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::AlwaysOn,
+            data_log_policy: DurableDataLogPolicy {
+                target_data_log_bytes: 4096,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+            write_backpressure_enabled: false,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: u64::MAX,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: u64::MAX,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 64,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 4,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 7),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store.shutdown_maintenance();
+        drop(store);
+
+        let reopened =
+            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 7));
+        reopened.shutdown_maintenance();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_maintenance_interleavings_preserve_durable_contents() {
+        for seed in 0..4 {
+            let root = durable_temp_dir(&format!("maintenance-generated-{seed}"));
+            let cfg = config();
+            let policy = MaintenancePolicy {
+                mode: MaintenanceMode::Manual,
+                data_log_policy: DurableDataLogPolicy {
+                    target_data_log_bytes: 4096,
+                    min_reclaimable_ratio_ppm: 1,
+                    min_reclaimable_bytes: 1,
+                    max_compaction_copy_bytes: u64::MAX,
+                },
+                write_backpressure_enabled: true,
+                dirty_low_watermark_bytes: 1,
+                dirty_high_watermark_bytes: u64::MAX,
+                max_sealed_logs: 64,
+                max_reclaimable_debt_bytes: u64::MAX,
+                compaction_copy_budget_per_tick: 16 * 4096,
+                max_sqlite_wal_bytes: u64::MAX,
+                max_logs_scanned_per_tick: 4,
+                max_concurrent_compaction_jobs: 1,
+            };
+            let mut rng = crate::sim::SeededRng::new(seed);
+            let mut store =
+                DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+            let device_id = store
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 8,
+                        block_size: 4096,
+                    },
+                    name: Some(format!("device-{seed}")),
+                })
+                .unwrap();
+            let mut model = [0u8; 8];
+            for step in 0..24 {
+                match rng.next_u64() % 5 {
+                    0 | 1 => {
+                        let block = rng.next_u64() as usize % model.len();
+                        let byte = (1 + rng.next_u64() % 254) as u8;
+                        store
+                            .write_device(
+                                device_id,
+                                (block * 4096) as u64,
+                                &[byte; 4096],
+                                WriteDurability::Flushed,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("seed={seed} step={step} write failed: {error}")
+                            });
+                        model[block] = byte;
+                    }
+                    2 => {
+                        store
+                            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+                            .unwrap();
+                        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+                    }
+                    3 => {
+                        store.run_maintenance_tick().unwrap();
+                    }
+                    _ => {
+                        drop(store);
+                        store =
+                            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy)
+                                .unwrap();
+                    }
+                }
+                let mut bytes = vec![0; model.len() * 4096];
+                store
+                    .read_device(device_id, ByteRange::new(0, bytes.len() as u64), &mut bytes)
+                    .unwrap_or_else(|error| panic!("seed={seed} step={step} read failed: {error}"));
+                for (block, expected) in model.iter().enumerate() {
+                    assert_eq!(
+                        &bytes[block * 4096..(block + 1) * 4096],
+                        &[*expected; 4096],
+                        "seed={seed} step={step} block={block}"
+                    );
+                }
+            }
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -16903,6 +18729,57 @@ mod tests {
 
         let tiny = TcpRemoteWireTransport::new(tcp_server.local_addr(), 4);
         assert!(tiny.call_wire(vec![0; 8]).is_err());
+        tcp_server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn tcp_wire_server_accepts_split_client_frames() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let block_server = Arc::new(LocalBlockServer::new(store));
+        let endpoint = Arc::new(NetworkBlockEndpoint::new(
+            block_server,
+            ServerIncarnation::from_raw(25),
+            8,
+            4,
+        ));
+        let tcp_server = start_tcp_wire_server(endpoint);
+        let request = RemoteWireRequest {
+            incarnation: ServerIncarnation::from_raw(25),
+            envelope: BlockRequestEnvelope::new(
+                RequestId::from_raw(1),
+                ClientEpoch::from_raw(1),
+                None,
+                BlockRequest::Create {
+                    request: CreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 16,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    },
+                },
+            ),
+        };
+        let frame = encode_network_frame(NETWORK_BLOCK_REQUEST, &request).unwrap();
+        let frame_len = u32::try_from(frame.len()).unwrap().to_be_bytes();
+        let mut stream = TcpStream::connect(tcp_server.local_addr()).unwrap();
+        stream.write_all(&frame_len).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        stream.write_all(&frame).unwrap();
+
+        let response = read_tcp_frame(&mut stream, DEFAULT_NETWORK_MAX_FRAME_BYTES).unwrap();
+        let reply: RemoteWireReply<BlockResponseEnvelope> =
+            decode_network_frame(NETWORK_BLOCK_RESPONSE, &response).unwrap();
+        assert!(matches!(
+            reply,
+            RemoteWireReply::Ok {
+                envelope: BlockResponseEnvelope {
+                    response: BlockResponse::Created(_),
+                    ..
+                },
+                ..
+            }
+        ));
         tcp_server.shutdown().unwrap();
     }
 

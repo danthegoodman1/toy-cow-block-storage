@@ -38,12 +38,15 @@ pub use id::{
 };
 pub use local::{
     ChaosRemoteWireTransport, ChaosTransportMetrics, DurableCompactionReport, DurableDataLogPolicy,
-    DurableObjectStore, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
-    InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
-    LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer, LocalObjectStore,
-    LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
+    DurableDataLogRef, DurableObjectStore, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane,
+    InMemorySegmentStore, InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient,
+    LocalBlockDevice, LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer,
+    LocalObjectStore, LocalStoreConfig, MaintenanceCommand, MaintenanceDataLogObservation,
+    MaintenanceDiagnostics, MaintenanceMode, MaintenanceNodeObservation, MaintenanceObservation,
+    MaintenancePolicy, MaintenanceScheduler, MaintenanceSkippedLog, MaintenanceTickPlan,
+    MaintenanceTickReport, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
     RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport,
-    RemoteWireTransport, SegmentLifecycleState, StorageNodeCustodianReport,
+    RemoteWireTransport, SegmentLifecycleState, StorageNodeCustodianReport, WriteAdmission,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

@@ -11,7 +11,7 @@ use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId, StorageNodeId};
 use toy_cow_block_storage::local::{
     DurableDataLogPolicy, DurableObjectStore, InMemoryMetadataPlane, InMemorySegmentStore,
-    LocalObjectStore, LocalStoreConfig,
+    LocalObjectStore, LocalStoreConfig, MaintenanceMode, MaintenancePolicy,
 };
 use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
 use toy_cow_block_storage::provider::{
@@ -1491,11 +1491,55 @@ fn seed_durable_native_history_with_durability(
     }
 }
 
+fn maintenance_bench_policy(mode: MaintenanceMode) -> MaintenancePolicy {
+    MaintenancePolicy {
+        mode,
+        data_log_policy: DurableDataLogPolicy {
+            target_data_log_bytes: 4096,
+            min_reclaimable_ratio_ppm: 1,
+            min_reclaimable_bytes: 1,
+            max_compaction_copy_bytes: u64::MAX,
+        },
+        write_backpressure_enabled: true,
+        dirty_low_watermark_bytes: 1,
+        dirty_high_watermark_bytes: u64::MAX,
+        max_sealed_logs: 1024,
+        max_reclaimable_debt_bytes: u64::MAX,
+        compaction_copy_budget_per_tick: u64::MAX,
+        max_sqlite_wal_bytes: u64::MAX,
+        max_logs_scanned_per_tick: 1024,
+        max_concurrent_compaction_jobs: 1,
+    }
+}
+
+fn seed_durable_compaction_debt(store: &DurableObjectStore, device_id: DeviceId, writes: u64) {
+    for block in 0..writes {
+        store
+            .write_device(
+                device_id,
+                block * 4096,
+                &[block as u8; 4096],
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+    }
+    store
+        .write_device(device_id, 0, &[255; 4096], WriteDurability::Flushed)
+        .unwrap();
+    store
+        .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+        .unwrap();
+    store
+        .run_storage_node_custodian(&std::collections::BTreeSet::new())
+        .unwrap();
+}
+
 fn durable_sqlite_operational_row_count(root: &Path) -> i64 {
     let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
     let mut rows = 0;
     for table in [
         "store_meta",
+        "maintenance_state",
         "data_logs",
         "segment_placements",
         "storage_nodes",
@@ -1881,6 +1925,124 @@ fn bench_durable_provider(c: &mut Criterion) {
                     .unwrap();
                 let elapsed = started.elapsed();
                 cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("maintenance_observe_idle", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("maintenance-observe-idle");
+                let store = DurableObjectStore::open_with_maintenance_policy(
+                    &root,
+                    durable_bench_config(),
+                    maintenance_bench_policy(MaintenanceMode::Manual),
+                )
+                .unwrap();
+                let started = Instant::now();
+                let observation = store.observe_maintenance().unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(observation);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("maintenance_tick_idle", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("maintenance-tick-idle");
+                let store = DurableObjectStore::open_with_maintenance_policy(
+                    &root,
+                    durable_bench_config(),
+                    maintenance_bench_policy(MaintenanceMode::Manual),
+                )
+                .unwrap();
+                let started = Instant::now();
+                let report = store.run_maintenance_tick().unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(report);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("maintenance_enabled_idle_block_write_4k_flushed", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("maintenance-enabled-idle-write");
+                let store = DurableObjectStore::open_with_maintenance_policy(
+                    &root,
+                    durable_bench_config(),
+                    maintenance_bench_policy(MaintenanceMode::AlwaysOn),
+                )
+                .unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                let payload = vec![4; 4096];
+                let started = Instant::now();
+                let commit = store
+                    .write_device(
+                        black_box(device_id),
+                        black_box(0),
+                        black_box(&payload),
+                        WriteDurability::Flushed,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                store.shutdown_maintenance();
+                cleanup_durable_bench_root(&root);
+                black_box(commit);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("maintenance_tick_active_compaction", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("maintenance-tick-active");
+                let store = DurableObjectStore::open_with_maintenance_policy(
+                    &root,
+                    durable_bench_config(),
+                    maintenance_bench_policy(MaintenanceMode::Manual),
+                )
+                .unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_compaction_debt(&store, device_id, 32);
+                let started = Instant::now();
+                let report = store.run_maintenance_tick().unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(report);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("maintenance_throttled_write", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("maintenance-throttled-write");
+                let mut policy = maintenance_bench_policy(MaintenanceMode::Manual);
+                policy.dirty_high_watermark_bytes = 1;
+                let store = DurableObjectStore::open_with_maintenance_policy(
+                    &root,
+                    durable_bench_config(),
+                    policy,
+                )
+                .unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_compaction_debt(&store, device_id, 32);
+                let started = Instant::now();
+                let err = store
+                    .write_device(device_id, 4096, &[7; 4096], WriteDurability::Flushed)
+                    .unwrap_err();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(err);
                 black_box(elapsed)
             })
         })
