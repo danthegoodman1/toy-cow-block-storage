@@ -476,6 +476,14 @@ or placement domain. It may be memory-backed, file-backed, or remote later.
 replica placement, tracks checksums and write-complete state, and exposes
 deletion eligibility from that node's perspective.
 
+The storage-node file I/O engine is below both contracts. The durable provider
+should introduce this internal boundary with ordinary blocking filesystem calls
+and conservative file and directory syncs. A later Linux-only `io_uring` backend
+may optimize concurrent segment reads, writes, and batching behind the same
+boundary, but it must preserve the same temp-write, file-sync, atomic-rename,
+directory-sync, catalog-transition, and restart-recovery semantics and must fall
+back to the portable backend without changing public behavior.
+
 The local v1 implementation may keep both in memory, but the distinction matters:
 global metadata says which logical segment is referenced; local segment metadata
 says where that segment's bytes live on a particular storage node. A logical

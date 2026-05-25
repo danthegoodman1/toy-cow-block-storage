@@ -616,6 +616,10 @@ Deliverables:
 - [ ] Provider choice documented in the spec.
 - [ ] Durable segment, local segment catalog, metadata plane, device catalog, and
   timeline implementations.
+- [ ] Internal `SegmentFileIo` or equivalent storage-node file I/O boundary
+  below `SegmentStore` and `LocalSegmentCatalog`.
+- [ ] Portable blocking filesystem segment I/O backend used by the durable
+  storage node by default.
 - [ ] Crash-consistent `sync_segment` and `flush` definitions, including exact
   `durable_through` semantics.
 - [ ] Durable metadata transaction or WAL records for commit groups, checkpoints,
@@ -628,6 +632,9 @@ Deliverables:
 - [ ] Cache coherence rules for hot heads, metadata nodes, checkpoints, and
   segment descriptors after restart.
 - [ ] Crash/restart tests using the provider conformance suite.
+- [ ] Fault-injected crash tests at each segment file I/O boundary: temp write,
+  temp file sync, atomic rename, final directory sync, catalog transition, and
+  restart recovery.
 - [ ] PITR and GC tests against the durable provider.
 
 Exit gate:
@@ -640,6 +647,10 @@ Exit gate:
   committed root set, never a partial commit group.
 - [ ] Pending segment writes left by crashed, expired, or fenced write intents
   become reclaimable without exposing data.
+- [ ] The portable segment file I/O backend preserves the documented durability
+  sequence: payload bytes are durable before final segment visibility, and final
+  path visibility is durable before catalog state can claim the segment is
+  durable.
 - [ ] Flush reports only commit sequences whose segment bytes and metadata
   records satisfy the provider's documented durability contract.
 - [ ] Cached reads after restart or stale cache invalidation cannot observe roots
@@ -735,7 +746,47 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 19: Optional ublk Adapter
+## Phase 19: Linux io_uring Storage Node Backend
+
+Status: not started.
+
+Add a Linux `io_uring` implementation of the Phase 16 storage-node segment file
+I/O boundary after the portable durable provider proves the crash-safety
+contract. This phase is a measured storage-node optimization, not a new public
+API and not a new durability model. The portable blocking filesystem backend
+remains the default fallback.
+
+Deliverables:
+
+- [ ] Linux-only `io_uring` backend behind an explicit feature flag.
+- [ ] The `io_uring` backend plugs into the Phase 16 segment file I/O boundary
+  without changing storage-node lifecycle, catalog, or metadata code.
+- [ ] Shared conformance and crash/restart tests run against both the portable
+  backend and the `io_uring` backend when the host supports it.
+- [ ] Benchmarks for concurrent segment reads, concurrent segment writes,
+  batched segment writes, sync-heavy writes, and mixed read/write storage-node
+  workloads.
+- [ ] Documentation of when the provider may select the portable backend
+  automatically, such as non-Linux hosts, unsupported kernels, disabled feature
+  flags, or failed backend initialization.
+
+Exit gate:
+
+- [ ] `BlockDevice`, `NativeFile`, `MetadataPlane`, `SegmentStore`, and
+  `LocalSegmentCatalog` public contracts do not change.
+- [ ] Both segment file I/O backends, when available, pass the same storage-node
+  conformance and crash/restart tests.
+- [ ] The `io_uring` backend preserves the exact Phase 16 durability contract:
+  payload bytes are durable before final segment visibility, and final path
+  visibility is durable before catalog state can claim the segment is durable.
+- [ ] Fallback to the portable backend is explicit, observable in diagnostics,
+  and does not weaken correctness.
+- [ ] The `io_uring` backend is kept only if benchmarks show meaningful
+  concurrent storage-node throughput or tail-latency improvement.
+- [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
+  API, native file API, or deterministic core logic.
+
+## Phase 20: Optional ublk Adapter
 
 Status: not started.
 
