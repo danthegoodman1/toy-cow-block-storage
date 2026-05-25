@@ -609,10 +609,15 @@ contains the durable deterministic metadata/catalog image; `segment_placements`
 maps logical segments to current data-log records; `data_logs` tracks active,
 sealed, and deleted log files plus live/dead byte estimates.
 
+Each data-log record carries a fixed magic, version, segment ID, payload length,
+CRC64-ECMA payload checksum, and payload bytes. Reopen rejects a current
+placement if the record checksum, segment ID, or payload length disagrees with
+SQLite placement state.
+
 Committed segment placement becomes:
 
 ```text
-segment_id -> storage_node_id, data_log_id, offset, length, checksum
+segment_id -> storage_node_id, data_log_id, offset, length, crc64_ecma
 ```
 
 Metadata leaves and native file extents still reference only logical
@@ -623,8 +628,8 @@ metadata roots.
 Durable write ordering:
 
 ```text
-append segment bytes to data log
-fsync data log
+append segment bytes to data log(s)
+fsync each touched data log once for the publish batch
 SQLite transaction inserts placement and publishes current_state
 commit SQLite transaction
 ```
@@ -663,6 +668,14 @@ Incremental data-log compaction:
 This makes compaction cost proportional to selected dirty log bytes and selected
 live relocated payloads. It must not be proportional to total live bytes on the
 storage node.
+
+Background compaction is a runtime policy layer, not hidden core behavior. The
+deterministic core exposes data-log accounting and an explicit compaction call;
+a later maintenance scheduler observes dirty bytes, sealed-log count, WAL size,
+PITR retention horizon, and custodian release evidence, then emits bounded
+compaction commands plus explicit write admission/backpressure decisions. Tests
+must be able to run the same policy by stepping a deterministic observation
+trace without wall-clock reads, sleeps, or process-global randomness.
 
 SQLite maintenance is separate from data compaction. WAL checkpointing,
 integrity checks, and optional vacuum/incremental vacuum manage metadata file

@@ -497,7 +497,10 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 22 owns multiple local storage-node endpoints and one-replica segment
   placement so file/block data can be partitioned by segment without changing
   public APIs.
-- Phase 23 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 23 owns deterministic background compaction scheduling, maintenance
+  budgets, and explicit write backpressure policy for the partitioned durable
+  layout.
+- Phase 24 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -886,15 +889,15 @@ not the scalable storage-node compaction strategy. Phase 21 removed that
 production path and replaced it with partitioned logs and per-log incremental
 compaction.
 
-Current host headline numbers with the portable blocking filesystem backend on
-macOS/APFS are approximately: block acknowledged 4 KiB write 27 us, block
-flushed 4 KiB write 4.9 ms, block flush after 32 acknowledged writes 5.5 ms,
-native acknowledged append 38 us, native flushed append 5.4 ms, native flush
-after 32 acknowledged writes 6.4 ms, reopen after 32 block writes 4.7 ms, and
-explicit compaction after 32 block writes 11.4 ms. The remaining floor is
-dominated by host sync latency and full-state commit serialization; the hot path
-no longer pays multiple segment-file and snapshot-rename syncs per logical
-write.
+Current short-run host smoke numbers with the SQLite plus partitioned data-log
+provider on macOS/APFS are approximately: block acknowledged 4 KiB write 15 us,
+block flushed 4 KiB write 6.5 ms, block flush after 32 acknowledged writes
+7.4 ms, native acknowledged append 19 us, native flushed append 5.5 ms, native
+flush after 32 acknowledged writes 7.7 ms, reopen after 32 block writes 2.6 ms,
+and an explicit no-op compaction pass after 32 block writes 83 us. The remaining
+floor is dominated by host sync latency and full-state commit serialization; a
+batched flush now pays one data-log sync per touched log plus one SQLite publish
+transaction instead of one payload sync per segment.
 
 ## Phase 21: Partitioned Durable Logs and Incremental Compaction
 
@@ -935,7 +938,7 @@ store/
 Logical segment placement becomes:
 
 ```text
-segment_id -> data_log_id, offset, length, checksum, storage_node_id
+segment_id -> data_log_id, offset, length, crc64_ecma, storage_node_id
 ```
 
 Deliverables:
@@ -959,6 +962,9 @@ Deliverables:
   before optimizing.
 - [x] Rolled data-log writer that appends immutable segment payload records and
   rolls files by configured byte size, record count, or explicit test trigger.
+  The data-log writer uses CRC64-ECMA for record payload checksums and batches
+  acknowledged flushes so each touched data log is fsynced once before the
+  SQLite publish transaction.
 - [x] Durable placement index recording each committed logical segment's current
   data-log location without storing physical placement in metadata leaves or
   native extents.
@@ -1124,8 +1130,9 @@ Exit gate:
   state without scanning metadata leaves for physical placement.
 - [x] Multi-node placement does not measurably regress one-node hot paths beyond
   an implementation-plan-recorded threshold. Phase 22 adds Criterion coverage
-  for three-node write placement and read fanout; before Phase 23, investigate
-  any >20% one-node hot-path regression on the same host and benchmark profile.
+  for three-node write placement and read fanout; before storage replication,
+  investigate any >20% one-node hot-path regression on the same host and
+  benchmark profile.
 
 Short-run Phase 22 Criterion smoke numbers on this host: three 4 KiB
 round-robin block writes across three in-memory nodes measured about 18.6 us
@@ -1133,7 +1140,84 @@ for the three-write batch, and a 12 KiB read fanning out across three nodes
 measured about 2.9 us. Treat these as regression smoke baselines, not durable
 storage headline numbers.
 
-## Phase 23: Storage Replication
+## Phase 23: Background Compaction Scheduling and Backpressure Policy
+
+Status: not started.
+
+Turn Phase 21's explicit manual compaction hook into a deterministic maintenance
+actor and policy surface. The core still must not hide background work inside
+metadata or storage-node state transitions. Instead, the runtime gets an
+explicit scheduler that observes durable-log/accounting metrics, chooses bounded
+maintenance work, and reports write admission/backpressure decisions that tests
+can replay exactly.
+
+Non-goals:
+
+- No storage replication.
+- No remote scheduler service.
+- No hidden thread in the deterministic core.
+- No sleeps, wall-clock reads, or process-global randomness in admission or
+  compaction decisions.
+- No automatic deletion that bypasses PITR, GC, custodian release evidence, or
+  data-log placement accounting.
+
+Deliverables:
+
+- [ ] `MaintenanceScheduler` or equivalent deterministic policy object with a
+  pure transition shape such as `step(observation) -> maintenance_commands,
+  admission_decision`.
+- [ ] Explicit observation model for per-node active/sealed data logs,
+  live/dead/reclaimable bytes, dirty-log count, active-log size, SQLite WAL
+  size, pending custodian releases, PITR retention horizon, compaction cursor,
+  and recent write/flush pressure.
+- [ ] Configured policy knobs for target data-log size, low/high dirty-byte
+  watermarks, maximum sealed-log count, maximum reclaimable-debt bytes,
+  compaction copy budget per tick, maximum SQLite WAL bytes, maximum concurrent
+  compaction jobs, and whether the runtime uses manual, opportunistic, or
+  always-on maintenance.
+- [ ] Explicit write admission decisions: accept, accept-and-schedule, throttle
+  with a documented reason, or reject because durable capacity/invariants would
+  be violated. Runtime adapters may translate throttle into waiting; the core
+  decision must remain observable and testable.
+- [ ] Background runtime loop for the local durable provider that executes
+  scheduler commands with bounded work per tick and clean shutdown semantics.
+  The loop must be optional and replaceable by manual stepping in tests.
+- [ ] Backpressure integration for block and native file writes that does not
+  change public read, write, append, fork, snapshot, restore, or flush
+  semantics.
+- [ ] Deterministic simulation covering writes racing compaction, PITR horizon
+  changes, deletes, GC release evidence, active-log rolling, repeated scheduler
+  ticks, low/high watermark crossings, and per-node maintenance fairness.
+- [ ] Fault tests for compaction job interruption, duplicated scheduler
+  commands, delayed custodian release evidence, stale observations, shutdown
+  during a tick, and restart with pending compaction debt.
+- [ ] Metrics/diagnostics that expose dirty bytes, reclaimable bytes, selected
+  logs, skipped logs with reasons, throttle decisions, bytes copied/deleted,
+  and scheduler tick outcomes.
+- [ ] Benchmarks for steady-state writes with background maintenance disabled,
+  enabled-but-idle, and actively compacting; tail latency under high dirty-log
+  pressure; and throughput under explicit throttling.
+
+Exit gate:
+
+- [ ] Manual compaction and background-scheduled compaction produce the same
+  final reachable bytes under the deterministic conformance suite.
+- [ ] Scheduler output is deterministic for a given observation trace.
+- [ ] Bounded maintenance work prevents one tick from rewriting or scanning an
+  unbounded amount of node data.
+- [ ] Backpressure cannot silently drop acknowledged writes or weaken flushed
+  durability.
+- [ ] PITR-retained segments are never selected for deletion, even under high
+  dirty-byte pressure.
+- [ ] The runtime can shut down after finishing or aborting a bounded tick and
+  reopen to a valid placement set.
+- [ ] With background maintenance enabled but no reclaimable debt, one-node hot
+  read/write paths do not regress beyond an implementation-plan-recorded
+  threshold.
+- [ ] The scheduler remains below the block/native public APIs and does not ask
+  clients to choose storage nodes, compact logs, or fan out writes.
+
+## Phase 24: Storage Replication
 
 Status: not started.
 
@@ -1193,7 +1277,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 24: Linux io_uring Storage Node Backend
+## Phase 25: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1234,7 +1318,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 25: Optional ublk Adapter
+## Phase 26: Optional ublk Adapter
 
 Status: not started.
 

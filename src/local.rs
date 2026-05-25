@@ -1652,6 +1652,8 @@ struct DataLogRow {
 const DATA_LOG_MAGIC: &[u8; 8] = b"TCOWDAT!";
 const DATA_LOG_VERSION: u16 = 1;
 const DATA_LOG_HEADER_LEN: usize = 8 + 2 + 16 + 8 + 8;
+const CRC64_ECMA_POLY: u64 = 0x42f0_e1eb_a9ea_3693;
+const CRC64_ECMA_TABLE: [u64; 256] = crc64_ecma_table();
 
 impl DurableSqliteStore {
     fn open(paths: DurableStorePaths, policy: DurableDataLogPolicy) -> Result<Self> {
@@ -1815,13 +1817,6 @@ impl DurableSqliteStore {
         let appended = self.append_segments(&conn, new_segments)?;
         let state_blob = encode_state_commit(&state_commit_for_image(image))?;
         let tx = conn.transaction().map_err(sqlite_error)?;
-        for log_id in &appended.sealed_logs {
-            tx.execute(
-                "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
-                params![u64_to_i64(*log_id)?],
-            )
-            .map_err(sqlite_error)?;
-        }
         for log in appended.logs.into_values() {
             tx.execute(
                 "INSERT INTO data_logs(log_id, state, total_bytes, live_bytes, dead_bytes)
@@ -1834,6 +1829,13 @@ impl DurableSqliteStore {
                     log.state,
                     u64_to_i64(log.total_bytes)?
                 ],
+            )
+            .map_err(sqlite_error)?;
+        }
+        for log_id in &appended.sealed_logs {
+            tx.execute(
+                "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
+                params![u64_to_i64(*log_id)?],
             )
             .map_err(sqlite_error)?;
         }
@@ -1894,6 +1896,8 @@ impl DurableSqliteStore {
         }
 
         let mut active = active_data_log(conn, &self.paths.data_dir)?;
+        let mut open_log: Option<(u64, File)> = None;
+        let mut created_log_file = false;
         for (segment_id, storage_node, bytes) in segments {
             let record = encode_data_log_record(segment_id, &bytes)?;
             let record_len = u64::try_from(record.len()).map_err(|_| {
@@ -1910,20 +1914,27 @@ impl DurableSqliteStore {
                 active = next_data_log(conn, &self.paths.data_dir, active.log_id)?;
             }
 
-            let path = data_log_path(&self.paths.data_dir, active.log_id);
-            let existed = path.exists();
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&path)
-                .map_err(fs_error)?;
-            let offset = file.metadata().map_err(fs_error)?.len();
-            file.write_all(&record).map_err(fs_error)?;
-            file.sync_data().map_err(fs_error)?;
-            if !existed {
-                sync_dir(&self.paths.data_dir)?;
+            if open_log.as_ref().map(|(log_id, _)| *log_id) != Some(active.log_id) {
+                sync_open_data_log(&mut open_log)?;
+                let path = data_log_path(&self.paths.data_dir, active.log_id);
+                let existed = path.exists();
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .read(true)
+                    .open(&path)
+                    .map_err(fs_error)?;
+                let file_len = file.metadata().map_err(fs_error)?.len();
+                active.total_bytes = active.total_bytes.max(file_len);
+                created_log_file |= !existed;
+                open_log = Some((active.log_id, file));
             }
+
+            let offset = active.total_bytes;
+            let Some((_, file)) = open_log.as_mut() else {
+                return Err(StorageError::conflict("data-log writer was not opened"));
+            };
+            file.write_all(&record).map_err(fs_error)?;
             let payload_offset = offset
                 .checked_add(DATA_LOG_HEADER_LEN as u64)
                 .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
@@ -1949,8 +1960,12 @@ impl DurableSqliteStore {
                 record_bytes: record_len,
                 payload_offset,
                 payload_bytes,
-                checksum: checksum64(&bytes),
+                checksum: data_log_checksum64(&bytes),
             });
+        }
+        sync_open_data_log(&mut open_log)?;
+        if created_log_file {
+            sync_dir(&self.paths.data_dir)?;
         }
         Ok(append)
     }
@@ -1967,7 +1982,7 @@ impl DurableSqliteStore {
         let data = decode_data_log_record(&record)?;
         if data.segment_id != placement.segment_id
             || data.bytes.len() as u64 != placement.payload_bytes
-            || checksum64(&data.bytes) != placement.checksum
+            || data_log_checksum64(&data.bytes) != placement.checksum
         {
             return Err(StorageError::corrupt(
                 "data-log record disagrees with SQLite placement",
@@ -2045,13 +2060,6 @@ impl DurableSqliteStore {
             }
             let appended = self.append_segments(&conn, payloads)?;
             let tx = conn.transaction().map_err(sqlite_error)?;
-            for log_id in &appended.sealed_logs {
-                tx.execute(
-                    "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
-                    params![u64_to_i64(*log_id)?],
-                )
-                .map_err(sqlite_error)?;
-            }
             for manifest in appended.logs.into_values() {
                 tx.execute(
                     "INSERT INTO data_logs(log_id, state, total_bytes, live_bytes, dead_bytes)
@@ -2064,6 +2072,13 @@ impl DurableSqliteStore {
                         manifest.state,
                         u64_to_i64(manifest.total_bytes)?
                     ],
+                )
+                .map_err(sqlite_error)?;
+            }
+            for log_id in &appended.sealed_logs {
+                tx.execute(
+                    "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
+                    params![u64_to_i64(*log_id)?],
                 )
                 .map_err(sqlite_error)?;
             }
@@ -2137,6 +2152,28 @@ impl DurableSqliteStore {
     }
 
     #[cfg(test)]
+    fn data_log_states_for_test(&self) -> Result<Vec<(u64, String)>> {
+        let conn = lock(&self.conn)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT log_id, state
+                 FROM data_logs
+                 WHERE state != 'deleted'
+                 ORDER BY log_id",
+            )
+            .map_err(sqlite_error)?;
+        let mut rows = stmt.query([]).map_err(sqlite_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let raw_log_id: i64 = row.get(0).map_err(sqlite_error)?;
+            let log_id = i64_to_u64(raw_log_id).map_err(sqlite_error)?;
+            let state: String = row.get(1).map_err(sqlite_error)?;
+            out.push((log_id, state));
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
     fn placement_for_test(&self, segment_id: SegmentId) -> Result<SegmentPlacementRow> {
         let conn = lock(&self.conn)?;
         Self::placement_for_segment(&conn, segment_id)
@@ -2174,6 +2211,13 @@ fn delete_data_log(data_dir: &Path, log_id: u64) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(fs_error(error)),
     }
+}
+
+fn sync_open_data_log(open_log: &mut Option<(u64, File)>) -> Result<()> {
+    if let Some((_, file)) = open_log.take() {
+        file.sync_data().map_err(fs_error)?;
+    }
+    Ok(())
 }
 
 fn sync_parent_dir(path: &Path) -> Result<()> {
@@ -2250,7 +2294,7 @@ fn encode_data_log_record(segment_id: SegmentId, bytes: &[u8]) -> Result<Vec<u8>
     out.extend_from_slice(&DATA_LOG_VERSION.to_be_bytes());
     out.extend_from_slice(&segment_id.raw().to_be_bytes());
     out.extend_from_slice(&payload_len.to_be_bytes());
-    out.extend_from_slice(&checksum64(bytes).to_be_bytes());
+    out.extend_from_slice(&data_log_checksum64(bytes).to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(out)
 }
@@ -2298,7 +2342,7 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
         return Err(StorageError::corrupt("data-log record length mismatch"));
     }
     let bytes = record[DATA_LOG_HEADER_LEN..].to_vec();
-    if checksum64(&bytes) != expected_checksum {
+    if data_log_checksum64(&bytes) != expected_checksum {
         return Err(StorageError::corrupt("data-log checksum mismatch"));
     }
     Ok(DataLogSegmentData { segment_id, bytes })
@@ -10300,6 +10344,35 @@ fn checksum64(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn data_log_checksum64(bytes: &[u8]) -> u64 {
+    let mut crc = 0u64;
+    for byte in bytes {
+        let index = ((crc >> 56) as u8 ^ *byte) as usize;
+        crc = (crc << 8) ^ CRC64_ECMA_TABLE[index];
+    }
+    crc
+}
+
+const fn crc64_ecma_table() -> [u64; 256] {
+    let mut table = [0u64; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = (index as u64) << 56;
+        let mut bit = 0;
+        while bit < 8 {
+            if crc & 0x8000_0000_0000_0000 != 0 {
+                crc = (crc << 1) ^ CRC64_ECMA_POLY;
+            } else {
+                crc <<= 1;
+            }
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+}
+
 fn replace_leaf_entries(
     entries: &[LeafEntry],
     covered_range: crate::api::BlockRange,
@@ -12670,6 +12743,143 @@ mod tests {
     }
 
     #[test]
+    fn data_log_checksum_uses_crc64_ecma_golden_value() {
+        assert_eq!(data_log_checksum64(b"123456789"), 0x6c40_df5f_0b49_7347);
+    }
+
+    #[test]
+    fn durable_batched_flush_persists_many_segments_in_one_data_log() {
+        let root = durable_temp_dir("batched-flush-one-log");
+        let cfg = config();
+        let store = DurableObjectStore::open_with_data_log_policy(
+            &root,
+            cfg,
+            DurableDataLogPolicy {
+                target_data_log_bytes: 1024 * 1024,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 32,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        for block in 0..32 {
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, block as u8),
+                    WriteDurability::Acknowledged,
+                )
+                .unwrap();
+        }
+        store.flush_device(device_id).unwrap();
+
+        let rows = store.durable.data_log_rows_for_test().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            store.durable.data_log_states_for_test().unwrap()[0].1,
+            "active"
+        );
+
+        drop(store);
+        let reopened = DurableObjectStore::open_with_data_log_policy(
+            &root,
+            cfg,
+            DurableDataLogPolicy {
+                target_data_log_bytes: 1024 * 1024,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let mut bytes = vec![0; 32 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 32 * 4096), &mut bytes)
+            .unwrap();
+        for block in 0..32 {
+            assert_eq!(
+                &bytes[block * 4096..(block + 1) * 4096],
+                repeated_blocks(1, block as u8).as_slice()
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_batched_flush_rolls_logs_and_reopens_every_segment() {
+        let root = durable_temp_dir("batched-flush-rolls");
+        let cfg = config();
+        let policy = DurableDataLogPolicy {
+            target_data_log_bytes: 4096,
+            min_reclaimable_ratio_ppm: 1,
+            min_reclaimable_bytes: 1,
+            max_compaction_copy_bytes: u64::MAX,
+        };
+        let store = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 4,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        for block in 0..4 {
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, (block + 1) as u8),
+                    WriteDurability::Acknowledged,
+                )
+                .unwrap();
+        }
+        store.flush_device(device_id).unwrap();
+
+        let states = store.durable.data_log_states_for_test().unwrap();
+        assert_eq!(states.len(), 4);
+        assert_eq!(
+            states
+                .iter()
+                .filter(|(_, state)| state.as_str() == "sealed")
+                .count(),
+            3
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|(_, state)| state.as_str() == "active")
+                .count(),
+            1
+        );
+
+        drop(store);
+        let reopened = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let mut bytes = vec![0; 4 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4 * 4096), &mut bytes)
+            .unwrap();
+        for block in 0..4 {
+            assert_eq!(
+                &bytes[block * 4096..(block + 1) * 4096],
+                repeated_blocks(1, (block + 1) as u8).as_slice()
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn durable_sqlite_data_log_ignores_unplaced_tail_records() {
         let root = durable_temp_dir("data-log-unplaced-tail");
         let cfg = config();
@@ -12757,6 +12967,53 @@ mod tests {
         file.seek(SeekFrom::Start(placement.payload_offset))
             .unwrap();
         file.write_all(&[0xff]).unwrap();
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_data_log_rejects_current_checksum_corruption() {
+        let root = durable_temp_dir("data-log-checksum-corruption");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 4),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let segment_id = first_device_segment(&store, device_id);
+        let placement = store.durable.placement_for_test(segment_id).unwrap();
+        drop(store);
+
+        let path = root
+            .join("data")
+            .join(format!("data-{:06}.log", placement.data_log_id));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let checksum_offset =
+            placement.record_offset + u64::try_from(DATA_LOG_MAGIC.len() + 2 + 16 + 8).unwrap();
+        file.seek(SeekFrom::Start(checksum_offset)).unwrap();
+        let mut byte = [0; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(checksum_offset)).unwrap();
+        file.write_all(&[!byte[0]]).unwrap();
+        file.sync_data().unwrap();
+
         assert!(DurableObjectStore::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
