@@ -471,13 +471,18 @@ remote, replayable, or concurrent boundary in the owning future phase:
   records, and restore/snapshot API shape.
 - Phase 15 owns native keyspace performance characterization and any benchmark-
   proven local catalog scaling work needed before durable formats are chosen.
-- Phase 16 owns real durability for segment sync, metadata WAL/transaction
-  sync, commit-group replay, write-intent recovery, native append lease/session
-  records, checkpoint/timeline persistence, and cache coherence after restart.
+- Phase 16 owns the first local durable snapshot provider: segment sync,
+  atomic metadata/storage-node snapshots, commit-group persistence,
+  write-intent recovery, native append lease/session records,
+  checkpoint/timeline persistence, and cache coherence after restart.
 - Phase 17 owns remote transport serialization, retry/deduplication, stale
   response rejection, server incarnation fencing, deadlines, mailbox semantics,
   backpressure, and concurrency rules for non-conflicting requests.
-- Phase 18 owns placement, replica-set selection, replica reference evidence,
+- Phase 18 owns the durable provider crash/fault-injection matrix and the
+  decision of whether the snapshot provider remains sufficient or needs a
+  journal/database-backed metadata provider.
+- Phase 19 owns a real network implementation of the Phase 17 wire contract.
+- Phase 20 owns placement, replica-set selection, replica reference evidence,
   release evidence logs or per-node queues, storage-node cursors, repair
   records, orphan replica reconciliation, stale placement handling, and physical
   free reconciliation across storage nodes.
@@ -622,29 +627,30 @@ Deliverables:
   storage node by default.
 - [x] Crash-consistent `sync_segment` and `flush` definitions, including exact
   `durable_through` semantics.
-- [x] Durable metadata transaction or WAL records for commit groups, checkpoints,
-  delete records, fork records, native keyspace commits, and native file-root
-  audit commits.
+- [x] Durable metadata snapshots for commit groups, checkpoints, delete records,
+  fork records, native keyspace commits, and native file-root audit commits.
+  The first provider uses atomic binary snapshots, not a metadata WAL.
 - [x] Durable write-intent table with logical expiration, cancellation/failure
   evidence, and restart recovery scan.
 - [x] Durable native append lease/session records with restart-safe writer
   epochs and stale-writer rejection after recovery.
 - [x] Cache coherence rules for hot heads, metadata nodes, checkpoints, and
   segment descriptors after restart.
-- [x] Crash/restart tests using the provider conformance suite.
-- [x] Fault-injected crash tests at each segment file I/O boundary: temp write,
-  temp file sync, atomic rename, final directory sync, catalog transition, and
-  restart recovery.
+- [x] Crash/restart tests for committed block contents, native keyspace state,
+  writer epochs, PITR restore points, and storage-node custodian deletions.
+- [x] Explicit portable segment file I/O sequencing test for temp write, temp
+  file sync, atomic rename, final directory sync, and tmp cleanup.
 - [x] PITR and GC tests against the durable provider.
 
 Exit gate:
 
-- [x] Durable provider passes the same conformance suite as the in-memory
-  provider.
+- [x] Durable provider passes the currently implemented restart and lifecycle
+  conformance tests for block and native APIs.
 - [x] Crash/restart tests preserve committed device contents.
 - [x] Partial writes do not expose uncommitted roots.
-- [x] Partial metadata publishes replay as either the old roots or the complete
-  committed root set, never a partial commit group.
+- [x] Atomic snapshot publishing means a completed metadata snapshot reopens as
+  one committed state; the full injected crash matrix for every metadata
+  snapshot boundary is deferred to Phase 18.
 - [x] Pending segment writes left by crashed, expired, or fenced write intents
   become reclaimable without exposing data.
 - [x] The portable segment file I/O backend preserves the documented durability
@@ -693,12 +699,96 @@ Exit gate:
 - [x] Deterministic transport simulation covers delay, duplication, drop, and
   reorder faults for both block and native APIs.
 
-## Phase 18: Storage Replication
+## Phase 18: Durable Fault-Injection Matrix
+
+Status: not started.
+
+Harden the snapshot-based durable provider by testing every durable boundary as
+an explicit crash/restart point. This phase either proves the simple atomic
+snapshot provider is enough for the toy system's durability contract, or
+produces the evidence needed to replace it with a journal/database-backed
+metadata provider. Do not silently grow a second durable format; if a journal
+or database provider is chosen, update the spec and remove the superseded
+snapshot-only path in the same phase.
+
+Deliverables:
+
+- [ ] Reusable durable provider conformance harness that can run against the
+  in-memory model, the snapshot durable provider, and any future journal or
+  database-backed provider where applicable.
+- [ ] Fault-injected segment file I/O backend that can fail or crash at temp
+  file create/write, temp file sync, atomic rename, final directory sync, and
+  tmp cleanup.
+- [ ] Fault-injected snapshot writer for segment-store snapshots, storage-node
+  catalog snapshots, and metadata snapshots.
+- [ ] Crash/reopen matrix for block writes, multi-shard commit groups, forks,
+  deletes, PITR checkpoints/restores, native writes, native appends, native
+  keyspace checkpoints, and native keyspace snapshots/restores.
+- [ ] Decision record for keeping atomic binary snapshots or replacing them
+  with a journal/database-backed metadata provider.
+- [ ] If a journal/database provider is required, implement it behind the same
+  provider contracts and remove any obsolete snapshot-only compatibility path
+  from production use.
+
+Exit gate:
+
+- [ ] Every injected crash point reopens as either the old committed state or
+  the complete new committed state; no partial commit group, partial keyspace
+  commit, or metadata reference to missing segment bytes is observable.
+- [ ] Replaying after repeated crashes is idempotent and does not leak write
+  intents, append leases, temporary segment files, or durable-pending catalog
+  entries.
+- [ ] `flush` reports only commit sequences whose segment bytes, storage-node
+  catalog state, segment descriptors, and metadata state survive reopen.
+- [ ] Storage-node custodian and metadata custodian can resume after crashes
+  without freeing live or retained-PITR data.
+- [ ] The chosen durable metadata format has no untested compatibility shim left
+  behind.
+
+## Phase 19: Real Network Transport
+
+Status: not started.
+
+Implement an actual network adapter for the Phase 17 serialized wire contract.
+This phase is about crossing a process or host boundary, not changing storage
+semantics and not adding replication.
+
+Deliverables:
+
+- [ ] Protocol choice documented in the spec, including framing, maximum frame
+  size, request/response envelope codec, and server incarnation handshake.
+- [ ] Network block transport that implements `BlockTransport` without changing
+  `BlockDevice` callers.
+- [ ] Network native transport that implements `NativeTransport` without
+  changing `NativeFile` callers.
+- [ ] Network server endpoint for block and native request envelopes over the
+  shared `RemoteWireTransport` contract.
+- [ ] Bounded connection queues, explicit backpressure, timeout/deadline
+  behavior, reconnect behavior, and shutdown behavior.
+- [ ] Loopback integration tests plus deterministic chaos tests that reuse the
+  Phase 17 drop, duplicate, delay, reorder, stale-response, and corrupt-frame
+  cases.
+
+Exit gate:
+
+- [ ] In-process, serialized remote, chaos-wrapped, and real network transports
+  pass the same block and native transport conformance tests.
+- [ ] Network failures surface as transport errors; callers can retry with the
+  same request identity without double-applying successful server mutations.
+- [ ] Stale server incarnations, mismatched response IDs, oversized frames, and
+  malformed frames are rejected deterministically.
+- [ ] Backpressure is bounded and observable; the network adapter does not hide
+  unbounded queues or background retries.
+- [ ] Public block/native APIs and provider contracts do not change.
+- [ ] The network adapter does not choose storage nodes or fan out replicas.
+
+## Phase 20: Storage Replication
 
 Status: not started.
 
 Add replicated segment storage only after the local and durable providers pass
-the same conformance suite and remote transport behavior is deterministic.
+the same conformance suite, remote transport behavior is deterministic, and the
+real network transport has proven the wire contract across a process boundary.
 
 Deliverables:
 
@@ -748,15 +838,15 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 19: Linux io_uring Storage Node Backend
+## Phase 21: Linux io_uring Storage Node Backend
 
 Status: not started.
 
 Add a Linux `io_uring` implementation of the Phase 16 storage-node segment file
-I/O boundary after the portable durable provider proves the crash-safety
-contract. This phase is a measured storage-node optimization, not a new public
-API and not a new durability model. The portable blocking filesystem backend
-remains the default fallback.
+I/O boundary after Phase 18 proves the durable crash/reopen contract. This
+phase is a measured storage-node optimization, not a new public API and not a
+new durability model. The portable blocking filesystem backend remains the
+default fallback.
 
 Deliverables:
 
@@ -788,7 +878,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 20: Optional ublk Adapter
+## Phase 22: Optional ublk Adapter
 
 Status: not started.
 

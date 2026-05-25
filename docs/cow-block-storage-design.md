@@ -479,6 +479,11 @@ The remote transport does not change the public block or native APIs. Existing
 clients can be constructed over any `BlockTransport` or `NativeTransport`,
 including the in-process transport and the serialized remote transport.
 
+A real network transport is a later adapter over the same wire contract. It
+must add framing, bounded queues, timeout/reconnect behavior, malformed-frame
+handling, and loopback/chaos conformance tests without changing block/native
+semantics or moving replica selection into clients.
+
 ### `MetadataPlane`
 
 `MetadataPlane` owns globally meaningful metadata durability:
@@ -542,6 +547,13 @@ segment files. This deliberately avoids choosing SQLite, RocksDB, or another
 database before the crash/restart contract is proven. A later provider may use
 a database, but it must preserve the same provider contracts and keep metadata
 state separate from storage-node local segment catalogs.
+
+The snapshot provider is the first durable implementation, not the final answer
+for every crash-recovery shape. The durable fault-injection phase must either
+prove atomic snapshots survive every required crash/reopen boundary or replace
+them with a journal/database-backed metadata provider. If that replacement is
+needed, the old snapshot-only production path should be removed rather than
+kept as a compatibility layer.
 
 Segment files are storage-node-local immutable payloads. `catalog.bin` records
 local reservation, durable-pending, referenced, released, and freed lifecycle
@@ -608,11 +620,12 @@ not become permanent shortcuts:
   per-shard/per-file conflict fencing so unrelated operations can proceed
   concurrently.
 - In-memory `sync_segment` and `flush` prove data-before-metadata ordering.
-  Durable providers must define crash-consistent segment sync, metadata WAL or
-  transaction sync, and exact `durable_through` semantics.
+  Durable providers must define crash-consistent segment sync, atomic metadata
+  snapshot or journal/database sync, and exact `durable_through` semantics.
 - In-memory commit groups prove atomic root visibility inside one metadata
-  plane. Durable providers must persist transaction records, replay partial
-  publish attempts safely, and preserve compare-and-swap fences after restart.
+  plane. Durable providers must persist commit records or snapshots, replay
+  partial publish attempts safely, and preserve compare-and-swap fences after
+  restart.
 - Write-intent expiry is injected by deterministic tests. Durable providers must
   store write-intent state, logical expiration, recovery scans, and custodian
   evidence for when pending segment data can no longer publish.
@@ -1248,6 +1261,7 @@ V1 uses:
 V1 does not use:
 
 - Kernel integration.
+- Real network transport for block/native servers.
 - Cross-machine replication.
 - A full POSIX filesystem implementation.
 - Compression, encryption, or deduplication.
