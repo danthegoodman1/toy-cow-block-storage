@@ -37,8 +37,8 @@ pub use id::{
     StorageNodeId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
-    ChaosRemoteWireTransport, ChaosTransportMetrics, DurableObjectStore,
-    InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
+    ChaosRemoteWireTransport, ChaosTransportMetrics, DurableCompactionReport, DurableDataLogPolicy,
+    DurableObjectStore, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
     LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer, LocalObjectStore,
     LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,

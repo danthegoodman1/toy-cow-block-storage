@@ -9,8 +9,8 @@ use std::{
 use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId};
 use toy_cow_block_storage::local::{
-    DurableObjectStore, InMemoryMetadataPlane, InMemorySegmentStore, LocalObjectStore,
-    LocalStoreConfig,
+    DurableDataLogPolicy, DurableObjectStore, InMemoryMetadataPlane, InMemorySegmentStore,
+    LocalObjectStore, LocalStoreConfig,
 };
 use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
 use toy_cow_block_storage::provider::{
@@ -1465,7 +1465,14 @@ fn bench_durable_provider(c: &mut Criterion) {
                     WriteDurability::Flushed,
                 );
                 let started = Instant::now();
-                store.compact_journal().unwrap();
+                store
+                    .compact_data_logs(DurableDataLogPolicy {
+                        target_data_log_bytes: 64 * 1024 * 1024,
+                        min_reclaimable_ratio_ppm: 0,
+                        min_reclaimable_bytes: 0,
+                        max_compaction_copy_bytes: u64::MAX,
+                    })
+                    .unwrap();
                 let elapsed = started.elapsed();
                 cleanup_durable_bench_root(&root);
                 black_box(elapsed)

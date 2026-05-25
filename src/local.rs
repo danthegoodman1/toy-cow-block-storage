@@ -5,6 +5,8 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::api::{
     BlockClient, BlockDevice, BlockRequest, BlockRequestEnvelope, BlockResponse,
@@ -1262,111 +1266,1025 @@ impl Default for LocalObjectStore {
 
 #[derive(Debug, Clone)]
 struct DurableStorePaths {
-    journal: PathBuf,
+    metadata: PathBuf,
+    data_dir: PathBuf,
 }
 
 impl DurableStorePaths {
     fn new(root: impl AsRef<Path>, _storage_node: StorageNodeId) -> Result<Self> {
         let root = root.as_ref();
-        let journal_dir = root.join("journal");
-        fs::create_dir_all(&journal_dir).map_err(fs_error)?;
+        let data_dir = root.join("data");
+        let tmp_dir = root.join("tmp");
+        fs::create_dir_all(&data_dir).map_err(fs_error)?;
+        fs::create_dir_all(&tmp_dir).map_err(fs_error)?;
         Ok(Self {
-            journal: journal_dir.join("store.log"),
+            metadata: root.join("metadata.sqlite"),
+            data_dir,
         })
     }
+}
+
+/// Policy for rolled durable data logs and explicit compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableDataLogPolicy {
+    pub target_data_log_bytes: u64,
+    pub min_reclaimable_ratio_ppm: u32,
+    pub min_reclaimable_bytes: u64,
+    pub max_compaction_copy_bytes: u64,
+}
+
+impl Default for DurableDataLogPolicy {
+    fn default() -> Self {
+        Self {
+            target_data_log_bytes: 64 * 1024 * 1024,
+            min_reclaimable_ratio_ppm: 500_000,
+            min_reclaimable_bytes: 4 * 1024 * 1024,
+            max_compaction_copy_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl DurableDataLogPolicy {
+    fn validate(self) -> Result<()> {
+        if self.target_data_log_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "target_data_log_bytes must be greater than zero",
+            ));
+        }
+        if self.min_reclaimable_ratio_ppm > 1_000_000 {
+            return Err(StorageError::invalid_argument(
+                "min_reclaimable_ratio_ppm must be <= 1_000_000",
+            ));
+        }
+        if self.max_compaction_copy_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "max_compaction_copy_bytes must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn compact_everything_for_test() -> Self {
+        Self {
+            target_data_log_bytes: 8 * 4096,
+            min_reclaimable_ratio_ppm: 1,
+            min_reclaimable_bytes: 1,
+            max_compaction_copy_bytes: u64::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCompactionReport {
+    pub deleted_logs: Vec<u64>,
+    pub relocated_logs: Vec<u64>,
+    pub relocated_segments: Vec<SegmentId>,
+    pub bytes_copied: u64,
+    pub bytes_deleted: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DurableSqliteStore {
+    paths: DurableStorePaths,
+    conn: Arc<Mutex<Connection>>,
+    policy: DurableDataLogPolicy,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentPlacementRow {
+    segment_id: SegmentId,
+    storage_node: StorageNodeId,
+    data_log_id: u64,
+    record_offset: u64,
+    record_bytes: u64,
+    payload_offset: u64,
+    payload_bytes: u64,
+    checksum: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DataLogRow {
+    log_id: u64,
+    total_bytes: u64,
+    live_bytes: u64,
+    dead_bytes: u64,
+}
+
+const DATA_LOG_MAGIC: &[u8; 8] = b"TCOWDAT!";
+const DATA_LOG_VERSION: u16 = 1;
+const DATA_LOG_HEADER_LEN: usize = 8 + 2 + 16 + 8 + 8;
+
+impl DurableSqliteStore {
+    fn open(paths: DurableStorePaths, policy: DurableDataLogPolicy) -> Result<Self> {
+        policy.validate()?;
+        let metadata_existed = paths.metadata.exists();
+        let conn = Connection::open(&paths.metadata).map_err(sqlite_error)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(sqlite_error)?;
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(sqlite_error)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(sqlite_error)?;
+        Self::initialize_schema(&conn)?;
+        if !metadata_existed {
+            sync_parent_dir(&paths.metadata)?;
+        }
+        Ok(Self {
+            paths,
+            conn: Arc::new(Mutex::new(conn)),
+            policy,
+        })
+    }
+
+    fn initialize_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS current_state (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              state_blob BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS data_logs (
+              log_id INTEGER PRIMARY KEY,
+              state TEXT NOT NULL CHECK (state IN ('active', 'sealed', 'deleted')),
+              total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
+              live_bytes INTEGER NOT NULL CHECK (live_bytes >= 0),
+              dead_bytes INTEGER NOT NULL CHECK (dead_bytes >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS segment_placements (
+              segment_id TEXT PRIMARY KEY,
+              storage_node TEXT NOT NULL,
+              data_log_id INTEGER NOT NULL,
+              record_offset INTEGER NOT NULL CHECK (record_offset >= 0),
+              record_bytes INTEGER NOT NULL CHECK (record_bytes > 0),
+              payload_offset INTEGER NOT NULL CHECK (payload_offset >= 0),
+              payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
+              checksum TEXT NOT NULL,
+              current INTEGER NOT NULL CHECK (current IN (0, 1)),
+              FOREIGN KEY(data_log_id) REFERENCES data_logs(log_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_segment_placements_log_current
+              ON segment_placements(data_log_id, current);
+            CREATE INDEX IF NOT EXISTS idx_data_logs_state_dead
+              ON data_logs(state, dead_bytes);
+            ",
+        )
+        .map_err(sqlite_error)
+    }
+
+    fn load(&self, expected_config: LocalStoreConfig) -> Result<Option<LocalObjectStore>> {
+        let conn = lock(&self.conn)?;
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT state_blob FROM current_state WHERE id = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        let commit = decode_state_commit(&blob)?;
+        if commit.metadata.config != expected_config
+            || commit.catalog.config != expected_config
+            || commit.segment_store.config != expected_config
+        {
+            return Err(StorageError::corrupt(
+                "durable SQLite state disagrees with open config",
+            ));
+        }
+
+        let mut records = BTreeMap::new();
+        for (segment_id, record) in commit.segment_store.records {
+            let placement = Self::placement_for_segment(&conn, segment_id)?;
+            validate_durable_segment_placement(segment_id, &record, &placement)?;
+            let bytes = self.read_segment_payload(&placement)?;
+            validate_durable_segment_bytes(segment_id, &record, &bytes)?;
+            records.insert(
+                segment_id,
+                SegmentRecord {
+                    bytes,
+                    synced: record.synced,
+                    commit: record.commit,
+                },
+            );
+        }
+
+        Ok(Some(LocalObjectStore::from_state_image(
+            DurableStoreImage {
+                config: commit.metadata.config,
+                metadata: commit.metadata.metadata,
+                segment_store: SegmentStoreInner {
+                    next_offset: commit.segment_store.next_offset,
+                    segments: records,
+                },
+                segment_catalog: commit.catalog.catalog,
+                next_write_intent: commit.metadata.next_write_intent,
+                next_extent_id: commit.metadata.next_extent_id,
+            },
+        )?))
+    }
+
+    fn persist(&self, image: &DurableStoreImage) -> Result<BTreeSet<SegmentId>> {
+        let mut conn = lock(&self.conn)?;
+        let current = current_sqlite_placements(&conn)?;
+        let image_segments: BTreeSet<_> = image.segment_store.segments.keys().copied().collect();
+        let mut new_segments = Vec::new();
+        for (segment_id, record) in &image.segment_store.segments {
+            if !current.contains_key(segment_id) {
+                new_segments.push((
+                    *segment_id,
+                    record.commit.placement.storage_node,
+                    record.bytes.clone(),
+                ));
+            }
+        }
+
+        let appended = self.append_segments(&conn, new_segments)?;
+        let state_blob = encode_state_commit(&state_commit_for_image(image))?;
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        for log_id in &appended.sealed_logs {
+            tx.execute(
+                "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
+                params![u64_to_i64(*log_id)?],
+            )
+            .map_err(sqlite_error)?;
+        }
+        for log in appended.logs.into_values() {
+            tx.execute(
+                "INSERT INTO data_logs(log_id, state, total_bytes, live_bytes, dead_bytes)
+                 VALUES (?1, ?2, ?3, 0, 0)
+                 ON CONFLICT(log_id) DO UPDATE SET
+                   state = excluded.state,
+                   total_bytes = MAX(data_logs.total_bytes, excluded.total_bytes)",
+                params![
+                    u64_to_i64(log.log_id)?,
+                    log.state,
+                    u64_to_i64(log.total_bytes)?
+                ],
+            )
+            .map_err(sqlite_error)?;
+        }
+
+        for (segment_id, placement) in &current {
+            if !image_segments.contains(segment_id) {
+                mark_placement_dead(&tx, placement)?;
+            }
+        }
+
+        for placement in appended.placements {
+            tx.execute(
+                "INSERT INTO segment_placements(
+                   segment_id, storage_node, data_log_id, record_offset, record_bytes,
+                   payload_offset, payload_bytes, checksum, current
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                params![
+                    segment_id_key(placement.segment_id),
+                    storage_node_key(placement.storage_node),
+                    u64_to_i64(placement.data_log_id)?,
+                    u64_to_i64(placement.record_offset)?,
+                    u64_to_i64(placement.record_bytes)?,
+                    u64_to_i64(placement.payload_offset)?,
+                    u64_to_i64(placement.payload_bytes)?,
+                    u64_key(placement.checksum),
+                ],
+            )
+            .map_err(sqlite_error)?;
+            tx.execute(
+                "UPDATE data_logs SET live_bytes = live_bytes + ?2
+                 WHERE log_id = ?1",
+                params![
+                    u64_to_i64(placement.data_log_id)?,
+                    u64_to_i64(placement.payload_bytes)?
+                ],
+            )
+            .map_err(sqlite_error)?;
+        }
+
+        tx.execute(
+            "INSERT INTO current_state(id, state_blob) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET state_blob = excluded.state_blob",
+            params![state_blob],
+        )
+        .map_err(sqlite_error)?;
+        tx.commit().map_err(sqlite_error)?;
+        Ok(image_segments)
+    }
+
+    fn append_segments(
+        &self,
+        conn: &Connection,
+        segments: Vec<(SegmentId, StorageNodeId, Vec<u8>)>,
+    ) -> Result<PendingDataLogAppend> {
+        let mut append = PendingDataLogAppend::default();
+        if segments.is_empty() {
+            return Ok(append);
+        }
+
+        let mut active = active_data_log(conn, &self.paths.data_dir)?;
+        for (segment_id, storage_node, bytes) in segments {
+            let record = encode_data_log_record(segment_id, &bytes)?;
+            let record_len = u64::try_from(record.len()).map_err(|_| {
+                StorageError::invalid_argument("data-log record length overflows u64")
+            })?;
+            if active.total_bytes != 0
+                && active
+                    .total_bytes
+                    .checked_add(record_len)
+                    .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
+                    > self.policy.target_data_log_bytes
+            {
+                append.sealed_logs.push(active.log_id);
+                active = next_data_log(conn, &self.paths.data_dir, active.log_id)?;
+            }
+
+            let path = data_log_path(&self.paths.data_dir, active.log_id);
+            let existed = path.exists();
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&path)
+                .map_err(fs_error)?;
+            let offset = file.metadata().map_err(fs_error)?.len();
+            file.write_all(&record).map_err(fs_error)?;
+            file.sync_data().map_err(fs_error)?;
+            if !existed {
+                sync_dir(&self.paths.data_dir)?;
+            }
+            let payload_offset = offset
+                .checked_add(DATA_LOG_HEADER_LEN as u64)
+                .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
+            let payload_bytes = u64::try_from(bytes.len())
+                .map_err(|_| StorageError::invalid_argument("payload length overflows u64"))?;
+            let new_total = offset
+                .checked_add(record_len)
+                .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
+            active.total_bytes = new_total;
+            append.logs.insert(
+                active.log_id,
+                PendingDataLogManifest {
+                    log_id: active.log_id,
+                    state: "active",
+                    total_bytes: new_total,
+                },
+            );
+            append.placements.push(SegmentPlacementRow {
+                segment_id,
+                storage_node,
+                data_log_id: active.log_id,
+                record_offset: offset,
+                record_bytes: record_len,
+                payload_offset,
+                payload_bytes,
+                checksum: checksum64(&bytes),
+            });
+        }
+        Ok(append)
+    }
+
+    fn read_segment_payload(&self, placement: &SegmentPlacementRow) -> Result<Vec<u8>> {
+        let path = data_log_path(&self.paths.data_dir, placement.data_log_id);
+        let mut file = File::open(&path).map_err(fs_error)?;
+        file.seek(SeekFrom::Start(placement.record_offset))
+            .map_err(fs_error)?;
+        let record_len = usize::try_from(placement.record_bytes)
+            .map_err(|_| StorageError::corrupt("data-log record length overflows usize"))?;
+        let mut record = vec![0; record_len];
+        file.read_exact(&mut record).map_err(fs_error)?;
+        let data = decode_data_log_record(&record)?;
+        if data.segment_id != placement.segment_id
+            || data.bytes.len() as u64 != placement.payload_bytes
+            || checksum64(&data.bytes) != placement.checksum
+        {
+            return Err(StorageError::corrupt(
+                "data-log record disagrees with SQLite placement",
+            ));
+        }
+        Ok(data.bytes)
+    }
+
+    fn placement_for_segment(
+        conn: &Connection,
+        segment_id: SegmentId,
+    ) -> Result<SegmentPlacementRow> {
+        conn.query_row(
+            "SELECT segment_id, storage_node, data_log_id, record_offset, record_bytes,
+                    payload_offset, payload_bytes, checksum
+             FROM segment_placements
+             WHERE segment_id = ?1 AND current = 1",
+            params![segment_id_key(segment_id)],
+            decode_placement_row,
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .ok_or_else(|| StorageError::corrupt("committed segment missing SQLite placement"))
+    }
+
+    pub fn compact_data_logs(
+        &self,
+        policy: DurableDataLogPolicy,
+    ) -> Result<DurableCompactionReport> {
+        policy.validate()?;
+        let mut report = DurableCompactionReport {
+            deleted_logs: Vec::new(),
+            relocated_logs: Vec::new(),
+            relocated_segments: Vec::new(),
+            bytes_copied: 0,
+            bytes_deleted: 0,
+        };
+        let mut conn = lock(&self.conn)?;
+        let candidates = compaction_candidates(&conn, policy)?;
+        for log in candidates {
+            if log.live_bytes == 0 {
+                let tx = conn.transaction().map_err(sqlite_error)?;
+                tx.execute(
+                    "UPDATE data_logs SET state = 'deleted' WHERE log_id = ?1",
+                    params![u64_to_i64(log.log_id)?],
+                )
+                .map_err(sqlite_error)?;
+                tx.commit().map_err(sqlite_error)?;
+                delete_data_log(&self.paths.data_dir, log.log_id)?;
+                report.bytes_deleted = report
+                    .bytes_deleted
+                    .checked_add(log.total_bytes)
+                    .ok_or_else(|| StorageError::conflict("compaction byte count overflow"))?;
+                report.deleted_logs.push(log.log_id);
+                continue;
+            }
+
+            if report
+                .bytes_copied
+                .checked_add(log.live_bytes)
+                .ok_or_else(|| StorageError::conflict("compaction byte count overflow"))?
+                > policy.max_compaction_copy_bytes
+            {
+                continue;
+            }
+
+            let placements = current_placements_for_log(&conn, log.log_id)?;
+            let mut payloads = Vec::new();
+            for placement in &placements {
+                payloads.push((
+                    placement.segment_id,
+                    placement.storage_node,
+                    self.read_segment_payload(placement)?,
+                ));
+            }
+            let appended = self.append_segments(&conn, payloads)?;
+            let tx = conn.transaction().map_err(sqlite_error)?;
+            for log_id in &appended.sealed_logs {
+                tx.execute(
+                    "UPDATE data_logs SET state = 'sealed' WHERE log_id = ?1 AND state != 'deleted'",
+                    params![u64_to_i64(*log_id)?],
+                )
+                .map_err(sqlite_error)?;
+            }
+            for manifest in appended.logs.into_values() {
+                tx.execute(
+                    "INSERT INTO data_logs(log_id, state, total_bytes, live_bytes, dead_bytes)
+                     VALUES (?1, ?2, ?3, 0, 0)
+                     ON CONFLICT(log_id) DO UPDATE SET
+                       state = excluded.state,
+                       total_bytes = MAX(data_logs.total_bytes, excluded.total_bytes)",
+                    params![
+                        u64_to_i64(manifest.log_id)?,
+                        manifest.state,
+                        u64_to_i64(manifest.total_bytes)?
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            }
+            for old in &placements {
+                mark_placement_dead(&tx, old)?;
+            }
+            for placement in appended.placements {
+                tx.execute(
+                    "INSERT INTO segment_placements(
+                       segment_id, storage_node, data_log_id, record_offset, record_bytes,
+                       payload_offset, payload_bytes, checksum, current
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
+                     ON CONFLICT(segment_id) DO UPDATE SET
+                       storage_node = excluded.storage_node,
+                       data_log_id = excluded.data_log_id,
+                       record_offset = excluded.record_offset,
+                       record_bytes = excluded.record_bytes,
+                       payload_offset = excluded.payload_offset,
+                       payload_bytes = excluded.payload_bytes,
+                       checksum = excluded.checksum,
+                       current = 1",
+                    params![
+                        segment_id_key(placement.segment_id),
+                        storage_node_key(placement.storage_node),
+                        u64_to_i64(placement.data_log_id)?,
+                        u64_to_i64(placement.record_offset)?,
+                        u64_to_i64(placement.record_bytes)?,
+                        u64_to_i64(placement.payload_offset)?,
+                        u64_to_i64(placement.payload_bytes)?,
+                        u64_key(placement.checksum),
+                    ],
+                )
+                .map_err(sqlite_error)?;
+                tx.execute(
+                    "UPDATE data_logs SET live_bytes = live_bytes + ?2
+                     WHERE log_id = ?1",
+                    params![
+                        u64_to_i64(placement.data_log_id)?,
+                        u64_to_i64(placement.payload_bytes)?
+                    ],
+                )
+                .map_err(sqlite_error)?;
+                report.relocated_segments.push(placement.segment_id);
+                report.bytes_copied = report
+                    .bytes_copied
+                    .checked_add(placement.payload_bytes)
+                    .ok_or_else(|| StorageError::conflict("compaction byte count overflow"))?;
+            }
+            tx.execute(
+                "UPDATE data_logs SET state = 'deleted', live_bytes = 0,
+                   dead_bytes = total_bytes
+                 WHERE log_id = ?1",
+                params![u64_to_i64(log.log_id)?],
+            )
+            .map_err(sqlite_error)?;
+            tx.commit().map_err(sqlite_error)?;
+            delete_data_log(&self.paths.data_dir, log.log_id)?;
+            report.bytes_deleted = report
+                .bytes_deleted
+                .checked_add(log.total_bytes)
+                .ok_or_else(|| StorageError::conflict("compaction byte count overflow"))?;
+            report.relocated_logs.push(log.log_id);
+        }
+        Ok(report)
+    }
+
+    #[cfg(test)]
+    fn data_log_rows_for_test(&self) -> Result<Vec<DataLogRow>> {
+        let conn = lock(&self.conn)?;
+        data_log_rows(&conn)
+    }
+
+    #[cfg(test)]
+    fn placement_for_test(&self, segment_id: SegmentId) -> Result<SegmentPlacementRow> {
+        let conn = lock(&self.conn)?;
+        Self::placement_for_segment(&conn, segment_id)
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingDataLogAppend {
+    placements: Vec<SegmentPlacementRow>,
+    logs: BTreeMap<u64, PendingDataLogManifest>,
+    sealed_logs: Vec<u64>,
 }
 
 #[derive(Debug)]
-struct DurableJournal {
-    path: PathBuf,
-    file: Mutex<File>,
+struct PendingDataLogManifest {
+    log_id: u64,
+    state: &'static str,
+    total_bytes: u64,
 }
 
-impl DurableJournal {
-    fn open(path: PathBuf) -> Result<Self> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| StorageError::invalid_argument("journal path has no parent"))?;
-        fs::create_dir_all(parent).map_err(fs_error)?;
-        let existed = path.exists();
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(fs_error)?;
-        if !existed {
-            File::open(parent)
-                .map_err(fs_error)?
-                .sync_all()
-                .map_err(fs_error)?;
-        }
-        Ok(Self {
-            path,
-            file: Mutex::new(file),
+#[derive(Debug, Clone)]
+struct DataLogSegmentData {
+    segment_id: SegmentId,
+    bytes: Vec<u8>,
+}
+
+fn data_log_path(data_dir: &Path, log_id: u64) -> PathBuf {
+    data_dir.join(format!("data-{log_id:06}.log"))
+}
+
+fn delete_data_log(data_dir: &Path, log_id: u64) -> Result<()> {
+    let path = data_log_path(data_dir, log_id);
+    match fs::remove_file(path) {
+        Ok(()) => sync_dir(data_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(fs_error(error)),
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| StorageError::invalid_argument("path has no parent directory"))?;
+    sync_dir(parent)
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    File::open(path)
+        .map_err(fs_error)?
+        .sync_all()
+        .map_err(fs_error)
+}
+
+fn encode_state_commit(commit: &DurableStateCommit) -> Result<Vec<u8>> {
+    let mut out = DurableEncoder::default();
+    commit.encode(&mut out)?;
+    Ok(out.finish())
+}
+
+fn decode_state_commit(bytes: &[u8]) -> Result<DurableStateCommit> {
+    let mut input = DurableDecoder { bytes, offset: 0 };
+    let commit = DurableStateCommit::decode(&mut input)?;
+    input.finish()?;
+    Ok(commit)
+}
+
+fn state_commit_for_image(image: &DurableStoreImage) -> DurableStateCommit {
+    DurableStateCommit {
+        metadata: DurableMetadataImage {
+            config: image.config,
+            metadata: image.metadata.clone(),
+            next_write_intent: image.next_write_intent,
+            next_extent_id: image.next_extent_id,
+        },
+        catalog: DurableCatalogImage {
+            config: image.config,
+            catalog: image.segment_catalog.clone(),
+        },
+        segment_store: DurableSegmentStoreImage {
+            config: image.config,
+            next_offset: image.segment_store.next_offset,
+            records: image
+                .segment_store
+                .segments
+                .iter()
+                .map(|(segment_id, record)| {
+                    (
+                        *segment_id,
+                        DurableSegmentRecord {
+                            synced: record.synced,
+                            commit: record.commit.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        },
+    }
+}
+
+fn encode_data_log_record(segment_id: SegmentId, bytes: &[u8]) -> Result<Vec<u8>> {
+    let payload_len = u64::try_from(bytes.len())
+        .map_err(|_| StorageError::invalid_argument("data-log payload length overflows u64"))?;
+    let mut out = Vec::with_capacity(DATA_LOG_HEADER_LEN + bytes.len());
+    out.extend_from_slice(DATA_LOG_MAGIC);
+    out.extend_from_slice(&DATA_LOG_VERSION.to_be_bytes());
+    out.extend_from_slice(&segment_id.raw().to_be_bytes());
+    out.extend_from_slice(&payload_len.to_be_bytes());
+    out.extend_from_slice(&checksum64(bytes).to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
+    if record.len() < DATA_LOG_HEADER_LEN {
+        return Err(StorageError::corrupt("data-log record is truncated"));
+    }
+    if &record[..DATA_LOG_MAGIC.len()] != DATA_LOG_MAGIC {
+        return Err(StorageError::corrupt("bad data-log magic"));
+    }
+    let version_offset = DATA_LOG_MAGIC.len();
+    let version = u16::from_be_bytes(
+        record[version_offset..version_offset + 2]
+            .try_into()
+            .map_err(|_| StorageError::corrupt("bad data-log version"))?,
+    );
+    if version != DATA_LOG_VERSION {
+        return Err(StorageError::corrupt("unsupported data-log version"));
+    }
+    let segment_start = version_offset + 2;
+    let segment_id = SegmentId::from_raw(u128::from_be_bytes(
+        record[segment_start..segment_start + 16]
+            .try_into()
+            .map_err(|_| StorageError::corrupt("bad data-log segment id"))?,
+    ));
+    let payload_len_start = segment_start + 16;
+    let payload_len = u64::from_be_bytes(
+        record[payload_len_start..payload_len_start + 8]
+            .try_into()
+            .map_err(|_| StorageError::corrupt("bad data-log payload length"))?,
+    );
+    let checksum_start = payload_len_start + 8;
+    let expected_checksum = u64::from_be_bytes(
+        record[checksum_start..checksum_start + 8]
+            .try_into()
+            .map_err(|_| StorageError::corrupt("bad data-log checksum"))?,
+    );
+    let payload_len_usize = usize::try_from(payload_len)
+        .map_err(|_| StorageError::corrupt("data-log payload length overflows usize"))?;
+    let expected_record_len = DATA_LOG_HEADER_LEN
+        .checked_add(payload_len_usize)
+        .ok_or_else(|| StorageError::corrupt("data-log record length overflow"))?;
+    if record.len() != expected_record_len {
+        return Err(StorageError::corrupt("data-log record length mismatch"));
+    }
+    let bytes = record[DATA_LOG_HEADER_LEN..].to_vec();
+    if checksum64(&bytes) != expected_checksum {
+        return Err(StorageError::corrupt("data-log checksum mismatch"));
+    }
+    Ok(DataLogSegmentData { segment_id, bytes })
+}
+
+fn current_sqlite_placements(
+    conn: &Connection,
+) -> Result<BTreeMap<SegmentId, SegmentPlacementRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT segment_id, storage_node, data_log_id, record_offset, record_bytes,
+                    payload_offset, payload_bytes, checksum
+             FROM segment_placements
+             WHERE current = 1",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let placement = decode_placement_row(row).map_err(sqlite_error)?;
+        out.insert(placement.segment_id, placement);
+    }
+    Ok(out)
+}
+
+fn current_placements_for_log(conn: &Connection, log_id: u64) -> Result<Vec<SegmentPlacementRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT segment_id, storage_node, data_log_id, record_offset, record_bytes,
+                    payload_offset, payload_bytes, checksum
+             FROM segment_placements
+             WHERE data_log_id = ?1 AND current = 1
+             ORDER BY record_offset",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt
+        .query(params![u64_to_i64(log_id)?])
+        .map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        out.push(decode_placement_row(row).map_err(sqlite_error)?);
+    }
+    Ok(out)
+}
+
+fn decode_placement_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentPlacementRow> {
+    let segment_id: String = row.get(0)?;
+    let storage_node: String = row.get(1)?;
+    let checksum: String = row.get(7)?;
+    Ok(SegmentPlacementRow {
+        segment_id: SegmentId::from_raw(parse_u128_key(&segment_id)?),
+        storage_node: StorageNodeId::from_raw(parse_u128_key(&storage_node)?),
+        data_log_id: i64_to_u64(row.get(2)?)?,
+        record_offset: i64_to_u64(row.get(3)?)?,
+        record_bytes: i64_to_u64(row.get(4)?)?,
+        payload_offset: i64_to_u64(row.get(5)?)?,
+        payload_bytes: i64_to_u64(row.get(6)?)?,
+        checksum: parse_u64_key(&checksum)?,
+    })
+}
+
+fn active_data_log(conn: &Connection, data_dir: &Path) -> Result<DataLogRow> {
+    if let Some(row) = conn
+        .query_row(
+            "SELECT log_id, total_bytes, live_bytes, dead_bytes
+             FROM data_logs
+             WHERE state = 'active'
+             ORDER BY log_id DESC
+             LIMIT 1",
+            [],
+            decode_data_log_row,
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    {
+        let path = data_log_path(data_dir, row.log_id);
+        let total_bytes = path
+            .metadata()
+            .map(|metadata| metadata.len().max(row.total_bytes))
+            .unwrap_or(row.total_bytes);
+        Ok(DataLogRow { total_bytes, ..row })
+    } else {
+        Ok(DataLogRow {
+            log_id: next_data_log_id(conn, data_dir, 0)?,
+            total_bytes: 0,
+            live_bytes: 0,
+            dead_bytes: 0,
         })
     }
-
-    fn append_synced(&self, records: &[DurableLogRecord]) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let mut bytes = Vec::new();
-        for record in records {
-            bytes.extend_from_slice(&encode_log_record(record)?);
-        }
-        let mut file = lock(&self.file)?;
-        file.write_all(&bytes).map_err(fs_error)?;
-        file.sync_data().map_err(fs_error)
-    }
-
-    fn rewrite_synced(&self, records: &[DurableLogRecord]) -> Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| StorageError::invalid_argument("journal path has no parent"))?;
-        fs::create_dir_all(parent).map_err(fs_error)?;
-        let tmp = self.path.with_extension("tmp");
-        {
-            let mut file = File::create(&tmp).map_err(fs_error)?;
-            for record in records {
-                file.write_all(&encode_log_record(record)?)
-                    .map_err(fs_error)?;
-            }
-            file.sync_data().map_err(fs_error)?;
-        }
-        fs::rename(&tmp, &self.path).map_err(fs_error)?;
-        File::open(parent)
-            .map_err(fs_error)?
-            .sync_all()
-            .map_err(fs_error)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(fs_error)?;
-        *lock(&self.file)? = file;
-        Ok(())
-    }
 }
 
-/// Local durable provider bundle using an append-only journal hot path.
+fn next_data_log(conn: &Connection, data_dir: &Path, previous: u64) -> Result<DataLogRow> {
+    Ok(DataLogRow {
+        log_id: next_data_log_id(conn, data_dir, previous)?,
+        total_bytes: 0,
+        live_bytes: 0,
+        dead_bytes: 0,
+    })
+}
+
+fn next_data_log_id(conn: &Connection, data_dir: &Path, floor: u64) -> Result<u64> {
+    let db_max = conn
+        .query_row(
+            "SELECT COALESCE(MAX(log_id), 0) FROM data_logs",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_error)
+        .and_then(|value| i64_to_u64(value).map_err(sqlite_error))?;
+    let fs_max = fs_data_log_max_id(data_dir)?;
+    db_max
+        .max(fs_max)
+        .max(floor)
+        .checked_add(1)
+        .ok_or_else(|| StorageError::conflict("data-log id overflow"))
+}
+
+fn fs_data_log_max_id(data_dir: &Path) -> Result<u64> {
+    let mut max_id = 0;
+    if !data_dir.exists() {
+        return Ok(max_id);
+    }
+    for entry in fs::read_dir(data_dir).map_err(fs_error)? {
+        let entry = entry.map_err(fs_error)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = name
+            .strip_prefix("data-")
+            .and_then(|rest| rest.strip_suffix(".log"))
+            .and_then(|raw| raw.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        max_id = max_id.max(id);
+    }
+    Ok(max_id)
+}
+
+#[cfg(test)]
+fn data_log_rows(conn: &Connection) -> Result<Vec<DataLogRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT log_id, total_bytes, live_bytes, dead_bytes
+             FROM data_logs
+             WHERE state != 'deleted'
+             ORDER BY log_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        out.push(decode_data_log_row(row).map_err(sqlite_error)?);
+    }
+    Ok(out)
+}
+
+fn compaction_candidates(
+    conn: &Connection,
+    policy: DurableDataLogPolicy,
+) -> Result<Vec<DataLogRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT log_id, total_bytes, live_bytes, dead_bytes
+             FROM data_logs
+             WHERE state = 'sealed'
+             ORDER BY dead_bytes DESC, log_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let row = decode_data_log_row(row).map_err(sqlite_error)?;
+        if row.total_bytes == 0 {
+            continue;
+        }
+        let reclaimable_ratio = row
+            .dead_bytes
+            .saturating_mul(1_000_000)
+            .checked_div(row.total_bytes)
+            .unwrap_or(0);
+        if row.dead_bytes >= policy.min_reclaimable_bytes
+            && reclaimable_ratio >= u64::from(policy.min_reclaimable_ratio_ppm)
+        {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_data_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DataLogRow> {
+    Ok(DataLogRow {
+        log_id: i64_to_u64(row.get(0)?)?,
+        total_bytes: i64_to_u64(row.get(1)?)?,
+        live_bytes: i64_to_u64(row.get(2)?)?,
+        dead_bytes: i64_to_u64(row.get(3)?)?,
+    })
+}
+
+fn mark_placement_dead(
+    tx: &rusqlite::Transaction<'_>,
+    placement: &SegmentPlacementRow,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE segment_placements SET current = 0 WHERE segment_id = ?1 AND current = 1",
+        params![segment_id_key(placement.segment_id)],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "UPDATE data_logs
+         SET live_bytes = MAX(live_bytes - ?2, 0),
+             dead_bytes = dead_bytes + ?2
+         WHERE log_id = ?1",
+        params![
+            u64_to_i64(placement.data_log_id)?,
+            u64_to_i64(placement.payload_bytes)?
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn validate_durable_segment_placement(
+    segment_id: SegmentId,
+    record: &DurableSegmentRecord,
+    placement: &SegmentPlacementRow,
+) -> Result<()> {
+    if placement.segment_id != segment_id
+        || placement.storage_node != record.commit.placement.storage_node
+        || placement.payload_bytes != record.commit.placement.bytes
+    {
+        return Err(StorageError::corrupt(
+            "SQLite placement disagrees with durable segment commit",
+        ));
+    }
+    Ok(())
+}
+
+fn segment_id_key(segment_id: SegmentId) -> String {
+    segment_id.raw().to_string()
+}
+
+fn storage_node_key(storage_node: StorageNodeId) -> String {
+    storage_node.raw().to_string()
+}
+
+fn u64_key(value: u64) -> String {
+    value.to_string()
+}
+
+fn parse_u128_key(value: &str) -> rusqlite::Result<u128> {
+    value.parse::<u128>().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn parse_u64_key(value: &str) -> rusqlite::Result<u64> {
+    value.parse::<u64>().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn u64_to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| StorageError::invalid_argument("u64 value overflows SQLite i64"))
+}
+
+fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+/// Local durable provider bundle using SQLite metadata and rolled data logs.
 #[derive(Debug, Clone)]
 pub struct DurableObjectStore {
     local: LocalObjectStore,
-    journal: Arc<DurableJournal>,
+    durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     persist_lock: Arc<Mutex<()>>,
 }
 
 impl DurableObjectStore {
     pub fn open(root: impl AsRef<Path>, config: LocalStoreConfig) -> Result<Self> {
+        Self::open_with_data_log_policy(root, config, DurableDataLogPolicy::default())
+    }
+
+    pub fn open_with_data_log_policy(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        policy: DurableDataLogPolicy,
+    ) -> Result<Self> {
         config.validate()?;
         let paths = DurableStorePaths::new(root, config.storage_node)?;
-        let journal = Arc::new(DurableJournal::open(paths.journal.clone())?);
+        let durable = DurableSqliteStore::open(paths, policy)?;
 
-        let local = Self::load_local_store_from_journal(&paths.journal, config)?
+        let local = durable
+            .load(config)?
             .unwrap_or(LocalObjectStore::with_config(config)?);
         let persisted_segments = local
             .state_image()?
@@ -1378,7 +2296,7 @@ impl DurableObjectStore {
 
         let store = Self {
             local,
-            journal,
+            durable,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             persist_lock: Arc::new(Mutex::new(())),
         };
@@ -1573,13 +2491,15 @@ impl DurableObjectStore {
         })
     }
 
-    pub fn compact_journal(&self) -> Result<()> {
+    pub fn compact_data_logs(
+        &self,
+        policy: DurableDataLogPolicy,
+    ) -> Result<DurableCompactionReport> {
         let _persist_guard = lock(&self.persist_lock)?;
+        let report = self.durable.compact_data_logs(policy)?;
         let image = self.local.state_image()?;
-        let (records, kept_segments) = Self::records_for_state_image(&image, &BTreeSet::new());
-        self.journal.rewrite_synced(&records)?;
-        *lock(&self.persisted_segments)? = kept_segments;
-        Ok(())
+        *lock(&self.persisted_segments)? = image.segment_store.segments.keys().copied().collect();
+        Ok(report)
     }
 
     pub fn run_metadata_custodian(
@@ -1617,110 +2537,12 @@ impl DurableObjectStore {
         }
     }
 
-    fn load_local_store_from_journal(
-        journal_path: &Path,
-        expected_config: LocalStoreConfig,
-    ) -> Result<Option<LocalObjectStore>> {
-        let replay = replay_durable_log(journal_path)?;
-        let Some(commit) = replay.last_commit else {
-            return Ok(None);
-        };
-        if commit.metadata.config != expected_config
-            || commit.catalog.config != expected_config
-            || commit.segment_store.config != expected_config
-        {
-            return Err(StorageError::corrupt(
-                "durable journal state disagrees with open config",
-            ));
-        }
-
-        let mut records = BTreeMap::new();
-        for (segment_id, record) in commit.segment_store.records {
-            let bytes = replay.segments.get(&segment_id).cloned().ok_or_else(|| {
-                StorageError::corrupt("journal commit references missing segment data")
-            })?;
-            validate_durable_segment_bytes(segment_id, &record, &bytes)?;
-            records.insert(
-                segment_id,
-                SegmentRecord {
-                    bytes,
-                    synced: record.synced,
-                    commit: record.commit,
-                },
-            );
-        }
-
-        Ok(Some(LocalObjectStore::from_state_image(
-            DurableStoreImage {
-                config: commit.metadata.config,
-                metadata: commit.metadata.metadata,
-                segment_store: SegmentStoreInner {
-                    next_offset: commit.segment_store.next_offset,
-                    segments: records,
-                },
-                segment_catalog: commit.catalog.catalog,
-                next_write_intent: commit.metadata.next_write_intent,
-                next_extent_id: commit.metadata.next_extent_id,
-            },
-        )?))
-    }
-
     fn persist(&self) -> Result<()> {
         let _persist_guard = lock(&self.persist_lock)?;
         let image = self.local.state_image()?;
-        let persisted_segments = lock(&self.persisted_segments)?;
-        let (records, kept_segments) = Self::records_for_state_image(&image, &persisted_segments);
-        drop(persisted_segments);
-        self.journal.append_synced(&records)?;
+        let kept_segments = self.durable.persist(&image)?;
         *lock(&self.persisted_segments)? = kept_segments;
         Ok(())
-    }
-
-    fn records_for_state_image(
-        image: &DurableStoreImage,
-        persisted_segments: &BTreeSet<SegmentId>,
-    ) -> (Vec<DurableLogRecord>, BTreeSet<SegmentId>) {
-        let kept_segments: BTreeSet<_> = image.segment_store.segments.keys().copied().collect();
-        let mut records = Vec::new();
-        for (segment_id, record) in &image.segment_store.segments {
-            if !persisted_segments.contains(segment_id) {
-                records.push(DurableLogRecord::SegmentData(DurableLogSegmentData {
-                    segment_id: *segment_id,
-                    bytes: record.bytes.clone(),
-                }));
-            }
-        }
-        records.push(DurableLogRecord::CommitState(Box::new(DurableLogCommit {
-            metadata: DurableMetadataImage {
-                config: image.config,
-                metadata: image.metadata.clone(),
-                next_write_intent: image.next_write_intent,
-                next_extent_id: image.next_extent_id,
-            },
-            catalog: DurableCatalogImage {
-                config: image.config,
-                catalog: image.segment_catalog.clone(),
-            },
-            segment_store: DurableSegmentStoreImage {
-                config: image.config,
-                next_offset: image.segment_store.next_offset,
-                records: image
-                    .segment_store
-                    .segments
-                    .iter()
-                    .map(|(segment_id, record)| {
-                        (
-                            *segment_id,
-                            DurableSegmentRecord {
-                                synced: record.synced,
-                                commit: record.commit.clone(),
-                            },
-                        )
-                    })
-                    .collect(),
-            },
-        })));
-        (records, kept_segments)
     }
 }
 
@@ -1824,28 +2646,10 @@ struct DurableCatalogImage {
 }
 
 #[derive(Debug, Clone)]
-struct DurableLogSegmentData {
-    segment_id: SegmentId,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct DurableLogCommit {
+struct DurableStateCommit {
     metadata: DurableMetadataImage,
     catalog: DurableCatalogImage,
     segment_store: DurableSegmentStoreImage,
-}
-
-#[derive(Debug, Clone)]
-enum DurableLogRecord {
-    SegmentData(DurableLogSegmentData),
-    CommitState(Box<DurableLogCommit>),
-}
-
-#[derive(Debug, Clone)]
-struct DurableLogReplay {
-    segments: BTreeMap<SegmentId, Vec<u8>>,
-    last_commit: Option<DurableLogCommit>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -6890,6 +7694,10 @@ fn serde_error(error: impl std::fmt::Display) -> StorageError {
     StorageError::corrupt(format!("binary envelope codec failed: {error}"))
 }
 
+fn sqlite_error(error: rusqlite::Error) -> StorageError {
+    StorageError::unavailable(format!("sqlite operation failed: {error}"))
+}
+
 fn durable_codec_error(reason: impl Into<String>) -> StorageError {
     StorageError::corrupt(format!("durable codec failed: {}", reason.into()))
 }
@@ -6904,12 +7712,6 @@ const DURABLE_TEST_IMAGE_METADATA: u8 = 1;
 const DURABLE_TEST_IMAGE_CATALOG: u8 = 2;
 #[cfg(test)]
 const DURABLE_TEST_IMAGE_SEGMENT_STORE: u8 = 3;
-const DURABLE_LOG_MAGIC: &[u8; 8] = b"TCOWJNL!";
-const DURABLE_LOG_VERSION: u16 = 1;
-const DURABLE_LOG_SEGMENT_DATA: u8 = 1;
-const DURABLE_LOG_COMMIT_STATE: u8 = 2;
-const DURABLE_LOG_HEADER_LEN: usize = 8 + 2 + 1 + 8;
-const DURABLE_LOG_CHECKSUM_LEN: usize = 8;
 const MAX_DURABLE_COLLECTION_LEN: u64 = 1_000_000;
 const MAX_DURABLE_STRING_LEN: u64 = 1_048_576;
 
@@ -8099,21 +8901,7 @@ impl DurableTestImageCodec for DurableMetadataImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_METADATA;
 }
 
-impl DurableCodec for DurableLogSegmentData {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.segment_id.encode(out)?;
-        self.bytes.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            segment_id: SegmentId::decode(input)?,
-            bytes: Vec::decode(input)?,
-        })
-    }
-}
-
-impl DurableCodec for DurableLogCommit {
+impl DurableCodec for DurableStateCommit {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.metadata.encode(out)?;
         self.catalog.encode(out)?;
@@ -8964,134 +9752,6 @@ fn decode_test_image<T: DurableTestImageCodec>(bytes: &[u8]) -> Result<T> {
     let value = T::decode(&mut input)?;
     input.finish()?;
     Ok(value)
-}
-
-fn encode_log_record(record: &DurableLogRecord) -> Result<Vec<u8>> {
-    let (kind, payload) = match record {
-        DurableLogRecord::SegmentData(record) => {
-            let mut out = DurableEncoder::default();
-            record.encode(&mut out)?;
-            (DURABLE_LOG_SEGMENT_DATA, out.finish())
-        }
-        DurableLogRecord::CommitState(record) => {
-            let mut out = DurableEncoder::default();
-            record.encode(&mut out)?;
-            (DURABLE_LOG_COMMIT_STATE, out.finish())
-        }
-    };
-    let payload_len = u64::try_from(payload.len())
-        .map_err(|_| durable_codec_error("journal payload length exceeds u64"))?;
-    let mut bytes =
-        Vec::with_capacity(DURABLE_LOG_HEADER_LEN + payload.len() + DURABLE_LOG_CHECKSUM_LEN);
-    bytes.extend_from_slice(DURABLE_LOG_MAGIC);
-    bytes.extend_from_slice(&DURABLE_LOG_VERSION.to_be_bytes());
-    bytes.push(kind);
-    bytes.extend_from_slice(&payload_len.to_be_bytes());
-    bytes.extend_from_slice(&payload);
-    bytes.extend_from_slice(&checksum64(&payload).to_be_bytes());
-    Ok(bytes)
-}
-
-fn decode_log_payload(kind: u8, payload: &[u8]) -> Result<DurableLogRecord> {
-    let mut input = DurableDecoder {
-        bytes: payload,
-        offset: 0,
-    };
-    let record = match kind {
-        DURABLE_LOG_SEGMENT_DATA => {
-            DurableLogRecord::SegmentData(DurableLogSegmentData::decode(&mut input)?)
-        }
-        DURABLE_LOG_COMMIT_STATE => {
-            DurableLogRecord::CommitState(Box::new(DurableLogCommit::decode(&mut input)?))
-        }
-        _ => return Err(durable_codec_error("invalid durable journal record kind")),
-    };
-    input.finish()?;
-    Ok(record)
-}
-
-fn replay_durable_log(path: &Path) -> Result<DurableLogReplay> {
-    if !path.exists() {
-        return Ok(DurableLogReplay {
-            segments: BTreeMap::new(),
-            last_commit: None,
-        });
-    }
-    let bytes = fs::read(path).map_err(fs_error)?;
-    let mut offset = 0usize;
-    let mut segments = BTreeMap::new();
-    let mut last_commit = None;
-    while offset < bytes.len() {
-        let remaining = bytes.len() - offset;
-        if remaining < DURABLE_LOG_HEADER_LEN {
-            break;
-        }
-        let magic_end = offset + DURABLE_LOG_MAGIC.len();
-        if &bytes[offset..magic_end] != DURABLE_LOG_MAGIC {
-            return Err(durable_codec_error("bad durable journal magic"));
-        }
-        let version_start = magic_end;
-        let version = u16::from_be_bytes(
-            bytes[version_start..version_start + 2]
-                .try_into()
-                .map_err(|_| durable_codec_error("invalid durable journal version"))?,
-        );
-        if version != DURABLE_LOG_VERSION {
-            return Err(durable_codec_error("unsupported durable journal version"));
-        }
-        let kind = bytes[version_start + 2];
-        let len_start = version_start + 3;
-        let payload_len = u64::from_be_bytes(
-            bytes[len_start..len_start + 8]
-                .try_into()
-                .map_err(|_| durable_codec_error("invalid durable journal payload length"))?,
-        );
-        if payload_len > MAX_DURABLE_COLLECTION_LEN.saturating_mul(1024) {
-            return Err(durable_codec_error("durable journal payload exceeds limit"));
-        }
-        let payload_len = usize::try_from(payload_len)
-            .map_err(|_| durable_codec_error("durable journal payload length overflows usize"))?;
-        let payload_start = offset + DURABLE_LOG_HEADER_LEN;
-        let checksum_start = payload_start
-            .checked_add(payload_len)
-            .ok_or_else(|| durable_codec_error("durable journal record offset overflow"))?;
-        let record_end = checksum_start
-            .checked_add(DURABLE_LOG_CHECKSUM_LEN)
-            .ok_or_else(|| durable_codec_error("durable journal checksum offset overflow"))?;
-        if record_end > bytes.len() {
-            break;
-        }
-        let payload = &bytes[payload_start..checksum_start];
-        let expected = u64::from_be_bytes(
-            bytes[checksum_start..record_end]
-                .try_into()
-                .map_err(|_| durable_codec_error("invalid durable journal checksum"))?,
-        );
-        if checksum64(payload) != expected {
-            return Err(durable_codec_error("durable journal checksum mismatch"));
-        }
-        match decode_log_payload(kind, payload)? {
-            DurableLogRecord::SegmentData(record) => {
-                if let Some(existing) = segments.get(&record.segment_id) {
-                    if existing != &record.bytes {
-                        return Err(durable_codec_error(
-                            "durable journal segment record conflicts with earlier bytes",
-                        ));
-                    }
-                } else {
-                    segments.insert(record.segment_id, record.bytes);
-                }
-            }
-            DurableLogRecord::CommitState(commit) => {
-                last_commit = Some(*commit);
-            }
-        }
-        offset = record_end;
-    }
-    Ok(DurableLogReplay {
-        segments,
-        last_commit,
-    })
 }
 
 fn validate_durable_segment_bytes(
@@ -11370,9 +12030,8 @@ mod tests {
                 WriteDurability::Flushed,
             )
             .unwrap();
-        let journal = root.join("journal").join("store.log");
-        assert!(journal.exists());
-        assert!(replay_durable_log(&journal).unwrap().last_commit.is_some());
+        assert!(root.join("metadata.sqlite").exists());
+        assert!(root.join("data").join("data-000001.log").exists());
 
         drop(store);
         let reopened = DurableObjectStore::open(&root, cfg).unwrap();
@@ -11458,8 +12117,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_journal_ignores_torn_tail_and_uncommitted_segment_records() {
-        let root = durable_temp_dir("journal-torn-tail");
+    fn durable_sqlite_data_log_ignores_unplaced_tail_records() {
+        let root = durable_temp_dir("data-log-unplaced-tail");
         let cfg = config();
         let store = DurableObjectStore::open(&root, cfg).unwrap();
         let device_id = store
@@ -11481,27 +12140,20 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let journal = root.join("journal").join("store.log");
-        let uncommitted =
-            encode_log_record(&DurableLogRecord::SegmentData(DurableLogSegmentData {
-                segment_id: SegmentId::from_raw(999),
-                bytes: repeated_blocks(1, 9),
-            }))
-            .unwrap();
+        let data_log = root.join("data").join("data-000001.log");
         OpenOptions::new()
             .append(true)
-            .open(&journal)
+            .open(&data_log)
             .unwrap()
-            .write_all(&uncommitted)
+            .write_all(
+                &encode_data_log_record(SegmentId::from_raw(999), &repeated_blocks(1, 9)).unwrap(),
+            )
             .unwrap();
-        let torn = encode_log_record(&DurableLogRecord::SegmentData(DurableLogSegmentData {
-            segment_id: SegmentId::from_raw(1000),
-            bytes: repeated_blocks(1, 10),
-        }))
-        .unwrap();
+        let torn =
+            encode_data_log_record(SegmentId::from_raw(1000), &repeated_blocks(1, 10)).unwrap();
         OpenOptions::new()
             .append(true)
-            .open(&journal)
+            .open(&data_log)
             .unwrap()
             .write_all(&torn[..torn.len() / 2])
             .unwrap();
@@ -11512,18 +12164,12 @@ mod tests {
             .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
             .unwrap();
         assert_eq!(bytes, repeated_blocks(1, 3));
-        assert!(
-            !reopened
-                .segment_store()
-                .contains_segment(SegmentId::from_raw(999))
-                .unwrap()
-        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn durable_journal_ignores_torn_commit_after_segment_records() {
-        let root = durable_temp_dir("journal-torn-commit");
+    fn durable_sqlite_data_log_rejects_current_payload_corruption() {
+        let root = durable_temp_dir("data-log-corruption");
         let cfg = config();
         let store = DurableObjectStore::open(&root, cfg).unwrap();
         let device_id = store
@@ -11539,6 +12185,97 @@ mod tests {
             .write_device(
                 device_id,
                 0,
+                &repeated_blocks(1, 4),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let segment_id = first_device_segment(&store, device_id);
+        let placement = store.durable.placement_for_test(segment_id).unwrap();
+        drop(store);
+
+        let path = root
+            .join("data")
+            .join(format!("data-{:06}.log", placement.data_log_id));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(placement.payload_offset))
+            .unwrap();
+        file.write_all(&[0xff]).unwrap();
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_missing_data_log_for_current_placement() {
+        let root = durable_temp_dir("missing-data-log");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 4),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+        fs::remove_file(root.join("data").join("data-000001.log")).unwrap();
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_data_log_compaction_relocates_partial_logs_and_deletes_dead_logs() {
+        let root = durable_temp_dir("data-log-compaction");
+        let cfg = config();
+        let policy = DurableDataLogPolicy {
+            target_data_log_bytes: 9 * 1024,
+            min_reclaimable_ratio_ppm: 1,
+            min_reclaimable_bytes: 1,
+            max_compaction_copy_bytes: u64::MAX,
+        };
+        let store = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 1),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                4096,
+                &repeated_blocks(1, 2),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                8192,
                 &repeated_blocks(1, 3),
                 WriteDurability::Flushed,
             )
@@ -11547,174 +12284,50 @@ mod tests {
             .write_device(
                 device_id,
                 0,
-                &repeated_blocks(1, 8),
-                WriteDurability::Acknowledged,
-            )
-            .unwrap();
-
-        let image = store.local.state_image().unwrap();
-        let persisted = lock(&store.persisted_segments).unwrap().clone();
-        let (records, _) = DurableObjectStore::records_for_state_image(&image, &persisted);
-        assert!(matches!(
-            records.last(),
-            Some(DurableLogRecord::CommitState(_))
-        ));
-        let journal = root.join("journal").join("store.log");
-        let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
-        for record in &records[..records.len() - 1] {
-            file.write_all(&encode_log_record(record).unwrap()).unwrap();
-        }
-        let commit = encode_log_record(records.last().unwrap()).unwrap();
-        file.write_all(&commit[..commit.len() / 2]).unwrap();
-        drop(file);
-        drop(store);
-
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
-        let mut bytes = vec![0; 4096];
-        reopened
-            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
-            .unwrap();
-        assert_eq!(bytes, repeated_blocks(1, 3));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn durable_journal_replay_is_idempotent_across_reopens() {
-        let root = durable_temp_dir("journal-replay-idempotent");
-        let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
-        let device_id = store
-            .create_device(CreateDeviceRequest {
-                spec: DeviceSpec {
-                    logical_blocks: 16,
-                    block_size: 4096,
-                },
-                name: None,
-            })
-            .unwrap();
-        store
-            .write_device(
-                device_id,
-                0,
-                &repeated_blocks(1, 5),
-                WriteDurability::Flushed,
-            )
-            .unwrap();
-        let keyspace_id = store
-            .create_keyspace(CreateKeyspaceRequest {
-                name: Some("ks".to_string()),
-            })
-            .unwrap();
-        let file_id = store
-            .create_file(
-                keyspace_id,
-                CreateFileRequest {
-                    spec: FileSpec {
-                        name: Some("file".to_string()),
-                    },
-                },
-            )
-            .unwrap();
-        let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
-        store
-            .append_file(lease, b"journal", WriteDurability::Flushed)
-            .unwrap();
-        drop(store);
-
-        let journal = root.join("journal").join("store.log");
-        let len_before = fs::metadata(&journal).unwrap().len();
-        for _ in 0..3 {
-            let replay_a = replay_durable_log(&journal).unwrap();
-            let replay_b = replay_durable_log(&journal).unwrap();
-            assert_eq!(replay_a.segments.len(), replay_b.segments.len());
-            assert_eq!(
-                replay_a
-                    .last_commit
-                    .as_ref()
-                    .unwrap()
-                    .metadata
-                    .metadata
-                    .next_commit_seq,
-                replay_b
-                    .last_commit
-                    .as_ref()
-                    .unwrap()
-                    .metadata
-                    .metadata
-                    .next_commit_seq
-            );
-
-            let reopened = DurableObjectStore::open(&root, cfg).unwrap();
-            let mut block = vec![0; 4096];
-            reopened
-                .read_device(device_id, ByteRange::new(0, 4096), &mut block)
-                .unwrap();
-            assert_eq!(block, repeated_blocks(1, 5));
-            let mut file = vec![0; b"journal".len()];
-            reopened
-                .read_file(
-                    keyspace_id,
-                    file_id,
-                    ByteRange::new(0, b"journal".len() as u64),
-                    &mut file,
-                )
-                .unwrap();
-            assert_eq!(file, b"journal");
-            drop(reopened);
-            assert_eq!(fs::metadata(&journal).unwrap().len(), len_before);
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn durable_journal_rejects_complete_checksum_corruption() {
-        let root = durable_temp_dir("journal-checksum-corruption");
-        let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
-        let device_id = store
-            .create_device(CreateDeviceRequest {
-                spec: DeviceSpec {
-                    logical_blocks: 16,
-                    block_size: 4096,
-                },
-                name: None,
-            })
-            .unwrap();
-        store
-            .write_device(
-                device_id,
-                0,
                 &repeated_blocks(1, 4),
                 WriteDurability::Flushed,
             )
             .unwrap();
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        let before = store.durable.data_log_rows_for_test().unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|log| log.log_id == 1 && log.dead_bytes > 0)
+        );
+
+        let report = store
+            .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
+            .unwrap();
+        assert!(report.relocated_logs.contains(&1));
+        assert!(!root.join("data").join("data-000001.log").exists());
+
         drop(store);
-
-        let journal = root.join("journal").join("store.log");
-        let mut corrupt =
-            encode_log_record(&DurableLogRecord::SegmentData(DurableLogSegmentData {
-                segment_id: SegmentId::from_raw(999),
-                bytes: repeated_blocks(1, 9),
-            }))
+        let reopened = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let mut bytes = vec![0; 3 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut bytes)
             .unwrap();
-        corrupt[DURABLE_LOG_HEADER_LEN] ^= 0xff;
-        OpenOptions::new()
-            .append(true)
-            .open(&journal)
-            .unwrap()
-            .write_all(&corrupt)
-            .unwrap();
-
-        assert!(replay_durable_log(&journal).is_err());
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert_eq!(&bytes[0..4096], repeated_blocks(1, 4).as_slice());
+        assert_eq!(&bytes[4096..8192], repeated_blocks(1, 2).as_slice());
+        assert_eq!(&bytes[8192..12288], repeated_blocks(1, 3).as_slice());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn durable_journal_rejects_commit_that_references_missing_segment_data() {
-        let source = durable_temp_dir("journal-missing-segment-source");
+    fn durable_data_log_compaction_honors_pitr_retention_until_gc_releases_segment() {
+        let root = durable_temp_dir("data-log-pitr-retention");
         let cfg = config();
-        let store = DurableObjectStore::open(&source, cfg).unwrap();
+        let policy = DurableDataLogPolicy {
+            target_data_log_bytes: 4096,
+            min_reclaimable_ratio_ppm: 1,
+            min_reclaimable_bytes: 1,
+            max_compaction_copy_bytes: u64::MAX,
+        };
+        let store = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -11728,137 +12341,54 @@ mod tests {
             .write_device(
                 device_id,
                 0,
-                &repeated_blocks(1, 4),
+                &repeated_blocks(1, 1),
                 WriteDurability::Flushed,
             )
             .unwrap();
-        drop(store);
-        let commit = replay_durable_log(&source.join("journal").join("store.log"))
-            .unwrap()
-            .last_commit
-            .unwrap();
-
-        let broken = durable_temp_dir("journal-missing-segment-broken");
-        let journal_dir = broken.join("journal");
-        fs::create_dir_all(&journal_dir).unwrap();
-        fs::write(
-            journal_dir.join("store.log"),
-            encode_log_record(&DurableLogRecord::CommitState(Box::new(commit))).unwrap(),
-        )
-        .unwrap();
-
-        assert!(DurableObjectStore::open(&broken, cfg).is_err());
-        let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(broken);
-    }
-
-    #[test]
-    fn durable_journal_compaction_preserves_replay_state_and_removes_history() {
-        let root = durable_temp_dir("journal-compaction");
-        let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
-        let device_id = store
-            .create_device(CreateDeviceRequest {
-                spec: DeviceSpec {
-                    logical_blocks: 32,
-                    block_size: 4096,
-                },
-                name: None,
-            })
-            .unwrap();
-        for block in 0..8 {
-            store
-                .write_device(
-                    device_id,
-                    block * 4096,
-                    &repeated_blocks(1, block as u8),
-                    WriteDurability::Flushed,
-                )
-                .unwrap();
-        }
-
-        let journal = root.join("journal").join("store.log");
-        let before_size = fs::metadata(&journal).unwrap().len();
-        let before_commit = replay_durable_log(&journal)
-            .unwrap()
-            .last_commit
-            .unwrap()
-            .metadata
-            .metadata
-            .next_commit_seq;
-
-        store.compact_journal().unwrap();
-        let after_size = fs::metadata(&journal).unwrap().len();
-        let after_commit = replay_durable_log(&journal)
-            .unwrap()
-            .last_commit
-            .unwrap()
-            .metadata
-            .metadata
-            .next_commit_seq;
-        assert!(after_size < before_size);
-        assert_eq!(after_commit, before_commit);
-
-        drop(store);
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
-        let mut bytes = vec![0; 8 * 4096];
-        reopened
-            .read_device(device_id, ByteRange::new(0, 8 * 4096), &mut bytes)
-            .unwrap();
-        for block in 0..8 {
-            let start = block * 4096;
-            let end = start + 4096;
-            assert_eq!(&bytes[start..end], vec![block as u8; 4096].as_slice());
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn durable_journal_ignores_abandoned_compaction_temp_file() {
-        let root = durable_temp_dir("journal-abandoned-compaction");
-        let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
-        let device_id = store
-            .create_device(CreateDeviceRequest {
-                spec: DeviceSpec {
-                    logical_blocks: 16,
-                    block_size: 4096,
-                },
-                name: None,
-            })
-            .unwrap();
+        let old_segment_id = first_device_segment(&store, device_id);
+        let old_placement = store.durable.placement_for_test(old_segment_id).unwrap();
         store
             .write_device(
                 device_id,
                 0,
-                &repeated_blocks(1, 12),
+                &repeated_blocks(1, 2),
                 WriteDurability::Flushed,
             )
             .unwrap();
 
-        let journal = root.join("journal").join("store.log");
-        fs::write(journal.with_extension("tmp"), b"incomplete compaction").unwrap();
-        drop(store);
-
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
-        let mut bytes = vec![0; 4096];
-        reopened
-            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+        let retained = RetentionPolicy::expire_deleted_immediately().with_pitr_grace_commits(10);
+        store.run_metadata_custodian(retained).unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        let retained_report = store
+            .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
             .unwrap();
-        assert_eq!(bytes, repeated_blocks(1, 12));
+        assert!(
+            !retained_report
+                .deleted_logs
+                .contains(&old_placement.data_log_id)
+        );
+        assert!(data_log_path(&root.join("data"), old_placement.data_log_id).exists());
+        assert!(store.durable.placement_for_test(old_segment_id).is_ok());
 
-        reopened.compact_journal().unwrap();
-        let mut compacted = vec![0; 4096];
-        let reopened_again = DurableObjectStore::open(&root, cfg).unwrap();
-        reopened_again
-            .read_device(device_id, ByteRange::new(0, 4096), &mut compacted)
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
-        assert_eq!(compacted, repeated_blocks(1, 12));
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        let expired_report = store
+            .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
+            .unwrap();
+        assert!(
+            expired_report
+                .deleted_logs
+                .contains(&old_placement.data_log_id)
+        );
+        assert!(!data_log_path(&root.join("data"), old_placement.data_log_id).exists());
+        assert!(store.durable.placement_for_test(old_segment_id).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn durable_journal_generated_replay_matches_reference_model() {
+    fn durable_sqlite_data_log_generated_replay_matches_reference_model() {
         #[derive(Clone, Copy)]
         struct ModelIds {
             device_id: DeviceId,
@@ -15577,6 +16107,25 @@ mod tests {
 
     fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {
         vec![byte; blocks as usize * 4096]
+    }
+
+    fn first_device_segment(store: &DurableObjectStore, device_id: DeviceId) -> SegmentId {
+        store
+            .metadata()
+            .get_head(device_id)
+            .unwrap()
+            .shard_roots
+            .iter()
+            .find_map(|root| {
+                let node = store.metadata().get_metadata_node(*root).unwrap();
+                match node.kind {
+                    MetadataNodeKind::Leaf { entries } => {
+                        entries.first().map(|entry| entry.segment_id)
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap()
     }
 
     fn read_device_bytes(device: &LocalBlockDevice, blocks: u64) -> Vec<u8> {

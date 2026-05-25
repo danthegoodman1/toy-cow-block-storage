@@ -553,34 +553,33 @@ global metadata says which logical segment is referenced; local segment metadata
 says where that segment's bytes live on a particular storage node. A logical
 segment may have one local replica in v1 and multiple replicas later.
 
-### Phase 16 Durable Provider Choice
+### Durable Provider Choice
 
-The first durable provider remains local and single-process. Phase 16 started
-with atomic snapshots to prove the durability boundary. Phase 20 replaces the
-production hot path with one append-oriented journal:
+The durable provider is local and single-process, but it preserves the same
+plane boundaries expected from a remote implementation. Phase 16 started with
+atomic snapshots to prove the durability boundary. Phase 20 replaced that with
+one append-oriented journal. Phase 21 removed the journal production path under
+the no-tombstones rule and now uses SQLite metadata plus rolled data logs.
 
 ```text
 store/
-  journal/
-    store.log
+  metadata.sqlite
+  metadata.sqlite-wal
+  metadata.sqlite-shm
+  data/
+    data-000001.log
+    data-000002.log
+    data-000003.log
+  tmp/
 ```
 
-The single local WAL is an implementation detail that gives the toy provider
-one ordered `sync_data` boundary for segment bytes plus metadata commit state.
-It does not collapse the model into one logical service. Journal records still
-separate:
-
-- segment/data records, owned by the storage-node plane;
-- storage-node catalog and segment descriptor state;
-- globally meaningful metadata heads, roots, timelines, checkpoints,
-  write-intent counters, and native writer epochs.
-
-A later provider may store those planes in separate physical files or services.
-For the next durable layout, use SQLite for metadata because it gives us
-transactions, indexes, constraints, crash recovery, and WAL management without
-inventing a small database. It must preserve the same data-before-metadata
-contract without making public block/native clients choose storage nodes or
-coordinate replicas.
+SQLite is the metadata publish boundary. Data-log files own large immutable
+segment payloads. The current local provider persists the deterministic
+metadata/catalog state as a SQLite blob, and separately stores indexed segment
+placement and data-log manifest rows so physical compaction does not need to
+inspect metadata leaves or native extents. Later phases may normalize more
+metadata tables if benchmarks or fault tests need direct SQLite queries, but
+they must not add a second production durable format beside this provider.
 
 ### Phase 18 Durable Format Decision
 
@@ -596,91 +595,19 @@ it. A tiny test-image wrapper remains only to exercise the crate-owned durable
 codec and atomic-write fault fixture; it is not a readable durable format or
 runtime provider.
 
-### Phase 20 Durable Journal Format
+### Partitioned Durable Data Logs
 
-The durable journal uses crate-owned codec rules: fixed big-endian integers,
-explicit enum tags, bounded collection and string lengths, deterministic
-`BTreeMap` ordering, duplicate-key rejection on decode, and trailing-byte
-rejection.
-
-Each journal record is:
-
-```text
-magic("TCOWJNL!"), version, record_kind, payload_len, payload, checksum64(payload)
-```
-
-Record kinds:
-
-- `SegmentData`: `segment_id` plus immutable segment bytes.
-- `CommitState`: the metadata image, storage-node catalog image, and segment
-  descriptor image that together define one replayable committed state.
-
-The v1 journal commit record carries the complete current state. That is
-intentional for simplicity and deterministic replay. It still removes the
-previous hot-path problem because flushed writes append records and sync one
-file instead of syncing one segment file plus several atomically renamed
-snapshots. Delta commit records are a later optimization only if benchmarks
-prove full commit records are the bottleneck.
-
-Replay scans complete records in order. An incomplete tail record is treated as
-a crash during append and ignored. A complete record with bad magic, unsupported
-version, unknown kind, malformed payload, checksum mismatch, or duplicate
-segment ID with conflicting bytes is corruption and prevents open. The last
-complete commit record wins. Segment records that are not referenced by that
-commit are orphan data and are not user-visible. A commit that references
-missing or checksum-mismatched segment bytes is rejected.
-
-Compaction is an explicit maintenance path. It writes the current live segment
-records plus one commit record to a temporary journal, syncs that file, renames
-it over `store.log`, syncs the parent directory, and reopens the append handle.
-This bounds replay time and physically drops old overwritten or custodian-freed
-segment records without affecting the write hot path. This is a
-correctness-first Phase 20 hook, not the long-term storage-node compaction
-strategy: it rewrites all currently live segment bytes for the durable store.
-
-The durable provider honors the public `WriteDurability` boundary. A successful
-`Acknowledged` block or native file write is committed to the live in-process
-mapping and visible to later reads, but may be lost across process crash until a
-later `flush`, a `Flushed` write, or another synchronous metadata operation
-persists the current state. A successful `Flushed` write has appended all newly
-referenced segment data records and the commit record, then synced the journal
-before the call returns. `flush` persists the current live state with the same
-ordered journal append and reports the latest committed sequence visible to the
-relevant device or native file as `durable_through`; it must not report a
-sequence whose commit record can reference segment bytes that are absent from
-replay.
-
-Synchronous metadata operations that do not carry a `WriteDurability` argument
--- create, checkpoint, fork, restore, delete, keyspace snapshot, and custodian
-operations -- persist before returning. Because the journal commit captures the
-current live state, those operations also flush any earlier acknowledged writes
-in the same store instance.
-
-### Future SQLite Metadata and Partitioned Durable Data Logs
-
-The scalable durable layout should store metadata in SQLite and segment payloads
-in partitioned data logs. SQLite owns transactional metadata, indexes, commit
-state, placement state, PITR, leases, and custodian evidence. Plain data-log
+The active durable layout stores transactional metadata in SQLite and segment
+payloads in partitioned data logs. SQLite owns the committed state image,
+placement state, data-log manifests, and publish transaction. Plain data-log
 files own large immutable segment bytes. This keeps compaction focused on
 selected data files instead of rewriting every live byte on a storage node.
 
-Target shape:
-
-```text
-store/
-  metadata.sqlite
-  metadata.sqlite-wal
-  metadata.sqlite-shm
-  data/
-    data-000001.log
-    data-000002.log
-    data-000003.log
-  tmp/
-```
-
-Data records live in rolled data-log files. Metadata commits, placement
-records, relocation records, write-intent state, append leases, PITR records,
-GC/custodian evidence, and data-log manifests live in SQLite tables.
+Data records live in rolled data-log files. The v1 SQLite schema has
+`current_state`, `segment_placements`, and `data_logs` tables. `current_state`
+contains the durable deterministic metadata/catalog image; `segment_placements`
+maps logical segments to current data-log records; `data_logs` tracks active,
+sealed, and deleted log files plus live/dead byte estimates.
 
 Committed segment placement becomes:
 
@@ -698,13 +625,29 @@ Durable write ordering:
 ```text
 append segment bytes to data log
 fsync data log
-SQLite transaction inserts placement and publishes metadata/root commit
+SQLite transaction inserts placement and publishes current_state
 commit SQLite transaction
 ```
 
 The SQLite transaction is the metadata publish boundary. It must not commit a
 metadata root that references data-log bytes that failed to reach the requested
 durability.
+
+The durable provider honors the public `WriteDurability` boundary. A successful
+`Acknowledged` block or native file write is committed to the live in-process
+mapping and visible to later reads, but may be lost across process crash until a
+later `flush`, a `Flushed` write, or another synchronous metadata operation
+persists the current state. A successful `Flushed` write has appended all newly
+referenced segment data records, synced their data logs, and committed the
+SQLite transaction before the call returns. `flush` persists the current live
+state with the same data-before-metadata ordering and reports the latest commit
+sequence visible to the relevant device or native file as `durable_through`.
+
+Synchronous metadata operations that do not carry a `WriteDurability` argument
+-- create, checkpoint, fork, restore, delete, keyspace snapshot, and custodian
+operations -- persist before returning. Because `current_state` captures the
+live deterministic state, those operations also flush any earlier acknowledged
+writes in the same store instance.
 
 Incremental data-log compaction:
 

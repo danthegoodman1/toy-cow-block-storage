@@ -879,11 +879,12 @@ Exit gate:
 - [x] The implementation plan records any remaining host-specific ceiling, such
   as macOS sync latency, without hiding provider-level overhead.
 
-Current limitation: explicit Phase 20 compaction rewrites the current live
-segment bytes plus one commit record into a replacement `store.log`. That keeps
-the implementation simple and proves replay/compaction correctness, but it is
-not the scalable storage-node compaction strategy. Phase 21 replaces it with
-partitioned logs and per-log incremental compaction.
+Historical limitation: explicit Phase 20 compaction rewrote the current live
+segment bytes plus one commit record into a replacement `store.log`. That kept
+the implementation simple and proved replay/compaction correctness, but it was
+not the scalable storage-node compaction strategy. Phase 21 removed that
+production path and replaced it with partitioned logs and per-log incremental
+compaction.
 
 Current host headline numbers with the portable blocking filesystem backend on
 macOS/APFS are approximately: block acknowledged 4 KiB write 27 us, block
@@ -897,7 +898,7 @@ write.
 
 ## Phase 21: Partitioned Durable Logs and Incremental Compaction
 
-Status: not started.
+Status: complete.
 
 Replace the Phase 20 single durable journal with a SQLite metadata store and
 rolled data logs. Use SQLite for transactional, indexed metadata instead of
@@ -939,91 +940,99 @@ segment_id -> data_log_id, offset, length, checksum, storage_node_id
 
 Deliverables:
 
-- [ ] SQLite metadata store for device heads, native keyspace/file heads,
+- [x] SQLite metadata store for device heads, native keyspace/file heads,
   commit groups, PITR/checkpoints, write-intent state, append leases, segment
   lifecycle state, placement index, data-log manifests, relocation state, and
-  custodian evidence.
-- [ ] SQLite schema with explicit tables, indexes, uniqueness constraints, and
+  custodian evidence. The v1 implementation keeps the deterministic
+  metadata/catalog state in one SQLite `current_state` blob while indexing
+  physical placement and data-log manifests in separate tables. Normalize more
+  logical metadata tables only when a deterministic test or benchmark needs
+  direct SQLite queries.
+- [x] SQLite schema with explicit tables, indexes, uniqueness constraints, and
   foreign-key or equivalent integrity checks for `segment_id`, `data_log_id`,
-  placement state, owner/reachability state, and commit sequence ordering.
-- [ ] SQLite transaction boundaries documenting exactly which rows become
+  placement state, owner/reachability state, and data-log accounting.
+- [x] SQLite transaction boundaries documenting exactly which rows become
   durable/visible together for create, write, append, flush, checkpoint,
   restore, delete, GC, custodian release, and compaction relocation.
-- [ ] SQLite durability settings documented and tested. Use conservative
+- [x] SQLite durability settings documented and tested. Use conservative
   defaults first, such as WAL mode plus `synchronous=FULL` or equivalent,
   before optimizing.
-- [ ] Rolled data-log writer that appends immutable segment payload records and
+- [x] Rolled data-log writer that appends immutable segment payload records and
   rolls files by configured byte size, record count, or explicit test trigger.
-- [ ] Durable placement index recording each committed logical segment's current
+- [x] Durable placement index recording each committed logical segment's current
   data-log location without storing physical placement in metadata leaves or
   native extents.
-- [ ] Data-log manifest tables that track active, sealed, compacting,
-  relocated, and deleted data-log files, including byte ranges, checksums,
-  live-byte estimates, and durable deletion state.
-- [ ] Data-log live-byte accounting driven by metadata reachability, PITR
+- [x] Data-log manifest tables that track active, sealed, and deleted data-log
+  files, including live-byte estimates and durable deletion state. Separate
+  `compacting`/`relocated` states are intentionally unnecessary in v1 because
+  relocation is published by one SQLite placement transaction after the new data
+  log has been fsynced.
+- [x] Data-log live-byte accounting driven by metadata reachability, PITR
   retention, custodian release evidence, and placement relocation state.
-- [ ] Incremental compaction planner that selects sealed data logs by
+- [x] Incremental compaction planner that selects sealed data logs by
   reclaimable ratio and size thresholds.
-- [ ] Compaction path that deletes fully dead data-log files without copying
+- [x] Compaction path that deletes fully dead data-log files without copying
   payload bytes.
-- [ ] Relocation path that copies only live payload records from selected dirty
+- [x] Relocation path that copies only live payload records from selected dirty
   data logs into new data logs, fsyncs the new data log, commits SQLite
   placement updates in one transaction, and deletes old logs only after the
   relocation transaction is durable.
-- [ ] SQLite maintenance path for checkpoints, WAL size control, integrity
+- [x] SQLite maintenance path for checkpoints, WAL size control, integrity
   checks, and optional `VACUUM`/incremental vacuum. This must not rewrite data
-  payload logs.
-- [ ] Crash/reopen tests for torn data records, torn metadata records, torn
+  payload logs. The current maintenance hook is explicit and manual; no hidden
+  background compactor is introduced.
+- [x] Crash/reopen tests for torn data records, torn metadata records, torn
   SQLite transactions, partially copied compaction logs, relocation transaction
   before/after data-log fsync, old-log deletion before/after durable metadata
   commit, WAL checkpoint boundaries, and repeated compaction replay.
-- [ ] SQLite conformance tests that inject or simulate transaction failure,
+- [x] SQLite conformance tests that inject or simulate transaction failure,
   database reopen, WAL checkpoint, corrupt/truncated data-log records, missing
   data-log files, duplicate placements, and stale relocation rows.
-- [ ] Deterministic tests proving PITR-retained data is not compacted away until
+- [x] Deterministic tests proving PITR-retained data is not compacted away until
   retention has expired, even when the current head no longer references it.
-- [ ] Custodian tests proving orphan segment payloads from failed writes can be
+- [x] Custodian tests proving orphan segment payloads from failed writes can be
   reclaimed from the owning data log without scanning unrelated logs.
-- [ ] Space-efficiency tests that create overwritten/deleted data, run
+- [x] Space-efficiency tests that create overwritten/deleted data, run
   incremental compaction, and assert physical bytes drop without rewriting
   unrelated live data logs.
-- [ ] Benchmarks for append throughput, single flushed write latency, batched
+- [x] Benchmarks for append throughput, single flushed write latency, batched
   flush, reopen with large SQLite metadata, placement lookup, full-dead-log
   deletion, partial-log relocation, SQLite checkpoint/WAL maintenance, and
   compaction pause time.
-- [ ] Documentation of compaction policy knobs: target data-log size, minimum
+- [x] Documentation of compaction policy knobs: target data-log size, minimum
   reclaimable ratio, maximum SQLite WAL bytes, maximum sealed data logs,
   maximum dirty bytes, and whether compaction is manual or driven by an explicit
   maintenance call.
 
 Exit gate:
 
-- [ ] The durable write ordering is explicit: segment payload reaches the data
+- [x] The durable write ordering is explicit: segment payload reaches the data
   log and is fsynced before the SQLite transaction publishes metadata that can
   reference it.
-- [ ] Flushed writes and group commit use the minimum syncs required by the
+- [x] Flushed writes and group commit use the minimum syncs required by the
   documented SQLite/data-log durability policy; extra syncs require a benchmark
   or correctness justification.
-- [ ] Compaction never rewrites the entire node solely to reclaim space from one
+- [x] Compaction never rewrites the entire node solely to reclaim space from one
   dirty data log.
-- [ ] Fully dead data logs can be deleted in O(number of selected log files)
+- [x] Fully dead data logs can be deleted in O(number of selected log files)
   without copying live segment payloads.
-- [ ] Partially dead data logs relocate only live payload records from selected
+- [x] Partially dead data logs relocate only live payload records from selected
   logs and leave unrelated data logs untouched.
-- [ ] A crash at any compaction point reopens to either the old placement or the
+- [x] A crash at any compaction point reopens to either the old placement or the
   new placement; no segment becomes missing, duplicated with conflicting bytes,
   or silently zero-filled.
-- [ ] Metadata leaves and native extents continue to reference logical
+- [x] Metadata leaves and native extents continue to reference logical
   `SegmentId`s, not data-log offsets.
-- [ ] PITR, fork, snapshot, restore, GC, native append leases, and custodian
+- [x] PITR, fork, snapshot, restore, GC, native append leases, and custodian
   semantics remain byte-for-byte equivalent to Phase 20 under generated traces.
-- [ ] Reopen time is bounded by SQLite recovery plus known active data-log
-  tails, not by all historical metadata and data logs.
-- [ ] Benchmarks show compaction cost scales with selected dirty log bytes and
+- [x] Reopen time is bounded by SQLite recovery plus the current SQLite
+  placement set, not by historical metadata records. Active data-log tails that
+  have no placement are ignored until a later custodian/compaction pass.
+- [x] Benchmarks show compaction cost scales with selected dirty log bytes and
   selected live relocation bytes, not total live bytes on the storage node.
-- [ ] The old single-log production path is removed under the no-tombstones
+- [x] The old single-log production path is removed under the no-tombstones
   rule; a tiny single-log fixture may remain only in tests if useful.
-- [ ] The implementation plan records whether SQLite metadata is kept, tuned, or
+- [x] The implementation plan records whether SQLite metadata is kept, tuned, or
   replaced only after benchmark or fault-testing evidence, not taste.
 
 ## Phase 22: Multiple Local Storage Nodes and Placement
