@@ -504,7 +504,7 @@ magic("TCOWWIRE"), version, frame_kind, payload
 
 Frame kinds distinguish block requests, block responses, native requests, and
 native responses. Payloads use the same explicit binary rules as the durable
-snapshot codec: fixed big-endian integers, explicit enum tags, bounded
+codec: fixed big-endian integers, explicit enum tags, bounded
 collections/strings, and strict rejection of malformed, oversized, mismatched,
 or trailing bytes. Server incarnation is inside the payload so stale clients and
 responses are rejected deterministically. The TCP layer is only a byte pipe; it
@@ -538,13 +538,15 @@ or placement domain. It may be memory-backed, file-backed, or remote later.
 replica placement, tracks checksums and write-complete state, and exposes
 deletion eligibility from that node's perspective.
 
-The storage-node file I/O engine is below both contracts. The durable provider
-should introduce this internal boundary with ordinary blocking filesystem calls
-and conservative file and directory syncs. A later Linux-only `io_uring` backend
-may optimize concurrent segment reads, writes, and batching behind the same
-boundary, but it must preserve the same temp-write, file-sync, atomic-rename,
-directory-sync, catalog-transition, and restart-recovery semantics and must fall
-back to the portable backend without changing public behavior.
+The storage-node byte I/O engine is below both contracts. Phase 20 removed the
+old file-per-segment durable backend from the production path; the active local
+durable provider writes segment bytes and commit state through an append
+journal, and Phase 21 replaces that with SQLite metadata plus rolled data logs.
+A later Linux-only `io_uring` backend should optimize the data-log append/read
+engine behind the same provider contracts, not resurrect a public
+file-per-segment API. It must preserve the same data-before-metadata ordering,
+sync, replay, catalog-transition, and restart-recovery semantics and must fall
+back to the portable data-log backend without changing public behavior.
 
 The local v1 implementation may keep both in memory, but the distinction matters:
 global metadata says which logical segment is referenced; local segment metadata
@@ -573,10 +575,12 @@ separate:
 - globally meaningful metadata heads, roots, timelines, checkpoints,
   write-intent counters, and native writer epochs.
 
-A later SQLite, RocksDB, split-log, or replicated provider may store those
-planes in separate physical files or services. It must preserve the same
-data-before-metadata contract without making public block/native clients choose
-storage nodes or coordinate replicas.
+A later provider may store those planes in separate physical files or services.
+For the next durable layout, use SQLite for metadata because it gives us
+transactions, indexes, constraints, crash recovery, and WAL management without
+inventing a small database. It must preserve the same data-before-metadata
+contract without making public block/native clients choose storage nodes or
+coordinate replicas.
 
 ### Phase 18 Durable Format Decision
 
@@ -587,15 +591,17 @@ performance-grade layout: fully flushed small writes were dominated by sync
 count, and batched flush still paid one payload sync per segment file.
 
 Phase 20 removes the snapshot production path instead of adding a second
-compatibility layer. The snapshot codec remains only as a deterministic test
-fixture for codec and fault-injection coverage.
+compatibility layer. The old file-per-segment durable backend was removed with
+it. A tiny test-image wrapper remains only to exercise the crate-owned durable
+codec and atomic-write fault fixture; it is not a readable durable format or
+runtime provider.
 
 ### Phase 20 Durable Journal Format
 
-The durable journal uses the same crate-owned codec rules as the snapshot
-fixture: fixed big-endian integers, explicit enum tags, bounded collection and
-string lengths, deterministic `BTreeMap` ordering, duplicate-key rejection on
-decode, and trailing-byte rejection.
+The durable journal uses crate-owned codec rules: fixed big-endian integers,
+explicit enum tags, bounded collection and string lengths, deterministic
+`BTreeMap` ordering, duplicate-key rejection on decode, and trailing-byte
+rejection.
 
 Each journal record is:
 
@@ -606,9 +612,8 @@ magic("TCOWJNL!"), version, record_kind, payload_len, payload, checksum64(payloa
 Record kinds:
 
 - `SegmentData`: `segment_id` plus immutable segment bytes.
-- `CommitState`: the metadata snapshot, storage-node catalog snapshot, and
-  segment descriptor snapshot that together define one replayable committed
-  state.
+- `CommitState`: the metadata image, storage-node catalog image, and segment
+  descriptor image that together define one replayable committed state.
 
 The v1 journal commit record carries the complete current state. That is
 intentional for simplicity and deterministic replay. It still removes the
@@ -629,7 +634,9 @@ Compaction is an explicit maintenance path. It writes the current live segment
 records plus one commit record to a temporary journal, syncs that file, renames
 it over `store.log`, syncs the parent directory, and reopens the append handle.
 This bounds replay time and physically drops old overwritten or custodian-freed
-segment records without affecting the write hot path.
+segment records without affecting the write hot path. This is a
+correctness-first Phase 20 hook, not the long-term storage-node compaction
+strategy: it rewrites all currently live segment bytes for the durable store.
 
 The durable provider honors the public `WriteDurability` boundary. A successful
 `Acknowledged` block or native file write is committed to the live in-process
@@ -648,6 +655,127 @@ Synchronous metadata operations that do not carry a `WriteDurability` argument
 operations -- persist before returning. Because the journal commit captures the
 current live state, those operations also flush any earlier acknowledged writes
 in the same store instance.
+
+### Future SQLite Metadata and Partitioned Durable Data Logs
+
+The scalable durable layout should store metadata in SQLite and segment payloads
+in partitioned data logs. SQLite owns transactional metadata, indexes, commit
+state, placement state, PITR, leases, and custodian evidence. Plain data-log
+files own large immutable segment bytes. This keeps compaction focused on
+selected data files instead of rewriting every live byte on a storage node.
+
+Target shape:
+
+```text
+store/
+  metadata.sqlite
+  metadata.sqlite-wal
+  metadata.sqlite-shm
+  data/
+    data-000001.log
+    data-000002.log
+    data-000003.log
+  tmp/
+```
+
+Data records live in rolled data-log files. Metadata commits, placement
+records, relocation records, write-intent state, append leases, PITR records,
+GC/custodian evidence, and data-log manifests live in SQLite tables.
+
+Committed segment placement becomes:
+
+```text
+segment_id -> storage_node_id, data_log_id, offset, length, checksum
+```
+
+Metadata leaves and native file extents still reference only logical
+`SegmentId`s. The placement index resolves `SegmentId` to the current physical
+data-log location. A relocation changes placement records, not user-visible
+metadata roots.
+
+Durable write ordering:
+
+```text
+append segment bytes to data log
+fsync data log
+SQLite transaction inserts placement and publishes metadata/root commit
+commit SQLite transaction
+```
+
+The SQLite transaction is the metadata publish boundary. It must not commit a
+metadata root that references data-log bytes that failed to reach the requested
+durability.
+
+Incremental data-log compaction:
+
+1. Compute live bytes per sealed data log from reachable metadata, PITR
+   retention, and placement records.
+2. Delete a sealed data log immediately when it has no live segment payloads.
+3. For a dirty log with enough dead space, copy only its live payload records
+   into a new data log.
+4. Fsync the new data log.
+5. Commit a SQLite transaction that updates placements and relocation state.
+6. Delete the old data log only after the SQLite transaction is durable.
+
+This makes compaction cost proportional to selected dirty log bytes and selected
+live relocated payloads. It must not be proportional to total live bytes on the
+storage node.
+
+SQLite maintenance is separate from data compaction. WAL checkpointing,
+integrity checks, and optional vacuum/incremental vacuum manage metadata file
+growth. Metadata maintenance must not rewrite data payload logs.
+
+PITR and GC are part of the live-byte decision. A segment no longer reachable
+from the current head may still be live because a retained checkpoint, restore
+point, fork, or keyspace snapshot can reach it. Physical payload deletion is
+allowed only after reachability and retention say the logical segment is no
+longer needed.
+
+### Future Multi-Storage-Node Placement
+
+After partitioned logs exist, the local provider should support multiple
+storage-node endpoints in one process with exactly one committed replica per
+logical segment. This proves the important placement boundary without adding
+quorum behavior, repair, or remote failure modes, and avoids multiplying a
+known whole-node compaction problem.
+
+Placement is per segment:
+
+```text
+metadata leaf / file extent -> logical segment_id
+placement index             -> segment_id -> storage_node_id + local placement
+storage node catalog        -> segment_id -> local lifecycle state
+```
+
+A block device or native file is not assigned to one storage node. Different
+ranges of the same device or file may resolve to different segment placements.
+Keeping an append-heavy file colocated on one node is a placement-policy choice,
+not a metadata invariant and not a public API promise.
+
+The local multi-node write path is:
+
+1. Choose one storage node for each new logical segment through a deterministic
+   `PlacementPolicy`.
+2. Reserve that segment in the chosen node's `LocalSegmentCatalog`.
+3. Write and sync bytes through that node's `SegmentStore`.
+4. Commit the local placement as durable-pending-metadata.
+5. Publish metadata that references only the logical `SegmentId`.
+6. Mark the chosen node's local placement referenced after metadata publish.
+
+The read path resolves each logical segment through the placement index, then
+reads from that node's segment store. A single public read may fan into multiple
+storage-node reads when the logical range spans segments on different nodes.
+
+Durable replay must restore the storage-node registry, placement index,
+per-node catalogs, and per-node segment bytes. A committed metadata reference to
+a segment with no committed placement, multiple conflicting one-replica
+placements, or missing/corrupt bytes is a provider error. It must not be treated
+as a sparse zero range.
+
+The metadata custodian still owns reachability. It emits release evidence keyed
+by logical segment and placement; storage-node custodians apply only evidence
+for their own node. Storage nodes must not crawl metadata trees or infer
+deletion from current heads.
 
 ### Future Storage Replication
 
@@ -674,14 +802,15 @@ than the desired background replica count but enough for the requested
 durability, repair can add missing replicas later without changing the public
 block or native API.
 
-Replicated storage also needs a durable release-evidence boundary between the
-metadata custodian and storage-node custodians. The local v1 implementation may
-return released segment IDs in process, but a remote implementation must persist
-release records by safe reachability epoch and let storage nodes consume them
-idempotently. Storage nodes must not crawl metadata trees or infer deletion from
-current heads. They apply metadata-produced release evidence to their local
-replica catalogs, free matching physical bytes, and record progress so missed,
-duplicated, delayed, or reordered release notifications can be reconciled.
+Replicated storage also needs durable reference/release evidence between the
+metadata custodian and storage-node custodians. The pragmatic local durable
+shape should use SQLite outbox tables keyed by safe commit/reachability epoch
+and per-storage-node apply cursor tables. External queues or custom evidence
+logs are later adapters only if remote deployment or benchmarks require them.
+Storage nodes must not crawl metadata trees or infer deletion from current
+heads. They apply metadata-produced evidence to their local replica catalogs,
+free matching physical bytes, and record cursor progress so missed, duplicated,
+delayed, or reordered notifications can be reconciled.
 
 ### Local V1 Boundaries That Must Become Real
 
@@ -711,14 +840,24 @@ not become permanent shortcuts:
   reconciliation so `DurablePendingMetadata` replicas become referenced after
   missed notifications or restarts.
 - Segment release evidence is returned as an in-process vector in v1. Replicated
-  storage needs durable release logs or per-node release queues with replay
-  cursors.
-- Placement is one local storage endpoint in v1. Replication needs storage-node
-  identity, capacity and failure-domain policy, replica-set selection, and stale
-  placement tests.
-- Repair is only a design hook in v1. Replication needs repair queues/cursors,
-  idempotent copy, source selection, checksum validation, and tests proving
-  repair never exposes uncommitted data.
+  storage should first use SQLite outbox/apply-cursor tables for release and
+  reference evidence; custom durable logs or external queues need specific
+  remote-deployment or benchmark evidence.
+- Durable compaction is one local append log in Phase 20. The SQLite metadata
+  plus partitioned-data-log phase needs placement tables, relocation
+  transactions, data-log manifests, and incremental compaction tests before
+  multi-node placement spreads the same problem across nodes.
+- Placement is one local storage endpoint in v1. The multi-node placement phase
+  needs storage-node registry state, deterministic one-replica placement,
+  per-node catalog routing, and stale placement tests before replication adds
+  replica sets.
+- Replication builds on multi-node placement. It needs capacity and
+  failure-domain policy, replica-set selection, quorum durability, and stale
+  replica-placement tests.
+- Repair is only a design hook in v1. Replication should first use SQLite repair
+  job and cursor tables for idempotent copy, source selection, checksum
+  validation, and restart; custom repair queues need specific remote-deployment
+  or benchmark evidence.
 - PITR retention is deterministic commit-age policy in v1. Durable providers may
   add richer per-owner policies, but expiration must still be driven by injected
   logical time or commit epochs, not hidden wall-clock reads.
@@ -1179,11 +1318,13 @@ PITR roots.
 
 In the local in-process implementation, that evidence can be a deterministic
 list of released segment IDs returned by the metadata sweep. In a remote or
-replicated implementation, the same concept must become a durable release log or
-per-storage-node release queue keyed by safe reachability epoch. Consumers must
-be able to replay from a cursor, tolerate duplicate records, and reconcile
-missed release events without asking storage nodes to interpret global metadata
-reachability themselves.
+replicated implementation, the same concept should first become SQLite-backed
+outbox rows keyed by safe reachability epoch plus per-storage-node apply
+cursors. Consumers must be able to replay from a cursor, tolerate duplicate
+records, and reconcile missed release events without asking storage nodes to
+interpret global metadata reachability themselves. Custom logs or external
+queues are later adapters only when remote deployment or benchmarks justify
+them.
 
 ### Storage-Node Custodian
 
@@ -1263,6 +1404,17 @@ Provider and service boundaries:
 - `SegmentStore`: write and read immutable segment bytes.
 - `LocalSegmentCatalog`: per-storage-node replica placement and local segment
   state.
+- `PartitionedDataLogStore`: durable manager for rolled segment payload logs,
+  manifests, checksums, and replay of data-log tails.
+- `SqliteMetadataStore`: durable metadata provider for roots, commits,
+  placement index, lifecycle state, PITR, leases, manifests, and custodian
+  evidence.
+- `CompactionPlanner`: deterministic maintenance policy that selects sealed
+  data logs for deletion or live-payload relocation.
+- `StorageNodeRegistry`: internal provider map from `StorageNodeId` to the
+  segment store and local catalog for that node.
+- `PlacementPolicy`: deterministic internal policy that chooses storage node
+  placement for new logical segments without exposing node choice to clients.
 - `MetadataCustodian`: global metadata and segment-reference reachability.
 - `StorageNodeCustodian`: local reservation, orphan, release, and free
   reconciliation.

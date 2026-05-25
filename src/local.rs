@@ -139,32 +139,32 @@ impl LocalObjectStore {
         })
     }
 
-    fn from_snapshot(snapshot: DurableStoreSnapshot) -> Result<Self> {
-        snapshot.config.validate()?;
+    fn from_state_image(image: DurableStoreImage) -> Result<Self> {
+        image.config.validate()?;
         Ok(Self {
             metadata: Arc::new(InMemoryMetadataPlane::from_inner(
-                snapshot.config,
-                snapshot.metadata,
+                image.config,
+                image.metadata,
             )?),
             segment_store: Arc::new(InMemorySegmentStore::from_inner(
-                snapshot.config,
-                snapshot.segment_store,
+                image.config,
+                image.segment_store,
             )?),
             segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::from_inner(
-                snapshot.config,
-                snapshot.segment_catalog,
+                image.config,
+                image.segment_catalog,
             )?),
-            next_write_intent: Arc::new(Mutex::new(snapshot.next_write_intent)),
-            next_extent_id: Arc::new(Mutex::new(snapshot.next_extent_id)),
+            next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
+            next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
         })
     }
 
-    fn snapshot(&self) -> Result<DurableStoreSnapshot> {
-        Ok(DurableStoreSnapshot {
+    fn state_image(&self) -> Result<DurableStoreImage> {
+        Ok(DurableStoreImage {
             config: self.metadata.config,
-            metadata: self.metadata.snapshot_inner()?,
-            segment_store: self.segment_store.snapshot_inner()?,
-            segment_catalog: self.segment_catalog.snapshot_inner()?,
+            metadata: self.metadata.state_inner()?,
+            segment_store: self.segment_store.state_inner()?,
+            segment_catalog: self.segment_catalog.state_inner()?,
             next_write_intent: *lock(&self.next_write_intent)?,
             next_extent_id: *lock(&self.next_extent_id)?,
         })
@@ -1260,207 +1260,6 @@ impl Default for LocalObjectStore {
     }
 }
 
-/// Internal storage-node file I/O boundary used by durable segment providers.
-///
-/// This sits below `SegmentStore` and `LocalSegmentCatalog`; changing the file
-/// I/O engine must not change block, native, metadata, PITR, or GC semantics.
-pub trait SegmentFileIo: Send + Sync {
-    /// Return whether the final immutable segment file exists on this storage
-    /// node.
-    ///
-    /// Success does not make the file durable by itself; it is only an
-    /// existence probe. Implementations must surface real metadata/read errors
-    /// instead of treating them as absence.
-    fn segment_file_exists(&self, segment_id: SegmentId) -> Result<bool>;
-
-    /// Write or replace the temporary segment payload.
-    ///
-    /// Success makes the temp path visible to this I/O implementation, but not
-    /// durable or readable as a final segment.
-    fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()>;
-
-    /// Flush the temporary segment payload before rename.
-    ///
-    /// Success means the temp file contents have been asked to reach stable
-    /// storage according to the backend's local durability mechanism.
-    fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()>;
-
-    /// Atomically move the synced temp payload to its final immutable path.
-    ///
-    /// Success may make the segment readable, but callers must still sync the
-    /// containing directory before catalog state can claim durable visibility.
-    fn rename_temp_to_final(&self, segment_id: SegmentId) -> Result<()>;
-
-    /// Flush final-path directory metadata after a rename or delete.
-    ///
-    /// Success is the storage-node boundary after which catalog metadata may
-    /// reference or forget the final file path.
-    fn sync_segment_dir(&self) -> Result<()>;
-
-    /// Read immutable final segment bytes.
-    ///
-    /// Missing, partial, or unreadable final files must be reported as errors.
-    fn read_segment_file(&self, segment_id: SegmentId) -> Result<Vec<u8>>;
-
-    /// Remove a final segment file and sync the containing directory.
-    ///
-    /// Success means the local storage node has durable deletion evidence for
-    /// that final path. Missing files are treated as already deleted.
-    fn delete_segment_file(&self, segment_id: SegmentId) -> Result<()>;
-
-    /// Remove temporary payloads that were never promoted to final files.
-    ///
-    /// Success means temp cleanup itself has been durably reflected in the temp
-    /// directory.
-    fn cleanup_tmp(&self) -> Result<()>;
-}
-
-/// Portable blocking filesystem implementation of `SegmentFileIo`.
-#[derive(Debug, Clone)]
-pub struct PortableSegmentFileIo {
-    segments_dir: PathBuf,
-    tmp_dir: PathBuf,
-}
-
-impl PortableSegmentFileIo {
-    pub fn new(node_dir: impl AsRef<Path>) -> Result<Self> {
-        let node_dir = node_dir.as_ref();
-        let segments_dir = node_dir.join("segments");
-        let tmp_dir = node_dir.join("tmp");
-        fs::create_dir_all(&segments_dir).map_err(fs_error)?;
-        fs::create_dir_all(&tmp_dir).map_err(fs_error)?;
-        Ok(Self {
-            segments_dir,
-            tmp_dir,
-        })
-    }
-
-    fn segment_path(&self, segment_id: SegmentId) -> PathBuf {
-        self.segments_dir
-            .join(format!("{:032x}.seg", segment_id.raw()))
-    }
-
-    fn tmp_path(&self, segment_id: SegmentId) -> PathBuf {
-        self.tmp_dir
-            .join(format!("{:032x}.partial", segment_id.raw()))
-    }
-
-    pub fn write_synced_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
-        write_synced_segment_with_io(self, segment_id, bytes)
-    }
-
-    pub fn write_synced_segments<'a>(
-        &self,
-        segments: impl IntoIterator<Item = (SegmentId, &'a [u8])>,
-    ) -> Result<()> {
-        write_synced_segments_with_io(self, segments)
-    }
-}
-
-fn write_synced_segment_with_io(
-    io: &dyn SegmentFileIo,
-    segment_id: SegmentId,
-    bytes: &[u8],
-) -> Result<()> {
-    write_synced_segments_with_io(io, [(segment_id, bytes)])
-}
-
-fn write_synced_segments_with_io<'a>(
-    io: &dyn SegmentFileIo,
-    segments: impl IntoIterator<Item = (SegmentId, &'a [u8])>,
-) -> Result<()> {
-    let mut renamed = false;
-    let mut pending_renames = Vec::new();
-    for (segment_id, bytes) in segments {
-        if io.segment_file_exists(segment_id)? {
-            let existing = io.read_segment_file(segment_id)?;
-            if existing == bytes {
-                continue;
-            } else {
-                return Err(StorageError::conflict(
-                    "durable segment file already exists with different bytes",
-                ));
-            }
-        }
-        io.write_temp_segment(segment_id, bytes)?;
-        io.sync_temp_segment(segment_id)?;
-        pending_renames.push(segment_id);
-    }
-
-    for segment_id in pending_renames {
-        io.rename_temp_to_final(segment_id)?;
-        renamed = true;
-    }
-    if renamed {
-        io.sync_segment_dir()?;
-    }
-    Ok(())
-}
-
-impl SegmentFileIo for PortableSegmentFileIo {
-    fn segment_file_exists(&self, segment_id: SegmentId) -> Result<bool> {
-        match fs::metadata(self.segment_path(segment_id)) {
-            Ok(metadata) => Ok(metadata.is_file()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(fs_error(error)),
-        }
-    }
-
-    fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
-        fs::create_dir_all(&self.tmp_dir).map_err(fs_error)?;
-        let mut file = File::create(self.tmp_path(segment_id)).map_err(fs_error)?;
-        file.write_all(bytes).map_err(fs_error)?;
-        Ok(())
-    }
-
-    fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()> {
-        File::open(self.tmp_path(segment_id))
-            .map_err(fs_error)?
-            .sync_data()
-            .map_err(fs_error)
-    }
-
-    fn rename_temp_to_final(&self, segment_id: SegmentId) -> Result<()> {
-        fs::create_dir_all(&self.segments_dir).map_err(fs_error)?;
-        fs::rename(self.tmp_path(segment_id), self.segment_path(segment_id)).map_err(fs_error)
-    }
-
-    fn sync_segment_dir(&self) -> Result<()> {
-        File::open(&self.segments_dir)
-            .map_err(fs_error)?
-            .sync_all()
-            .map_err(fs_error)
-    }
-
-    fn read_segment_file(&self, segment_id: SegmentId) -> Result<Vec<u8>> {
-        fs::read(self.segment_path(segment_id)).map_err(fs_error)
-    }
-
-    fn delete_segment_file(&self, segment_id: SegmentId) -> Result<()> {
-        let path = self.segment_path(segment_id);
-        match fs::remove_file(path) {
-            Ok(()) => self.sync_segment_dir(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(fs_error(error)),
-        }
-    }
-
-    fn cleanup_tmp(&self) -> Result<()> {
-        fs::create_dir_all(&self.tmp_dir).map_err(fs_error)?;
-        for entry in fs::read_dir(&self.tmp_dir).map_err(fs_error)? {
-            let entry = entry.map_err(fs_error)?;
-            let file_type = entry.file_type().map_err(fs_error)?;
-            if file_type.is_file() {
-                fs::remove_file(entry.path()).map_err(fs_error)?;
-            }
-        }
-        File::open(&self.tmp_dir)
-            .map_err(fs_error)?
-            .sync_all()
-            .map_err(fs_error)
-    }
-}
-
 #[derive(Debug, Clone)]
 struct DurableStorePaths {
     journal: PathBuf,
@@ -1570,7 +1369,7 @@ impl DurableObjectStore {
         let local = Self::load_local_store_from_journal(&paths.journal, config)?
             .unwrap_or(LocalObjectStore::with_config(config)?);
         let persisted_segments = local
-            .snapshot()?
+            .state_image()?
             .segment_store
             .segments
             .keys()
@@ -1776,8 +1575,8 @@ impl DurableObjectStore {
 
     pub fn compact_journal(&self) -> Result<()> {
         let _persist_guard = lock(&self.persist_lock)?;
-        let snapshot = self.local.snapshot()?;
-        let (records, kept_segments) = Self::records_for_snapshot(&snapshot, &BTreeSet::new());
+        let image = self.local.state_image()?;
+        let (records, kept_segments) = Self::records_for_state_image(&image, &BTreeSet::new());
         self.journal.rewrite_synced(&records)?;
         *lock(&self.persisted_segments)? = kept_segments;
         Ok(())
@@ -1851,8 +1650,8 @@ impl DurableObjectStore {
             );
         }
 
-        Ok(Some(LocalObjectStore::from_snapshot(
-            DurableStoreSnapshot {
+        Ok(Some(LocalObjectStore::from_state_image(
+            DurableStoreImage {
                 config: commit.metadata.config,
                 metadata: commit.metadata.metadata,
                 segment_store: SegmentStoreInner {
@@ -1868,22 +1667,22 @@ impl DurableObjectStore {
 
     fn persist(&self) -> Result<()> {
         let _persist_guard = lock(&self.persist_lock)?;
-        let snapshot = self.local.snapshot()?;
+        let image = self.local.state_image()?;
         let persisted_segments = lock(&self.persisted_segments)?;
-        let (records, kept_segments) = Self::records_for_snapshot(&snapshot, &persisted_segments);
+        let (records, kept_segments) = Self::records_for_state_image(&image, &persisted_segments);
         drop(persisted_segments);
         self.journal.append_synced(&records)?;
         *lock(&self.persisted_segments)? = kept_segments;
         Ok(())
     }
 
-    fn records_for_snapshot(
-        snapshot: &DurableStoreSnapshot,
+    fn records_for_state_image(
+        image: &DurableStoreImage,
         persisted_segments: &BTreeSet<SegmentId>,
     ) -> (Vec<DurableLogRecord>, BTreeSet<SegmentId>) {
-        let kept_segments: BTreeSet<_> = snapshot.segment_store.segments.keys().copied().collect();
+        let kept_segments: BTreeSet<_> = image.segment_store.segments.keys().copied().collect();
         let mut records = Vec::new();
-        for (segment_id, record) in &snapshot.segment_store.segments {
+        for (segment_id, record) in &image.segment_store.segments {
             if !persisted_segments.contains(segment_id) {
                 records.push(DurableLogRecord::SegmentData(DurableLogSegmentData {
                     segment_id: *segment_id,
@@ -1892,20 +1691,20 @@ impl DurableObjectStore {
             }
         }
         records.push(DurableLogRecord::CommitState(Box::new(DurableLogCommit {
-            metadata: DurableMetadataSnapshot {
-                config: snapshot.config,
-                metadata: snapshot.metadata.clone(),
-                next_write_intent: snapshot.next_write_intent,
-                next_extent_id: snapshot.next_extent_id,
+            metadata: DurableMetadataImage {
+                config: image.config,
+                metadata: image.metadata.clone(),
+                next_write_intent: image.next_write_intent,
+                next_extent_id: image.next_extent_id,
             },
-            catalog: DurableCatalogSnapshot {
-                config: snapshot.config,
-                catalog: snapshot.segment_catalog.clone(),
+            catalog: DurableCatalogImage {
+                config: image.config,
+                catalog: image.segment_catalog.clone(),
             },
-            segment_store: DurableSegmentStoreSnapshot {
-                config: snapshot.config,
-                next_offset: snapshot.segment_store.next_offset,
-                records: snapshot
+            segment_store: DurableSegmentStoreImage {
+                config: image.config,
+                next_offset: image.segment_store.next_offset,
+                records: image
                     .segment_store
                     .segments
                     .iter()
@@ -1988,7 +1787,7 @@ pub struct StorageNodeCustodianReport {
 }
 
 #[derive(Debug, Clone)]
-struct DurableStoreSnapshot {
+struct DurableStoreImage {
     config: LocalStoreConfig,
     metadata: MetadataInner,
     segment_store: SegmentStoreInner,
@@ -1998,7 +1797,7 @@ struct DurableStoreSnapshot {
 }
 
 #[derive(Debug, Clone)]
-struct DurableSegmentStoreSnapshot {
+struct DurableSegmentStoreImage {
     config: LocalStoreConfig,
     next_offset: u64,
     records: BTreeMap<SegmentId, DurableSegmentRecord>,
@@ -2011,7 +1810,7 @@ struct DurableSegmentRecord {
 }
 
 #[derive(Debug, Clone)]
-struct DurableMetadataSnapshot {
+struct DurableMetadataImage {
     config: LocalStoreConfig,
     metadata: MetadataInner,
     next_write_intent: u128,
@@ -2019,7 +1818,7 @@ struct DurableMetadataSnapshot {
 }
 
 #[derive(Debug, Clone)]
-struct DurableCatalogSnapshot {
+struct DurableCatalogImage {
     config: LocalStoreConfig,
     catalog: CatalogInner,
 }
@@ -2032,9 +1831,9 @@ struct DurableLogSegmentData {
 
 #[derive(Debug, Clone)]
 struct DurableLogCommit {
-    metadata: DurableMetadataSnapshot,
-    catalog: DurableCatalogSnapshot,
-    segment_store: DurableSegmentStoreSnapshot,
+    metadata: DurableMetadataImage,
+    catalog: DurableCatalogImage,
+    segment_store: DurableSegmentStoreImage,
 }
 
 #[derive(Debug, Clone)]
@@ -2242,7 +2041,7 @@ impl InMemoryMetadataPlane {
         })
     }
 
-    fn snapshot_inner(&self) -> Result<MetadataInner> {
+    fn state_inner(&self) -> Result<MetadataInner> {
         Ok(lock(&self.inner)?.clone())
     }
 
@@ -4391,7 +4190,7 @@ impl InMemorySegmentStore {
         })
     }
 
-    fn snapshot_inner(&self) -> Result<SegmentStoreInner> {
+    fn state_inner(&self) -> Result<SegmentStoreInner> {
         Ok(lock(&self.inner)?.clone())
     }
 
@@ -4583,7 +4382,7 @@ impl InMemoryLocalSegmentCatalog {
         })
     }
 
-    fn snapshot_inner(&self) -> Result<CatalogInner> {
+    fn state_inner(&self) -> Result<CatalogInner> {
         Ok(lock(&self.inner)?.clone())
     }
 
@@ -5648,7 +5447,10 @@ impl RemoteWireTransport for RemoteBlockEndpoint {
     }
 }
 
-/// Serialized block transport over a deterministic remote endpoint.
+/// Phase 17 serialized block transport over a deterministic remote endpoint.
+///
+/// This deliberately remains an in-process test/model transport. The Phase 19
+/// TCP path uses `NetworkBlockTransport` and the crate-owned network codec.
 #[derive(Clone)]
 pub struct RemoteBlockTransport {
     wire: Arc<dyn RemoteWireTransport>,
@@ -5840,7 +5642,10 @@ impl RemoteWireTransport for RemoteNativeEndpoint {
     }
 }
 
-/// Serialized native transport over a deterministic remote endpoint.
+/// Phase 17 serialized native transport over a deterministic remote endpoint.
+///
+/// This deliberately remains an in-process test/model transport. The Phase 19
+/// TCP path uses `NetworkNativeTransport` and the crate-owned network codec.
 #[derive(Clone)]
 pub struct RemoteNativeTransport {
     wire: Arc<dyn RemoteWireTransport>,
@@ -7090,15 +6895,15 @@ fn durable_codec_error(reason: impl Into<String>) -> StorageError {
 }
 
 #[cfg(test)]
-const DURABLE_SNAPSHOT_MAGIC: &[u8; 8] = b"TCOWSNAP";
+const DURABLE_TEST_IMAGE_MAGIC: &[u8; 8] = b"TCOWIMG!";
 #[cfg(test)]
-const DURABLE_SNAPSHOT_VERSION: u16 = 1;
+const DURABLE_TEST_IMAGE_VERSION: u16 = 1;
 #[cfg(test)]
-const DURABLE_SNAPSHOT_METADATA: u8 = 1;
+const DURABLE_TEST_IMAGE_METADATA: u8 = 1;
 #[cfg(test)]
-const DURABLE_SNAPSHOT_CATALOG: u8 = 2;
+const DURABLE_TEST_IMAGE_CATALOG: u8 = 2;
 #[cfg(test)]
-const DURABLE_SNAPSHOT_SEGMENT_STORE: u8 = 3;
+const DURABLE_TEST_IMAGE_SEGMENT_STORE: u8 = 3;
 const DURABLE_LOG_MAGIC: &[u8; 8] = b"TCOWJNL!";
 const DURABLE_LOG_VERSION: u16 = 1;
 const DURABLE_LOG_SEGMENT_DATA: u8 = 1;
@@ -7114,8 +6919,8 @@ trait DurableCodec: Sized {
 }
 
 #[cfg(test)]
-trait DurableSnapshotCodec: DurableCodec {
-    const SNAPSHOT_KIND: u8;
+trait DurableTestImageCodec: DurableCodec {
+    const IMAGE_KIND: u8;
 }
 
 #[derive(Debug, Default)]
@@ -7127,8 +6932,8 @@ impl DurableEncoder {
     #[cfg(test)]
     fn new(kind: u8) -> Self {
         let mut encoder = Self { bytes: Vec::new() };
-        encoder.bytes.extend_from_slice(DURABLE_SNAPSHOT_MAGIC);
-        encoder.put_u16(DURABLE_SNAPSHOT_VERSION);
+        encoder.bytes.extend_from_slice(DURABLE_TEST_IMAGE_MAGIC);
+        encoder.put_u16(DURABLE_TEST_IMAGE_VERSION);
         encoder.put_u8(kind);
         encoder
     }
@@ -7167,17 +6972,17 @@ impl<'a> DurableDecoder<'a> {
     #[cfg(test)]
     fn new(bytes: &'a [u8], expected_kind: u8) -> Result<Self> {
         let mut decoder = Self { bytes, offset: 0 };
-        let magic = decoder.take(DURABLE_SNAPSHOT_MAGIC.len())?;
-        if magic != DURABLE_SNAPSHOT_MAGIC {
-            return Err(durable_codec_error("bad snapshot magic"));
+        let magic = decoder.take(DURABLE_TEST_IMAGE_MAGIC.len())?;
+        if magic != DURABLE_TEST_IMAGE_MAGIC {
+            return Err(durable_codec_error("bad test image magic"));
         }
         let version = decoder.u16()?;
-        if version != DURABLE_SNAPSHOT_VERSION {
-            return Err(durable_codec_error("unsupported snapshot version"));
+        if version != DURABLE_TEST_IMAGE_VERSION {
+            return Err(durable_codec_error("unsupported test image version"));
         }
         let kind = decoder.u8()?;
         if kind != expected_kind {
-            return Err(durable_codec_error("snapshot kind mismatch"));
+            return Err(durable_codec_error("test image kind mismatch"));
         }
         Ok(decoder)
     }
@@ -7186,7 +6991,7 @@ impl<'a> DurableDecoder<'a> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
-            Err(durable_codec_error("trailing bytes in snapshot"))
+            Err(durable_codec_error("trailing bytes in durable buffer"))
         }
     }
 
@@ -7194,9 +6999,9 @@ impl<'a> DurableDecoder<'a> {
         let end = self
             .offset
             .checked_add(len)
-            .ok_or_else(|| durable_codec_error("snapshot offset overflow"))?;
+            .ok_or_else(|| durable_codec_error("durable buffer offset overflow"))?;
         if end > self.bytes.len() {
-            return Err(durable_codec_error("unexpected end of snapshot"));
+            return Err(durable_codec_error("unexpected end of durable buffer"));
         }
         let out = &self.bytes[self.offset..end];
         self.offset = end;
@@ -7207,7 +7012,7 @@ impl<'a> DurableDecoder<'a> {
         Ok(*self
             .take(1)?
             .first()
-            .ok_or_else(|| durable_codec_error("unexpected end of snapshot"))?)
+            .ok_or_else(|| durable_codec_error("unexpected end of durable buffer"))?)
     }
 
     fn u16(&mut self) -> Result<u16> {
@@ -8167,7 +7972,7 @@ impl DurableCodec for DurableSegmentRecord {
     }
 }
 
-impl DurableCodec for DurableSegmentStoreSnapshot {
+impl DurableCodec for DurableSegmentStoreImage {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.config.encode(out)?;
         self.next_offset.encode(out)?;
@@ -8184,11 +7989,11 @@ impl DurableCodec for DurableSegmentStoreSnapshot {
 }
 
 #[cfg(test)]
-impl DurableSnapshotCodec for DurableSegmentStoreSnapshot {
-    const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_SEGMENT_STORE;
+impl DurableTestImageCodec for DurableSegmentStoreImage {
+    const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_SEGMENT_STORE;
 }
 
-impl DurableCodec for DurableCatalogSnapshot {
+impl DurableCodec for DurableCatalogImage {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.config.encode(out)?;
         self.catalog.encode(out)
@@ -8203,8 +8008,8 @@ impl DurableCodec for DurableCatalogSnapshot {
 }
 
 #[cfg(test)]
-impl DurableSnapshotCodec for DurableCatalogSnapshot {
-    const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_CATALOG;
+impl DurableTestImageCodec for DurableCatalogImage {
+    const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_CATALOG;
 }
 
 impl DurableCodec for MetadataInner {
@@ -8271,7 +8076,7 @@ impl DurableCodec for MetadataInner {
     }
 }
 
-impl DurableCodec for DurableMetadataSnapshot {
+impl DurableCodec for DurableMetadataImage {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.config.encode(out)?;
         self.metadata.encode(out)?;
@@ -8290,8 +8095,8 @@ impl DurableCodec for DurableMetadataSnapshot {
 }
 
 #[cfg(test)]
-impl DurableSnapshotCodec for DurableMetadataSnapshot {
-    const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_METADATA;
+impl DurableTestImageCodec for DurableMetadataImage {
+    const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_METADATA;
 }
 
 impl DurableCodec for DurableLogSegmentData {
@@ -8317,9 +8122,9 @@ impl DurableCodec for DurableLogCommit {
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
         Ok(Self {
-            metadata: DurableMetadataSnapshot::decode(input)?,
-            catalog: DurableCatalogSnapshot::decode(input)?,
-            segment_store: DurableSegmentStoreSnapshot::decode(input)?,
+            metadata: DurableMetadataImage::decode(input)?,
+            catalog: DurableCatalogImage::decode(input)?,
+            segment_store: DurableSegmentStoreImage::decode(input)?,
         })
     }
 }
@@ -9147,15 +8952,15 @@ impl<T: DurableCodec> DurableCodec for RemoteWireReply<T> {
 }
 
 #[cfg(test)]
-fn encode_snapshot<T: DurableSnapshotCodec>(value: &T) -> Result<Vec<u8>> {
-    let mut out = DurableEncoder::new(T::SNAPSHOT_KIND);
+fn encode_test_image<T: DurableTestImageCodec>(value: &T) -> Result<Vec<u8>> {
+    let mut out = DurableEncoder::new(T::IMAGE_KIND);
     value.encode(&mut out)?;
     Ok(out.finish())
 }
 
 #[cfg(test)]
-fn decode_snapshot<T: DurableSnapshotCodec>(bytes: &[u8]) -> Result<T> {
-    let mut input = DurableDecoder::new(bytes, T::SNAPSHOT_KIND)?;
+fn decode_test_image<T: DurableTestImageCodec>(bytes: &[u8]) -> Result<T> {
+    let mut input = DurableDecoder::new(bytes, T::IMAGE_KIND)?;
     let value = T::decode(&mut input)?;
     input.finish()?;
     Ok(value)
@@ -9316,7 +9121,7 @@ fn validate_durable_segment_bytes(
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotWriteFault {
+enum TestImageWriteFault {
     TempWrite,
     TempSync,
     Rename,
@@ -9324,13 +9129,13 @@ enum SnapshotWriteFault {
 }
 
 #[cfg(test)]
-fn maybe_snapshot_write_fault(
-    fault: Option<SnapshotWriteFault>,
-    point: SnapshotWriteFault,
+fn maybe_test_image_write_fault(
+    fault: Option<TestImageWriteFault>,
+    point: TestImageWriteFault,
 ) -> Result<()> {
     if fault == Some(point) {
         Err(StorageError::unavailable(format!(
-            "injected snapshot write fault at {point:?}"
+            "injected test image write fault at {point:?}"
         )))
     } else {
         Ok(())
@@ -9338,32 +9143,32 @@ fn maybe_snapshot_write_fault(
 }
 
 #[cfg(test)]
-fn write_snapshot_atomic<T: DurableSnapshotCodec>(path: &Path, value: &T) -> Result<()> {
-    write_snapshot_atomic_with_fault(path, value, None)
+fn write_test_image_atomic<T: DurableTestImageCodec>(path: &Path, value: &T) -> Result<()> {
+    write_test_image_atomic_with_fault(path, value, None)
 }
 
 #[cfg(test)]
-fn write_snapshot_atomic_with_fault<T: DurableSnapshotCodec>(
+fn write_test_image_atomic_with_fault<T: DurableTestImageCodec>(
     path: &Path,
     value: &T,
-    fault: Option<SnapshotWriteFault>,
+    fault: Option<TestImageWriteFault>,
 ) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| StorageError::invalid_argument("snapshot path has no parent"))?;
+        .ok_or_else(|| StorageError::invalid_argument("test image path has no parent"))?;
     fs::create_dir_all(parent).map_err(fs_error)?;
     let tmp = path.with_extension("tmp");
-    let bytes = encode_snapshot(value)?;
-    maybe_snapshot_write_fault(fault, SnapshotWriteFault::TempWrite)?;
+    let bytes = encode_test_image(value)?;
+    maybe_test_image_write_fault(fault, TestImageWriteFault::TempWrite)?;
     {
         let mut file = File::create(&tmp).map_err(fs_error)?;
         file.write_all(&bytes).map_err(fs_error)?;
-        maybe_snapshot_write_fault(fault, SnapshotWriteFault::TempSync)?;
+        maybe_test_image_write_fault(fault, TestImageWriteFault::TempSync)?;
         file.sync_data().map_err(fs_error)?;
     }
-    maybe_snapshot_write_fault(fault, SnapshotWriteFault::Rename)?;
+    maybe_test_image_write_fault(fault, TestImageWriteFault::Rename)?;
     fs::rename(&tmp, path).map_err(fs_error)?;
-    maybe_snapshot_write_fault(fault, SnapshotWriteFault::DirSync)?;
+    maybe_test_image_write_fault(fault, TestImageWriteFault::DirSync)?;
     File::open(parent)
         .map_err(fs_error)?
         .sync_all()
@@ -9560,28 +9365,28 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    fn durable_snapshots_from_store(
+    fn durable_images_from_store(
         store: &LocalObjectStore,
     ) -> (
-        DurableMetadataSnapshot,
-        DurableCatalogSnapshot,
-        DurableSegmentStoreSnapshot,
+        DurableMetadataImage,
+        DurableCatalogImage,
+        DurableSegmentStoreImage,
     ) {
-        let snapshot = store.snapshot().unwrap();
-        let metadata = DurableMetadataSnapshot {
-            config: snapshot.config,
-            metadata: snapshot.metadata,
-            next_write_intent: snapshot.next_write_intent,
-            next_extent_id: snapshot.next_extent_id,
+        let image = store.state_image().unwrap();
+        let metadata = DurableMetadataImage {
+            config: image.config,
+            metadata: image.metadata,
+            next_write_intent: image.next_write_intent,
+            next_extent_id: image.next_extent_id,
         };
-        let catalog = DurableCatalogSnapshot {
-            config: snapshot.config,
-            catalog: snapshot.segment_catalog,
+        let catalog = DurableCatalogImage {
+            config: image.config,
+            catalog: image.segment_catalog,
         };
-        let segment_store = DurableSegmentStoreSnapshot {
-            config: snapshot.config,
-            next_offset: snapshot.segment_store.next_offset,
-            records: snapshot
+        let segment_store = DurableSegmentStoreImage {
+            config: image.config,
+            next_offset: image.segment_store.next_offset,
+            records: image
                 .segment_store
                 .segments
                 .iter()
@@ -9597,85 +9402,6 @@ mod tests {
                 .collect(),
         };
         (metadata, catalog, segment_store)
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum SegmentIoFault {
-        WriteTemp,
-        SyncTemp,
-        Rename,
-        SyncDir,
-        CleanupTmp,
-    }
-
-    #[derive(Debug)]
-    struct FaultingSegmentFileIo {
-        inner: PortableSegmentFileIo,
-        next_fault: Mutex<Option<SegmentIoFault>>,
-    }
-
-    impl FaultingSegmentFileIo {
-        fn new(inner: PortableSegmentFileIo) -> Self {
-            Self {
-                inner,
-                next_fault: Mutex::new(None),
-            }
-        }
-
-        fn fail_next(&self, fault: SegmentIoFault) {
-            *self.next_fault.lock().unwrap() = Some(fault);
-        }
-
-        fn maybe_fail(&self, fault: SegmentIoFault) -> Result<()> {
-            let mut next_fault = self.next_fault.lock().unwrap();
-            if *next_fault == Some(fault) {
-                *next_fault = None;
-                Err(StorageError::unavailable(format!(
-                    "injected segment I/O fault at {fault:?}"
-                )))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    impl SegmentFileIo for FaultingSegmentFileIo {
-        fn segment_file_exists(&self, segment_id: SegmentId) -> Result<bool> {
-            self.inner.segment_file_exists(segment_id)
-        }
-
-        fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
-            self.maybe_fail(SegmentIoFault::WriteTemp)?;
-            self.inner.write_temp_segment(segment_id, bytes)
-        }
-
-        fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()> {
-            self.maybe_fail(SegmentIoFault::SyncTemp)?;
-            self.inner.sync_temp_segment(segment_id)
-        }
-
-        fn rename_temp_to_final(&self, segment_id: SegmentId) -> Result<()> {
-            self.maybe_fail(SegmentIoFault::Rename)?;
-            self.inner.rename_temp_to_final(segment_id)
-        }
-
-        fn sync_segment_dir(&self) -> Result<()> {
-            self.maybe_fail(SegmentIoFault::SyncDir)?;
-            self.inner.sync_segment_dir()
-        }
-
-        fn read_segment_file(&self, segment_id: SegmentId) -> Result<Vec<u8>> {
-            self.inner.read_segment_file(segment_id)
-        }
-
-        fn delete_segment_file(&self, segment_id: SegmentId) -> Result<()> {
-            self.inner.delete_segment_file(segment_id)
-        }
-
-        fn cleanup_tmp(&self) -> Result<()> {
-            self.maybe_fail(SegmentIoFault::CleanupTmp)?;
-            self.inner.cleanup_tmp()
-        }
     }
 
     trait ProviderConformanceStore {
@@ -11386,71 +11112,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_segment_file_io_stages_syncs_renames_and_cleans_tmp() {
-        let root = durable_temp_dir("segment-io");
-        let node_dir = root.join("storage-nodes").join("node");
-        let io = PortableSegmentFileIo::new(&node_dir).unwrap();
-        let segment = SegmentId::from_raw(7);
-        let bytes = vec![9; 4096];
-
-        io.write_temp_segment(segment, &bytes).unwrap();
-        assert!(io.read_segment_file(segment).is_err());
-        assert!(io.tmp_path(segment).exists());
-        io.sync_temp_segment(segment).unwrap();
-        io.rename_temp_to_final(segment).unwrap();
-        io.sync_segment_dir().unwrap();
-        assert_eq!(io.read_segment_file(segment).unwrap(), bytes);
-
-        let partial = SegmentId::from_raw(8);
-        io.write_temp_segment(partial, &[1; 4096]).unwrap();
-        io.cleanup_tmp().unwrap();
-        assert!(!io.tmp_path(partial).exists());
-        io.delete_segment_file(segment).unwrap();
-        assert!(io.read_segment_file(segment).is_err());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn fault_injected_segment_file_io_exposes_only_synced_renamed_segments() {
-        let root = durable_temp_dir("segment-io-faults");
-        let node_dir = root.join("storage-nodes").join("node");
-        let io = FaultingSegmentFileIo::new(PortableSegmentFileIo::new(&node_dir).unwrap());
-        let bytes = vec![4; 4096];
-
-        for (raw, fault) in [
-            (1, SegmentIoFault::WriteTemp),
-            (2, SegmentIoFault::SyncTemp),
-            (3, SegmentIoFault::Rename),
-        ] {
-            let segment = SegmentId::from_raw(raw);
-            io.fail_next(fault);
-            assert!(write_synced_segment_with_io(&io, segment, &bytes).is_err());
-            assert!(
-                io.read_segment_file(segment).is_err(),
-                "segment {raw} became visible before rename completed"
-            );
-            io.cleanup_tmp().unwrap();
-        }
-
-        let dir_sync_segment = SegmentId::from_raw(4);
-        io.fail_next(SegmentIoFault::SyncDir);
-        assert!(write_synced_segment_with_io(&io, dir_sync_segment, &bytes).is_err());
-        assert_eq!(io.read_segment_file(dir_sync_segment).unwrap(), bytes);
-        write_synced_segment_with_io(&io, dir_sync_segment, &bytes).unwrap();
-
-        let cleanup_segment = SegmentId::from_raw(5);
-        io.write_temp_segment(cleanup_segment, &[1; 4096]).unwrap();
-        io.fail_next(SegmentIoFault::CleanupTmp);
-        assert!(io.cleanup_tmp().is_err());
-        assert!(io.inner.tmp_path(cleanup_segment).exists());
-        io.cleanup_tmp().unwrap();
-        assert!(!io.inner.tmp_path(cleanup_segment).exists());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn durable_snapshot_codec_round_trips_real_block_and_native_state() {
+    fn durable_state_image_codec_round_trips_real_block_and_native_state() {
         let store = LocalObjectStore::with_config(tree_config()).unwrap();
         let device = create_local_device(&store, 32);
         device.write_at(7 * 4096, &repeated_blocks(3, 8)).unwrap();
@@ -11478,31 +11140,31 @@ mod tests {
             .unwrap();
         native.checkpoint_keyspace(keyspace_id).unwrap();
 
-        let (metadata, catalog, segment_store) = durable_snapshots_from_store(&store);
+        let (metadata, catalog, segment_store) = durable_images_from_store(&store);
         for bytes in [
-            encode_snapshot(&metadata).unwrap(),
-            encode_snapshot(&catalog).unwrap(),
-            encode_snapshot(&segment_store).unwrap(),
+            encode_test_image(&metadata).unwrap(),
+            encode_test_image(&catalog).unwrap(),
+            encode_test_image(&segment_store).unwrap(),
         ] {
-            assert!(bytes.starts_with(DURABLE_SNAPSHOT_MAGIC));
+            assert!(bytes.starts_with(DURABLE_TEST_IMAGE_MAGIC));
         }
 
-        let metadata_bytes = encode_snapshot(&metadata).unwrap();
-        let catalog_bytes = encode_snapshot(&catalog).unwrap();
-        let segment_store_bytes = encode_snapshot(&segment_store).unwrap();
+        let metadata_bytes = encode_test_image(&metadata).unwrap();
+        let catalog_bytes = encode_test_image(&catalog).unwrap();
+        let segment_store_bytes = encode_test_image(&segment_store).unwrap();
         assert_eq!(
-            encode_snapshot(&decode_snapshot::<DurableMetadataSnapshot>(&metadata_bytes).unwrap())
+            encode_test_image(&decode_test_image::<DurableMetadataImage>(&metadata_bytes).unwrap())
                 .unwrap(),
             metadata_bytes
         );
         assert_eq!(
-            encode_snapshot(&decode_snapshot::<DurableCatalogSnapshot>(&catalog_bytes).unwrap())
+            encode_test_image(&decode_test_image::<DurableCatalogImage>(&catalog_bytes).unwrap())
                 .unwrap(),
             catalog_bytes
         );
         assert_eq!(
-            encode_snapshot(
-                &decode_snapshot::<DurableSegmentStoreSnapshot>(&segment_store_bytes).unwrap()
+            encode_test_image(
+                &decode_test_image::<DurableSegmentStoreImage>(&segment_store_bytes).unwrap()
             )
             .unwrap(),
             segment_store_bytes
@@ -11510,8 +11172,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_snapshot_codec_has_stable_catalog_golden_bytes() {
-        let snapshot = DurableCatalogSnapshot {
+    fn durable_state_image_codec_has_stable_catalog_golden_bytes() {
+        let image = DurableCatalogImage {
             config: LocalStoreConfig::default(),
             catalog: CatalogInner {
                 next_segment_id: 1,
@@ -11520,9 +11182,9 @@ mod tests {
         };
 
         assert_eq!(
-            bytes_to_hex(&encode_snapshot(&snapshot).unwrap()),
+            bytes_to_hex(&encode_test_image(&image).unwrap()),
             concat!(
-                "54434f57534e4150",
+                "54434f57494d4721",
                 "0001",
                 "02",
                 "0000000000000001",
@@ -11538,36 +11200,36 @@ mod tests {
     }
 
     #[test]
-    fn durable_snapshot_codec_rejects_malformed_inputs() {
-        let snapshot = DurableCatalogSnapshot {
+    fn durable_state_image_codec_rejects_malformed_inputs() {
+        let image = DurableCatalogImage {
             config: LocalStoreConfig::default(),
             catalog: CatalogInner {
                 next_segment_id: 1,
                 entries: BTreeMap::new(),
             },
         };
-        let bytes = encode_snapshot(&snapshot).unwrap();
+        let bytes = encode_test_image(&image).unwrap();
 
         let mut bad_magic = bytes.clone();
         bad_magic[0] ^= 0xff;
-        assert!(decode_snapshot::<DurableCatalogSnapshot>(&bad_magic).is_err());
+        assert!(decode_test_image::<DurableCatalogImage>(&bad_magic).is_err());
 
         let mut bad_version = bytes.clone();
         bad_version[9] = 2;
-        assert!(decode_snapshot::<DurableCatalogSnapshot>(&bad_version).is_err());
+        assert!(decode_test_image::<DurableCatalogImage>(&bad_version).is_err());
 
         let mut bad_kind = bytes.clone();
-        bad_kind[10] = DURABLE_SNAPSHOT_METADATA;
-        assert!(decode_snapshot::<DurableCatalogSnapshot>(&bad_kind).is_err());
-        assert!(decode_snapshot::<DurableMetadataSnapshot>(&bytes).is_err());
+        bad_kind[10] = DURABLE_TEST_IMAGE_METADATA;
+        assert!(decode_test_image::<DurableCatalogImage>(&bad_kind).is_err());
+        assert!(decode_test_image::<DurableMetadataImage>(&bytes).is_err());
 
         let mut truncated = bytes.clone();
         truncated.pop();
-        assert!(decode_snapshot::<DurableCatalogSnapshot>(&truncated).is_err());
+        assert!(decode_test_image::<DurableCatalogImage>(&truncated).is_err());
 
         let mut trailing = bytes.clone();
         trailing.push(0);
-        assert!(decode_snapshot::<DurableCatalogSnapshot>(&trailing).is_err());
+        assert!(decode_test_image::<DurableCatalogImage>(&trailing).is_err());
 
         let mut invalid_tag = DurableEncoder { bytes: Vec::new() };
         99u8.encode(&mut invalid_tag).unwrap();
@@ -11605,34 +11267,34 @@ mod tests {
     }
 
     #[test]
-    fn fault_injected_snapshot_writer_reopens_old_or_complete_new_snapshot() {
-        fn assert_snapshot_faults<T: DurableSnapshotCodec + Clone>(path: &Path, old: T, new: T) {
-            write_snapshot_atomic(path, &old).unwrap();
-            let old_bytes = encode_snapshot(&old).unwrap();
-            let new_bytes = encode_snapshot(&new).unwrap();
+    fn fault_injected_test_image_writer_reopens_old_or_complete_new_image() {
+        fn assert_test_image_faults<T: DurableTestImageCodec + Clone>(path: &Path, old: T, new: T) {
+            write_test_image_atomic(path, &old).unwrap();
+            let old_bytes = encode_test_image(&old).unwrap();
+            let new_bytes = encode_test_image(&new).unwrap();
 
             for fault in [
-                SnapshotWriteFault::TempWrite,
-                SnapshotWriteFault::TempSync,
-                SnapshotWriteFault::Rename,
-                SnapshotWriteFault::DirSync,
+                TestImageWriteFault::TempWrite,
+                TestImageWriteFault::TempSync,
+                TestImageWriteFault::Rename,
+                TestImageWriteFault::DirSync,
             ] {
-                write_snapshot_atomic(path, &old).unwrap();
-                assert!(write_snapshot_atomic_with_fault(path, &new, Some(fault)).is_err());
+                write_test_image_atomic(path, &old).unwrap();
+                assert!(write_test_image_atomic_with_fault(path, &new, Some(fault)).is_err());
                 let visible = fs::read(path).unwrap();
                 assert!(
                     visible == old_bytes || visible == new_bytes,
-                    "fault {fault:?} left a partial snapshot"
+                    "fault {fault:?} left a partial test image"
                 );
-                assert!(decode_snapshot::<T>(&visible).is_ok());
+                assert!(decode_test_image::<T>(&visible).is_ok());
             }
 
-            write_snapshot_atomic(path, &new).unwrap();
+            write_test_image_atomic(path, &new).unwrap();
             assert_eq!(fs::read(path).unwrap(), new_bytes);
         }
 
-        let root = durable_temp_dir("snapshot-writer-faults");
-        let old_catalog = DurableCatalogSnapshot {
+        let root = durable_temp_dir("test-image-writer-faults");
+        let old_catalog = DurableCatalogImage {
             config: LocalStoreConfig::default(),
             catalog: CatalogInner {
                 next_segment_id: 1,
@@ -11642,7 +11304,7 @@ mod tests {
         let mut new_catalog = old_catalog.clone();
         new_catalog.catalog.next_segment_id = 2;
 
-        let old_segment_store = DurableSegmentStoreSnapshot {
+        let old_segment_store = DurableSegmentStoreImage {
             config: LocalStoreConfig::default(),
             next_offset: 0,
             records: BTreeMap::new(),
@@ -11650,7 +11312,7 @@ mod tests {
         let mut new_segment_store = old_segment_store.clone();
         new_segment_store.next_offset = 4096;
 
-        let old_metadata = DurableMetadataSnapshot {
+        let old_metadata = DurableMetadataImage {
             config: LocalStoreConfig::default(),
             metadata: MetadataInner::new(),
             next_write_intent: 1,
@@ -11659,18 +11321,18 @@ mod tests {
         let mut new_metadata = old_metadata.clone();
         new_metadata.next_write_intent = 2;
 
-        assert_snapshot_faults(
-            &root.join("metadata").join("catalog.bin"),
+        assert_test_image_faults(
+            &root.join("metadata").join("catalog.img"),
             old_catalog,
             new_catalog,
         );
-        assert_snapshot_faults(
-            &root.join("storage-node").join("segment-store.bin"),
+        assert_test_image_faults(
+            &root.join("storage-node").join("segment-store.img"),
             old_segment_store,
             new_segment_store,
         );
-        assert_snapshot_faults(
-            &root.join("metadata").join("metadata.bin"),
+        assert_test_image_faults(
+            &root.join("metadata").join("metadata.img"),
             old_metadata,
             new_metadata,
         );
@@ -11890,9 +11552,9 @@ mod tests {
             )
             .unwrap();
 
-        let snapshot = store.local.snapshot().unwrap();
+        let image = store.local.state_image().unwrap();
         let persisted = lock(&store.persisted_segments).unwrap().clone();
-        let (records, _) = DurableObjectStore::records_for_snapshot(&snapshot, &persisted);
+        let (records, _) = DurableObjectStore::records_for_state_image(&image, &persisted);
         assert!(matches!(
             records.last(),
             Some(DurableLogRecord::CommitState(_))

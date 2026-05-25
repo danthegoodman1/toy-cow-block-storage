@@ -42,9 +42,8 @@ pub use local::{
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
     LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer, LocalObjectStore,
     LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
-    PortableSegmentFileIo, RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint,
-    RemoteNativeTransport, RemoteWireTransport, SegmentFileIo, SegmentLifecycleState,
-    StorageNodeCustodianReport,
+    RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport,
+    RemoteWireTransport, SegmentLifecycleState, StorageNodeCustodianReport,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

@@ -476,7 +476,9 @@ remote, replayable, or concurrent boundary in the owning future phase:
   write-intent recovery, native append lease/session records,
   checkpoint/timeline persistence, and cache coherence after restart. Its
   `bincode` snapshot scaffolding was replaced by crate-owned durable codecs in
-  Phase 18, then removed from the production hot path in Phase 20.
+  Phase 18. Phase 20 removed the snapshot production hot path and the old
+  file-per-segment runtime backend instead of carrying them as compatibility
+  layers.
 - Phase 17 owns remote transport serialization, retry/deduplication, stale
   response rejection, server incarnation fencing, deadlines, mailbox semantics,
   backpressure, and concurrency rules for non-conflicting requests. Its current
@@ -487,12 +489,18 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 19 owns a real network implementation of the Phase 17 wire contract,
   including a crate-owned wire codec rather than serde/bincode-derived frames.
 - Phase 20 owns replacing the snapshot-only performance path with a measured
-  durable journal and segment-log provider before storage replication builds on
-  the wrong persistence shape.
-- Phase 21 owns placement, replica-set selection, replica reference evidence,
-  release evidence logs or per-node queues, storage-node cursors, repair
-  records, orphan replica reconciliation, stale placement handling, and physical
-  free reconciliation across storage nodes.
+  durable journal provider before storage replication builds on the wrong
+  persistence shape. Its journal/data-log direction replaces the old
+  per-segment-file runtime path in full.
+- Phase 21 owns a SQLite metadata store plus partitioned durable data logs and
+  incremental compaction so compaction does not rewrite the entire live node.
+- Phase 22 owns multiple local storage-node endpoints and one-replica segment
+  placement so file/block data can be partitioned by segment without changing
+  public APIs.
+- Phase 23 owns replica-set selection, SQLite-backed reference/release outbox
+  and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
+  stale placement handling, and physical free reconciliation across replicated
+  storage nodes.
 
 Do not treat an in-process handoff in the local provider as evidence that the
 distributed boundary is done. A later phase is complete only when the handoff is
@@ -628,14 +636,14 @@ Deliverables:
 - [x] Provider choice documented in the spec.
 - [x] Durable segment, local segment catalog, metadata plane, device catalog, and
   timeline implementations.
-- [x] Internal `SegmentFileIo` or equivalent storage-node file I/O boundary
-  below `SegmentStore` and `LocalSegmentCatalog`.
-- [x] Portable blocking filesystem segment I/O backend used by the durable
-  storage node by default.
+- [x] Initial storage-node file I/O proof below `SegmentStore` and
+  `LocalSegmentCatalog`. Phase 20 replaced this production path with a journal
+  writer and removed the old file-per-segment backend from runtime code.
 - [x] Crash-consistent `sync_segment`, `Acknowledged`, `Flushed`, and `flush`
   definitions, including exact `durable_through` semantics.
-- [x] Durable metadata snapshots for commit groups, checkpoints, delete records,
-  fork records, native keyspace commits, and native file-root audit commits.
+- [x] Durable metadata state images for commit groups, checkpoints, delete
+  records, fork records, native keyspace commits, and native file-root audit
+  commits.
   The first provider used atomic `bincode` snapshots as temporary scaffolding;
   Phase 18 replaced that format and Phase 20 removed snapshots from the
   production hot path.
@@ -647,8 +655,9 @@ Deliverables:
   segment descriptors after restart.
 - [x] Crash/restart tests for committed block contents, native keyspace state,
   writer epochs, PITR restore points, and storage-node custodian deletions.
-- [x] Explicit portable segment file I/O sequencing test for temp write, temp
-  file sync, atomic rename, final directory sync, and tmp cleanup.
+- [x] Explicit portable segment file I/O sequencing test for the original
+  snapshot provider. Phase 20 deleted that backend after the journal rewrite
+  passed its crash/replay tests.
 - [x] PITR and GC tests against the durable provider.
 - [x] Durable Criterion baselines for acknowledged writes, flushed writes,
   batched flushes, reopen reads, and reopen after committed history.
@@ -659,15 +668,14 @@ Exit gate:
   conformance tests for block and native APIs.
 - [x] Crash/restart tests preserve committed device contents.
 - [x] Partial writes do not expose uncommitted roots.
-- [x] Atomic snapshot publishing meant a completed metadata snapshot reopened as
-  one committed state; Phase 18 covered the crash matrix and Phase 20 replaced
-  this with journal commit replay.
+- [x] Atomic snapshot publishing meant a completed metadata state image reopened
+  as one committed state; Phase 18 covered the crash matrix and Phase 20
+  replaced this with journal commit replay.
 - [x] Pending segment writes left by crashed, expired, or fenced write intents
   become reclaimable without exposing data.
-- [x] The portable segment file I/O backend preserves the documented durability
-  sequence: payload bytes are durable before final segment visibility, and final
-  path visibility is durable before catalog state can claim the segment is
-  durable.
+- [x] The original portable segment file I/O backend preserved the documented
+  durability sequence while it was the production provider. Phase 20 replaced
+  the runtime durability boundary with ordered journal append plus sync.
 - [x] `Acknowledged` writes are read-visible in the live process but need a
   later `flush` or `Flushed` write for restart visibility.
 - [x] Flush reports only commit sequences whose segment bytes and metadata
@@ -731,17 +739,17 @@ Deliverables:
 - [x] Reusable durable provider conformance harness that can run against the
   in-memory model, the snapshot durable provider, and any future journal or
   database-backed provider where applicable.
-- [x] Crate-owned durable snapshot codec with explicit magic, schema version,
+- [x] Crate-owned durable state-image codec with explicit magic, schema version,
   record kind, enum tags, fixed integer endianness, bounded collection/string
   lengths, trailing-byte rejection, and deterministic map ordering.
 - [x] Durable codec tests for round trips, stable golden bytes, unsupported
   versions, invalid tags, truncated payloads, trailing bytes, oversized lengths,
   and length-prefix overflow.
-- [x] Fault-injected segment file I/O backend that can fail or crash at temp
-  file create/write, temp file sync, atomic rename, final directory sync, and
-  tmp cleanup.
-- [x] Fault-injected snapshot writer for segment-store snapshots, storage-node
-  catalog snapshots, and metadata snapshots.
+- [x] Fault-injected segment file I/O backend for the original snapshot
+  provider. Phase 20 removed the file-per-segment runtime backend rather than
+  carrying it forward as compatibility scaffolding.
+- [x] Fault-injected state-image writer for codec/atomic-write coverage of the
+  old snapshot proof shape; it remains test-only and is not a durable provider.
 - [x] Crash/reopen matrix for block writes, multi-shard commit groups, forks,
   deletes, PITR checkpoints/restores, native writes, native appends, native
   keyspace checkpoints, and native keyspace snapshots/restores.
@@ -838,17 +846,18 @@ Deliverables:
 - [x] Explicit compact checkpoint path so replay time can be bounded without
   rewriting the whole metadata plane on every write; a periodic scheduler can
   call this maintenance hook later without changing the durable format.
-- [x] Segment log or extent-packed storage-node layout that can persist a batch
-  of small immutable segments with fewer sync boundaries than one file per
-  segment.
+- [x] Single append journal that persists batches of immutable segment data and
+  metadata commit records with fewer sync boundaries than one file per segment.
+  This is the correctness/performance baseline; partitioned logs and
+  incremental compaction are Phase 21.
 - [x] Group-commit path for acknowledged writes where `flush` can persist many
   committed mappings with one ordered durability sequence.
 - [x] Crash/reopen and fault-injection matrix for journal append, checkpoint
   publish, segment-log append, batch sync, replay truncation, and checkpoint
   compaction.
 - [x] Migration-free replacement of the snapshot performance path under the
-  no-tombstones rule; the snapshot provider may remain only as a deterministic
-  test fixture if it is no longer the production durable provider.
+  no-tombstones rule; no file-per-segment durable backend remains in runtime
+  code. The remaining state-image codec fixture is test-only.
 - [x] Criterion baselines for acknowledged latency, single flushed latency,
   batched flush throughput, reopen replay time, checkpoint compaction, native
   append, and block/native reads after reopen.
@@ -870,6 +879,12 @@ Exit gate:
 - [x] The implementation plan records any remaining host-specific ceiling, such
   as macOS sync latency, without hiding provider-level overhead.
 
+Current limitation: explicit Phase 20 compaction rewrites the current live
+segment bytes plus one commit record into a replacement `store.log`. That keeps
+the implementation simple and proves replay/compaction correctness, but it is
+not the scalable storage-node compaction strategy. Phase 21 replaces it with
+partitioned logs and per-log incremental compaction.
+
 Current host headline numbers with the portable blocking filesystem backend on
 macOS/APFS are approximately: block acknowledged 4 KiB write 27 us, block
 flushed 4 KiB write 4.9 ms, block flush after 32 acknowledged writes 5.5 ms,
@@ -880,33 +895,258 @@ dominated by host sync latency and full-state commit serialization; the hot path
 no longer pays multiple segment-file and snapshot-rename syncs per logical
 write.
 
-## Phase 21: Storage Replication
+## Phase 21: Partitioned Durable Logs and Incremental Compaction
 
 Status: not started.
 
-Add replicated segment storage only after the local and durable providers pass
-the same conformance suite, remote transport behavior is deterministic, and the
-real network transport has proven the wire contract across a process boundary.
+Replace the Phase 20 single durable journal with a SQLite metadata store and
+rolled data logs. Use SQLite for transactional, indexed metadata instead of
+inventing a custom metadata database. Keep large immutable segment payloads in
+plain rolled data files so storage-node compaction can reclaim space
+incrementally. The goal is to make compaction proportional to selected dirty
+data-log files, not to total live bytes on the node.
+
+Non-goals:
+
+- No storage replication.
+- No multi-node placement changes.
+- No public block/native API changes.
+- No background compaction thread hidden inside deterministic code.
+- No adaptive data layout unless a benchmark proves the simple rolled-log
+  layout is the bottleneck.
+- No custom metadata log unless SQLite cannot satisfy a documented correctness
+  or performance requirement under deterministic fault testing.
+
+Target durable layout:
+
+```text
+store/
+  metadata.sqlite
+  metadata.sqlite-wal
+  metadata.sqlite-shm
+  data/
+    data-000001.log
+    data-000002.log
+    data-000003.log
+  tmp/
+```
+
+Logical segment placement becomes:
+
+```text
+segment_id -> data_log_id, offset, length, checksum, storage_node_id
+```
 
 Deliverables:
 
-- [ ] Placement coordinator that chooses replica sets for logical segments.
-- [ ] Storage-node identity, capacity, and failure-domain policy inputs for
-  placement decisions.
+- [ ] SQLite metadata store for device heads, native keyspace/file heads,
+  commit groups, PITR/checkpoints, write-intent state, append leases, segment
+  lifecycle state, placement index, data-log manifests, relocation state, and
+  custodian evidence.
+- [ ] SQLite schema with explicit tables, indexes, uniqueness constraints, and
+  foreign-key or equivalent integrity checks for `segment_id`, `data_log_id`,
+  placement state, owner/reachability state, and commit sequence ordering.
+- [ ] SQLite transaction boundaries documenting exactly which rows become
+  durable/visible together for create, write, append, flush, checkpoint,
+  restore, delete, GC, custodian release, and compaction relocation.
+- [ ] SQLite durability settings documented and tested. Use conservative
+  defaults first, such as WAL mode plus `synchronous=FULL` or equivalent,
+  before optimizing.
+- [ ] Rolled data-log writer that appends immutable segment payload records and
+  rolls files by configured byte size, record count, or explicit test trigger.
+- [ ] Durable placement index recording each committed logical segment's current
+  data-log location without storing physical placement in metadata leaves or
+  native extents.
+- [ ] Data-log manifest tables that track active, sealed, compacting,
+  relocated, and deleted data-log files, including byte ranges, checksums,
+  live-byte estimates, and durable deletion state.
+- [ ] Data-log live-byte accounting driven by metadata reachability, PITR
+  retention, custodian release evidence, and placement relocation state.
+- [ ] Incremental compaction planner that selects sealed data logs by
+  reclaimable ratio and size thresholds.
+- [ ] Compaction path that deletes fully dead data-log files without copying
+  payload bytes.
+- [ ] Relocation path that copies only live payload records from selected dirty
+  data logs into new data logs, fsyncs the new data log, commits SQLite
+  placement updates in one transaction, and deletes old logs only after the
+  relocation transaction is durable.
+- [ ] SQLite maintenance path for checkpoints, WAL size control, integrity
+  checks, and optional `VACUUM`/incremental vacuum. This must not rewrite data
+  payload logs.
+- [ ] Crash/reopen tests for torn data records, torn metadata records, torn
+  SQLite transactions, partially copied compaction logs, relocation transaction
+  before/after data-log fsync, old-log deletion before/after durable metadata
+  commit, WAL checkpoint boundaries, and repeated compaction replay.
+- [ ] SQLite conformance tests that inject or simulate transaction failure,
+  database reopen, WAL checkpoint, corrupt/truncated data-log records, missing
+  data-log files, duplicate placements, and stale relocation rows.
+- [ ] Deterministic tests proving PITR-retained data is not compacted away until
+  retention has expired, even when the current head no longer references it.
+- [ ] Custodian tests proving orphan segment payloads from failed writes can be
+  reclaimed from the owning data log without scanning unrelated logs.
+- [ ] Space-efficiency tests that create overwritten/deleted data, run
+  incremental compaction, and assert physical bytes drop without rewriting
+  unrelated live data logs.
+- [ ] Benchmarks for append throughput, single flushed write latency, batched
+  flush, reopen with large SQLite metadata, placement lookup, full-dead-log
+  deletion, partial-log relocation, SQLite checkpoint/WAL maintenance, and
+  compaction pause time.
+- [ ] Documentation of compaction policy knobs: target data-log size, minimum
+  reclaimable ratio, maximum SQLite WAL bytes, maximum sealed data logs,
+  maximum dirty bytes, and whether compaction is manual or driven by an explicit
+  maintenance call.
+
+Exit gate:
+
+- [ ] The durable write ordering is explicit: segment payload reaches the data
+  log and is fsynced before the SQLite transaction publishes metadata that can
+  reference it.
+- [ ] Flushed writes and group commit use the minimum syncs required by the
+  documented SQLite/data-log durability policy; extra syncs require a benchmark
+  or correctness justification.
+- [ ] Compaction never rewrites the entire node solely to reclaim space from one
+  dirty data log.
+- [ ] Fully dead data logs can be deleted in O(number of selected log files)
+  without copying live segment payloads.
+- [ ] Partially dead data logs relocate only live payload records from selected
+  logs and leave unrelated data logs untouched.
+- [ ] A crash at any compaction point reopens to either the old placement or the
+  new placement; no segment becomes missing, duplicated with conflicting bytes,
+  or silently zero-filled.
+- [ ] Metadata leaves and native extents continue to reference logical
+  `SegmentId`s, not data-log offsets.
+- [ ] PITR, fork, snapshot, restore, GC, native append leases, and custodian
+  semantics remain byte-for-byte equivalent to Phase 20 under generated traces.
+- [ ] Reopen time is bounded by SQLite recovery plus known active data-log
+  tails, not by all historical metadata and data logs.
+- [ ] Benchmarks show compaction cost scales with selected dirty log bytes and
+  selected live relocation bytes, not total live bytes on the storage node.
+- [ ] The old single-log production path is removed under the no-tombstones
+  rule; a tiny single-log fixture may remain only in tests if useful.
+- [ ] The implementation plan records whether SQLite metadata is kept, tuned, or
+  replaced only after benchmark or fault-testing evidence, not taste.
+
+## Phase 22: Multiple Local Storage Nodes and Placement
+
+Status: not started.
+
+Split the remaining "one local storage endpoint" shortcut before introducing
+replication. This phase comes after partitioned logs so adding nodes does not
+multiply a known whole-node compaction problem. It is still local,
+single-process, and one replica per logical segment. Its purpose is to prove
+that placement is per segment, not per file, per device, or per public client,
+and that all block/native behavior, PITR, GC, custodian, durability, and replay
+semantics survive when a single file or device has segments spread across
+multiple storage nodes.
+
+Non-goals:
+
+- No remote storage nodes.
+- No quorum writes.
+- No background repair.
+- No public API change for `BlockDevice`, `NativeFile`, or clients.
+- No replica-set policy beyond exactly one committed placement per segment.
+
+Deliverables:
+
+- [ ] `StorageNodeRegistry` or equivalent internal provider boundary mapping
+  `StorageNodeId` to one `SegmentStore` and one `LocalSegmentCatalog`.
+- [ ] Per-segment `PlacementPolicy` that chooses one storage node for each new
+  logical segment using deterministic inputs. Start with simple round-robin,
+  hash, or capacity-weighted placement; do not add adaptive balancing until a
+  benchmark or simulation needs it.
+- [ ] Segment placement index that resolves `SegmentId` to its committed local
+  `SegmentReplicaPlacement`. Metadata leaves and native extents must continue
+  to reference only logical `SegmentId`s.
+- [ ] Block and native write paths route reservation, byte write, sync,
+  local-catalog commit, metadata publish, and referenced transition through the
+  selected storage node.
+- [ ] Block and native read paths resolve each segment through the placement
+  index, then read from that segment's storage node. A single read may span
+  segments on different nodes.
+- [ ] Durable provider replay persists and restores storage-node registry
+  state, placement index state, per-node local catalogs, and per-node segment
+  bytes. A referenced segment with no committed placement or missing bytes is
+  rejected at reopen.
+- [ ] Durable compaction preserves only live committed placements and the
+  segment bytes reachable from those placements.
+- [ ] Metadata custodian output is routed to the owning storage-node catalog for
+  each released segment. Storage-node custodians must not crawl metadata trees
+  or infer deletion from current heads.
+- [ ] Local storage-node custodian runs per node and reclaims expired
+  reservations, failed writes, orphan durable-pending segments, released
+  segments, and missed frees on the correct node.
+- [ ] Deterministic simulation for mixed block/native traces where writes,
+  overwrites, appends, forks, snapshots/restores, deletes, PITR expiry, and GC
+  spread segments across multiple local storage nodes.
+- [ ] Fault tests for stale placement records, duplicate placements, missing
+  placement, wrong-node reads, unavailable selected node before write, failure
+  after segment sync but before metadata publish, delayed/duplicated release
+  routing, and restart during placement publication.
+- [ ] Provider conformance suite runs against one-node and multi-node local
+  providers with identical public behavior.
+- [ ] Benchmarks for placement overhead, multi-node read fanout, concurrent
+  writes to different nodes, custodian sweep cost by node count, reopen replay
+  with multiple node catalogs, and fork/restore staying O(1).
+- [ ] Design docs explain that a native file may have extents on many storage
+  nodes and that colocating a file is a placement-policy choice, not a
+  metadata/API requirement.
+
+Exit gate:
+
+- [ ] `BlockDevice`, `NativeFile`, `MetadataPlane`, and public transport APIs do
+  not expose storage-node choice.
+- [ ] Logical metadata still references `SegmentId`, never physical file paths,
+  node-local offsets, or placement records.
+- [ ] A single native file and a single block device can have committed segments
+  on multiple storage nodes, and reads reconstruct the correct bytes.
+- [ ] Fork, snapshot, restore, PITR, and GC behavior are byte-for-byte identical
+  to the one-node provider under generated traces.
+- [ ] A write is acknowledged only after the selected node's segment bytes meet
+  the requested durability and metadata publish succeeds.
+- [ ] Failed metadata publish after a durable segment write leaves a reclaimable
+  orphan on exactly the selected node.
+- [ ] Missing or conflicting placement is detected as corruption/unavailability;
+  it is never silently treated as zero-filled data.
+- [ ] Released segments are freed only by storage-node-local custodian evidence
+  routed from metadata reachability, expired intents, or local failed-write
+  evidence.
+- [ ] Durable replay after crash can rebuild placement and per-node catalog
+  state without scanning metadata leaves for physical placement.
+- [ ] Multi-node placement does not measurably regress one-node hot paths beyond
+  an implementation-plan-recorded threshold.
+
+## Phase 23: Storage Replication
+
+Status: not started.
+
+Add replicated segment storage only after Phase 21 proves incremental
+compaction and Phase 22 proves segment placement across multiple local storage
+nodes. The local and durable providers must pass the same conformance suite,
+remote transport behavior must be deterministic, and the real network transport
+must have proven the wire contract across a process boundary.
+
+Deliverables:
+
+- [ ] Placement coordinator that chooses replica sets for logical segments using
+  the Phase 22 storage-node registry and placement-policy boundary.
+- [ ] Replica count, durability class, capacity, and failure-domain policy
+  inputs for replica-set decisions.
 - [ ] Replica write path that reserves, writes, syncs, and records one local
   replica commit per selected storage endpoint.
 - [ ] Metadata publish waits for the requested replica durability before making
   the logical segment visible.
-- [ ] Durable metadata-to-storage reference evidence stream or reconciliation
-  path so durable-pending replicas become `Referenced` after metadata publish.
-- [ ] Durable metadata-to-storage release evidence stream or per-node release
-  queues keyed by safe reachability epoch.
-- [ ] Storage-node reference/release cursors and idempotent apply paths for
+- [ ] SQLite-backed metadata outbox tables for reference and release evidence
+  keyed by safe commit/reachability epoch. Do not introduce custom evidence logs
+  or queues unless local SQLite tables fail a documented remote or performance
+  requirement.
+- [ ] Per-storage-node apply cursor tables and idempotent apply paths for
   referenced and released logical segments.
 - [ ] Repair path that can add missing background replicas after metadata
   publish without changing public block or native APIs.
-- [ ] Repair records and cursors for idempotent copy, source selection, checksum
-  validation, and restart after interrupted repair.
+- [ ] SQLite-backed repair job table and per-node repair cursors for idempotent
+  copy, source selection, checksum validation, and restart after interrupted
+  repair. External work queues are optional later adapters, not the base model.
 - [ ] Custodian reconciliation for failed replica writes, orphan replicas, and
   stale local catalog or stale placement state.
 - [ ] Fault simulation for replica delay, loss, duplication, stale writes,
@@ -929,33 +1169,34 @@ Exit gate:
   free physical bytes only from durable release evidence, expired intents, or
   local failed-write evidence.
 - [ ] Reference and release evidence replay is idempotent and can resume from
-  per-node cursors after storage-node or metadata-service restart.
+  SQLite-backed per-node cursors after storage-node or metadata-service restart.
 - [ ] Repair never makes uncommitted data visible.
 - [ ] Stale placement decisions cannot overwrite, free, or repair the wrong
   logical segment or replica placement.
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 22: Linux io_uring Storage Node Backend
+## Phase 24: Linux io_uring Storage Node Backend
 
 Status: not started.
 
-Add a Linux `io_uring` implementation of the Phase 16 storage-node segment file
-I/O boundary after Phase 18 proves the durable crash/reopen contract. This
-phase is a measured storage-node optimization, not a new public API and not a
-new durability model. The portable blocking filesystem backend remains the
-default fallback.
+Add a Linux `io_uring` implementation behind the Phase 21 storage-node data-log
+I/O boundary after the SQLite metadata plus rolled-log provider proves its
+crash/reopen contract. This phase is a measured storage-node optimization, not
+a new public API and not a new durability model. The portable blocking data-log
+backend remains the default fallback.
 
 Deliverables:
 
 - [ ] Linux-only `io_uring` backend behind an explicit feature flag.
-- [ ] The `io_uring` backend plugs into the Phase 16 segment file I/O boundary
-  without changing storage-node lifecycle, catalog, or metadata code.
+- [ ] The `io_uring` backend plugs into the Phase 21 data-log append/read
+  boundary without changing storage-node lifecycle, catalog, placement, or
+  metadata code.
 - [ ] Shared conformance and crash/restart tests run against both the portable
   backend and the `io_uring` backend when the host supports it.
-- [ ] Benchmarks for concurrent segment reads, concurrent segment writes,
-  batched segment writes, sync-heavy writes, and mixed read/write storage-node
-  workloads.
+- [ ] Benchmarks for concurrent segment reads, concurrent data-log appends,
+  batched appends, sync-heavy writes, compaction relocation reads/writes, and
+  mixed read/write storage-node workloads.
 - [ ] Documentation of when the provider may select the portable backend
   automatically, such as non-Linux hosts, unsupported kernels, disabled feature
   flags, or failed backend initialization.
@@ -964,11 +1205,11 @@ Exit gate:
 
 - [ ] `BlockDevice`, `NativeFile`, `MetadataPlane`, `SegmentStore`, and
   `LocalSegmentCatalog` public contracts do not change.
-- [ ] Both segment file I/O backends, when available, pass the same storage-node
+- [ ] Both data-log I/O backends, when available, pass the same storage-node
   conformance and crash/restart tests.
-- [ ] The `io_uring` backend preserves the exact Phase 16 durability contract:
-  payload bytes are durable before final segment visibility, and final path
-  visibility is durable before catalog state can claim the segment is durable.
+- [ ] The `io_uring` backend preserves the exact Phase 21 durability contract:
+  segment payload bytes reach the selected data log before SQLite metadata can
+  publish a placement that references them.
 - [ ] Fallback to the portable backend is explicit, observable in diagnostics,
   and does not weaken correctness.
 - [ ] The `io_uring` backend is kept only if benchmarks show meaningful
@@ -976,7 +1217,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 23: Optional ublk Adapter
+## Phase 25: Optional ublk Adapter
 
 Status: not started.
 
