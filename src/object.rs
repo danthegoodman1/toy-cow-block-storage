@@ -4,8 +4,8 @@ use crate::api::BlockRange;
 use crate::error::{Result, StorageError};
 use crate::id::{
     BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq, DeviceGeneration, DeviceId,
-    FileId, FileVersion, KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalTime,
-    MetadataNodeId, SegmentId, ShardId,
+    FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId,
+    LogicalTime, MetadataNodeId, SegmentId, ShardId,
 };
 
 /// Owner namespace for shared metadata roots.
@@ -148,19 +148,18 @@ pub struct KeyspaceFile {
     pub head: FileHead,
 }
 
-/// Immutable native keyspace catalog.
+/// Immutable native keyspace catalog shard.
 ///
-/// The local v1 catalog body is a deterministic `BTreeMap` from scoped
-/// `FileId` to catalog entries. The public API depends only on the immutable
-/// catalog root boundary, so a later implementation can replace this body with
-/// a sharded or tree-backed catalog without changing callers.
+/// A shard owns a deterministic subset of the files in one immutable keyspace
+/// root. Updating one file creates one fresh shard body and one fresh
+/// `KeyspaceRoot`; untouched shard bodies remain shared by root ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyspaceRoot {
-    pub root_id: KeyspaceRootId,
+pub struct KeyspaceCatalogShard {
+    pub shard_id: KeyspaceCatalogShardId,
     pub files: BTreeMap<FileId, KeyspaceFile>,
 }
 
-impl KeyspaceRoot {
+impl KeyspaceCatalogShard {
     pub fn validate(&self) -> Result<()> {
         for (file_id, entry) in &self.files {
             if *file_id != entry.head.file_id {
@@ -169,6 +168,32 @@ impl KeyspaceRoot {
                 ));
             }
         }
+        Ok(())
+    }
+}
+
+/// Immutable native keyspace catalog root.
+///
+/// The local catalog is sharded so native file publish cost is bounded by one
+/// deterministic catalog shard instead of the whole keyspace. The public API
+/// still depends only on the immutable catalog root boundary: snapshots and
+/// restores copy one `KeyspaceRootId`, while file creates/writes/appends publish
+/// one new root plus one changed shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspaceRoot {
+    pub root_id: KeyspaceRootId,
+    pub shard_roots: Vec<KeyspaceCatalogShardId>,
+    pub file_count: usize,
+}
+
+impl KeyspaceRoot {
+    pub fn validate(&self) -> Result<()> {
+        if self.shard_roots.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "keyspace catalog root must include at least one shard",
+            ));
+        }
+
         Ok(())
     }
 }

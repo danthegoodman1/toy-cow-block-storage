@@ -15,15 +15,15 @@ use crate::extent::{
 };
 use crate::id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
-    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceGeneration, KeyspaceId,
-    KeyspaceRootId, LogicalTime, MetadataNodeId, RequestId, SegmentId, StorageNodeId,
-    WriteIntentId, WriterEpoch,
+    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId,
+    KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalTime, MetadataNodeId, RequestId,
+    SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
-    ForkRecord, KeyspaceCommit, KeyspaceFile, KeyspaceHead, KeyspaceRoot, LeafEntry, MappingOwner,
-    MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, SegmentDescriptor, ShardCommit,
-    ShardRootUpdate,
+    ForkRecord, KeyspaceCatalogShard, KeyspaceCommit, KeyspaceFile, KeyspaceHead, KeyspaceRoot,
+    LeafEntry, MappingOwner, MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate,
+    SegmentDescriptor, ShardCommit, ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
@@ -31,6 +31,8 @@ use crate::provider::{
     MetadataSnapshotKeyspaceRequest, RetentionPolicy, SegmentReplicaCommit,
     SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent, SegmentStore,
 };
+
+const KEYSPACE_CATALOG_SHARD_COUNT: usize = 256;
 
 /// Local provider configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1283,6 +1285,7 @@ struct MetadataInner {
     next_file_id: u128,
     next_metadata_node_id: u128,
     next_keyspace_root_id: u128,
+    next_keyspace_catalog_shard_id: u128,
     next_commit_group_id: u128,
     next_commit_seq: u64,
     next_checkpoint_id: u128,
@@ -1292,6 +1295,7 @@ struct MetadataInner {
     device_specs: BTreeMap<DeviceId, crate::api::DeviceSpec>,
     keyspace_heads: BTreeMap<KeyspaceId, KeyspaceHead>,
     keyspace_roots: BTreeMap<KeyspaceRootId, KeyspaceRoot>,
+    keyspace_catalog_shards: BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>,
     file_writer_epochs: BTreeMap<(KeyspaceId, FileId), WriterEpoch>,
     metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
@@ -1313,6 +1317,7 @@ impl MetadataInner {
             next_file_id: 1,
             next_metadata_node_id: 1,
             next_keyspace_root_id: 1,
+            next_keyspace_catalog_shard_id: 1,
             next_commit_group_id: 1,
             next_commit_seq: 1,
             next_checkpoint_id: 1,
@@ -1322,6 +1327,7 @@ impl MetadataInner {
             device_specs: BTreeMap::new(),
             keyspace_heads: BTreeMap::new(),
             keyspace_roots: BTreeMap::new(),
+            keyspace_catalog_shards: BTreeMap::new(),
             file_writer_epochs: BTreeMap::new(),
             metadata_nodes: BTreeMap::new(),
             commit_groups: BTreeMap::new(),
@@ -1383,6 +1389,12 @@ impl MetadataInner {
     fn alloc_keyspace_root_id(&mut self) -> KeyspaceRootId {
         let id = KeyspaceRootId::from_raw(self.next_keyspace_root_id);
         self.next_keyspace_root_id += 1;
+        id
+    }
+
+    fn alloc_keyspace_catalog_shard_id(&mut self) -> KeyspaceCatalogShardId {
+        let id = KeyspaceCatalogShardId::from_raw(self.next_keyspace_catalog_shard_id);
+        self.next_keyspace_catalog_shard_id += 1;
         id
     }
 
@@ -1655,6 +1667,32 @@ impl InMemoryMetadataPlane {
     }
 
     #[cfg(test)]
+    fn keyspace_root_for_test(&self, keyspace_id: KeyspaceId) -> Result<KeyspaceRoot> {
+        let inner = lock(&self.inner)?;
+        Self::current_keyspace_root_locked(&inner, keyspace_id)
+    }
+
+    #[cfg(test)]
+    fn keyspace_catalog_shard_count_for_test(&self) -> Result<usize> {
+        Ok(lock(&self.inner)?.keyspace_catalog_shards.len())
+    }
+
+    #[cfg(test)]
+    fn validate_keyspace_catalog_for_test(&self, keyspace_id: KeyspaceId) -> Result<()> {
+        let inner = lock(&self.inner)?;
+        let root = Self::current_keyspace_root_locked(&inner, keyspace_id)?;
+        Self::validate_keyspace_catalog_root_locked(&inner, &root)
+    }
+
+    #[cfg(test)]
+    fn clear_keyspace_commits_for_test(&self, keyspace_id: KeyspaceId) -> Result<()> {
+        lock(&self.inner)?
+            .keyspace_commits
+            .retain(|commit| commit.keyspace_id != keyspace_id);
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn set_next_commit_seq_for_test(&self, next_commit_seq: u64) -> Result<()> {
         lock(&self.inner)?.next_commit_seq = next_commit_seq;
         Ok(())
@@ -1837,6 +1875,17 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::not_found("keyspace_root", root_id.to_string()))
     }
 
+    fn keyspace_catalog_shard_locked(
+        inner: &MetadataInner,
+        shard_id: KeyspaceCatalogShardId,
+    ) -> Result<KeyspaceCatalogShard> {
+        inner
+            .keyspace_catalog_shards
+            .get(&shard_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace_catalog_shard", shard_id.to_string()))
+    }
+
     fn current_keyspace_root_locked(
         inner: &MetadataInner,
         keyspace_id: KeyspaceId,
@@ -1848,16 +1897,35 @@ impl InMemoryMetadataPlane {
         Self::keyspace_root_locked(inner, head.root)
     }
 
+    fn keyspace_catalog_shard_index(file_id: FileId, root: &KeyspaceRoot) -> Result<usize> {
+        if root.shard_roots.is_empty() {
+            return Err(StorageError::corrupt("keyspace root has no catalog shards"));
+        }
+        Ok((file_id.raw() % root.shard_roots.len() as u128) as usize)
+    }
+
+    fn keyspace_file_in_root_locked(
+        inner: &MetadataInner,
+        root_id: KeyspaceRootId,
+        file_id: FileId,
+    ) -> Result<KeyspaceFile> {
+        let root = Self::keyspace_root_locked(inner, root_id)?;
+        let shard_index = Self::keyspace_catalog_shard_index(file_id, &root)?;
+        let shard = Self::keyspace_catalog_shard_locked(inner, root.shard_roots[shard_index])?;
+        shard
+            .files
+            .get(&file_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))
+    }
+
     fn file_head_locked(
         inner: &MetadataInner,
         keyspace_id: KeyspaceId,
         file_id: FileId,
     ) -> Result<FileHead> {
-        Self::current_keyspace_root_locked(inner, keyspace_id)?
-            .files
-            .get(&file_id)
-            .map(|entry| entry.head.clone())
-            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))
+        let root = Self::current_keyspace_root_locked(inner, keyspace_id)?;
+        Self::keyspace_file_in_root_locked(inner, root.root_id, file_id).map(|entry| entry.head)
     }
 
     #[cfg(test)]
@@ -1866,24 +1934,113 @@ impl InMemoryMetadataPlane {
         keyspace_id: KeyspaceId,
         file_id: FileId,
     ) -> Result<Option<String>> {
-        Self::current_keyspace_root_locked(inner, keyspace_id)?
-            .files
-            .get(&file_id)
-            .map(|entry| entry.name.clone())
-            .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))
+        let root = Self::current_keyspace_root_locked(inner, keyspace_id)?;
+        Self::keyspace_file_in_root_locked(inner, root.root_id, file_id).map(|entry| entry.name)
+    }
+
+    fn insert_keyspace_catalog_shard_locked(
+        inner: &mut MetadataInner,
+        files: BTreeMap<FileId, KeyspaceFile>,
+    ) -> Result<KeyspaceCatalogShard> {
+        let shard = KeyspaceCatalogShard {
+            shard_id: inner.alloc_keyspace_catalog_shard_id(),
+            files,
+        };
+        shard.validate()?;
+        inner
+            .keyspace_catalog_shards
+            .insert(shard.shard_id, shard.clone());
+        Ok(shard)
     }
 
     fn insert_keyspace_root_locked(
         inner: &mut MetadataInner,
-        files: BTreeMap<FileId, KeyspaceFile>,
+        shard_roots: Vec<KeyspaceCatalogShardId>,
+        file_count: usize,
     ) -> Result<KeyspaceRoot> {
         let root = KeyspaceRoot {
             root_id: inner.alloc_keyspace_root_id(),
-            files,
+            shard_roots,
+            file_count,
         };
         root.validate()?;
         inner.keyspace_roots.insert(root.root_id, root.clone());
         Ok(root)
+    }
+
+    fn insert_empty_keyspace_root_locked(inner: &mut MetadataInner) -> Result<KeyspaceRoot> {
+        let mut shard_roots = Vec::with_capacity(KEYSPACE_CATALOG_SHARD_COUNT);
+        for _ in 0..KEYSPACE_CATALOG_SHARD_COUNT {
+            let shard = Self::insert_keyspace_catalog_shard_locked(inner, BTreeMap::new())?;
+            shard_roots.push(shard.shard_id);
+        }
+        Self::insert_keyspace_root_locked(inner, shard_roots, 0)
+    }
+
+    #[cfg(test)]
+    fn validate_keyspace_catalog_root_locked(
+        inner: &MetadataInner,
+        root: &KeyspaceRoot,
+    ) -> Result<()> {
+        root.validate()?;
+        if root.shard_roots.len() != KEYSPACE_CATALOG_SHARD_COUNT {
+            return Err(StorageError::corrupt(
+                "keyspace root has unexpected catalog shard count",
+            ));
+        }
+
+        let mut unique_shards = BTreeSet::new();
+        let mut actual_file_count = 0usize;
+        for (shard_index, shard_id) in root.shard_roots.iter().copied().enumerate() {
+            if !unique_shards.insert(shard_id) {
+                return Err(StorageError::corrupt(
+                    "keyspace root contains duplicate catalog shard",
+                ));
+            }
+            let shard = Self::keyspace_catalog_shard_locked(inner, shard_id)?;
+            shard.validate()?;
+            actual_file_count = actual_file_count
+                .checked_add(shard.files.len())
+                .ok_or_else(|| StorageError::corrupt("keyspace file count overflows usize"))?;
+            for file_id in shard.files.keys().copied() {
+                if Self::keyspace_catalog_shard_index(file_id, root)? != shard_index {
+                    return Err(StorageError::corrupt(
+                        "keyspace file is stored in the wrong catalog shard",
+                    ));
+                }
+            }
+        }
+        if actual_file_count != root.file_count {
+            return Err(StorageError::corrupt(
+                "keyspace root file_count does not match catalog shards",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn update_keyspace_file_locked(
+        inner: &mut MetadataInner,
+        root: &KeyspaceRoot,
+        file_id: FileId,
+        entry: KeyspaceFile,
+    ) -> Result<KeyspaceRoot> {
+        let shard_index = Self::keyspace_catalog_shard_index(file_id, root)?;
+        let shard_id = root.shard_roots[shard_index];
+        let shard = Self::keyspace_catalog_shard_locked(inner, shard_id)?;
+        let mut files = shard.files.clone();
+        let replaced = files.insert(file_id, entry).is_some();
+        let new_shard = Self::insert_keyspace_catalog_shard_locked(inner, files)?;
+        let mut shard_roots = root.shard_roots.clone();
+        shard_roots[shard_index] = new_shard.shard_id;
+        let file_count = if replaced {
+            root.file_count
+        } else {
+            root.file_count
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("keyspace file count overflow"))?
+        };
+        Self::insert_keyspace_root_locked(inner, shard_roots, file_count)
     }
 
     fn collect_keyspace_metadata_roots_locked(
@@ -1892,7 +2049,10 @@ impl InMemoryMetadataPlane {
         out: &mut Vec<MetadataNodeId>,
     ) -> Result<()> {
         let root = Self::keyspace_root_locked(inner, root_id)?;
-        out.extend(root.files.values().map(|entry| entry.head.root));
+        for shard_id in root.shard_roots {
+            let shard = Self::keyspace_catalog_shard_locked(inner, shard_id)?;
+            out.extend(shard.files.values().map(|entry| entry.head.root));
+        }
         Ok(())
     }
 
@@ -2758,7 +2918,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
         self.config.validate()?;
         let mut inner = lock(&self.inner)?;
         let keyspace_id = inner.alloc_keyspace_id();
-        let root = Self::insert_keyspace_root_locked(&mut inner, BTreeMap::new())?;
+        let root = Self::insert_empty_keyspace_root_locked(&mut inner)?;
         let head = KeyspaceHead {
             keyspace_id,
             generation: KeyspaceGeneration::from_raw(0),
@@ -2795,7 +2955,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
             keyspace_id,
             generation: head.generation,
             latest_commit: head.latest_commit,
-            file_count: root.files.len(),
+            file_count: root.file_count,
         })
     }
 
@@ -2828,15 +2988,15 @@ impl MetadataPlane for InMemoryMetadataPlane {
         };
         file_head.validate_current(root.covered_range, self.config.block_size)?;
 
-        let mut files = keyspace_root.files.clone();
-        files.insert(
+        let new_keyspace_root = Self::update_keyspace_file_locked(
+            &mut inner,
+            &keyspace_root,
             file_id,
             KeyspaceFile {
                 name: request.request.spec.name.clone(),
                 head: file_head.clone(),
             },
-        );
-        let new_keyspace_root = Self::insert_keyspace_root_locked(&mut inner, files)?;
+        )?;
 
         let commit_group = CommitGroup {
             commit_group: commit_group_id,
@@ -3057,11 +3217,8 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     }
                     _ => unreachable!("length checked above"),
                 };
-                let current_entry = current_catalog
-                    .files
-                    .get(&file_id)
-                    .cloned()
-                    .ok_or_else(|| StorageError::not_found("file", file_id.to_string()))?;
+                let current_entry =
+                    Self::keyspace_file_in_root_locked(&inner, current_catalog.root_id, file_id)?;
                 let current = current_entry.head.clone();
                 match intent.fence {
                     MetadataFence::FileVersion(version) if version == current.version => {}
@@ -3123,15 +3280,15 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     new_root_node.covered_range,
                     self.config.block_size,
                 )?;
-                let mut files = current_catalog.files.clone();
-                files.insert(
+                let new_catalog = Self::update_keyspace_file_locked(
+                    &mut inner,
+                    &current_catalog,
                     file_id,
                     KeyspaceFile {
                         head: next_head.clone(),
                         ..current_entry
                     },
-                );
-                let new_catalog = Self::insert_keyspace_root_locked(&mut inner, files)?;
+                )?;
                 let mut next_keyspace = current_keyspace.clone();
                 next_keyspace.generation =
                     Self::next_keyspace_generation(next_keyspace.generation)?;
@@ -3296,8 +3453,29 @@ impl MetadataPlane for InMemoryMetadataPlane {
         if !inner.keyspace_heads.contains_key(&source) {
             return Err(StorageError::not_found("keyspace", source.to_string()));
         }
-        let target_commit = Self::target_commit_for_keyspace_restore_locked(&inner, source, point)?;
-        let root = Self::replay_keyspace_root_locked(&inner, source, target_commit, None)?;
+        let root = match point {
+            RestorePoint::Checkpoint(checkpoint_id) => {
+                let checkpoint =
+                    inner
+                        .checkpoints
+                        .get(&checkpoint_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            StorageError::not_found("checkpoint", checkpoint_id.to_string())
+                        })?;
+                if checkpoint.owner != MappingOwner::NativeKeyspace(source) {
+                    return Err(StorageError::invalid_argument(
+                        "checkpoint does not belong to source keyspace",
+                    ));
+                }
+                Self::checkpoint_keyspace_root(&checkpoint)?
+            }
+            RestorePoint::Commit(_) | RestorePoint::Time(_) => {
+                let target_commit =
+                    Self::target_commit_for_keyspace_restore_locked(&inner, source, point)?;
+                Self::replay_keyspace_root_locked(&inner, source, target_commit, None)?
+            }
+        };
         if !inner.keyspace_roots.contains_key(&root) {
             return Err(StorageError::not_found("keyspace_root", root.to_string()));
         }
@@ -7637,6 +7815,107 @@ mod tests {
     }
 
     #[test]
+    fn native_keyspace_catalog_publish_copies_only_one_catalog_shard() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let mut file_ids = Vec::new();
+        for index in 0..(KEYSPACE_CATALOG_SHARD_COUNT + 4) {
+            file_ids.push(
+                client
+                    .create_file(
+                        keyspace_id,
+                        CreateFileRequest {
+                            spec: FileSpec {
+                                name: Some(format!("file-{index}")),
+                            },
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(keyspace_id)
+            .unwrap();
+
+        let before_write = store
+            .metadata()
+            .keyspace_root_for_test(keyspace_id)
+            .unwrap();
+        let first_shard =
+            InMemoryMetadataPlane::keyspace_catalog_shard_index(file_ids[0], &before_write)
+                .unwrap();
+        let crowded_shard = InMemoryMetadataPlane::keyspace_catalog_shard_index(
+            file_ids[KEYSPACE_CATALOG_SHARD_COUNT],
+            &before_write,
+        )
+        .unwrap();
+        assert_eq!(crowded_shard, first_shard);
+        let shard_count_before_write = store
+            .metadata()
+            .keyspace_catalog_shard_count_for_test()
+            .unwrap();
+        let file = client
+            .open_file(keyspace_id, file_ids[KEYSPACE_CATALOG_SHARD_COUNT])
+            .unwrap();
+        file.write_at(0, &[7; 4096]).unwrap();
+        let after_write = store
+            .metadata()
+            .keyspace_root_for_test(keyspace_id)
+            .unwrap();
+
+        assert_eq!(before_write.file_count, KEYSPACE_CATALOG_SHARD_COUNT + 4);
+        assert_eq!(after_write.file_count, before_write.file_count);
+        assert_eq!(after_write.shard_roots.len(), KEYSPACE_CATALOG_SHARD_COUNT);
+        assert_eq!(changed_catalog_shards(&before_write, &after_write), 1);
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(keyspace_id)
+            .unwrap();
+        assert_eq!(
+            store
+                .metadata()
+                .keyspace_catalog_shard_count_for_test()
+                .unwrap(),
+            shard_count_before_write + 1
+        );
+
+        let before_create = after_write;
+        let shard_count_before_create = store
+            .metadata()
+            .keyspace_catalog_shard_count_for_test()
+            .unwrap();
+        client
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("new-file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let after_create = store
+            .metadata()
+            .keyspace_root_for_test(keyspace_id)
+            .unwrap();
+        assert_eq!(after_create.file_count, before_create.file_count + 1);
+        assert_eq!(changed_catalog_shards(&before_create, &after_create), 1);
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(keyspace_id)
+            .unwrap();
+        assert_eq!(
+            store
+                .metadata()
+                .keyspace_catalog_shard_count_for_test()
+                .unwrap(),
+            shard_count_before_create + 1
+        );
+    }
+
+    #[test]
     fn native_keyspace_snapshot_and_restore_are_filesystem_level() {
         let store = LocalObjectStore::with_config(config()).unwrap();
         let client = create_native_client(&store);
@@ -7683,6 +7962,10 @@ mod tests {
             .unwrap();
 
         let nodes_before_restore = store.metadata().metadata_node_count().unwrap();
+        let catalog_shards_before_restore = store
+            .metadata()
+            .keyspace_catalog_shard_count_for_test()
+            .unwrap();
         let restored_keyspace = client
             .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(checkpoint))
             .unwrap();
@@ -7697,6 +7980,13 @@ mod tests {
         assert_eq!(
             store.metadata().metadata_node_count().unwrap(),
             nodes_before_restore
+        );
+        assert_eq!(
+            store
+                .metadata()
+                .keyspace_catalog_shard_count_for_test()
+                .unwrap(),
+            catalog_shards_before_restore
         );
         assert_eq!(
             store
@@ -7761,6 +8051,10 @@ mod tests {
             .unwrap()
             .root;
         let nodes_before_snapshot = store.metadata().metadata_node_count().unwrap();
+        let catalog_shards_before_snapshot = store
+            .metadata()
+            .keyspace_catalog_shard_count_for_test()
+            .unwrap();
         let snapshot_keyspace = client
             .snapshot_keyspace(
                 keyspace_id,
@@ -7781,6 +8075,13 @@ mod tests {
         assert_eq!(
             store.metadata().metadata_node_count().unwrap(),
             nodes_before_snapshot
+        );
+        assert_eq!(
+            store
+                .metadata()
+                .keyspace_catalog_shard_count_for_test()
+                .unwrap(),
+            catalog_shards_before_snapshot
         );
         assert_eq!(
             store
@@ -7822,6 +8123,22 @@ mod tests {
                 .chain(repeated_blocks(1, 6))
                 .collect::<Vec<_>>()
         );
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(keyspace_id)
+            .unwrap();
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(restored_keyspace)
+            .unwrap();
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(restored_by_time)
+            .unwrap();
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(snapshot_keyspace)
+            .unwrap();
     }
 
     #[test]
@@ -7841,6 +8158,49 @@ mod tests {
 
         corrupted.roots = first.roots;
         assert!(store.metadata().validate_checkpoint(&corrupted).is_err());
+    }
+
+    #[test]
+    fn native_keyspace_checkpoint_restore_uses_checkpoint_root_without_timeline_replay() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, file) = create_local_file(&client, keyspace_id);
+
+        file.write_at(0, b"stable").unwrap();
+        let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
+        let checkpoint_root = store
+            .metadata()
+            .get_keyspace_head(keyspace_id)
+            .unwrap()
+            .root;
+        let changed = file.write_at(0, b"change").unwrap();
+
+        store
+            .metadata()
+            .clear_keyspace_commits_for_test(keyspace_id)
+            .unwrap();
+
+        let restored = client
+            .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(checkpoint))
+            .unwrap();
+        assert_eq!(
+            store.metadata().get_keyspace_head(restored).unwrap().root,
+            checkpoint_root
+        );
+        let restored_file = client.open_file(restored, file_id).unwrap();
+        let mut actual = vec![0; b"stable".len()];
+        restored_file.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, b"stable");
+        assert!(
+            client
+                .restore_keyspace(keyspace_id, RestorePoint::Commit(changed.commit_seq))
+                .is_err()
+        );
+        store
+            .metadata()
+            .validate_keyspace_catalog_for_test(restored)
+            .unwrap();
     }
 
     #[test]
@@ -7989,6 +8349,10 @@ mod tests {
                     file_model.version = commit.version;
                     commit.commit_seq
                 };
+                store
+                    .metadata()
+                    .validate_keyspace_catalog_for_test(keyspace_id)
+                    .unwrap();
                 history.push((commit_seq, model.clone()));
                 if harness.rng.next_u64() % 4 == 0 {
                     client.checkpoint_keyspace(keyspace_id).unwrap();
@@ -8000,6 +8364,10 @@ mod tests {
                 let (commit_seq, expected) = &history[index];
                 let restored = client
                     .restore_keyspace(keyspace_id, RestorePoint::Commit(*commit_seq))
+                    .unwrap();
+                store
+                    .metadata()
+                    .validate_keyspace_catalog_for_test(restored)
                     .unwrap();
                 for (file_id, expected_file) in expected {
                     let restored_file = client.open_file(restored, *file_id).unwrap();
@@ -8283,6 +8651,16 @@ mod tests {
         let mut out = vec![0; blocks as usize * 4096];
         file.read_at(0, &mut out).unwrap();
         out
+    }
+
+    fn changed_catalog_shards(before: &KeyspaceRoot, after: &KeyspaceRoot) -> usize {
+        assert_eq!(before.shard_roots.len(), after.shard_roots.len());
+        before
+            .shard_roots
+            .iter()
+            .zip(&after.shard_roots)
+            .filter(|(before, after)| before != after)
+            .count()
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

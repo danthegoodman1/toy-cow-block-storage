@@ -43,6 +43,7 @@ id_type!(SegmentId, u128);
 id_type!(StorageNodeId, u128);
 id_type!(MetadataNodeId, u128);
 id_type!(KeyspaceRootId, u128);
+id_type!(KeyspaceCatalogShardId, u128);
 id_type!(ShardId, u32);
 id_type!(WriteIntentId, u128);
 id_type!(AppendLeaseId, u128);

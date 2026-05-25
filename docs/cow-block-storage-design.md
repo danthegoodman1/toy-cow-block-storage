@@ -311,6 +311,11 @@ KeyspaceHead {
 }
 
 KeyspaceRoot {
+  file_count
+  catalog_shards[0..K-1] -> KeyspaceCatalogShard
+}
+
+KeyspaceCatalogShard {
   file_id -> {
     name
     FileHead
@@ -323,6 +328,13 @@ keyspace lineage by copying the retained `KeyspaceRoot` pointer, so all files in
 the namespace and their catalog metadata are restored to one coherent point in
 time. File creation metadata belongs inside the immutable catalog root; it must
 not live in a mutable side table that snapshots have to rediscover.
+
+The local Phase 15 provider uses a fixed provider-private catalog shard count.
+Creating or mutating one file copies exactly one catalog shard plus one
+`KeyspaceRoot`, while untouched catalog shards and all file metadata trees stay
+shared. The shard count is not part of the public API; durable or remote
+providers may choose a different sharding or indexing policy while preserving
+the same root-pointer snapshot and restore semantics.
 
 The native API publishes mappings shaped like:
 
@@ -348,6 +360,70 @@ Public native guarantees:
 
 The native API must not be implemented on top of the block API. Both APIs share
 the lower substrate; they do not stack on each other.
+
+### Native Keyspace Scaling Decision
+
+Phase 15 replaces the original local whole-catalog `BTreeMap` body with sharded
+immutable keyspace catalog roots before durable formats exist. The benchmarked
+whole-map approach made native file create/write/append cost proportional to the
+number of files in the keyspace because every publish cloned the full catalog.
+The local provider now models the intended durable shape:
+
+- hot file reads use provider-private root and shard lookups;
+- file creates, writes, and appends copy one catalog shard plus one catalog
+  root;
+- keyspace checkpoints, snapshots, and restores copy root IDs and do not walk
+  file metadata trees;
+- append-only keyspace and file commit records remain the PITR source of truth;
+- callers never learn catalog shard IDs or coordinate catalog placement.
+
+The remaining local-provider limitation is concurrency: the in-memory metadata
+plane still uses one process-local mutex, so independent-file operations prove
+catalog-shard data shape but not concurrent metadata execution. Phase 17 owns
+the remote/server mailbox work needed to let non-conflicting operations proceed
+concurrently without changing the public API.
+
+Current Criterion baseline bands for the local in-memory provider are recorded
+with the regression benchmark suite. Normal CI should run
+`cargo bench --bench regression -- --test`; performance investigations should
+run `cargo bench --bench regression` and compare the `native_keyspace_scaling`,
+`native_alignment`, `native_snapshot_restore_root_copy`, and
+`native_concurrent_batches` groups.
+
+The root-copy microbenchmarks intentionally isolate dependence on source
+keyspace size, not every local bookkeeping cost: checkpoint, snapshot, and
+restore still include local ID allocation and map insertion for the new record
+or keyspace. The create-file benchmarks are starting-size measurements; the
+measured keyspace grows during the benchmark loop. These details are local
+provider artifacts, while the invariant under test is that none of those paths
+walk file metadata trees or clone a whole keyspace catalog body.
+
+Phase 15 local baseline ranges on this workstation:
+
+| Operation | 1 file | 1k files | 100k files |
+| --- | ---: | ---: | ---: |
+| file info | ~200 ns | ~250 ns | ~4.5 us |
+| 4 KiB file read | ~470 ns | ~520 ns | ~4.9 us |
+| 4 KiB `write_at` | ~8.4 us | ~8.4 us | ~40 us |
+| 1-byte append with lease | ~18 us | ~18 us | ~53 us |
+| create file | ~65-80 us | ~65-80 us | ~65-80 us |
+| stale lease rejection | ~0.6 us | ~0.6 us | ~9 us |
+| checkpoint root copy | ~90 ns | ~100 ns | ~90 ns |
+| snapshot root copy | ~170 ns | ~170 ns | ~170 ns |
+| checkpoint restore root copy | ~170 ns | ~190 ns | ~200 ns |
+
+Alignment and concurrency baselines:
+
+- aligned 4 KiB native write: ~8.3 us
+- unaligned partial-block native write: ~8.5 us
+- aligned 4 KiB append with a fresh lease: ~12 us
+- unaligned 17-byte append with a fresh lease: ~12 us
+- aligned 4 KiB native read: ~0.6 us
+- unaligned 17-byte native read: ~0.5 us
+- four-thread independent write batch: ~71 us
+- four-thread conflicting write batch: ~74 us
+- four-thread independent append batch: ~93 us
+- four-thread conflicting append batch: ~66 us
 
 ### `BlockServer`
 

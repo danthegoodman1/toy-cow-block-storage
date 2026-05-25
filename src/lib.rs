@@ -32,8 +32,9 @@ pub use extent::{
 };
 pub use id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,
-    DeviceId, ExtentId, FileId, FileVersion, KeyspaceGeneration, KeyspaceId, KeyspaceRootId,
-    LogicalDeadline, LogicalTime, RequestId, StorageNodeId, WriteIntentId, WriterEpoch,
+    DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration,
+    KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, RequestId, StorageNodeId,
+    WriteIntentId, WriterEpoch,
 };
 pub use local::{
     InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,

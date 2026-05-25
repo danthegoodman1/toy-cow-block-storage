@@ -544,7 +544,7 @@ Exit gate:
 
 ## Phase 15: Native Keyspace Performance and Scaling
 
-Status: not started.
+Status: complete.
 
 Characterize the local native keyspace implementation before durable providers
 freeze the wrong shape into a storage format. The goal is not to optimize by
@@ -552,57 +552,56 @@ instinct. The goal is to prove which costs are acceptable for a correctness
 model, which costs are only local-provider artifacts, and whether the public
 API and deterministic core leave room for high-performance implementations.
 
-The current local catalog is intentionally simple: each immutable `KeyspaceRoot`
-contains a deterministic map of file catalog entries. That is a good
-correctness model, but it is not by itself proof that large keyspaces or
-high-concurrency native workloads scale. This phase either proves the simple
-model is good enough for the next phase, or replaces it with the smallest
-benchmark-justified scalable structure, such as sharded immutable keyspace
-catalog roots.
+Before this phase, each immutable `KeyspaceRoot` contained one deterministic
+map of file catalog entries. That was a good correctness model, but the Phase
+15 benchmarks showed whole-catalog publish cost would freeze the wrong shape
+into durable providers. The local catalog now uses sharded immutable keyspace
+catalog roots: file create/write/append copies one catalog shard plus one root,
+while snapshot and restore continue to copy only root IDs.
 
 Deliverables:
 
-- [ ] Criterion benchmarks for native file create, info, write, append, read,
+- [x] Criterion benchmarks for native file create, info, write, append, read,
   checkpoint, snapshot, restore, and stale-lease rejection at keyspace sizes
-  `1`, `1k`, `100k`, and the largest practical local stress size.
-- [ ] Benchmarks for concurrent native writes/appends across independent files
+  `1`, `1k`, and `100k`; `100k` is the current normal-run local stress size.
+- [x] Benchmarks for concurrent native writes/appends across independent files
   and, separately, conflicting write/append attempts against one file.
-- [ ] Benchmarks for aligned write/append/read versus unaligned
+- [x] Benchmarks for aligned write/append/read versus unaligned
   write/append/read, including the partial-tail-block COW path.
-- [ ] Benchmarks that assert keyspace snapshot and restore stay O(1) in file
+- [x] Benchmarks that assert keyspace snapshot and restore stay O(1) in file
   metadata-tree nodes and do not walk file contents.
-- [ ] Regression thresholds or documented baseline ranges for native hot paths
+- [x] Regression thresholds or documented baseline ranges for native hot paths
   in the Criterion suite.
-- [ ] A written decision record in the design spec: keep the local catalog as a
+- [x] A written decision record in the design spec: keep the local catalog as a
   correctness model, or implement a sharded keyspace catalog before durable
   providers.
-- [ ] If benchmarks show `O(file_count)` publish cost is material, replace the
+- [x] If benchmarks show `O(file_count)` publish cost is material, replace the
   local `BTreeMap` catalog root body with sharded immutable catalog roots or an
   equally simple measured alternative.
-- [ ] If catalog sharding is added, deterministic generated tests compare
+- [x] If catalog sharding is added, deterministic generated tests compare
   native keyspace behavior against the existing simple historical model.
-- [ ] If catalog sharding is added, benchmark and test that independent file
+- [x] If catalog sharding is added, benchmark and test that independent file
   publishes contend at catalog-shard granularity rather than whole-keyspace
   granularity.
-- [ ] Documentation of the intended high-performance implementation shape:
+- [x] Documentation of the intended high-performance implementation shape:
   cached hot file heads, sharded catalog-root publishes, append-only timeline
   records, and provider-private indexes that do not leak into public APIs.
 
 Exit gate:
 
-- [ ] Native keyspace benchmarks report headline numbers for normal operations,
+- [x] Native keyspace benchmarks report headline numbers for normal operations,
   large keyspaces, concurrent independent-file operations, conflicting-file
   operations, snapshot, restore, and fork-like root-pointer copy behavior.
-- [ ] The measured local implementation has no hidden whole-keyspace work on
+- [x] The measured local implementation has no hidden whole-keyspace work on
   snapshot or restore.
-- [ ] Any remaining whole-keyspace work on append/create is explicitly
+- [x] Any remaining whole-keyspace work on append/create is explicitly
   classified as a local-provider limitation or eliminated before Phase 16.
-- [ ] The public `NativeKeyspaceClient`, `NativeFile`, `MetadataPlane`, and
+- [x] The public `NativeKeyspaceClient`, `NativeFile`, `MetadataPlane`, and
   transport interfaces do not require callers to coordinate catalog shards,
   metadata placement, storage placement, or replica durability.
-- [ ] A future durable or remote provider can implement the measured scalable
+- [x] A future durable or remote provider can implement the measured scalable
   shape without changing public APIs.
-- [ ] Performance optimizations are backed by benchmarks and deterministic
+- [x] Performance optimizations are backed by benchmarks and deterministic
   conformance tests, not by speculative abstractions.
 
 ## Phase 16: Durable Provider
