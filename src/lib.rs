@@ -25,17 +25,16 @@ pub use api::{
 };
 pub use error::{Result, StorageError};
 pub use extent::{
-    AppendCommit, AppendExtentReservation, AppendLease, AppendReservationAbort,
-    AppendReservationFill, AppendReservationPlacement, CreateFileRequest, CreateKeyspaceRequest,
-    FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient,
-    NativeOperation, NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope,
-    NativeServer, NativeTransport, SnapshotKeyspaceRequest,
+    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, FileSpec,
+    FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeOperation,
+    NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer,
+    NativeTransport, SnapshotKeyspaceRequest,
 };
 pub use id::{
-    AppendLeaseId, AppendReservationId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
-    CommitSeq, DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId,
-    KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, RequestId,
-    ServerIncarnation, StorageNodeId, WriteIntentId, WriterEpoch,
+    AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,
+    DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration,
+    KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, RequestId, ServerIncarnation,
+    StorageNodeId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
     ChaosRemoteWireTransport, ChaosTransportMetrics, DurableCompactionReport, DurableDataLogPolicy,

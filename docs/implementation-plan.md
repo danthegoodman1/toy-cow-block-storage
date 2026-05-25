@@ -500,13 +500,10 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 23 owns row-native SQLite metadata publishing so durable writes,
   forks, restores, PITR, GC, and reopen update/query operational rows instead
   of replacing a whole logical state blob.
-- Phase 24 owns native large append segment reservations so append-heavy users
-  can coalesce many chunk fills into one exact logical segment commit without
-  exposing storage-node placement.
-- Phase 25 owns deterministic background compaction scheduling, maintenance
+- Phase 24 owns deterministic background compaction scheduling, maintenance
   budgets, and explicit write backpressure policy for the partitioned durable
   layout.
-- Phase 26 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 25 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -1249,87 +1246,7 @@ native flush after 32 acknowledged writes about 10 ms with high host variance.
 Treat these as regression smoke baselines; the sync-heavy floor remains
 host/filesystem dependent.
 
-## Phase 24: Native Large Append Segment Reservations
-
-Status: complete.
-
-Add a native-file-only hard reservation API for append-heavy callers that need
-one exact append extent to commit as one logical segment. This is a performance
-contract, not topology exposure: callers get an opaque reservation and the
-provider still chooses storage-node placement privately.
-
-Non-goals:
-
-- No block API change.
-- No client-selected storage node or physical offset.
-- No best-effort splitting for `SingleSegmentRequired`.
-- No durable/resumable staged fills before final commit.
-
-Deliverables:
-
-- [x] Public native reservation types and request/response variants for reserve,
-  chunk fill, commit, and abort.
-- [x] `NativeFile` methods for reserving an exact append extent, filling it in
-  chunks, committing it with a requested durability, and aborting it.
-- [x] V1 validation requiring nonzero block-aligned exact length,
-  block-aligned current file size, configured maximum reservation size, matching
-  append lease target, and single-segment placement.
-- [x] Local provider reservation state keyed by opaque reservation ID and append
-  writer fence. The selected storage node and `SegmentId` remain provider
-  private.
-- [x] Out-of-order chunk fill support with duplicate identical fills accepted
-  and overlapping conflicting fills rejected.
-- [x] Commit path that writes and syncs exactly one immutable segment, publishes
-  one native file-version transition, and marks that segment referenced.
-- [x] Abort/stale-lease cleanup for unwritten reservations, with durable segment
-  write failures routed through the existing orphan/custodian path.
-- [x] Row-native durable publishing fixed to export segment records based on
-  actually persisted segment bytes, not just segment ID high-water cursors, so
-  segment IDs consumed by uncommitted reservations cannot make later commits
-  unreopenable.
-- [x] Local append hot path avoids avoidable large-buffer duplication: aligned
-  normal appends move one owned segment buffer into the in-memory segment store,
-  reserved append commit consumes its staged buffer instead of cloning it, and
-  the in-memory descriptor checksum uses wide deterministic mixing. Durable
-  data-log CRC64 remains unchanged.
-- [x] Criterion coverage comparing one 32 MiB normal append, one 32 MiB
-  reserved append filled in 4 KiB chunks, the regular many-small-append
-  regression case, an optional long 8192 normal 4 KiB append case, and
-  multi-node reserved append placement overhead.
-
-Exit gate:
-
-- [x] A reserved 32 MiB append reads back correctly and creates exactly one
-  logical segment.
-- [x] Normal append remains the fallback for unaligned writes and is not routed
-  through reservation staging.
-- [x] Stale writer epochs reject without exposing partial file contents and
-  release unwritten reservation state.
-- [x] Uncommitted staged fills are not visible and do not survive reopen as
-  committed data.
-- [x] Reopened durable stores accept committed reserved appends only when the
-  segment record, placement, catalog entry, and bytes are complete.
-- [x] Multi-node providers can place successive reserved appends for one file on
-  different nodes while preserving file byte order.
-- [x] The feature is kept only if benchmarks show it improves the intended
-  append workload, especially many small appends coalesced into one reserved
-  extent. If it does not, optimize or remove it rather than leaving a decorative
-  API.
-
-Short-run Phase 24 Criterion smoke numbers on this host after append hot-path
-hardening: one normal 32 MiB append measured about 2.5 ms, one reserved 32 MiB
-append filled in 4 KiB chunks measured about 2.9 ms, 1024 normal 4 KiB appends
-measured about 109 ms, the optional long 8192 normal 4 KiB append case measured
-about 37 s before the hot-path hardening, and three 4 KiB reserved appends
-across three local nodes measured about 20 us. The regular regression target
-uses 1024 normal 4 KiB appends so the benchmark suite stays practical for
-routine gates; set `TOY_COW_LONG_BENCH` to include the 8192-append headline run.
-The single-large-append path is now in the low single-digit millisecond range,
-while the intended many-small-append coalescing case remains meaningfully
-faster at the regular regression size and orders of magnitude faster in the
-optional 8192-append headline run.
-
-## Phase 25: Background Compaction Scheduling and Backpressure Policy
+## Phase 24: Background Compaction Scheduling and Backpressure Policy
 
 Status: not started.
 
@@ -1406,7 +1323,7 @@ Exit gate:
 - [ ] The scheduler remains below the block/native public APIs and does not ask
   clients to choose storage nodes, compact logs, or fan out writes.
 
-## Phase 26: Storage Replication
+## Phase 25: Storage Replication
 
 Status: not started.
 
@@ -1466,7 +1383,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 27: Linux io_uring Storage Node Backend
+## Phase 26: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1507,7 +1424,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 28: Optional ublk Adapter
+## Phase 27: Optional ublk Adapter
 
 Status: not started.
 

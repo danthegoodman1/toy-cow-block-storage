@@ -1,8 +1,8 @@
 use crate::api::{ByteRange, FlushResult, ReadResponse, RestorePoint, WriteDurability};
 use crate::error::{Result, StorageError};
 use crate::id::{
-    AppendLeaseId, AppendReservationId, CheckpointId, ClientEpoch, CommitSeq, ExtentId, FileId,
-    FileVersion, KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
+    AppendLeaseId, CheckpointId, ClientEpoch, CommitSeq, ExtentId, FileId, FileVersion,
+    KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -51,37 +51,6 @@ pub struct AppendLease {
     pub base_version: FileVersion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AppendReservationPlacement {
-    SingleSegmentRequired,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppendExtentReservation {
-    pub reservation_id: AppendReservationId,
-    pub keyspace_id: KeyspaceId,
-    pub file_id: FileId,
-    pub lease: AppendLease,
-    pub base_size: u64,
-    pub exact_bytes: u64,
-    pub placement: AppendReservationPlacement,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppendReservationFill {
-    pub reservation_id: AppendReservationId,
-    pub range: ByteRange,
-    pub filled_bytes: u64,
-    pub complete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppendReservationAbort {
-    pub reservation_id: AppendReservationId,
-    pub keyspace_id: KeyspaceId,
-    pub file_id: FileId,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendCommit {
     pub keyspace_id: KeyspaceId,
@@ -113,10 +82,6 @@ pub enum NativeOperation {
     Write,
     AcquireAppend,
     Append,
-    ReserveAppend,
-    FillReservedAppend,
-    CommitReservedAppend,
-    AbortReservedAppend,
     Flush,
     CheckpointKeyspace,
     SnapshotKeyspace,
@@ -187,48 +152,6 @@ pub trait NativeFile: Send + Sync {
     /// zero-length append is invalid because it creates no useful extent or
     /// version transition.
     fn append_with_lease(&self, lease: AppendLease, data: &[u8]) -> Result<AppendCommit>;
-
-    /// Reserve an exact append extent that must commit as one logical segment.
-    ///
-    /// This is a hard performance contract for append-heavy callers. Success
-    /// grants an opaque reservation tied to the supplied append lease, current
-    /// file size, and exact byte length. The provider chooses placement; callers
-    /// must not learn or choose storage nodes. V1 reservations require a
-    /// block-aligned file size and block-aligned exact length.
-    fn reserve_append_extent(
-        &self,
-        lease: AppendLease,
-        exact_bytes: u64,
-    ) -> Result<AppendExtentReservation>;
-
-    /// Stage bytes into a reserved append extent.
-    ///
-    /// Fills are not durable or visible before `commit_reserved_append`.
-    /// Implementors must allow out-of-order fills, accept duplicate identical
-    /// fills, and reject overlapping conflicting bytes.
-    fn fill_reserved_append(
-        &self,
-        reservation: AppendExtentReservation,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<AppendReservationFill>;
-
-    /// Commit a fully filled reserved append extent.
-    ///
-    /// Success writes and syncs one immutable logical segment, publishes one
-    /// file-version transition, and marks the selected provider placement
-    /// referenced. Failure must not expose partial file contents.
-    fn commit_reserved_append(
-        &self,
-        reservation: AppendExtentReservation,
-        durability: WriteDurability,
-    ) -> Result<AppendCommit>;
-
-    /// Abort a reserved append extent and release its provider-local staging.
-    fn abort_reserved_append(
-        &self,
-        reservation: AppendExtentReservation,
-    ) -> Result<AppendReservationAbort>;
 
     /// Flush previously acknowledged native file writes.
     ///
@@ -318,31 +241,6 @@ pub enum NativeRequest {
         bytes: Vec<u8>,
         durability: WriteDurability,
     },
-    ReserveAppend {
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        lease: AppendLease,
-        exact_bytes: u64,
-        placement: AppendReservationPlacement,
-    },
-    FillReservedAppend {
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        reservation: AppendExtentReservation,
-        offset: u64,
-        bytes: Vec<u8>,
-    },
-    CommitReservedAppend {
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        reservation: AppendExtentReservation,
-        durability: WriteDurability,
-    },
-    AbortReservedAppend {
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        reservation: AppendExtentReservation,
-    },
     Flush {
         keyspace_id: KeyspaceId,
         file_id: FileId,
@@ -371,10 +269,6 @@ impl NativeRequest {
             Self::Write { .. } => NativeOperation::Write,
             Self::AcquireAppend { .. } => NativeOperation::AcquireAppend,
             Self::Append { .. } => NativeOperation::Append,
-            Self::ReserveAppend { .. } => NativeOperation::ReserveAppend,
-            Self::FillReservedAppend { .. } => NativeOperation::FillReservedAppend,
-            Self::CommitReservedAppend { .. } => NativeOperation::CommitReservedAppend,
-            Self::AbortReservedAppend { .. } => NativeOperation::AbortReservedAppend,
             Self::Flush { .. } => NativeOperation::Flush,
             Self::CheckpointKeyspace { .. } => NativeOperation::CheckpointKeyspace,
             Self::SnapshotKeyspace { .. } => NativeOperation::SnapshotKeyspace,
@@ -391,10 +285,6 @@ impl NativeRequest {
             | Self::Write { keyspace_id, .. }
             | Self::AcquireAppend { keyspace_id, .. }
             | Self::Append { keyspace_id, .. }
-            | Self::ReserveAppend { keyspace_id, .. }
-            | Self::FillReservedAppend { keyspace_id, .. }
-            | Self::CommitReservedAppend { keyspace_id, .. }
-            | Self::AbortReservedAppend { keyspace_id, .. }
             | Self::Flush { keyspace_id, .. }
             | Self::CheckpointKeyspace { keyspace_id } => Some(*keyspace_id),
             Self::SnapshotKeyspace { source, .. } | Self::RestoreKeyspace { source, .. } => {
@@ -411,10 +301,6 @@ impl NativeRequest {
             | Self::Write { file_id, .. }
             | Self::AcquireAppend { file_id, .. }
             | Self::Append { file_id, .. }
-            | Self::ReserveAppend { file_id, .. }
-            | Self::FillReservedAppend { file_id, .. }
-            | Self::CommitReservedAppend { file_id, .. }
-            | Self::AbortReservedAppend { file_id, .. }
             | Self::Flush { file_id, .. } => Some(*file_id),
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
@@ -440,20 +326,11 @@ impl NativeRequest {
                 })?;
                 Ok(Some(ByteRange::new(0, len)))
             }
-            Self::ReserveAppend { exact_bytes, .. } => Ok(Some(ByteRange::new(0, *exact_bytes))),
-            Self::FillReservedAppend { offset, bytes, .. } => {
-                let len = u64::try_from(bytes.len()).map_err(|_| {
-                    StorageError::invalid_argument("reserved append fill length overflows u64")
-                })?;
-                Ok(Some(ByteRange::new(*offset, len)))
-            }
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
             | Self::CreateFile { .. }
             | Self::FileInfo { .. }
             | Self::AcquireAppend { .. }
-            | Self::CommitReservedAppend { .. }
-            | Self::AbortReservedAppend { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -480,10 +357,6 @@ impl NativeRequest {
             | Self::Write { .. }
             | Self::AcquireAppend { .. }
             | Self::Append { .. }
-            | Self::ReserveAppend { .. }
-            | Self::FillReservedAppend { .. }
-            | Self::CommitReservedAppend { .. }
-            | Self::AbortReservedAppend { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -526,71 +399,6 @@ impl NativeRequest {
 
                 Ok(())
             }
-            Self::ReserveAppend {
-                keyspace_id,
-                file_id,
-                lease,
-                exact_bytes,
-                placement: AppendReservationPlacement::SingleSegmentRequired,
-            } => {
-                if *exact_bytes == 0 {
-                    return Err(StorageError::invalid_argument(
-                        "reserved append length must not be zero",
-                    ));
-                }
-
-                if *keyspace_id != lease.keyspace_id || *file_id != lease.file_id {
-                    return Err(StorageError::invalid_argument(
-                        "append lease target does not match reservation target",
-                    ));
-                }
-
-                Ok(())
-            }
-            Self::FillReservedAppend {
-                keyspace_id,
-                file_id,
-                reservation,
-                offset,
-                bytes,
-            } => {
-                if *keyspace_id != reservation.keyspace_id || *file_id != reservation.file_id {
-                    return Err(StorageError::invalid_argument(
-                        "reserved append target does not match request target",
-                    ));
-                }
-                let len = u64::try_from(bytes.len()).map_err(|_| {
-                    StorageError::invalid_argument("reserved append fill length overflows u64")
-                })?;
-                ByteRange::new(*offset, len).end_exclusive()?;
-                let end = offset.checked_add(len).ok_or_else(|| {
-                    StorageError::invalid_argument("reserved append fill range overflows")
-                })?;
-                if end > reservation.exact_bytes {
-                    return Err(StorageError::invalid_argument(
-                        "reserved append fill exceeds reservation length",
-                    ));
-                }
-                Ok(())
-            }
-            Self::CommitReservedAppend {
-                keyspace_id,
-                file_id,
-                reservation,
-                ..
-            }
-            | Self::AbortReservedAppend {
-                keyspace_id,
-                file_id,
-                reservation,
-            } => {
-                if *keyspace_id != reservation.keyspace_id || *file_id != reservation.file_id {
-                    return Err(StorageError::invalid_argument(
-                        "reserved append target does not match request target",
-                    ));
-                }
-                Ok(())
-            }
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
             | Self::FileInfo { .. }
@@ -614,10 +422,6 @@ pub enum NativeResponse {
     Write(FileWriteCommit),
     Append(AppendCommit),
     AppendLease(AppendLease),
-    AppendReserved(AppendExtentReservation),
-    AppendReservationFilled(AppendReservationFill),
-    AppendReservationCommitted(AppendCommit),
-    AppendReservationAborted(AppendReservationAbort),
     Flush(FlushResult),
     KeyspaceCheckpointed(CheckpointId),
     KeyspaceSnapshotted(KeyspaceId),
@@ -810,78 +614,6 @@ mod tests {
             durability: WriteDurability::Acknowledged,
         };
         assert!(mismatched.validate_for_existing_file().is_err());
-    }
-
-    #[test]
-    fn reserved_append_validation_requires_matching_target_and_bounded_fill() {
-        let keyspace_id = KeyspaceId::from_raw(5);
-        let file_id = FileId::from_raw(7);
-        let lease = lease(keyspace_id, file_id);
-        let valid = NativeRequest::ReserveAppend {
-            keyspace_id,
-            file_id,
-            lease: lease.clone(),
-            exact_bytes: 4096,
-            placement: AppendReservationPlacement::SingleSegmentRequired,
-        };
-        assert_eq!(valid.operation(), NativeOperation::ReserveAppend);
-        assert!(valid.validate_for_existing_file().is_ok());
-        assert_eq!(valid.byte_range().unwrap(), Some(ByteRange::new(0, 4096)));
-
-        let empty = NativeRequest::ReserveAppend {
-            keyspace_id,
-            file_id,
-            lease: lease.clone(),
-            exact_bytes: 0,
-            placement: AppendReservationPlacement::SingleSegmentRequired,
-        };
-        assert!(empty.validate_for_existing_file().is_err());
-
-        let reservation = AppendExtentReservation {
-            reservation_id: AppendReservationId::from_raw(99),
-            keyspace_id,
-            file_id,
-            lease,
-            base_size: 0,
-            exact_bytes: 4096,
-            placement: AppendReservationPlacement::SingleSegmentRequired,
-        };
-        let fill = NativeRequest::FillReservedAppend {
-            keyspace_id,
-            file_id,
-            reservation: reservation.clone(),
-            offset: 1024,
-            bytes: vec![7; 2048],
-        };
-        assert_eq!(fill.operation(), NativeOperation::FillReservedAppend);
-        assert_eq!(fill.byte_range().unwrap(), Some(ByteRange::new(1024, 2048)));
-        assert!(fill.validate_for_existing_file().is_ok());
-
-        let overflowing = NativeRequest::FillReservedAppend {
-            keyspace_id,
-            file_id,
-            reservation: reservation.clone(),
-            offset: 4095,
-            bytes: vec![1, 2],
-        };
-        assert!(overflowing.validate_for_existing_file().is_err());
-
-        let commit = NativeRequest::CommitReservedAppend {
-            keyspace_id,
-            file_id,
-            reservation: reservation.clone(),
-            durability: WriteDurability::Acknowledged,
-        };
-        assert_eq!(commit.operation(), NativeOperation::CommitReservedAppend);
-        assert!(commit.validate_for_existing_file().is_ok());
-
-        let abort = NativeRequest::AbortReservedAppend {
-            keyspace_id,
-            file_id,
-            reservation,
-        };
-        assert_eq!(abort.operation(), NativeOperation::AbortReservedAppend);
-        assert!(abort.validate_for_existing_file().is_ok());
     }
 
     #[test]
