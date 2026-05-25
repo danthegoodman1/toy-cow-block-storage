@@ -474,14 +474,19 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 16 owns the first local durable snapshot provider: segment sync,
   atomic metadata/storage-node snapshots, commit-group persistence,
   write-intent recovery, native append lease/session records,
-  checkpoint/timeline persistence, and cache coherence after restart.
+  checkpoint/timeline persistence, and cache coherence after restart. Its
+  current `bincode` snapshots are scaffolding, not a committed durable format.
 - Phase 17 owns remote transport serialization, retry/deduplication, stale
   response rejection, server incarnation fencing, deadlines, mailbox semantics,
-  backpressure, and concurrency rules for non-conflicting requests.
+  backpressure, and concurrency rules for non-conflicting requests. Its current
+  `bincode` wire envelope is scaffolding, not the real network format.
 - Phase 18 owns the durable provider crash/fault-injection matrix and the
   decision of whether the snapshot provider remains sufficient or needs a
-  journal/database-backed metadata provider.
-- Phase 19 owns a real network implementation of the Phase 17 wire contract.
+  journal/database-backed metadata provider. It also owns replacing durable
+  `bincode` snapshots with a crate-owned binary codec before the durable format
+  is considered production-grade.
+- Phase 19 owns a real network implementation of the Phase 17 wire contract,
+  including a crate-owned wire codec rather than serde/bincode-derived frames.
 - Phase 20 owns placement, replica-set selection, replica reference evidence,
   release evidence logs or per-node queues, storage-node cursors, repair
   records, orphan replica reconciliation, stale placement handling, and physical
@@ -629,7 +634,8 @@ Deliverables:
   `durable_through` semantics.
 - [x] Durable metadata snapshots for commit groups, checkpoints, delete records,
   fork records, native keyspace commits, and native file-root audit commits.
-  The first provider uses atomic binary snapshots, not a metadata WAL.
+  The first provider uses atomic `bincode` snapshots as temporary scaffolding,
+  not a committed durable format and not a metadata WAL.
 - [x] Durable write-intent table with logical expiration, cancellation/failure
   evidence, and restart recovery scan.
 - [x] Durable native append lease/session records with restart-safe writer
@@ -709,13 +715,21 @@ snapshot provider is enough for the toy system's durability contract, or
 produces the evidence needed to replace it with a journal/database-backed
 metadata provider. Do not silently grow a second durable format; if a journal
 or database provider is chosen, update the spec and remove the superseded
-snapshot-only path in the same phase.
+snapshot-only path in the same phase. `bincode` is not an acceptable durable
+format after this phase; replace it with a crate-owned binary codec before the
+crash matrix is treated as production-grade evidence.
 
 Deliverables:
 
 - [ ] Reusable durable provider conformance harness that can run against the
   in-memory model, the snapshot durable provider, and any future journal or
   database-backed provider where applicable.
+- [ ] Crate-owned durable snapshot codec with explicit magic, schema version,
+  record kind, enum tags, fixed integer endianness, bounded collection/string
+  lengths, trailing-byte rejection, and deterministic map ordering.
+- [ ] Durable codec tests for round trips, stable golden bytes, unsupported
+  versions, invalid tags, truncated payloads, trailing bytes, oversized lengths,
+  and length-prefix overflow.
 - [ ] Fault-injected segment file I/O backend that can fail or crash at temp
   file create/write, temp file sync, atomic rename, final directory sync, and
   tmp cleanup.
@@ -729,6 +743,9 @@ Deliverables:
 - [ ] If a journal/database provider is required, implement it behind the same
   provider contracts and remove any obsolete snapshot-only compatibility path
   from production use.
+- [ ] Remove `bincode` from durable snapshot persistence. Keeping serde/bincode
+  only for test fixtures or debug helpers is allowed if it is not a production
+  durable or wire format.
 
 Exit gate:
 
@@ -744,6 +761,9 @@ Exit gate:
   without freeing live or retained-PITR data.
 - [ ] The chosen durable metadata format has no untested compatibility shim left
   behind.
+- [ ] Durable reopen never depends on serde-derived struct layout or bincode
+  defaults; every persisted byte is accepted or rejected by crate-owned codec
+  rules.
 
 ## Phase 19: Real Network Transport
 
@@ -751,12 +771,19 @@ Status: not started.
 
 Implement an actual network adapter for the Phase 17 serialized wire contract.
 This phase is about crossing a process or host boundary, not changing storage
-semantics and not adding replication.
+semantics and not adding replication. The Phase 17 `bincode` envelope is
+temporary local scaffolding; real network frames must use a crate-owned codec.
 
 Deliverables:
 
 - [ ] Protocol choice documented in the spec, including framing, maximum frame
   size, request/response envelope codec, and server incarnation handshake.
+- [ ] Crate-owned wire codec with explicit magic, protocol version, frame kind,
+  request/response kind tags, fixed integer endianness, bounded payload lengths,
+  and trailing-byte rejection.
+- [ ] Wire codec tests for round trips, stable golden frames, unsupported
+  versions, invalid tags, truncated frames, oversized frames, trailing bytes,
+  corrupt length prefixes, and mismatched request/response IDs.
 - [ ] Network block transport that implements `BlockTransport` without changing
   `BlockDevice` callers.
 - [ ] Network native transport that implements `NativeTransport` without
@@ -777,6 +804,8 @@ Exit gate:
   same request identity without double-applying successful server mutations.
 - [ ] Stale server incarnations, mismatched response IDs, oversized frames, and
   malformed frames are rejected deterministically.
+- [ ] No production network path uses serde/bincode-derived framing or enum
+  layout.
 - [ ] Backpressure is bounded and observable; the network adapter does not hide
   unbounded queues or background retries.
 - [ ] Public block/native APIs and provider contracts do not change.

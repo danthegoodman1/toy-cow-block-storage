@@ -452,11 +452,12 @@ deterministically.
 ### Phase 17 Remote Transport Choice
 
 The first remote-capable transport is an in-process serialized endpoint, not a
-network socket. Requests and responses cross a crate-owned binary envelope that
-includes server incarnation, client epoch, request ID, optional logical
-deadline, and the public block or native request/response body. This proves the
-remote contract without making Phase 17 depend on TCP, HTTP, gRPC, or an async
-runtime.
+network socket. Requests and responses cross a binary envelope that includes
+server incarnation, client epoch, request ID, optional logical deadline, and
+the public block or native request/response body. The Phase 17 envelope may use
+`bincode` as temporary local scaffolding to prove the remote contract without
+depending on TCP, HTTP, gRPC, or an async runtime. It is not the real network
+format.
 
 Remote endpoints keep a bounded request-deduplication cache keyed by server
 incarnation, client epoch, and request ID. Reusing a key for different request
@@ -482,7 +483,10 @@ including the in-process transport and the serialized remote transport.
 A real network transport is a later adapter over the same wire contract. It
 must add framing, bounded queues, timeout/reconnect behavior, malformed-frame
 handling, and loopback/chaos conformance tests without changing block/native
-semantics or moving replica selection into clients.
+semantics or moving replica selection into clients. Production network frames
+must use a crate-owned codec with explicit magic, version, frame kind, tags,
+fixed endianness, bounded lengths, and deterministic rejection of malformed or
+trailing bytes.
 
 ### `MetadataPlane`
 
@@ -541,19 +545,25 @@ store/
       tmp/
 ```
 
-The Phase 16 metadata provider uses crate-owned binary snapshots written with
-the same temp-file, file-sync, atomic-rename, and directory-sync discipline as
-segment files. This deliberately avoids choosing SQLite, RocksDB, or another
-database before the crash/restart contract is proven. A later provider may use
-a database, but it must preserve the same provider contracts and keep metadata
-state separate from storage-node local segment catalogs.
+The Phase 16 metadata provider uses atomic binary snapshots written with the
+same temp-file, file-sync, atomic-rename, and directory-sync discipline as
+segment files. The current implementation uses `bincode` as scaffolding for
+those snapshots so the durable boundary can be tested before the format is
+designed. `bincode` is not the durable format. The durable fault-injection
+phase must replace it with a crate-owned codec or choose a journal/database
+provider. A later provider may use SQLite, RocksDB, or another database, but it
+must preserve the same provider contracts and keep metadata state separate from
+storage-node local segment catalogs.
 
 The snapshot provider is the first durable implementation, not the final answer
 for every crash-recovery shape. The durable fault-injection phase must either
 prove atomic snapshots survive every required crash/reopen boundary or replace
 them with a journal/database-backed metadata provider. If that replacement is
 needed, the old snapshot-only production path should be removed rather than
-kept as a compatibility layer.
+kept as a compatibility layer. If snapshots remain, their codec must have
+explicit magic, schema version, record kind, fixed integer endianness, bounded
+lengths, deterministic map ordering, and strict malformed/trailing-byte
+rejection.
 
 Segment files are storage-node-local immutable payloads. `catalog.bin` records
 local reservation, durable-pending, referenced, released, and freed lifecycle
