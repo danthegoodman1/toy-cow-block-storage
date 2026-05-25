@@ -487,7 +487,10 @@ remote, replayable, or concurrent boundary in the owning future phase:
   is considered production-grade.
 - Phase 19 owns a real network implementation of the Phase 17 wire contract,
   including a crate-owned wire codec rather than serde/bincode-derived frames.
-- Phase 20 owns placement, replica-set selection, replica reference evidence,
+- Phase 20 owns replacing the snapshot-only performance path with a measured
+  durable journal and segment-log provider before storage replication builds on
+  the wrong persistence shape.
+- Phase 21 owns placement, replica-set selection, replica reference evidence,
   release evidence logs or per-node queues, storage-node cursors, repair
   records, orphan replica reconciliation, stale placement handling, and physical
   free reconciliation across storage nodes.
@@ -630,8 +633,8 @@ Deliverables:
   below `SegmentStore` and `LocalSegmentCatalog`.
 - [x] Portable blocking filesystem segment I/O backend used by the durable
   storage node by default.
-- [x] Crash-consistent `sync_segment` and `flush` definitions, including exact
-  `durable_through` semantics.
+- [x] Crash-consistent `sync_segment`, `Acknowledged`, `Flushed`, and `flush`
+  definitions, including exact `durable_through` semantics.
 - [x] Durable metadata snapshots for commit groups, checkpoints, delete records,
   fork records, native keyspace commits, and native file-root audit commits.
   The first provider uses atomic `bincode` snapshots as temporary scaffolding,
@@ -647,6 +650,8 @@ Deliverables:
 - [x] Explicit portable segment file I/O sequencing test for temp write, temp
   file sync, atomic rename, final directory sync, and tmp cleanup.
 - [x] PITR and GC tests against the durable provider.
+- [x] Durable Criterion baselines for acknowledged writes, flushed writes,
+  batched flushes, reopen reads, and reopen after committed history.
 
 Exit gate:
 
@@ -663,6 +668,8 @@ Exit gate:
   sequence: payload bytes are durable before final segment visibility, and final
   path visibility is durable before catalog state can claim the segment is
   durable.
+- [x] `Acknowledged` writes are read-visible in the live process but need a
+  later `flush` or `Flushed` write for restart visibility.
 - [x] Flush reports only commit sequences whose segment bytes and metadata
   records satisfy the provider's documented durability contract.
 - [x] Cached reads after restart or stale cache invalidation cannot observe roots
@@ -811,7 +818,57 @@ Exit gate:
 - [x] Public block/native APIs and provider contracts do not change.
 - [x] The network adapter does not choose storage nodes or fan out replicas.
 
-## Phase 20: Storage Replication
+## Phase 20: Durable Journal and Segment Log Provider
+
+Status: not started.
+
+The snapshot durable provider is now a correctness baseline, not the intended
+high-performance durable layout. Phase 16/18 benchmarks showed that fully
+flushed 4 KiB writes are dominated by per-operation segment-file and snapshot
+syncs, and that batching acknowledged writes still pays one temp-file sync per
+segment. Before adding replicated storage, replace the performance path with an
+append-oriented durable provider that preserves the same public contracts.
+
+Deliverables:
+
+- [ ] Append-only metadata journal or database-backed metadata provider for
+  device heads, keyspace heads, commit groups, PITR records, checkpoints,
+  write-intent state, append leases, and GC/custodian evidence.
+- [ ] Periodic compact checkpoints so replay time is bounded without rewriting
+  the whole metadata plane on every write.
+- [ ] Segment log or extent-packed storage-node layout that can persist a batch
+  of small immutable segments with fewer sync boundaries than one file per
+  segment.
+- [ ] Group-commit path for acknowledged writes where `flush` can persist many
+  committed mappings with one ordered durability sequence.
+- [ ] Crash/reopen and fault-injection matrix for journal append, checkpoint
+  publish, segment-log append, batch sync, replay truncation, and checkpoint
+  compaction.
+- [ ] Migration-free replacement of the snapshot performance path under the
+  no-tombstones rule; the snapshot provider may remain only as a deterministic
+  test fixture if it is no longer the production durable provider.
+- [ ] Criterion baselines for acknowledged latency, single flushed latency,
+  batched flush throughput, reopen replay time, checkpoint compaction, native
+  append, and block/native reads after reopen.
+
+Exit gate:
+
+- [ ] The journal/segment-log provider passes the same provider conformance,
+  PITR, GC, custodian, restart, and malformed-input tests as the snapshot
+  provider.
+- [ ] A flushed write still persists segment bytes before metadata can reference
+  them, and `flush` reports only replay-survivable commit sequences.
+- [ ] Acknowledged writes remain read-visible in-process and become
+  restart-visible only after `flush`, `Flushed`, or another documented
+  synchronous metadata operation.
+- [ ] Replayed state is byte-for-byte equivalent to the deterministic in-memory
+  model for block and native generated traces.
+- [ ] Benchmarks demonstrate that the new durable path materially improves
+  fully flushed writes and batched flushes on the same host.
+- [ ] The implementation plan records any remaining host-specific ceiling, such
+  as macOS sync latency, without hiding provider-level overhead.
+
+## Phase 21: Storage Replication
 
 Status: not started.
 
@@ -867,7 +924,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 21: Linux io_uring Storage Node Backend
+## Phase 22: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -907,7 +964,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 22: Optional ublk Adapter
+## Phase 23: Optional ublk Adapter
 
 Status: not started.
 

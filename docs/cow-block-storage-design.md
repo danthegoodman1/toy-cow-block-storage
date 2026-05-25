@@ -597,6 +597,14 @@ tests. A journal or database provider would be justified when snapshot rewrite
 cost, multi-process writers, partial replay, or larger metadata sets become the
 measured bottleneck.
 
+The first durable Criterion baselines now show that the snapshot provider is a
+correctness baseline rather than a performance-grade durable layout: fully
+flushed small writes are dominated by sync count, and batched flush still pays
+one payload sync per segment file. The next durable performance phase should
+replace the hot path with an append-only metadata journal/database plus a
+segment-log or equivalent batched segment layout before replication builds on
+this provider.
+
 The durable snapshot format is now crate-owned rather than serde/bincode-owned:
 
 ```text
@@ -618,14 +626,22 @@ metadata snapshot records globally meaningful heads, roots, timelines,
 checkpoints, write-intent counters, and native writer epochs; it does not store
 storage-node file paths as metadata truth.
 
-Because Phase 16 uses synchronous provider persistence, a successful public
-write, checkpoint, fork, restore, delete, native write, or native append has
-already persisted its segment files, storage-node catalog snapshot, segment
-descriptor snapshot, and metadata snapshot before the call returns. `flush`
-therefore reports the latest committed sequence visible to the relevant device
-or native file as `durable_through`; it must not report a sequence whose
-metadata snapshot can reference segment bytes that failed the storage-node
-durability sequence.
+The durable provider honors the public `WriteDurability` boundary. A successful
+`Acknowledged` block or native file write is committed to the live in-process
+mapping and visible to later reads, but may be lost across process crash until a
+later `flush`, a `Flushed` write, or another synchronous metadata operation
+persists the current state. A successful `Flushed` write has persisted segment
+files, storage-node catalog snapshot, segment descriptor snapshot, and metadata
+snapshot before the call returns. `flush` persists the current live state and
+reports the latest committed sequence visible to the relevant device or native
+file as `durable_through`; it must not report a sequence whose metadata snapshot
+can reference segment bytes that failed the storage-node durability sequence.
+
+Synchronous metadata operations that do not carry a `WriteDurability` argument
+-- create, checkpoint, fork, restore, delete, keyspace snapshot, and custodian
+operations -- persist before returning. Because the snapshot captures current
+live state, those operations also flush any earlier acknowledged writes in the
+same store instance.
 
 ### Future Storage Replication
 

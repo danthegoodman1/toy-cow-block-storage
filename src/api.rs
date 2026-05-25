@@ -221,7 +221,12 @@ impl BlockRange {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WriteDurability {
+    /// Commit the write to the live in-process mapping and make it visible to
+    /// later reads, but allow the provider to batch stable-storage persistence
+    /// until a later `flush` or stronger write.
     Acknowledged,
+    /// Commit the write and return only after the provider's stable-storage
+    /// durability contract is satisfied for the committed sequence.
     Flushed,
 }
 

@@ -1,9 +1,16 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::{hint::black_box, time::Duration};
+use std::{
+    fs,
+    hint::black_box,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId};
 use toy_cow_block_storage::local::{
-    InMemoryMetadataPlane, InMemorySegmentStore, LocalObjectStore, LocalStoreConfig,
+    DurableObjectStore, InMemoryMetadataPlane, InMemorySegmentStore, LocalObjectStore,
+    LocalStoreConfig,
 };
 use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
 use toy_cow_block_storage::provider::{
@@ -1181,9 +1188,419 @@ fn bench_native_concurrent_batches(c: &mut Criterion) {
     group.finish();
 }
 
+static NEXT_DURABLE_BENCH_ROOT: AtomicU64 = AtomicU64::new(1);
+
+fn durable_bench_config() -> LocalStoreConfig {
+    LocalStoreConfig {
+        shard_count: 4,
+        block_size: 4096,
+        file_root_blocks: 1024,
+        metadata_fanout: 4,
+        metadata_leaf_blocks: 16,
+        storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+    }
+}
+
+fn durable_bench_root(name: &str) -> PathBuf {
+    let id = NEXT_DURABLE_BENCH_ROOT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join("toy-cow-block-storage-benches")
+        .join(format!("{name}-{}-{id}", std::process::id()))
+}
+
+fn cleanup_durable_bench_root(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
+
+fn elapsed_durable_iters(iters: u64, mut run_one: impl FnMut() -> Duration) -> Duration {
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..iters {
+        elapsed += run_one();
+    }
+    elapsed
+}
+
+fn create_durable_block_device(store: &DurableObjectStore, logical_blocks: u64) -> DeviceId {
+    store
+        .create_device(toy_cow_block_storage::CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap()
+}
+
+fn create_durable_native_file(store: &DurableObjectStore) -> (KeyspaceId, FileId) {
+    let keyspace_id = store
+        .create_keyspace(toy_cow_block_storage::CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            toy_cow_block_storage::CreateFileRequest {
+                spec: toy_cow_block_storage::FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    (keyspace_id, file_id)
+}
+
+fn seed_durable_block_history(store: &DurableObjectStore, device_id: DeviceId, writes: u64) {
+    seed_durable_block_history_with_durability(
+        store,
+        device_id,
+        writes,
+        WriteDurability::Acknowledged,
+    );
+}
+
+fn seed_durable_block_history_with_durability(
+    store: &DurableObjectStore,
+    device_id: DeviceId,
+    writes: u64,
+    durability: WriteDurability,
+) {
+    for block in 0..writes {
+        store
+            .write_device(device_id, block * 4096, &[block as u8; 4096], durability)
+            .unwrap();
+    }
+}
+
+fn seed_durable_native_history(
+    store: &DurableObjectStore,
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    writes: u64,
+) {
+    seed_durable_native_history_with_durability(
+        store,
+        keyspace_id,
+        file_id,
+        writes,
+        WriteDurability::Acknowledged,
+    );
+}
+
+fn seed_durable_native_history_with_durability(
+    store: &DurableObjectStore,
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    writes: u64,
+    durability: WriteDurability,
+) {
+    for block in 0..writes {
+        store
+            .write_file_at(
+                keyspace_id,
+                file_id,
+                block * 4096,
+                &[block as u8; 4096],
+                durability,
+            )
+            .unwrap();
+    }
+}
+
+fn bench_durable_provider(c: &mut Criterion) {
+    let mut group = c.benchmark_group("durable_provider");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    group.bench_function("block_write_4k_acknowledged_fresh", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("block-write-ack-fresh");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                let payload = vec![3; 4096];
+                let started = Instant::now();
+                store
+                    .write_device(
+                        black_box(device_id),
+                        black_box(0),
+                        black_box(&payload),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("block_write_4k_flushed_fresh", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("block-write-flushed-fresh");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                let payload = vec![3; 4096];
+                let started = Instant::now();
+                store
+                    .write_device(
+                        black_box(device_id),
+                        black_box(0),
+                        black_box(&payload),
+                        WriteDurability::Flushed,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("block_flush_after_32_acknowledged_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("block-flush-after-32");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history(&store, device_id, 32);
+                let started = Instant::now();
+                store.flush_device(black_box(device_id)).unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("block_overwrite_4k_flushed_after_32_flushed_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("block-overwrite-flushed-after-32");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    32,
+                    WriteDurability::Flushed,
+                );
+                let payload = vec![9; 4096];
+                let started = Instant::now();
+                store
+                    .write_device(
+                        black_box(device_id),
+                        black_box(0),
+                        black_box(&payload),
+                        WriteDurability::Flushed,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("block_read_4k_after_reopen", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("block-read-reopen");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                store
+                    .write_device(device_id, 0, &[7; 4096], WriteDurability::Flushed)
+                    .unwrap();
+                drop(store);
+                let reopened = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let mut buf = vec![0; 4096];
+                let started = Instant::now();
+                reopened
+                    .read_device(
+                        black_box(device_id),
+                        black_box(ByteRange::new(0, 4096)),
+                        black_box(&mut buf),
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(buf[0]);
+                elapsed
+            })
+        })
+    });
+
+    group.bench_function("open_after_32_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("open-after-32-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    32,
+                    WriteDurability::Flushed,
+                );
+                drop(store);
+                let started = Instant::now();
+                let reopened = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let elapsed = started.elapsed();
+                black_box(reopened.device_info(device_id).unwrap());
+                drop(reopened);
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("native_write_at_4k_acknowledged_fresh", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("native-write-ack-fresh");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let (keyspace_id, file_id) = create_durable_native_file(&store);
+                let payload = vec![4; 4096];
+                let started = Instant::now();
+                store
+                    .write_file_at(
+                        black_box(keyspace_id),
+                        black_box(file_id),
+                        black_box(0),
+                        black_box(&payload),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("native_write_at_4k_flushed_fresh", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("native-write-flushed-fresh");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let (keyspace_id, file_id) = create_durable_native_file(&store);
+                let payload = vec![4; 4096];
+                let started = Instant::now();
+                store
+                    .write_file_at(
+                        black_box(keyspace_id),
+                        black_box(file_id),
+                        black_box(0),
+                        black_box(&payload),
+                        WriteDurability::Flushed,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("native_flush_after_32_acknowledged_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("native-flush-after-32");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let (keyspace_id, file_id) = create_durable_native_file(&store);
+                seed_durable_native_history(&store, keyspace_id, file_id, 32);
+                let started = Instant::now();
+                store
+                    .flush_file(black_box(keyspace_id), black_box(file_id))
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("native_write_at_4k_flushed_after_32_flushed_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("native-write-flushed-after-32");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let (keyspace_id, file_id) = create_durable_native_file(&store);
+                seed_durable_native_history_with_durability(
+                    &store,
+                    keyspace_id,
+                    file_id,
+                    32,
+                    WriteDurability::Flushed,
+                );
+                let payload = vec![8; 4096];
+                let started = Instant::now();
+                store
+                    .write_file_at(
+                        black_box(keyspace_id),
+                        black_box(file_id),
+                        black_box(0),
+                        black_box(&payload),
+                        WriteDurability::Flushed,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("native_append_4k_acknowledged_fresh", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("native-append-ack-fresh");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let (keyspace_id, file_id) = create_durable_native_file(&store);
+                let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                let payload = vec![5; 4096];
+                let started = Instant::now();
+                store
+                    .append_file(
+                        black_box(lease),
+                        black_box(&payload),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("native_append_4k_flushed_fresh", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("native-append-flushed-fresh");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let (keyspace_id, file_id) = create_durable_native_file(&store);
+                let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                let payload = vec![5; 4096];
+                let started = Instant::now();
+                store
+                    .append_file(
+                        black_box(lease),
+                        black_box(&payload),
+                        WriteDurability::Flushed,
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
 }
 criterion_main!(regression);

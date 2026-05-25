@@ -1348,6 +1348,13 @@ impl PortableSegmentFileIo {
         write_synced_segment_with_io(self, segment_id, bytes)
     }
 
+    pub fn write_synced_segments<'a>(
+        &self,
+        segments: impl IntoIterator<Item = (SegmentId, &'a [u8])>,
+    ) -> Result<()> {
+        write_synced_segments_with_io(self, segments)
+    }
+
     fn prune_unlisted_segments(&self, keep: &BTreeSet<SegmentId>) -> Result<()> {
         fs::create_dir_all(&self.segments_dir).map_err(fs_error)?;
         let mut deleted = false;
@@ -1386,21 +1393,39 @@ fn write_synced_segment_with_io(
     segment_id: SegmentId,
     bytes: &[u8],
 ) -> Result<()> {
-    if io.segment_file_exists(segment_id)? {
-        let existing = io.read_segment_file(segment_id)?;
-        if existing == bytes {
-            return Ok(());
-        } else {
-            return Err(StorageError::conflict(
-                "durable segment file already exists with different bytes",
-            ));
+    write_synced_segments_with_io(io, [(segment_id, bytes)])
+}
+
+fn write_synced_segments_with_io<'a>(
+    io: &dyn SegmentFileIo,
+    segments: impl IntoIterator<Item = (SegmentId, &'a [u8])>,
+) -> Result<()> {
+    let mut renamed = false;
+    let mut pending_renames = Vec::new();
+    for (segment_id, bytes) in segments {
+        if io.segment_file_exists(segment_id)? {
+            let existing = io.read_segment_file(segment_id)?;
+            if existing == bytes {
+                continue;
+            } else {
+                return Err(StorageError::conflict(
+                    "durable segment file already exists with different bytes",
+                ));
+            }
         }
+        io.write_temp_segment(segment_id, bytes)?;
+        io.sync_temp_segment(segment_id)?;
+        pending_renames.push(segment_id);
     }
 
-    io.write_temp_segment(segment_id, bytes)?;
-    io.sync_temp_segment(segment_id)?;
-    io.rename_temp_to_final(segment_id)?;
-    io.sync_segment_dir()
+    for segment_id in pending_renames {
+        io.rename_temp_to_final(segment_id)?;
+        renamed = true;
+    }
+    if renamed {
+        io.sync_segment_dir()?;
+    }
+    Ok(())
 }
 
 impl SegmentFileIo for PortableSegmentFileIo {
@@ -1422,7 +1447,7 @@ impl SegmentFileIo for PortableSegmentFileIo {
     fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()> {
         File::open(self.tmp_path(segment_id))
             .map_err(fs_error)?
-            .sync_all()
+            .sync_data()
             .map_err(fs_error)
     }
 
@@ -1501,6 +1526,8 @@ pub struct DurableObjectStore {
     local: LocalObjectStore,
     paths: Arc<DurableStorePaths>,
     segment_io: Arc<PortableSegmentFileIo>,
+    persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl DurableObjectStore {
@@ -1518,13 +1545,21 @@ impl DurableObjectStore {
         } else {
             LocalObjectStore::with_config(config)?
         };
+        let persisted_segments = local
+            .snapshot()?
+            .segment_store
+            .segments
+            .keys()
+            .copied()
+            .collect();
 
         let store = Self {
             local,
             paths: Arc::new(paths),
             segment_io,
+            persisted_segments: Arc::new(Mutex::new(persisted_segments)),
+            persist_lock: Arc::new(Mutex::new(())),
         };
-        store.persist()?;
         Ok(store)
     }
 
@@ -1627,7 +1662,10 @@ impl DurableObjectStore {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<WriteCommit> {
-        self.run_and_persist(|local| local.write_device(device_id, offset, data, durability))
+        self.run_and_maybe_persist(
+            matches!(durability, crate::api::WriteDurability::Flushed),
+            |local| local.write_device(device_id, offset, data, durability),
+        )
     }
 
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
@@ -1655,9 +1693,10 @@ impl DurableObjectStore {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<FileWriteCommit> {
-        self.run_and_persist(|local| {
-            local.write_file_at(keyspace_id, file_id, offset, data, durability)
-        })
+        self.run_and_maybe_persist(
+            matches!(durability, crate::api::WriteDurability::Flushed),
+            |local| local.write_file_at(keyspace_id, file_id, offset, data, durability),
+        )
     }
 
     pub fn append_file(
@@ -1666,7 +1705,10 @@ impl DurableObjectStore {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<AppendCommit> {
-        self.run_and_persist(|local| local.append_file(lease, data, durability))
+        self.run_and_maybe_persist(
+            matches!(durability, crate::api::WriteDurability::Flushed),
+            |local| local.append_file(lease, data, durability),
+        )
     }
 
     pub fn read_file(
@@ -1691,6 +1733,24 @@ impl DurableObjectStore {
         self.run_and_persist(|local| local.delete_device(device_id))
     }
 
+    pub fn flush_device(&self, device_id: DeviceId) -> Result<FlushResult> {
+        self.persist()?;
+        let info = self.local.metadata.device_info(device_id)?;
+        Ok(FlushResult {
+            device_id,
+            durable_through: info.latest_commit,
+        })
+    }
+
+    pub fn flush_file(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FlushResult> {
+        self.persist()?;
+        let head = self.local.metadata.get_file_head(keyspace_id, file_id)?;
+        Ok(FlushResult {
+            device_id: DeviceId::from_raw(file_id.raw()),
+            durable_through: head.latest_commit,
+        })
+    }
+
     pub fn run_metadata_custodian(
         &self,
         policy: RetentionPolicy,
@@ -1706,7 +1766,18 @@ impl DurableObjectStore {
     }
 
     fn run_and_persist<T>(&self, op: impl FnOnce(&LocalObjectStore) -> Result<T>) -> Result<T> {
+        self.run_and_maybe_persist(true, op)
+    }
+
+    fn run_and_maybe_persist<T>(
+        &self,
+        persist: bool,
+        op: impl FnOnce(&LocalObjectStore) -> Result<T>,
+    ) -> Result<T> {
         let result = op(&self.local);
+        if !persist {
+            return result;
+        }
         let persist = self.persist();
         match (result, persist) {
             (Ok(value), Ok(())) => Ok(value),
@@ -1768,13 +1839,20 @@ impl DurableObjectStore {
     }
 
     fn persist(&self) -> Result<()> {
+        let _persist_guard = lock(&self.persist_lock)?;
         let snapshot = self.local.snapshot()?;
-        for (segment_id, record) in &snapshot.segment_store.segments {
-            self.segment_io
-                .write_synced_segment(*segment_id, &record.bytes)?;
-        }
         let kept_segments: BTreeSet<_> = snapshot.segment_store.segments.keys().copied().collect();
-        self.segment_io.prune_unlisted_segments(&kept_segments)?;
+        {
+            let persisted_segments = lock(&self.persisted_segments)?;
+            self.segment_io.write_synced_segments(
+                snapshot
+                    .segment_store
+                    .segments
+                    .iter()
+                    .filter(|(segment_id, _)| !persisted_segments.contains(segment_id))
+                    .map(|(segment_id, record)| (*segment_id, record.bytes.as_slice())),
+            )?;
+        }
 
         let segment_store_snapshot = DurableSegmentStoreSnapshot {
             config: snapshot.config,
@@ -1807,7 +1885,10 @@ impl DurableObjectStore {
 
         write_snapshot_atomic(&self.paths.segment_store_snapshot, &segment_store_snapshot)?;
         write_snapshot_atomic(&self.paths.catalog_snapshot, &catalog_snapshot)?;
-        write_snapshot_atomic(&self.paths.metadata_snapshot, &metadata_snapshot)
+        write_snapshot_atomic(&self.paths.metadata_snapshot, &metadata_snapshot)?;
+        self.segment_io.prune_unlisted_segments(&kept_segments)?;
+        *lock(&self.persisted_segments)? = kept_segments;
+        Ok(())
     }
 }
 
@@ -9021,7 +9102,7 @@ fn write_snapshot_atomic_with_fault<T: DurableSnapshotCodec>(
         let mut file = File::create(&tmp).map_err(fs_error)?;
         file.write_all(&bytes).map_err(fs_error)?;
         maybe_snapshot_write_fault(fault, SnapshotWriteFault::TempSync)?;
-        file.sync_all().map_err(fs_error)?;
+        file.sync_data().map_err(fs_error)?;
     }
     maybe_snapshot_write_fault(fault, SnapshotWriteFault::Rename)?;
     fs::rename(&tmp, path).map_err(fs_error)?;
@@ -9529,7 +9610,7 @@ mod tests {
             offset: u64,
             data: &[u8],
         ) -> Result<WriteCommit> {
-            self.write_device(device_id, offset, data, WriteDurability::Acknowledged)
+            self.write_device(device_id, offset, data, WriteDurability::Flushed)
         }
 
         fn read_device_for_conformance(
@@ -9578,13 +9659,7 @@ mod tests {
             offset: u64,
             data: &[u8],
         ) -> Result<FileWriteCommit> {
-            self.write_file_at(
-                keyspace_id,
-                file_id,
-                offset,
-                data,
-                WriteDurability::Acknowledged,
-            )
+            self.write_file_at(keyspace_id, file_id, offset, data, WriteDurability::Flushed)
         }
 
         fn acquire_append_for_conformance(
@@ -9600,7 +9675,7 @@ mod tests {
             lease: AppendLease,
             data: &[u8],
         ) -> Result<AppendCommit> {
-            self.append_file(lease, data, WriteDurability::Acknowledged)
+            self.append_file(lease, data, WriteDurability::Flushed)
         }
 
         fn read_file_for_conformance(
@@ -11364,7 +11439,7 @@ mod tests {
                 device_id,
                 0,
                 &repeated_blocks(2, 3),
-                WriteDurability::Acknowledged,
+                WriteDurability::Flushed,
             )
             .unwrap();
         let checkpoint = store.checkpoint(device_id).unwrap();
@@ -11373,7 +11448,7 @@ mod tests {
                 device_id,
                 0,
                 &repeated_blocks(2, 4),
-                WriteDurability::Acknowledged,
+                WriteDurability::Flushed,
             )
             .unwrap();
         assert!(root.join("metadata").join("metadata.bin").exists());
@@ -11416,6 +11491,58 @@ mod tests {
     }
 
     #[test]
+    fn durable_acknowledged_write_requires_flush_for_restart_visibility() {
+        let root = durable_temp_dir("ack-flush-restart");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 6),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        drop(store);
+        let reopened_before_flush = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut before_flush = vec![99; 4096];
+        reopened_before_flush
+            .read_device(device_id, ByteRange::new(0, 4096), &mut before_flush)
+            .unwrap();
+        assert_eq!(before_flush, vec![0; 4096]);
+
+        reopened_before_flush
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 7),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let flush = reopened_before_flush.flush_device(device_id).unwrap();
+        assert!(flush.durable_through.raw() > 0);
+
+        drop(reopened_before_flush);
+        let reopened_after_flush = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut after_flush = vec![0; 4096];
+        reopened_after_flush
+            .read_device(device_id, ByteRange::new(0, 4096), &mut after_flush)
+            .unwrap();
+        assert_eq!(after_flush, repeated_blocks(1, 7));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn durable_provider_reopens_native_keyspace_and_writer_epochs() {
         let root = durable_temp_dir("native-restart");
         let cfg = config();
@@ -11446,7 +11573,7 @@ mod tests {
                 .is_err()
         );
         reopened
-            .append_file(fresh, b"durable", WriteDurability::Acknowledged)
+            .append_file(fresh, b"durable", WriteDurability::Flushed)
             .unwrap();
         let mut bytes = vec![0; b"durable".len()];
         reopened
@@ -11494,7 +11621,7 @@ mod tests {
                 device_id,
                 7 * 4096,
                 &repeated_blocks(3, 4),
-                WriteDurability::Acknowledged,
+                WriteDurability::Flushed,
             )
             .unwrap();
         let checkpoint = store.checkpoint(device_id).unwrap();
@@ -11512,7 +11639,7 @@ mod tests {
                 forked,
                 8 * 4096,
                 &repeated_blocks(1, 9),
-                WriteDurability::Acknowledged,
+                WriteDurability::Flushed,
             )
             .unwrap();
         let restored = store
@@ -11546,13 +11673,7 @@ mod tests {
             )
             .unwrap();
         store
-            .write_file_at(
-                keyspace_id,
-                file_a,
-                0,
-                b"before",
-                WriteDurability::Acknowledged,
-            )
+            .write_file_at(keyspace_id, file_a, 0, b"before", WriteDurability::Flushed)
             .unwrap();
         let keyspace_checkpoint = store.checkpoint_keyspace(keyspace_id).unwrap();
         let snapshot_keyspace = store
@@ -11565,17 +11686,11 @@ mod tests {
             )
             .unwrap();
         store
-            .write_file_at(
-                keyspace_id,
-                file_a,
-                0,
-                b"after!",
-                WriteDurability::Acknowledged,
-            )
+            .write_file_at(keyspace_id, file_a, 0, b"after!", WriteDurability::Flushed)
             .unwrap();
         let lease = store.acquire_append_lease(keyspace_id, file_b).unwrap();
         store
-            .append_file(lease, b"tail", WriteDurability::Acknowledged)
+            .append_file(lease, b"tail", WriteDurability::Flushed)
             .unwrap();
         let restored_keyspace = store
             .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(keyspace_checkpoint))
@@ -11691,7 +11806,7 @@ mod tests {
                 device_id,
                 0,
                 &repeated_blocks(1, 8),
-                WriteDurability::Acknowledged,
+                WriteDurability::Flushed,
             )
             .unwrap();
         assert!(segment_path.exists());
