@@ -43,6 +43,7 @@ id_type!(KeyspaceId, u128);
 id_type!(FileId, u128);
 id_type!(RequestId, u128);
 id_type!(ClientEpoch, u64);
+id_type!(ServerIncarnation, u64);
 id_type!(DeviceGeneration, u64);
 id_type!(KeyspaceGeneration, u64);
 id_type!(FileVersion, u64);

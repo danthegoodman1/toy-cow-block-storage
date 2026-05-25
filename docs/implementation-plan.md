@@ -659,36 +659,36 @@ Exit gate:
 
 ## Phase 17: Remote Transport
 
-Status: not started.
+Status: complete.
 
 Replace the local transports with remote-capable implementations without
 changing the public block or native APIs.
 
 Deliverables:
 
-- [ ] Remote transport choice documented in the spec.
-- [ ] Serialization format for request and response envelopes.
-- [ ] Retry, deadline, duplicate-request, duplicate-response, and stale-response
+- [x] Remote transport choice documented in the spec.
+- [x] Serialization format for request and response envelopes.
+- [x] Retry, deadline, duplicate-request, duplicate-response, and stale-response
   tests.
-- [ ] Bounded request deduplication keyed by request ID, client epoch, and server
+- [x] Bounded request deduplication keyed by request ID, client epoch, and server
   incarnation.
-- [ ] Server actor mailbox, backpressure, and shutdown semantics.
-- [ ] Concurrency model that serializes or fences conflicting operations while
+- [x] Server actor mailbox, backpressure, and shutdown semantics.
+- [x] Concurrency model that serializes or fences conflicting operations while
   allowing non-conflicting shard/file operations to proceed independently.
-- [ ] Local and remote transport conformance tests.
+- [x] Local and remote transport conformance tests.
 
 Exit gate:
 
-- [ ] `BlockDevice` and `NativeFile` callers do not change when transport
+- [x] `BlockDevice` and `NativeFile` callers do not change when transport
   changes.
-- [ ] Request identity and client epoch fence duplicate or stale responses.
-- [ ] Server incarnation changes prevent old retry streams from being applied to
+- [x] Request identity and client epoch fence duplicate or stale responses.
+- [x] Server incarnation changes prevent old retry streams from being applied to
   a restarted server instance.
-- [ ] Backpressure is explicit and testable; unbounded queues are not hidden in
+- [x] Backpressure is explicit and testable; unbounded queues are not hidden in
   the transport.
-- [ ] Non-conflicting operations are not forced through a whole-server global
+- [x] Non-conflicting operations are not forced through a whole-server global
   lock by the interface.
-- [ ] Deterministic transport simulation covers delay, duplication, drop, and
+- [x] Deterministic transport simulation covers delay, duplication, drop, and
   reorder faults.
 
 ## Phase 18: Storage Replication

@@ -33,15 +33,16 @@ pub use extent::{
 pub use id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,
     DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration,
-    KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, RequestId, StorageNodeId,
-    WriteIntentId, WriterEpoch,
+    KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, RequestId, ServerIncarnation,
+    StorageNodeId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
     DurableObjectStore, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
     LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer, LocalObjectStore,
     LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
-    PortableSegmentFileIo, SegmentFileIo, SegmentLifecycleState, StorageNodeCustodianReport,
+    PortableSegmentFileIo, RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint,
+    RemoteNativeTransport, SegmentFileIo, SegmentLifecycleState, StorageNodeCustodianReport,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

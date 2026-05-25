@@ -449,6 +449,27 @@ Transport envelopes carry request identity, optional deadline, and client epoch
 or session identity so that retries and stale responses can be modeled
 deterministically.
 
+### Phase 17 Remote Transport Choice
+
+The first remote-capable transport is an in-process serialized endpoint, not a
+network socket. Requests and responses cross a crate-owned binary envelope that
+includes server incarnation, client epoch, request ID, optional logical
+deadline, and the public block or native request/response body. This proves the
+remote contract without making Phase 17 depend on TCP, HTTP, gRPC, or an async
+runtime.
+
+Remote endpoints keep a bounded request-deduplication cache keyed by server
+incarnation, client epoch, and request ID. Reusing a key for different request
+bytes is rejected. Duplicate retries with identical bytes return the cached
+wire response. Endpoints also expose deterministic mailbox capacity, shutdown,
+and injected logical-time deadline behavior so delay, retry, stale
+incarnation, stale response, and backpressure cases can be tested without real
+network nondeterminism.
+
+The remote transport does not change the public block or native APIs. Existing
+clients can be constructed over any `BlockTransport` or `NativeTransport`,
+including the in-process transport and the serialized remote transport.
+
 ### `MetadataPlane`
 
 `MetadataPlane` owns globally meaningful metadata durability:

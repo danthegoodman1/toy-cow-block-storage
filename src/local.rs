@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -21,7 +22,7 @@ use crate::id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
     DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId,
     KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalTime, MetadataNodeId, RequestId,
-    SegmentId, StorageNodeId, WriteIntentId, WriterEpoch,
+    SegmentId, ServerIncarnation, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
@@ -4642,6 +4643,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
 
 /// Local block request coordinator.
 type RequestKey = (ClientEpoch, RequestId);
+const SERVER_LOCK_STRIPES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedBlockRequest {
@@ -4660,7 +4662,7 @@ pub struct LocalBlockServer {
     store: LocalObjectStore,
     request_log: Arc<Mutex<Vec<RequestId>>>,
     responses: Arc<Mutex<BTreeMap<RequestKey, CachedBlockRequest>>>,
-    serial: Arc<Mutex<()>>,
+    stripes: Arc<Vec<Mutex<()>>>,
 }
 
 impl LocalBlockServer {
@@ -4669,7 +4671,7 @@ impl LocalBlockServer {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(BTreeMap::new())),
-            serial: Arc::new(Mutex::new(())),
+            stripes: Arc::new(server_lock_stripes()),
         }
     }
 
@@ -4713,7 +4715,7 @@ impl LocalBlockServer {
 
 impl BlockServer for LocalBlockServer {
     fn handle(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope> {
-        let _serial_guard = lock(&self.serial)?;
+        let _stripe_guard = lock(&self.stripes[block_request_stripe(&request.request)])?;
         if let Some(response) = self.cached_response(&request)? {
             return Ok(response);
         }
@@ -4787,7 +4789,7 @@ pub struct LocalNativeServer {
     store: LocalObjectStore,
     request_log: Arc<Mutex<Vec<RequestId>>>,
     responses: Arc<Mutex<BTreeMap<RequestKey, CachedNativeRequest>>>,
-    serial: Arc<Mutex<()>>,
+    stripes: Arc<Vec<Mutex<()>>>,
 }
 
 impl LocalNativeServer {
@@ -4796,7 +4798,7 @@ impl LocalNativeServer {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(BTreeMap::new())),
-            serial: Arc::new(Mutex::new(())),
+            stripes: Arc::new(server_lock_stripes()),
         }
     }
 
@@ -4840,7 +4842,7 @@ impl LocalNativeServer {
 
 impl NativeServer for LocalNativeServer {
     fn handle(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope> {
-        let _serial_guard = lock(&self.serial)?;
+        let _stripe_guard = lock(&self.stripes[native_request_stripe(&request.request)])?;
         if let Some(response) = self.cached_response(&request)? {
             return Ok(response);
         }
@@ -5002,16 +5004,437 @@ impl NativeTransport for InProcessNativeTransport {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RemoteWireRequest<T> {
+    incarnation: ServerIncarnation,
+    envelope: T,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum RemoteWireReply<T> {
+    Ok {
+        incarnation: ServerIncarnation,
+        envelope: T,
+    },
+    Err {
+        incarnation: ServerIncarnation,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteCacheEntry {
+    request_bytes: Vec<u8>,
+    response_bytes: Vec<u8>,
+}
+
+type RemoteRequestKey = (ServerIncarnation, ClientEpoch, RequestId);
+
+#[derive(Debug)]
+struct RemoteEndpointState {
+    cache: BTreeMap<RemoteRequestKey, RemoteCacheEntry>,
+    order: VecDeque<RemoteRequestKey>,
+    in_flight: usize,
+    shutdown: bool,
+    logical_time: LogicalTime,
+}
+
+impl RemoteEndpointState {
+    fn new() -> Self {
+        Self {
+            cache: BTreeMap::new(),
+            order: VecDeque::new(),
+            in_flight: 0,
+            shutdown: false,
+            logical_time: LogicalTime::from_raw(0),
+        }
+    }
+}
+
+/// Deterministic remote-capable block endpoint.
+#[derive(Clone)]
+pub struct RemoteBlockEndpoint {
+    server: Arc<dyn BlockServer>,
+    incarnation: ServerIncarnation,
+    dedupe_capacity: usize,
+    mailbox_capacity: usize,
+    state: Arc<Mutex<RemoteEndpointState>>,
+}
+
+impl RemoteBlockEndpoint {
+    pub fn new(
+        server: Arc<dyn BlockServer>,
+        incarnation: ServerIncarnation,
+        dedupe_capacity: usize,
+        mailbox_capacity: usize,
+    ) -> Self {
+        Self {
+            server,
+            incarnation,
+            dedupe_capacity,
+            mailbox_capacity,
+            state: Arc::new(Mutex::new(RemoteEndpointState::new())),
+        }
+    }
+
+    pub fn incarnation(&self) -> ServerIncarnation {
+        self.incarnation
+    }
+
+    pub fn set_shutdown(&self, shutdown: bool) -> Result<()> {
+        lock(&self.state)?.shutdown = shutdown;
+        Ok(())
+    }
+
+    pub fn set_logical_time(&self, logical_time: LogicalTime) -> Result<()> {
+        lock(&self.state)?.logical_time = logical_time;
+        Ok(())
+    }
+
+    pub fn handle_wire(&self, request_bytes: &[u8]) -> Result<Vec<u8>> {
+        let wire: RemoteWireRequest<BlockRequestEnvelope> =
+            bincode::deserialize(request_bytes).map_err(serde_error)?;
+        if wire.incarnation != self.incarnation {
+            return self.encode_error("stale block server incarnation");
+        }
+        if let Some(deadline) = wire.envelope.deadline
+            && deadline.raw() < lock(&self.state)?.logical_time.raw()
+        {
+            return self.encode_error("block request deadline expired");
+        }
+        let key = (
+            self.incarnation,
+            wire.envelope.client_epoch,
+            wire.envelope.request_id,
+        );
+
+        {
+            let mut state = lock(&self.state)?;
+            if state.shutdown {
+                return self.encode_error("block endpoint is shut down");
+            }
+            if let Some(entry) = state.cache.get(&key) {
+                if entry.request_bytes == request_bytes {
+                    return Ok(entry.response_bytes.clone());
+                }
+                return self.encode_error(
+                    "request ID and client epoch reused for a different remote block request",
+                );
+            }
+            if state.in_flight >= self.mailbox_capacity {
+                return self.encode_error("block endpoint mailbox is full");
+            }
+            state.in_flight += 1;
+        }
+
+        let response = self.server.handle(wire.envelope);
+        {
+            let mut state = lock(&self.state)?;
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        let response_bytes = match response {
+            Ok(envelope) => bincode::serialize(&RemoteWireReply::Ok {
+                incarnation: self.incarnation,
+                envelope,
+            })
+            .map_err(serde_error)?,
+            Err(error) => bincode::serialize(&RemoteWireReply::<BlockResponseEnvelope>::Err {
+                incarnation: self.incarnation,
+                reason: error.to_string(),
+            })
+            .map_err(serde_error)?,
+        };
+
+        let mut state = lock(&self.state)?;
+        if self.dedupe_capacity != 0 {
+            state.cache.insert(
+                key,
+                RemoteCacheEntry {
+                    request_bytes: request_bytes.to_vec(),
+                    response_bytes: response_bytes.clone(),
+                },
+            );
+            state.order.push_back(key);
+            while state.order.len() > self.dedupe_capacity {
+                if let Some(evicted) = state.order.pop_front() {
+                    state.cache.remove(&evicted);
+                }
+            }
+        }
+        Ok(response_bytes)
+    }
+
+    fn encode_error(&self, reason: impl Into<String>) -> Result<Vec<u8>> {
+        bincode::serialize(&RemoteWireReply::<BlockResponseEnvelope>::Err {
+            incarnation: self.incarnation,
+            reason: reason.into(),
+        })
+        .map_err(serde_error)
+    }
+}
+
+/// Serialized block transport over a deterministic remote endpoint.
+#[derive(Clone)]
+pub struct RemoteBlockTransport {
+    endpoint: Arc<RemoteBlockEndpoint>,
+    incarnation: ServerIncarnation,
+}
+
+impl RemoteBlockTransport {
+    pub fn new(endpoint: Arc<RemoteBlockEndpoint>) -> Self {
+        Self {
+            incarnation: endpoint.incarnation(),
+            endpoint,
+        }
+    }
+
+    fn encode_request(&self, request: BlockRequestEnvelope) -> Result<Vec<u8>> {
+        bincode::serialize(&RemoteWireRequest {
+            incarnation: self.incarnation,
+            envelope: request,
+        })
+        .map_err(serde_error)
+    }
+
+    fn decode_response(
+        &self,
+        request_id: RequestId,
+        bytes: &[u8],
+    ) -> Result<BlockResponseEnvelope> {
+        let reply: RemoteWireReply<BlockResponseEnvelope> =
+            bincode::deserialize(bytes).map_err(serde_error)?;
+        match reply {
+            RemoteWireReply::Ok {
+                incarnation,
+                envelope,
+            } if incarnation == self.incarnation && envelope.request_id == request_id => {
+                Ok(envelope)
+            }
+            RemoteWireReply::Ok { incarnation, .. } if incarnation != self.incarnation => {
+                Err(StorageError::conflict("stale block server incarnation"))
+            }
+            RemoteWireReply::Ok { .. } => Err(StorageError::corrupt(
+                "remote block response request ID does not match request",
+            )),
+            RemoteWireReply::Err {
+                incarnation,
+                reason,
+            } if incarnation == self.incarnation => Err(StorageError::unavailable(reason)),
+            RemoteWireReply::Err { .. } => {
+                Err(StorageError::conflict("stale block server incarnation"))
+            }
+        }
+    }
+}
+
+impl BlockTransport for RemoteBlockTransport {
+    fn call(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope> {
+        let request_id = request.request_id;
+        let request_bytes = self.encode_request(request)?;
+        let response_bytes = self.endpoint.handle_wire(&request_bytes)?;
+        self.decode_response(request_id, &response_bytes)
+    }
+}
+
+/// Deterministic remote-capable native endpoint.
+#[derive(Clone)]
+pub struct RemoteNativeEndpoint {
+    server: Arc<dyn NativeServer>,
+    incarnation: ServerIncarnation,
+    dedupe_capacity: usize,
+    mailbox_capacity: usize,
+    state: Arc<Mutex<RemoteEndpointState>>,
+}
+
+impl RemoteNativeEndpoint {
+    pub fn new(
+        server: Arc<dyn NativeServer>,
+        incarnation: ServerIncarnation,
+        dedupe_capacity: usize,
+        mailbox_capacity: usize,
+    ) -> Self {
+        Self {
+            server,
+            incarnation,
+            dedupe_capacity,
+            mailbox_capacity,
+            state: Arc::new(Mutex::new(RemoteEndpointState::new())),
+        }
+    }
+
+    pub fn incarnation(&self) -> ServerIncarnation {
+        self.incarnation
+    }
+
+    pub fn set_shutdown(&self, shutdown: bool) -> Result<()> {
+        lock(&self.state)?.shutdown = shutdown;
+        Ok(())
+    }
+
+    pub fn set_logical_time(&self, logical_time: LogicalTime) -> Result<()> {
+        lock(&self.state)?.logical_time = logical_time;
+        Ok(())
+    }
+
+    pub fn handle_wire(&self, request_bytes: &[u8]) -> Result<Vec<u8>> {
+        let wire: RemoteWireRequest<NativeRequestEnvelope> =
+            bincode::deserialize(request_bytes).map_err(serde_error)?;
+        if wire.incarnation != self.incarnation {
+            return self.encode_error("stale native server incarnation");
+        }
+        if let Some(deadline) = wire.envelope.deadline
+            && deadline.raw() < lock(&self.state)?.logical_time.raw()
+        {
+            return self.encode_error("native request deadline expired");
+        }
+        let key = (
+            self.incarnation,
+            wire.envelope.client_epoch,
+            wire.envelope.request_id,
+        );
+
+        {
+            let mut state = lock(&self.state)?;
+            if state.shutdown {
+                return self.encode_error("native endpoint is shut down");
+            }
+            if let Some(entry) = state.cache.get(&key) {
+                if entry.request_bytes == request_bytes {
+                    return Ok(entry.response_bytes.clone());
+                }
+                return self.encode_error(
+                    "request ID and client epoch reused for a different remote native request",
+                );
+            }
+            if state.in_flight >= self.mailbox_capacity {
+                return self.encode_error("native endpoint mailbox is full");
+            }
+            state.in_flight += 1;
+        }
+
+        let response = self.server.handle(wire.envelope);
+        {
+            let mut state = lock(&self.state)?;
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        let response_bytes = match response {
+            Ok(envelope) => bincode::serialize(&RemoteWireReply::Ok {
+                incarnation: self.incarnation,
+                envelope,
+            })
+            .map_err(serde_error)?,
+            Err(error) => bincode::serialize(&RemoteWireReply::<NativeResponseEnvelope>::Err {
+                incarnation: self.incarnation,
+                reason: error.to_string(),
+            })
+            .map_err(serde_error)?,
+        };
+
+        let mut state = lock(&self.state)?;
+        if self.dedupe_capacity != 0 {
+            state.cache.insert(
+                key,
+                RemoteCacheEntry {
+                    request_bytes: request_bytes.to_vec(),
+                    response_bytes: response_bytes.clone(),
+                },
+            );
+            state.order.push_back(key);
+            while state.order.len() > self.dedupe_capacity {
+                if let Some(evicted) = state.order.pop_front() {
+                    state.cache.remove(&evicted);
+                }
+            }
+        }
+        Ok(response_bytes)
+    }
+
+    fn encode_error(&self, reason: impl Into<String>) -> Result<Vec<u8>> {
+        bincode::serialize(&RemoteWireReply::<NativeResponseEnvelope>::Err {
+            incarnation: self.incarnation,
+            reason: reason.into(),
+        })
+        .map_err(serde_error)
+    }
+}
+
+/// Serialized native transport over a deterministic remote endpoint.
+#[derive(Clone)]
+pub struct RemoteNativeTransport {
+    endpoint: Arc<RemoteNativeEndpoint>,
+    incarnation: ServerIncarnation,
+}
+
+impl RemoteNativeTransport {
+    pub fn new(endpoint: Arc<RemoteNativeEndpoint>) -> Self {
+        Self {
+            incarnation: endpoint.incarnation(),
+            endpoint,
+        }
+    }
+
+    fn encode_request(&self, request: NativeRequestEnvelope) -> Result<Vec<u8>> {
+        bincode::serialize(&RemoteWireRequest {
+            incarnation: self.incarnation,
+            envelope: request,
+        })
+        .map_err(serde_error)
+    }
+
+    fn decode_response(
+        &self,
+        request_id: RequestId,
+        bytes: &[u8],
+    ) -> Result<NativeResponseEnvelope> {
+        let reply: RemoteWireReply<NativeResponseEnvelope> =
+            bincode::deserialize(bytes).map_err(serde_error)?;
+        match reply {
+            RemoteWireReply::Ok {
+                incarnation,
+                envelope,
+            } if incarnation == self.incarnation && envelope.request_id == request_id => {
+                Ok(envelope)
+            }
+            RemoteWireReply::Ok { incarnation, .. } if incarnation != self.incarnation => {
+                Err(StorageError::conflict("stale native server incarnation"))
+            }
+            RemoteWireReply::Ok { .. } => Err(StorageError::corrupt(
+                "remote native response request ID does not match request",
+            )),
+            RemoteWireReply::Err {
+                incarnation,
+                reason,
+            } if incarnation == self.incarnation => Err(StorageError::unavailable(reason)),
+            RemoteWireReply::Err { .. } => {
+                Err(StorageError::conflict("stale native server incarnation"))
+            }
+        }
+    }
+}
+
+impl NativeTransport for RemoteNativeTransport {
+    fn call(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope> {
+        let request_id = request.request_id;
+        let request_bytes = self.encode_request(request)?;
+        let response_bytes = self.endpoint.handle_wire(&request_bytes)?;
+        self.decode_response(request_id, &response_bytes)
+    }
+}
+
 /// Local `BlockClient` backed by a block transport.
 #[derive(Clone)]
 pub struct LocalBlockClient {
-    transport: InProcessBlockTransport,
+    transport: Arc<dyn BlockTransport>,
     client_epoch: crate::id::ClientEpoch,
     next_request_id: Arc<Mutex<u128>>,
 }
 
 impl LocalBlockClient {
     pub fn new(transport: InProcessBlockTransport) -> Self {
+        Self::with_transport(Arc::new(transport))
+    }
+
+    pub fn with_transport(transport: Arc<dyn BlockTransport>) -> Self {
         Self {
             transport,
             client_epoch: crate::id::ClientEpoch::from_raw(1),
@@ -5066,7 +5489,7 @@ impl BlockClient for LocalBlockClient {
 #[derive(Clone)]
 pub struct LocalBlockDevice {
     device_id: DeviceId,
-    transport: InProcessBlockTransport,
+    transport: Arc<dyn BlockTransport>,
     client_epoch: crate::id::ClientEpoch,
     next_request_id: Arc<Mutex<u128>>,
 }
@@ -5240,13 +5663,17 @@ impl BlockDevice for LocalBlockDevice {
 /// Local `NativeKeyspaceClient` backed by a native transport.
 #[derive(Clone)]
 pub struct LocalNativeClient {
-    transport: InProcessNativeTransport,
+    transport: Arc<dyn NativeTransport>,
     client_epoch: crate::id::ClientEpoch,
     next_request_id: Arc<Mutex<u128>>,
 }
 
 impl LocalNativeClient {
     pub fn new(transport: InProcessNativeTransport) -> Self {
+        Self::with_transport(Arc::new(transport))
+    }
+
+    pub fn with_transport(transport: Arc<dyn NativeTransport>) -> Self {
         Self {
             transport,
             client_epoch: crate::id::ClientEpoch::from_raw(1),
@@ -5400,7 +5827,7 @@ impl NativeKeyspaceClient for LocalNativeClient {
 pub struct LocalNativeFile {
     keyspace_id: KeyspaceId,
     file_id: FileId,
-    transport: InProcessNativeTransport,
+    transport: Arc<dyn NativeTransport>,
     client_epoch: crate::id::ClientEpoch,
     next_request_id: Arc<Mutex<u128>>,
 }
@@ -5538,6 +5965,31 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
     mutex
         .lock()
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
+}
+
+fn server_lock_stripes() -> Vec<Mutex<()>> {
+    (0..SERVER_LOCK_STRIPES).map(|_| Mutex::new(())).collect()
+}
+
+fn stripe_for_raw(raw: u128) -> usize {
+    (raw % SERVER_LOCK_STRIPES as u128) as usize
+}
+
+fn block_request_stripe(request: &BlockRequest) -> usize {
+    request
+        .target_device_id()
+        .map(|device_id| stripe_for_raw(device_id.raw()))
+        .unwrap_or(0)
+}
+
+fn native_request_stripe(request: &NativeRequest) -> usize {
+    match (request.target_keyspace_id(), request.target_file_id()) {
+        (Some(keyspace_id), Some(file_id)) => {
+            stripe_for_raw(keyspace_id.raw().wrapping_mul(1_099_511_628_211) ^ file_id.raw())
+        }
+        (Some(keyspace_id), None) => stripe_for_raw(keyspace_id.raw()),
+        (None, _) => 0,
+    }
 }
 
 fn fs_error(error: std::io::Error) -> StorageError {
@@ -7455,6 +7907,318 @@ mod tests {
                 RequestId::from_raw(4),
                 RequestId::from_raw(5)
             ]
+        );
+    }
+
+    #[test]
+    fn remote_block_transport_serializes_dedupes_and_rejects_stale_faults() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let block_server = Arc::new(LocalBlockServer::new(store));
+        let endpoint = Arc::new(RemoteBlockEndpoint::new(
+            block_server.clone(),
+            ServerIncarnation::from_raw(1),
+            8,
+            4,
+        ));
+        let transport = RemoteBlockTransport::new(endpoint.clone());
+        let create = BlockRequestEnvelope::new(
+            RequestId::from_raw(1),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Create {
+                request: CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 16,
+                        block_size: 4096,
+                    },
+                    name: None,
+                },
+            },
+        );
+        let created = transport.call(create.clone()).unwrap();
+        let duplicate = transport.call(create).unwrap();
+        assert_eq!(duplicate, created);
+        assert_eq!(
+            block_server.request_log().unwrap(),
+            vec![RequestId::from_raw(1)]
+        );
+        let device_id = match created.response {
+            BlockResponse::Created(device_id) => device_id,
+            _ => panic!("unexpected block response"),
+        };
+
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(1),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Info { device_id },
+                ))
+                .is_err()
+        );
+
+        endpoint
+            .set_logical_time(LogicalTime::from_raw(10))
+            .unwrap();
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(2),
+                    ClientEpoch::from_raw(1),
+                    Some(LogicalDeadline::from_raw(9)),
+                    BlockRequest::Info { device_id },
+                ))
+                .is_err()
+        );
+        endpoint.set_shutdown(true).unwrap();
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(3),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Info { device_id },
+                ))
+                .is_err()
+        );
+        endpoint.set_shutdown(false).unwrap();
+
+        let stale_wire = bincode::serialize(&RemoteWireRequest {
+            incarnation: ServerIncarnation::from_raw(99),
+            envelope: BlockRequestEnvelope::new(
+                RequestId::from_raw(4),
+                ClientEpoch::from_raw(1),
+                None,
+                BlockRequest::Info { device_id },
+            ),
+        })
+        .unwrap();
+        let stale_response = endpoint.handle_wire(&stale_wire).unwrap();
+        assert!(
+            transport
+                .decode_response(RequestId::from_raw(4), &stale_response)
+                .is_err()
+        );
+
+        let mismatched = bincode::serialize(&RemoteWireReply::Ok {
+            incarnation: ServerIncarnation::from_raw(1),
+            envelope: BlockResponseEnvelope {
+                request_id: RequestId::from_raw(44),
+                response: BlockResponse::Info(
+                    block_server.store.metadata.device_info(device_id).unwrap(),
+                ),
+            },
+        })
+        .unwrap();
+        assert!(
+            transport
+                .decode_response(RequestId::from_raw(4), &mismatched)
+                .is_err()
+        );
+        assert!(
+            transport
+                .decode_response(RequestId::from_raw(4), &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_block_endpoint_enforces_backpressure() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let block_server = Arc::new(LocalBlockServer::new(store));
+        let endpoint = Arc::new(RemoteBlockEndpoint::new(
+            block_server,
+            ServerIncarnation::from_raw(1),
+            8,
+            0,
+        ));
+        let transport = RemoteBlockTransport::new(endpoint);
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(1),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Create {
+                        request: CreateDeviceRequest {
+                            spec: DeviceSpec {
+                                logical_blocks: 16,
+                                block_size: 4096,
+                            },
+                            name: None,
+                        },
+                    },
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn server_lock_striping_does_not_force_unrelated_targets_through_one_lock() {
+        let device_a = BlockRequest::Info {
+            device_id: DeviceId::from_raw(1),
+        };
+        let device_b = BlockRequest::Info {
+            device_id: DeviceId::from_raw(2),
+        };
+        assert_ne!(
+            block_request_stripe(&device_a),
+            block_request_stripe(&device_b)
+        );
+
+        let file_a = NativeRequest::FileInfo {
+            keyspace_id: KeyspaceId::from_raw(1),
+            file_id: FileId::from_raw(1),
+        };
+        let file_b = NativeRequest::FileInfo {
+            keyspace_id: KeyspaceId::from_raw(1),
+            file_id: FileId::from_raw(2),
+        };
+        assert_ne!(
+            native_request_stripe(&file_a),
+            native_request_stripe(&file_b)
+        );
+    }
+
+    #[test]
+    fn remote_native_transport_serializes_retries_and_preserves_file_semantics() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let native_server = Arc::new(LocalNativeServer::new(store));
+        let endpoint = Arc::new(RemoteNativeEndpoint::new(
+            native_server.clone(),
+            ServerIncarnation::from_raw(5),
+            8,
+            4,
+        ));
+        let transport = RemoteNativeTransport::new(endpoint.clone());
+        let client = LocalNativeClient::with_transport(Arc::new(transport.clone()));
+        let keyspace_id = client
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("remote".to_string()),
+            })
+            .unwrap();
+        let file_id = client
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            )
+            .unwrap();
+        let file = client.open_file(keyspace_id, file_id).unwrap();
+        file.append_with_lease(file.acquire_append().unwrap(), b"remote")
+            .unwrap();
+        let mut bytes = vec![0; b"remote".len()];
+        file.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, b"remote");
+
+        let info = NativeRequestEnvelope::new(
+            RequestId::from_raw(50),
+            ClientEpoch::from_raw(1),
+            None,
+            NativeRequest::FileInfo {
+                keyspace_id,
+                file_id,
+            },
+        );
+        let first = transport.call(info.clone()).unwrap();
+        let duplicate = transport.call(info).unwrap();
+        assert_eq!(duplicate, first);
+
+        assert!(
+            transport
+                .call(NativeRequestEnvelope::new(
+                    RequestId::from_raw(50),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    NativeRequest::KeyspaceInfo { keyspace_id },
+                ))
+                .is_err()
+        );
+
+        endpoint
+            .set_logical_time(LogicalTime::from_raw(10))
+            .unwrap();
+        assert!(
+            transport
+                .call(NativeRequestEnvelope::new(
+                    RequestId::from_raw(51),
+                    ClientEpoch::from_raw(1),
+                    Some(LogicalDeadline::from_raw(9)),
+                    NativeRequest::FileInfo {
+                        keyspace_id,
+                        file_id,
+                    },
+                ))
+                .is_err()
+        );
+        endpoint.set_shutdown(true).unwrap();
+        assert!(
+            transport
+                .call(NativeRequestEnvelope::new(
+                    RequestId::from_raw(52),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    NativeRequest::FileInfo {
+                        keyspace_id,
+                        file_id,
+                    },
+                ))
+                .is_err()
+        );
+        endpoint.set_shutdown(false).unwrap();
+
+        let stale_wire = bincode::serialize(&RemoteWireRequest {
+            incarnation: ServerIncarnation::from_raw(99),
+            envelope: NativeRequestEnvelope::new(
+                RequestId::from_raw(53),
+                ClientEpoch::from_raw(1),
+                None,
+                NativeRequest::FileInfo {
+                    keyspace_id,
+                    file_id,
+                },
+            ),
+        })
+        .unwrap();
+        let stale_response = endpoint.handle_wire(&stale_wire).unwrap();
+        assert!(
+            transport
+                .decode_response(RequestId::from_raw(53), &stale_response)
+                .is_err()
+        );
+
+        let mismatched = bincode::serialize(&RemoteWireReply::Ok {
+            incarnation: ServerIncarnation::from_raw(5),
+            envelope: NativeResponseEnvelope {
+                request_id: RequestId::from_raw(99),
+                response: NativeResponse::FileInfo(
+                    native_server
+                        .store
+                        .metadata
+                        .get_file_info(keyspace_id, file_id)
+                        .unwrap(),
+                ),
+            },
+        })
+        .unwrap();
+        assert!(
+            transport
+                .decode_response(RequestId::from_raw(54), &mismatched)
+                .is_err()
+        );
+        assert!(
+            transport
+                .decode_response(RequestId::from_raw(54), &[])
+                .is_err()
+        );
+
+        assert!(
+            native_server
+                .request_log()
+                .unwrap()
+                .contains(&RequestId::from_raw(50))
         );
     }
 

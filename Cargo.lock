@@ -509,7 +509,6 @@ dependencies = [
  "bincode",
  "criterion",
  "serde",
- "serde_json",
 ]
 
 [[package]]
