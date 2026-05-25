@@ -471,20 +471,19 @@ remote, replayable, or concurrent boundary in the owning future phase:
   records, and restore/snapshot API shape.
 - Phase 15 owns native keyspace performance characterization and any benchmark-
   proven local catalog scaling work needed before durable formats are chosen.
-- Phase 16 owns the first local durable snapshot provider: segment sync,
+- Phase 16 owned the first local durable snapshot provider: segment sync,
   atomic metadata/storage-node snapshots, commit-group persistence,
   write-intent recovery, native append lease/session records,
   checkpoint/timeline persistence, and cache coherence after restart. Its
-  current `bincode` snapshots are scaffolding, not a committed durable format.
+  `bincode` snapshot scaffolding was replaced by crate-owned durable codecs in
+  Phase 18, then removed from the production hot path in Phase 20.
 - Phase 17 owns remote transport serialization, retry/deduplication, stale
   response rejection, server incarnation fencing, deadlines, mailbox semantics,
   backpressure, and concurrency rules for non-conflicting requests. Its current
   `bincode` wire envelope is scaffolding, not the real network format.
-- Phase 18 owns the durable provider crash/fault-injection matrix and the
-  decision of whether the snapshot provider remains sufficient or needs a
-  journal/database-backed metadata provider. It also owns replacing durable
-  `bincode` snapshots with a crate-owned binary codec before the durable format
-  is considered production-grade.
+- Phase 18 owns the durable provider crash/fault-injection matrix and replaced
+  durable `bincode` snapshots with a crate-owned binary codec. Its snapshot
+  production path became the correctness baseline that Phase 20 superseded.
 - Phase 19 owns a real network implementation of the Phase 17 wire contract,
   including a crate-owned wire codec rather than serde/bincode-derived frames.
 - Phase 20 owns replacing the snapshot-only performance path with a measured
@@ -637,8 +636,9 @@ Deliverables:
   definitions, including exact `durable_through` semantics.
 - [x] Durable metadata snapshots for commit groups, checkpoints, delete records,
   fork records, native keyspace commits, and native file-root audit commits.
-  The first provider uses atomic `bincode` snapshots as temporary scaffolding,
-  not a committed durable format and not a metadata WAL.
+  The first provider used atomic `bincode` snapshots as temporary scaffolding;
+  Phase 18 replaced that format and Phase 20 removed snapshots from the
+  production hot path.
 - [x] Durable write-intent table with logical expiration, cancellation/failure
   evidence, and restart recovery scan.
 - [x] Durable native append lease/session records with restart-safe writer
@@ -659,9 +659,9 @@ Exit gate:
   conformance tests for block and native APIs.
 - [x] Crash/restart tests preserve committed device contents.
 - [x] Partial writes do not expose uncommitted roots.
-- [x] Atomic snapshot publishing means a completed metadata snapshot reopens as
-  one committed state; the full injected crash matrix for every metadata
-  snapshot boundary is deferred to Phase 18.
+- [x] Atomic snapshot publishing meant a completed metadata snapshot reopened as
+  one committed state; Phase 18 covered the crash matrix and Phase 20 replaced
+  this with journal commit replay.
 - [x] Pending segment writes left by crashed, expired, or fenced write intents
   become reclaimable without exposing data.
 - [x] The portable segment file I/O backend preserves the documented durability
@@ -747,9 +747,9 @@ Deliverables:
   keyspace checkpoints, and native keyspace snapshots/restores.
 - [x] Decision record for keeping atomic binary snapshots or replacing them
   with a journal/database-backed metadata provider.
-- [x] The Phase 18 decision keeps atomic binary snapshots for this toy durable
-  provider; no journal/database provider is required yet, so there is no second
-  production durable path to remove.
+- [x] The Phase 18 decision kept atomic binary snapshots for this toy durable
+  provider until Phase 20 benchmark evidence justified replacing the production
+  path with a journal.
 - [x] Remove `bincode` from durable snapshot persistence. Keeping serde/bincode
   only for test fixtures or debug helpers is allowed if it is not a production
   durable or wire format.
@@ -820,53 +820,65 @@ Exit gate:
 
 ## Phase 20: Durable Journal and Segment Log Provider
 
-Status: not started.
+Status: complete.
 
-The snapshot durable provider is now a correctness baseline, not the intended
+The snapshot durable provider was a correctness baseline, not the intended
 high-performance durable layout. Phase 16/18 benchmarks showed that fully
 flushed 4 KiB writes are dominated by per-operation segment-file and snapshot
 syncs, and that batching acknowledged writes still pays one temp-file sync per
-segment. Before adding replicated storage, replace the performance path with an
-append-oriented durable provider that preserves the same public contracts.
+segment. Phase 20 replaces that performance path with an append-oriented durable
+provider that preserves the same public contracts before adding replicated
+storage.
 
 Deliverables:
 
-- [ ] Append-only metadata journal or database-backed metadata provider for
+- [x] Append-only metadata journal or database-backed metadata provider for
   device heads, keyspace heads, commit groups, PITR records, checkpoints,
   write-intent state, append leases, and GC/custodian evidence.
-- [ ] Periodic compact checkpoints so replay time is bounded without rewriting
-  the whole metadata plane on every write.
-- [ ] Segment log or extent-packed storage-node layout that can persist a batch
+- [x] Explicit compact checkpoint path so replay time can be bounded without
+  rewriting the whole metadata plane on every write; a periodic scheduler can
+  call this maintenance hook later without changing the durable format.
+- [x] Segment log or extent-packed storage-node layout that can persist a batch
   of small immutable segments with fewer sync boundaries than one file per
   segment.
-- [ ] Group-commit path for acknowledged writes where `flush` can persist many
+- [x] Group-commit path for acknowledged writes where `flush` can persist many
   committed mappings with one ordered durability sequence.
-- [ ] Crash/reopen and fault-injection matrix for journal append, checkpoint
+- [x] Crash/reopen and fault-injection matrix for journal append, checkpoint
   publish, segment-log append, batch sync, replay truncation, and checkpoint
   compaction.
-- [ ] Migration-free replacement of the snapshot performance path under the
+- [x] Migration-free replacement of the snapshot performance path under the
   no-tombstones rule; the snapshot provider may remain only as a deterministic
   test fixture if it is no longer the production durable provider.
-- [ ] Criterion baselines for acknowledged latency, single flushed latency,
+- [x] Criterion baselines for acknowledged latency, single flushed latency,
   batched flush throughput, reopen replay time, checkpoint compaction, native
   append, and block/native reads after reopen.
 
 Exit gate:
 
-- [ ] The journal/segment-log provider passes the same provider conformance,
+- [x] The journal/segment-log provider passes the same provider conformance,
   PITR, GC, custodian, restart, and malformed-input tests as the snapshot
   provider.
-- [ ] A flushed write still persists segment bytes before metadata can reference
+- [x] A flushed write still persists segment bytes before metadata can reference
   them, and `flush` reports only replay-survivable commit sequences.
-- [ ] Acknowledged writes remain read-visible in-process and become
+- [x] Acknowledged writes remain read-visible in-process and become
   restart-visible only after `flush`, `Flushed`, or another documented
   synchronous metadata operation.
-- [ ] Replayed state is byte-for-byte equivalent to the deterministic in-memory
+- [x] Replayed state is byte-for-byte equivalent to the deterministic in-memory
   model for block and native generated traces.
-- [ ] Benchmarks demonstrate that the new durable path materially improves
+- [x] Benchmarks demonstrate that the new durable path materially improves
   fully flushed writes and batched flushes on the same host.
-- [ ] The implementation plan records any remaining host-specific ceiling, such
+- [x] The implementation plan records any remaining host-specific ceiling, such
   as macOS sync latency, without hiding provider-level overhead.
+
+Current host headline numbers with the portable blocking filesystem backend on
+macOS/APFS are approximately: block acknowledged 4 KiB write 27 us, block
+flushed 4 KiB write 4.9 ms, block flush after 32 acknowledged writes 5.5 ms,
+native acknowledged append 38 us, native flushed append 5.4 ms, native flush
+after 32 acknowledged writes 6.4 ms, reopen after 32 block writes 4.7 ms, and
+explicit compaction after 32 block writes 11.4 ms. The remaining floor is
+dominated by host sync latency and full-state commit serialization; the hot path
+no longer pays multiple segment-file and snapshot-rename syncs per logical
+write.
 
 ## Phase 21: Storage Replication
 

@@ -1452,6 +1452,27 @@ fn bench_durable_provider(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("compact_after_32_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("compact-after-32-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    32,
+                    WriteDurability::Flushed,
+                );
+                let started = Instant::now();
+                store.compact_journal().unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
     group.bench_function("native_write_at_4k_acknowledged_fresh", |b| {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {

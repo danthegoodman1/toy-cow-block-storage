@@ -553,95 +553,101 @@ segment may have one local replica in v1 and multiple replicas later.
 
 ### Phase 16 Durable Provider Choice
 
-The first durable provider remains local and single-process, but persists the
-metadata service and storage-node state as separate planes:
+The first durable provider remains local and single-process. Phase 16 started
+with atomic snapshots to prove the durability boundary. Phase 20 replaces the
+production hot path with one append-oriented journal:
 
 ```text
 store/
-  metadata/
-    metadata.bin
-  storage-nodes/
-    node-<storage-node-id>/
-      catalog.bin
-      segment-store.bin
-      segments/
-      tmp/
+  journal/
+    store.log
 ```
 
-The Phase 16 metadata provider uses atomic binary snapshots written with the
-same temp-file, file-sync, atomic-rename, and directory-sync discipline as
-segment files. Phase 16 temporarily used `bincode` as scaffolding for those
-snapshots so the durable boundary could be tested before the format was
-designed. Phase 18 replaced that scaffolding with the crate-owned codec
-described below. A later provider may use SQLite, RocksDB, or another database,
-but it must preserve the same provider contracts and keep metadata state
-separate from storage-node local segment catalogs.
+The single local WAL is an implementation detail that gives the toy provider
+one ordered `sync_data` boundary for segment bytes plus metadata commit state.
+It does not collapse the model into one logical service. Journal records still
+separate:
 
-The snapshot provider is the first durable implementation, not the final answer
-for every crash-recovery shape. The durable fault-injection phase must either
-prove atomic snapshots survive every required crash/reopen boundary or replace
-them with a journal/database-backed metadata provider. If that replacement is
-needed, the old snapshot-only production path should be removed rather than
-kept as a compatibility layer. If snapshots remain, their codec must have
-explicit magic, schema version, record kind, fixed integer endianness, bounded
-lengths, deterministic map ordering, and strict malformed/trailing-byte
-rejection.
+- segment/data records, owned by the storage-node plane;
+- storage-node catalog and segment descriptor state;
+- globally meaningful metadata heads, roots, timelines, checkpoints,
+  write-intent counters, and native writer epochs.
+
+A later SQLite, RocksDB, split-log, or replicated provider may store those
+planes in separate physical files or services. It must preserve the same
+data-before-metadata contract without making public block/native clients choose
+storage nodes or coordinate replicas.
 
 ### Phase 18 Durable Format Decision
 
-Phase 18 keeps atomic binary snapshots for the local durable provider. The
-reason is deliberately small: the current toy provider has one local writer,
-rewrites compact metadata snapshots, and can prove the restart contract with
-explicit temp-write, file-sync, rename, directory-sync, and malformed-codec
-tests. A journal or database provider would be justified when snapshot rewrite
-cost, multi-process writers, partial replay, or larger metadata sets become the
-measured bottleneck.
+Phase 18 kept atomic binary snapshots for the local durable provider because
+they were enough to prove the first crash/restart contract. Benchmarks then
+showed the snapshot provider was a correctness baseline rather than a
+performance-grade layout: fully flushed small writes were dominated by sync
+count, and batched flush still paid one payload sync per segment file.
 
-The first durable Criterion baselines now show that the snapshot provider is a
-correctness baseline rather than a performance-grade durable layout: fully
-flushed small writes are dominated by sync count, and batched flush still pays
-one payload sync per segment file. The next durable performance phase should
-replace the hot path with an append-only metadata journal/database plus a
-segment-log or equivalent batched segment layout before replication builds on
-this provider.
+Phase 20 removes the snapshot production path instead of adding a second
+compatibility layer. The snapshot codec remains only as a deterministic test
+fixture for codec and fault-injection coverage.
 
-The durable snapshot format is now crate-owned rather than serde/bincode-owned:
+### Phase 20 Durable Journal Format
+
+The durable journal uses the same crate-owned codec rules as the snapshot
+fixture: fixed big-endian integers, explicit enum tags, bounded collection and
+string lengths, deterministic `BTreeMap` ordering, duplicate-key rejection on
+decode, and trailing-byte rejection.
+
+Each journal record is:
 
 ```text
-magic("TCOWSNAP"), version, snapshot_kind, payload
+magic("TCOWJNL!"), version, record_kind, payload_len, payload, checksum64(payload)
 ```
 
-The payload uses fixed big-endian integers, explicit enum tags, bounded
-collection and string lengths, deterministic `BTreeMap` ordering, duplicate-key
-rejection on decode, and trailing-byte rejection. There is no compatibility
-reader for the temporary Phase 16 bincode snapshots. That is intentional under
-the project's no-tombstones rule: the toy system has no external format promise
-yet, so the old scaffolding was replaced instead of retained.
+Record kinds:
 
-Segment files are storage-node-local immutable payloads. `catalog.bin` records
-local reservation, durable-pending, referenced, released, and freed lifecycle
-state for that node. `segment-store.bin` records the durable segment descriptors
-and placement metadata needed to validate segment files at restart. The
-metadata snapshot records globally meaningful heads, roots, timelines,
-checkpoints, write-intent counters, and native writer epochs; it does not store
-storage-node file paths as metadata truth.
+- `SegmentData`: `segment_id` plus immutable segment bytes.
+- `CommitState`: the metadata snapshot, storage-node catalog snapshot, and
+  segment descriptor snapshot that together define one replayable committed
+  state.
+
+The v1 journal commit record carries the complete current state. That is
+intentional for simplicity and deterministic replay. It still removes the
+previous hot-path problem because flushed writes append records and sync one
+file instead of syncing one segment file plus several atomically renamed
+snapshots. Delta commit records are a later optimization only if benchmarks
+prove full commit records are the bottleneck.
+
+Replay scans complete records in order. An incomplete tail record is treated as
+a crash during append and ignored. A complete record with bad magic, unsupported
+version, unknown kind, malformed payload, checksum mismatch, or duplicate
+segment ID with conflicting bytes is corruption and prevents open. The last
+complete commit record wins. Segment records that are not referenced by that
+commit are orphan data and are not user-visible. A commit that references
+missing or checksum-mismatched segment bytes is rejected.
+
+Compaction is an explicit maintenance path. It writes the current live segment
+records plus one commit record to a temporary journal, syncs that file, renames
+it over `store.log`, syncs the parent directory, and reopens the append handle.
+This bounds replay time and physically drops old overwritten or custodian-freed
+segment records without affecting the write hot path.
 
 The durable provider honors the public `WriteDurability` boundary. A successful
 `Acknowledged` block or native file write is committed to the live in-process
 mapping and visible to later reads, but may be lost across process crash until a
 later `flush`, a `Flushed` write, or another synchronous metadata operation
-persists the current state. A successful `Flushed` write has persisted segment
-files, storage-node catalog snapshot, segment descriptor snapshot, and metadata
-snapshot before the call returns. `flush` persists the current live state and
-reports the latest committed sequence visible to the relevant device or native
-file as `durable_through`; it must not report a sequence whose metadata snapshot
-can reference segment bytes that failed the storage-node durability sequence.
+persists the current state. A successful `Flushed` write has appended all newly
+referenced segment data records and the commit record, then synced the journal
+before the call returns. `flush` persists the current live state with the same
+ordered journal append and reports the latest committed sequence visible to the
+relevant device or native file as `durable_through`; it must not report a
+sequence whose commit record can reference segment bytes that are absent from
+replay.
 
 Synchronous metadata operations that do not carry a `WriteDurability` argument
 -- create, checkpoint, fork, restore, delete, keyspace snapshot, and custodian
-operations -- persist before returning. Because the snapshot captures current
-live state, those operations also flush any earlier acknowledged writes in the
-same store instance.
+operations -- persist before returning. Because the journal commit captures the
+current live state, those operations also flush any earlier acknowledged writes
+in the same store instance.
 
 ### Future Storage Replication
 

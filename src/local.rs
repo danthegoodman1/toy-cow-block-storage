@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -1354,38 +1355,6 @@ impl PortableSegmentFileIo {
     ) -> Result<()> {
         write_synced_segments_with_io(self, segments)
     }
-
-    fn prune_unlisted_segments(&self, keep: &BTreeSet<SegmentId>) -> Result<()> {
-        fs::create_dir_all(&self.segments_dir).map_err(fs_error)?;
-        let mut deleted = false;
-        for entry in fs::read_dir(&self.segments_dir).map_err(fs_error)? {
-            let entry = entry.map_err(fs_error)?;
-            if !entry.file_type().map_err(fs_error)?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                return Err(StorageError::corrupt(
-                    "durable segment file name is not valid UTF-8",
-                ));
-            };
-            let Some(raw) = name.strip_suffix(".seg") else {
-                return Err(StorageError::corrupt(
-                    "unknown file in durable segment directory",
-                ));
-            };
-            let raw = u128::from_str_radix(raw, 16)
-                .map_err(|_| StorageError::corrupt("durable segment file name is invalid"))?;
-            if !keep.contains(&SegmentId::from_raw(raw)) {
-                fs::remove_file(path).map_err(fs_error)?;
-                deleted = true;
-            }
-        }
-        if deleted {
-            self.sync_segment_dir()?;
-        }
-        Ok(())
-    }
 }
 
 fn write_synced_segment_with_io(
@@ -1494,38 +1463,100 @@ impl SegmentFileIo for PortableSegmentFileIo {
 
 #[derive(Debug, Clone)]
 struct DurableStorePaths {
-    metadata_snapshot: PathBuf,
-    catalog_snapshot: PathBuf,
-    segment_store_snapshot: PathBuf,
+    journal: PathBuf,
 }
 
 impl DurableStorePaths {
-    fn new(root: impl AsRef<Path>, storage_node: StorageNodeId) -> Result<(Self, PathBuf)> {
+    fn new(root: impl AsRef<Path>, _storage_node: StorageNodeId) -> Result<Self> {
         let root = root.as_ref();
-        let metadata_dir = root.join("metadata");
-        let node_dir = root
-            .join("storage-nodes")
-            .join(format!("node-{:032x}", storage_node.raw()));
-        fs::create_dir_all(&metadata_dir).map_err(fs_error)?;
-        fs::create_dir_all(&node_dir).map_err(fs_error)?;
-        Ok((
-            Self {
-                metadata_snapshot: metadata_dir.join("metadata.bin"),
-                catalog_snapshot: node_dir.join("catalog.bin"),
-                segment_store_snapshot: node_dir.join("segment-store.bin"),
-            },
-            node_dir,
-        ))
+        let journal_dir = root.join("journal");
+        fs::create_dir_all(&journal_dir).map_err(fs_error)?;
+        Ok(Self {
+            journal: journal_dir.join("store.log"),
+        })
     }
 }
 
-/// Local durable provider bundle using separated metadata and storage-node
-/// files.
+#[derive(Debug)]
+struct DurableJournal {
+    path: PathBuf,
+    file: Mutex<File>,
+}
+
+impl DurableJournal {
+    fn open(path: PathBuf) -> Result<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| StorageError::invalid_argument("journal path has no parent"))?;
+        fs::create_dir_all(parent).map_err(fs_error)?;
+        let existed = path.exists();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(fs_error)?;
+        if !existed {
+            File::open(parent)
+                .map_err(fs_error)?
+                .sync_all()
+                .map_err(fs_error)?;
+        }
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+        })
+    }
+
+    fn append_synced(&self, records: &[DurableLogRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        for record in records {
+            bytes.extend_from_slice(&encode_log_record(record)?);
+        }
+        let mut file = lock(&self.file)?;
+        file.write_all(&bytes).map_err(fs_error)?;
+        file.sync_data().map_err(fs_error)
+    }
+
+    fn rewrite_synced(&self, records: &[DurableLogRecord]) -> Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| StorageError::invalid_argument("journal path has no parent"))?;
+        fs::create_dir_all(parent).map_err(fs_error)?;
+        let tmp = self.path.with_extension("tmp");
+        {
+            let mut file = File::create(&tmp).map_err(fs_error)?;
+            for record in records {
+                file.write_all(&encode_log_record(record)?)
+                    .map_err(fs_error)?;
+            }
+            file.sync_data().map_err(fs_error)?;
+        }
+        fs::rename(&tmp, &self.path).map_err(fs_error)?;
+        File::open(parent)
+            .map_err(fs_error)?
+            .sync_all()
+            .map_err(fs_error)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(fs_error)?;
+        *lock(&self.file)? = file;
+        Ok(())
+    }
+}
+
+/// Local durable provider bundle using an append-only journal hot path.
 #[derive(Debug, Clone)]
 pub struct DurableObjectStore {
     local: LocalObjectStore,
-    paths: Arc<DurableStorePaths>,
-    segment_io: Arc<PortableSegmentFileIo>,
+    journal: Arc<DurableJournal>,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     persist_lock: Arc<Mutex<()>>,
 }
@@ -1533,18 +1564,11 @@ pub struct DurableObjectStore {
 impl DurableObjectStore {
     pub fn open(root: impl AsRef<Path>, config: LocalStoreConfig) -> Result<Self> {
         config.validate()?;
-        let (paths, node_dir) = DurableStorePaths::new(root, config.storage_node)?;
-        let segment_io = Arc::new(PortableSegmentFileIo::new(&node_dir)?);
-        segment_io.cleanup_tmp()?;
+        let paths = DurableStorePaths::new(root, config.storage_node)?;
+        let journal = Arc::new(DurableJournal::open(paths.journal.clone())?);
 
-        let local = if paths.metadata_snapshot.exists()
-            || paths.catalog_snapshot.exists()
-            || paths.segment_store_snapshot.exists()
-        {
-            Self::load_local_store(&paths, segment_io.as_ref())?
-        } else {
-            LocalObjectStore::with_config(config)?
-        };
+        let local = Self::load_local_store_from_journal(&paths.journal, config)?
+            .unwrap_or(LocalObjectStore::with_config(config)?);
         let persisted_segments = local
             .snapshot()?
             .segment_store
@@ -1555,8 +1579,7 @@ impl DurableObjectStore {
 
         let store = Self {
             local,
-            paths: Arc::new(paths),
-            segment_io,
+            journal,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             persist_lock: Arc::new(Mutex::new(())),
         };
@@ -1751,6 +1774,15 @@ impl DurableObjectStore {
         })
     }
 
+    pub fn compact_journal(&self) -> Result<()> {
+        let _persist_guard = lock(&self.persist_lock)?;
+        let snapshot = self.local.snapshot()?;
+        let (records, kept_segments) = Self::records_for_snapshot(&snapshot, &BTreeSet::new());
+        self.journal.rewrite_synced(&records)?;
+        *lock(&self.persisted_segments)? = kept_segments;
+        Ok(())
+    }
+
     pub fn run_metadata_custodian(
         &self,
         policy: RetentionPolicy,
@@ -1786,35 +1818,29 @@ impl DurableObjectStore {
         }
     }
 
-    fn load_local_store(
-        paths: &DurableStorePaths,
-        io: &PortableSegmentFileIo,
-    ) -> Result<LocalObjectStore> {
-        let metadata: DurableMetadataSnapshot = read_snapshot(&paths.metadata_snapshot)?;
-        let catalog: DurableCatalogSnapshot = read_snapshot(&paths.catalog_snapshot)?;
-        let segment_store: DurableSegmentStoreSnapshot =
-            read_snapshot(&paths.segment_store_snapshot)?;
-        if metadata.config != catalog.config || metadata.config != segment_store.config {
+    fn load_local_store_from_journal(
+        journal_path: &Path,
+        expected_config: LocalStoreConfig,
+    ) -> Result<Option<LocalObjectStore>> {
+        let replay = replay_durable_log(journal_path)?;
+        let Some(commit) = replay.last_commit else {
+            return Ok(None);
+        };
+        if commit.metadata.config != expected_config
+            || commit.catalog.config != expected_config
+            || commit.segment_store.config != expected_config
+        {
             return Err(StorageError::corrupt(
-                "durable provider snapshots disagree on store config",
+                "durable journal state disagrees with open config",
             ));
         }
 
         let mut records = BTreeMap::new();
-        for (segment_id, record) in segment_store.records {
-            let bytes = io.read_segment_file(segment_id)?;
-            let bytes_len = u64::try_from(bytes.len())
-                .map_err(|_| StorageError::corrupt("durable segment length overflows u64"))?;
-            if bytes_len != record.commit.descriptor.bytes {
-                return Err(StorageError::corrupt(
-                    "durable segment file length does not match catalog",
-                ));
-            }
-            if record.commit.descriptor.checksum != Some(checksum64(&bytes)) {
-                return Err(StorageError::corrupt(
-                    "durable segment file checksum does not match catalog",
-                ));
-            }
+        for (segment_id, record) in commit.segment_store.records {
+            let bytes = replay.segments.get(&segment_id).cloned().ok_or_else(|| {
+                StorageError::corrupt("journal commit references missing segment data")
+            })?;
+            validate_durable_segment_bytes(segment_id, &record, &bytes)?;
             records.insert(
                 segment_id,
                 SegmentRecord {
@@ -1825,70 +1851,77 @@ impl DurableObjectStore {
             );
         }
 
-        LocalObjectStore::from_snapshot(DurableStoreSnapshot {
-            config: metadata.config,
-            metadata: metadata.metadata,
-            segment_store: SegmentStoreInner {
-                next_offset: segment_store.next_offset,
-                segments: records,
+        Ok(Some(LocalObjectStore::from_snapshot(
+            DurableStoreSnapshot {
+                config: commit.metadata.config,
+                metadata: commit.metadata.metadata,
+                segment_store: SegmentStoreInner {
+                    next_offset: commit.segment_store.next_offset,
+                    segments: records,
+                },
+                segment_catalog: commit.catalog.catalog,
+                next_write_intent: commit.metadata.next_write_intent,
+                next_extent_id: commit.metadata.next_extent_id,
             },
-            segment_catalog: catalog.catalog,
-            next_write_intent: metadata.next_write_intent,
-            next_extent_id: metadata.next_extent_id,
-        })
+        )?))
     }
 
     fn persist(&self) -> Result<()> {
         let _persist_guard = lock(&self.persist_lock)?;
         let snapshot = self.local.snapshot()?;
+        let persisted_segments = lock(&self.persisted_segments)?;
+        let (records, kept_segments) = Self::records_for_snapshot(&snapshot, &persisted_segments);
+        drop(persisted_segments);
+        self.journal.append_synced(&records)?;
+        *lock(&self.persisted_segments)? = kept_segments;
+        Ok(())
+    }
+
+    fn records_for_snapshot(
+        snapshot: &DurableStoreSnapshot,
+        persisted_segments: &BTreeSet<SegmentId>,
+    ) -> (Vec<DurableLogRecord>, BTreeSet<SegmentId>) {
         let kept_segments: BTreeSet<_> = snapshot.segment_store.segments.keys().copied().collect();
-        {
-            let persisted_segments = lock(&self.persisted_segments)?;
-            self.segment_io.write_synced_segments(
-                snapshot
+        let mut records = Vec::new();
+        for (segment_id, record) in &snapshot.segment_store.segments {
+            if !persisted_segments.contains(segment_id) {
+                records.push(DurableLogRecord::SegmentData(DurableLogSegmentData {
+                    segment_id: *segment_id,
+                    bytes: record.bytes.clone(),
+                }));
+            }
+        }
+        records.push(DurableLogRecord::CommitState(Box::new(DurableLogCommit {
+            metadata: DurableMetadataSnapshot {
+                config: snapshot.config,
+                metadata: snapshot.metadata.clone(),
+                next_write_intent: snapshot.next_write_intent,
+                next_extent_id: snapshot.next_extent_id,
+            },
+            catalog: DurableCatalogSnapshot {
+                config: snapshot.config,
+                catalog: snapshot.segment_catalog.clone(),
+            },
+            segment_store: DurableSegmentStoreSnapshot {
+                config: snapshot.config,
+                next_offset: snapshot.segment_store.next_offset,
+                records: snapshot
                     .segment_store
                     .segments
                     .iter()
-                    .filter(|(segment_id, _)| !persisted_segments.contains(segment_id))
-                    .map(|(segment_id, record)| (*segment_id, record.bytes.as_slice())),
-            )?;
-        }
-
-        let segment_store_snapshot = DurableSegmentStoreSnapshot {
-            config: snapshot.config,
-            next_offset: snapshot.segment_store.next_offset,
-            records: snapshot
-                .segment_store
-                .segments
-                .iter()
-                .map(|(segment_id, record)| {
-                    (
-                        *segment_id,
-                        DurableSegmentRecord {
-                            synced: record.synced,
-                            commit: record.commit.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        };
-        let catalog_snapshot = DurableCatalogSnapshot {
-            config: snapshot.config,
-            catalog: snapshot.segment_catalog,
-        };
-        let metadata_snapshot = DurableMetadataSnapshot {
-            config: snapshot.config,
-            metadata: snapshot.metadata,
-            next_write_intent: snapshot.next_write_intent,
-            next_extent_id: snapshot.next_extent_id,
-        };
-
-        write_snapshot_atomic(&self.paths.segment_store_snapshot, &segment_store_snapshot)?;
-        write_snapshot_atomic(&self.paths.catalog_snapshot, &catalog_snapshot)?;
-        write_snapshot_atomic(&self.paths.metadata_snapshot, &metadata_snapshot)?;
-        self.segment_io.prune_unlisted_segments(&kept_segments)?;
-        *lock(&self.persisted_segments)? = kept_segments;
-        Ok(())
+                    .map(|(segment_id, record)| {
+                        (
+                            *segment_id,
+                            DurableSegmentRecord {
+                                synced: record.synced,
+                                commit: record.commit.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        })));
+        (records, kept_segments)
     }
 }
 
@@ -1989,6 +2022,31 @@ struct DurableMetadataSnapshot {
 struct DurableCatalogSnapshot {
     config: LocalStoreConfig,
     catalog: CatalogInner,
+}
+
+#[derive(Debug, Clone)]
+struct DurableLogSegmentData {
+    segment_id: SegmentId,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct DurableLogCommit {
+    metadata: DurableMetadataSnapshot,
+    catalog: DurableCatalogSnapshot,
+    segment_store: DurableSegmentStoreSnapshot,
+}
+
+#[derive(Debug, Clone)]
+enum DurableLogRecord {
+    SegmentData(DurableLogSegmentData),
+    CommitState(Box<DurableLogCommit>),
+}
+
+#[derive(Debug, Clone)]
+struct DurableLogReplay {
+    segments: BTreeMap<SegmentId, Vec<u8>>,
+    last_commit: Option<DurableLogCommit>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -7028,14 +7086,25 @@ fn serde_error(error: impl std::fmt::Display) -> StorageError {
 }
 
 fn durable_codec_error(reason: impl Into<String>) -> StorageError {
-    StorageError::corrupt(format!("durable snapshot codec failed: {}", reason.into()))
+    StorageError::corrupt(format!("durable codec failed: {}", reason.into()))
 }
 
+#[cfg(test)]
 const DURABLE_SNAPSHOT_MAGIC: &[u8; 8] = b"TCOWSNAP";
+#[cfg(test)]
 const DURABLE_SNAPSHOT_VERSION: u16 = 1;
+#[cfg(test)]
 const DURABLE_SNAPSHOT_METADATA: u8 = 1;
+#[cfg(test)]
 const DURABLE_SNAPSHOT_CATALOG: u8 = 2;
+#[cfg(test)]
 const DURABLE_SNAPSHOT_SEGMENT_STORE: u8 = 3;
+const DURABLE_LOG_MAGIC: &[u8; 8] = b"TCOWJNL!";
+const DURABLE_LOG_VERSION: u16 = 1;
+const DURABLE_LOG_SEGMENT_DATA: u8 = 1;
+const DURABLE_LOG_COMMIT_STATE: u8 = 2;
+const DURABLE_LOG_HEADER_LEN: usize = 8 + 2 + 1 + 8;
+const DURABLE_LOG_CHECKSUM_LEN: usize = 8;
 const MAX_DURABLE_COLLECTION_LEN: u64 = 1_000_000;
 const MAX_DURABLE_STRING_LEN: u64 = 1_048_576;
 
@@ -7044,6 +7113,7 @@ trait DurableCodec: Sized {
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self>;
 }
 
+#[cfg(test)]
 trait DurableSnapshotCodec: DurableCodec {
     const SNAPSHOT_KIND: u8;
 }
@@ -7054,6 +7124,7 @@ struct DurableEncoder {
 }
 
 impl DurableEncoder {
+    #[cfg(test)]
     fn new(kind: u8) -> Self {
         let mut encoder = Self { bytes: Vec::new() };
         encoder.bytes.extend_from_slice(DURABLE_SNAPSHOT_MAGIC);
@@ -7093,6 +7164,7 @@ struct DurableDecoder<'a> {
 }
 
 impl<'a> DurableDecoder<'a> {
+    #[cfg(test)]
     fn new(bytes: &'a [u8], expected_kind: u8) -> Result<Self> {
         let mut decoder = Self { bytes, offset: 0 };
         let magic = decoder.take(DURABLE_SNAPSHOT_MAGIC.len())?;
@@ -8111,6 +8183,7 @@ impl DurableCodec for DurableSegmentStoreSnapshot {
     }
 }
 
+#[cfg(test)]
 impl DurableSnapshotCodec for DurableSegmentStoreSnapshot {
     const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_SEGMENT_STORE;
 }
@@ -8129,6 +8202,7 @@ impl DurableCodec for DurableCatalogSnapshot {
     }
 }
 
+#[cfg(test)]
 impl DurableSnapshotCodec for DurableCatalogSnapshot {
     const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_CATALOG;
 }
@@ -8215,8 +8289,39 @@ impl DurableCodec for DurableMetadataSnapshot {
     }
 }
 
+#[cfg(test)]
 impl DurableSnapshotCodec for DurableMetadataSnapshot {
     const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_METADATA;
+}
+
+impl DurableCodec for DurableLogSegmentData {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.segment_id.encode(out)?;
+        self.bytes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            segment_id: SegmentId::decode(input)?,
+            bytes: Vec::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableLogCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.metadata.encode(out)?;
+        self.catalog.encode(out)?;
+        self.segment_store.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            metadata: DurableMetadataSnapshot::decode(input)?,
+            catalog: DurableCatalogSnapshot::decode(input)?,
+            segment_store: DurableSegmentStoreSnapshot::decode(input)?,
+        })
+    }
 }
 
 impl DurableCodec for WriteDurability {
@@ -9041,12 +9146,14 @@ impl<T: DurableCodec> DurableCodec for RemoteWireReply<T> {
     }
 }
 
+#[cfg(test)]
 fn encode_snapshot<T: DurableSnapshotCodec>(value: &T) -> Result<Vec<u8>> {
     let mut out = DurableEncoder::new(T::SNAPSHOT_KIND);
     value.encode(&mut out)?;
     Ok(out.finish())
 }
 
+#[cfg(test)]
 fn decode_snapshot<T: DurableSnapshotCodec>(bytes: &[u8]) -> Result<T> {
     let mut input = DurableDecoder::new(bytes, T::SNAPSHOT_KIND)?;
     let value = T::decode(&mut input)?;
@@ -9054,13 +9161,160 @@ fn decode_snapshot<T: DurableSnapshotCodec>(bytes: &[u8]) -> Result<T> {
     Ok(value)
 }
 
-fn read_snapshot<T: DurableSnapshotCodec>(path: &Path) -> Result<T> {
-    let mut file = File::open(path).map_err(fs_error)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(fs_error)?;
-    decode_snapshot(&bytes)
+fn encode_log_record(record: &DurableLogRecord) -> Result<Vec<u8>> {
+    let (kind, payload) = match record {
+        DurableLogRecord::SegmentData(record) => {
+            let mut out = DurableEncoder::default();
+            record.encode(&mut out)?;
+            (DURABLE_LOG_SEGMENT_DATA, out.finish())
+        }
+        DurableLogRecord::CommitState(record) => {
+            let mut out = DurableEncoder::default();
+            record.encode(&mut out)?;
+            (DURABLE_LOG_COMMIT_STATE, out.finish())
+        }
+    };
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| durable_codec_error("journal payload length exceeds u64"))?;
+    let mut bytes =
+        Vec::with_capacity(DURABLE_LOG_HEADER_LEN + payload.len() + DURABLE_LOG_CHECKSUM_LEN);
+    bytes.extend_from_slice(DURABLE_LOG_MAGIC);
+    bytes.extend_from_slice(&DURABLE_LOG_VERSION.to_be_bytes());
+    bytes.push(kind);
+    bytes.extend_from_slice(&payload_len.to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(&checksum64(&payload).to_be_bytes());
+    Ok(bytes)
 }
 
+fn decode_log_payload(kind: u8, payload: &[u8]) -> Result<DurableLogRecord> {
+    let mut input = DurableDecoder {
+        bytes: payload,
+        offset: 0,
+    };
+    let record = match kind {
+        DURABLE_LOG_SEGMENT_DATA => {
+            DurableLogRecord::SegmentData(DurableLogSegmentData::decode(&mut input)?)
+        }
+        DURABLE_LOG_COMMIT_STATE => {
+            DurableLogRecord::CommitState(Box::new(DurableLogCommit::decode(&mut input)?))
+        }
+        _ => return Err(durable_codec_error("invalid durable journal record kind")),
+    };
+    input.finish()?;
+    Ok(record)
+}
+
+fn replay_durable_log(path: &Path) -> Result<DurableLogReplay> {
+    if !path.exists() {
+        return Ok(DurableLogReplay {
+            segments: BTreeMap::new(),
+            last_commit: None,
+        });
+    }
+    let bytes = fs::read(path).map_err(fs_error)?;
+    let mut offset = 0usize;
+    let mut segments = BTreeMap::new();
+    let mut last_commit = None;
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining < DURABLE_LOG_HEADER_LEN {
+            break;
+        }
+        let magic_end = offset + DURABLE_LOG_MAGIC.len();
+        if &bytes[offset..magic_end] != DURABLE_LOG_MAGIC {
+            return Err(durable_codec_error("bad durable journal magic"));
+        }
+        let version_start = magic_end;
+        let version = u16::from_be_bytes(
+            bytes[version_start..version_start + 2]
+                .try_into()
+                .map_err(|_| durable_codec_error("invalid durable journal version"))?,
+        );
+        if version != DURABLE_LOG_VERSION {
+            return Err(durable_codec_error("unsupported durable journal version"));
+        }
+        let kind = bytes[version_start + 2];
+        let len_start = version_start + 3;
+        let payload_len = u64::from_be_bytes(
+            bytes[len_start..len_start + 8]
+                .try_into()
+                .map_err(|_| durable_codec_error("invalid durable journal payload length"))?,
+        );
+        if payload_len > MAX_DURABLE_COLLECTION_LEN.saturating_mul(1024) {
+            return Err(durable_codec_error("durable journal payload exceeds limit"));
+        }
+        let payload_len = usize::try_from(payload_len)
+            .map_err(|_| durable_codec_error("durable journal payload length overflows usize"))?;
+        let payload_start = offset + DURABLE_LOG_HEADER_LEN;
+        let checksum_start = payload_start
+            .checked_add(payload_len)
+            .ok_or_else(|| durable_codec_error("durable journal record offset overflow"))?;
+        let record_end = checksum_start
+            .checked_add(DURABLE_LOG_CHECKSUM_LEN)
+            .ok_or_else(|| durable_codec_error("durable journal checksum offset overflow"))?;
+        if record_end > bytes.len() {
+            break;
+        }
+        let payload = &bytes[payload_start..checksum_start];
+        let expected = u64::from_be_bytes(
+            bytes[checksum_start..record_end]
+                .try_into()
+                .map_err(|_| durable_codec_error("invalid durable journal checksum"))?,
+        );
+        if checksum64(payload) != expected {
+            return Err(durable_codec_error("durable journal checksum mismatch"));
+        }
+        match decode_log_payload(kind, payload)? {
+            DurableLogRecord::SegmentData(record) => {
+                if let Some(existing) = segments.get(&record.segment_id) {
+                    if existing != &record.bytes {
+                        return Err(durable_codec_error(
+                            "durable journal segment record conflicts with earlier bytes",
+                        ));
+                    }
+                } else {
+                    segments.insert(record.segment_id, record.bytes);
+                }
+            }
+            DurableLogRecord::CommitState(commit) => {
+                last_commit = Some(*commit);
+            }
+        }
+        offset = record_end;
+    }
+    Ok(DurableLogReplay {
+        segments,
+        last_commit,
+    })
+}
+
+fn validate_durable_segment_bytes(
+    segment_id: SegmentId,
+    record: &DurableSegmentRecord,
+    bytes: &[u8],
+) -> Result<()> {
+    let bytes_len = u64::try_from(bytes.len())
+        .map_err(|_| StorageError::corrupt("durable segment length overflows u64"))?;
+    if bytes_len != record.commit.descriptor.bytes {
+        return Err(StorageError::corrupt(
+            "durable segment length does not match journal commit",
+        ));
+    }
+    if record.commit.descriptor.segment_id != segment_id {
+        return Err(StorageError::corrupt(
+            "durable segment record key disagrees with descriptor",
+        ));
+    }
+    if record.commit.descriptor.checksum != Some(checksum64(bytes)) {
+        return Err(StorageError::corrupt(
+            "durable segment checksum does not match journal data",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotWriteFault {
     TempWrite,
@@ -9069,6 +9323,7 @@ enum SnapshotWriteFault {
     DirSync,
 }
 
+#[cfg(test)]
 fn maybe_snapshot_write_fault(
     fault: Option<SnapshotWriteFault>,
     point: SnapshotWriteFault,
@@ -9082,10 +9337,12 @@ fn maybe_snapshot_write_fault(
     }
 }
 
+#[cfg(test)]
 fn write_snapshot_atomic<T: DurableSnapshotCodec>(path: &Path, value: &T) -> Result<()> {
     write_snapshot_atomic_with_fault(path, value, None)
 }
 
+#[cfg(test)]
 fn write_snapshot_atomic_with_fault<T: DurableSnapshotCodec>(
     path: &Path,
     value: &T,
@@ -11451,13 +11708,9 @@ mod tests {
                 WriteDurability::Flushed,
             )
             .unwrap();
-        assert!(root.join("metadata").join("metadata.bin").exists());
-        assert!(
-            root.join("storage-nodes")
-                .join(format!("node-{:032x}", cfg.storage_node.raw()))
-                .join("catalog.bin")
-                .exists()
-        );
+        let journal = root.join("journal").join("store.log");
+        assert!(journal.exists());
+        assert!(replay_durable_log(&journal).unwrap().last_commit.is_some());
 
         drop(store);
         let reopened = DurableObjectStore::open(&root, cfg).unwrap();
@@ -11540,6 +11793,577 @@ mod tests {
             .unwrap();
         assert_eq!(after_flush, repeated_blocks(1, 7));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_journal_ignores_torn_tail_and_uncommitted_segment_records() {
+        let root = durable_temp_dir("journal-torn-tail");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 3),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let journal = root.join("journal").join("store.log");
+        let uncommitted =
+            encode_log_record(&DurableLogRecord::SegmentData(DurableLogSegmentData {
+                segment_id: SegmentId::from_raw(999),
+                bytes: repeated_blocks(1, 9),
+            }))
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&uncommitted)
+            .unwrap();
+        let torn = encode_log_record(&DurableLogRecord::SegmentData(DurableLogSegmentData {
+            segment_id: SegmentId::from_raw(1000),
+            bytes: repeated_blocks(1, 10),
+        }))
+        .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&torn[..torn.len() / 2])
+            .unwrap();
+
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 3));
+        assert!(
+            !reopened
+                .segment_store()
+                .contains_segment(SegmentId::from_raw(999))
+                .unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_journal_ignores_torn_commit_after_segment_records() {
+        let root = durable_temp_dir("journal-torn-commit");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 3),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 8),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        let snapshot = store.local.snapshot().unwrap();
+        let persisted = lock(&store.persisted_segments).unwrap().clone();
+        let (records, _) = DurableObjectStore::records_for_snapshot(&snapshot, &persisted);
+        assert!(matches!(
+            records.last(),
+            Some(DurableLogRecord::CommitState(_))
+        ));
+        let journal = root.join("journal").join("store.log");
+        let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+        for record in &records[..records.len() - 1] {
+            file.write_all(&encode_log_record(record).unwrap()).unwrap();
+        }
+        let commit = encode_log_record(records.last().unwrap()).unwrap();
+        file.write_all(&commit[..commit.len() / 2]).unwrap();
+        drop(file);
+        drop(store);
+
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 3));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_journal_replay_is_idempotent_across_reopens() {
+        let root = durable_temp_dir("journal-replay-idempotent");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 5),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+        store
+            .append_file(lease, b"journal", WriteDurability::Flushed)
+            .unwrap();
+        drop(store);
+
+        let journal = root.join("journal").join("store.log");
+        let len_before = fs::metadata(&journal).unwrap().len();
+        for _ in 0..3 {
+            let replay_a = replay_durable_log(&journal).unwrap();
+            let replay_b = replay_durable_log(&journal).unwrap();
+            assert_eq!(replay_a.segments.len(), replay_b.segments.len());
+            assert_eq!(
+                replay_a
+                    .last_commit
+                    .as_ref()
+                    .unwrap()
+                    .metadata
+                    .metadata
+                    .next_commit_seq,
+                replay_b
+                    .last_commit
+                    .as_ref()
+                    .unwrap()
+                    .metadata
+                    .metadata
+                    .next_commit_seq
+            );
+
+            let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+            let mut block = vec![0; 4096];
+            reopened
+                .read_device(device_id, ByteRange::new(0, 4096), &mut block)
+                .unwrap();
+            assert_eq!(block, repeated_blocks(1, 5));
+            let mut file = vec![0; b"journal".len()];
+            reopened
+                .read_file(
+                    keyspace_id,
+                    file_id,
+                    ByteRange::new(0, b"journal".len() as u64),
+                    &mut file,
+                )
+                .unwrap();
+            assert_eq!(file, b"journal");
+            drop(reopened);
+            assert_eq!(fs::metadata(&journal).unwrap().len(), len_before);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_journal_rejects_complete_checksum_corruption() {
+        let root = durable_temp_dir("journal-checksum-corruption");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 4),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let journal = root.join("journal").join("store.log");
+        let mut corrupt =
+            encode_log_record(&DurableLogRecord::SegmentData(DurableLogSegmentData {
+                segment_id: SegmentId::from_raw(999),
+                bytes: repeated_blocks(1, 9),
+            }))
+            .unwrap();
+        corrupt[DURABLE_LOG_HEADER_LEN] ^= 0xff;
+        OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&corrupt)
+            .unwrap();
+
+        assert!(replay_durable_log(&journal).is_err());
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_journal_rejects_commit_that_references_missing_segment_data() {
+        let source = durable_temp_dir("journal-missing-segment-source");
+        let cfg = config();
+        let store = DurableObjectStore::open(&source, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 4),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+        let commit = replay_durable_log(&source.join("journal").join("store.log"))
+            .unwrap()
+            .last_commit
+            .unwrap();
+
+        let broken = durable_temp_dir("journal-missing-segment-broken");
+        let journal_dir = broken.join("journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+        fs::write(
+            journal_dir.join("store.log"),
+            encode_log_record(&DurableLogRecord::CommitState(Box::new(commit))).unwrap(),
+        )
+        .unwrap();
+
+        assert!(DurableObjectStore::open(&broken, cfg).is_err());
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(broken);
+    }
+
+    #[test]
+    fn durable_journal_compaction_preserves_replay_state_and_removes_history() {
+        let root = durable_temp_dir("journal-compaction");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 32,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        for block in 0..8 {
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, block as u8),
+                    WriteDurability::Flushed,
+                )
+                .unwrap();
+        }
+
+        let journal = root.join("journal").join("store.log");
+        let before_size = fs::metadata(&journal).unwrap().len();
+        let before_commit = replay_durable_log(&journal)
+            .unwrap()
+            .last_commit
+            .unwrap()
+            .metadata
+            .metadata
+            .next_commit_seq;
+
+        store.compact_journal().unwrap();
+        let after_size = fs::metadata(&journal).unwrap().len();
+        let after_commit = replay_durable_log(&journal)
+            .unwrap()
+            .last_commit
+            .unwrap()
+            .metadata
+            .metadata
+            .next_commit_seq;
+        assert!(after_size < before_size);
+        assert_eq!(after_commit, before_commit);
+
+        drop(store);
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 8 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 8 * 4096), &mut bytes)
+            .unwrap();
+        for block in 0..8 {
+            let start = block * 4096;
+            let end = start + 4096;
+            assert_eq!(&bytes[start..end], vec![block as u8; 4096].as_slice());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_journal_ignores_abandoned_compaction_temp_file() {
+        let root = durable_temp_dir("journal-abandoned-compaction");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 12),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+
+        let journal = root.join("journal").join("store.log");
+        fs::write(journal.with_extension("tmp"), b"incomplete compaction").unwrap();
+        drop(store);
+
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 12));
+
+        reopened.compact_journal().unwrap();
+        let mut compacted = vec![0; 4096];
+        let reopened_again = DurableObjectStore::open(&root, cfg).unwrap();
+        reopened_again
+            .read_device(device_id, ByteRange::new(0, 4096), &mut compacted)
+            .unwrap();
+        assert_eq!(compacted, repeated_blocks(1, 12));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_journal_generated_replay_matches_reference_model() {
+        #[derive(Clone, Copy)]
+        struct ModelIds {
+            device_id: DeviceId,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+        }
+
+        fn assert_models(
+            store: &DurableObjectStore,
+            ids: ModelIds,
+            blocks: &[u8],
+            file_blocks: &[u8],
+            seed: u64,
+            trace: &[String],
+        ) {
+            let mut actual_blocks = vec![0; blocks.len() * 4096];
+            store
+                .read_device(
+                    ids.device_id,
+                    ByteRange::new(0, actual_blocks.len() as u64),
+                    &mut actual_blocks,
+                )
+                .unwrap();
+            assert_model_blocks(&actual_blocks, blocks, seed, trace, "durable block replay");
+
+            let mut actual_file = vec![0; file_blocks.len() * 4096];
+            store
+                .read_file(
+                    ids.keyspace_id,
+                    ids.file_id,
+                    ByteRange::new(0, actual_file.len() as u64),
+                    &mut actual_file,
+                )
+                .unwrap();
+            assert_model_blocks(
+                &actual_file,
+                file_blocks,
+                seed,
+                trace,
+                "durable file replay",
+            );
+        }
+
+        for seed in 0..4 {
+            let root = durable_temp_dir(&format!("journal-generated-replay-{seed}"));
+            let cfg = tree_config();
+            let mut rng = crate::sim::SeededRng::new(seed);
+            let mut trace = Vec::new();
+            let mut store = DurableObjectStore::open(&root, cfg).unwrap();
+            let device_id = store
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 16,
+                        block_size: 4096,
+                    },
+                    name: Some(format!("device-{seed}")),
+                })
+                .unwrap();
+            let keyspace_id = store
+                .create_keyspace(CreateKeyspaceRequest {
+                    name: Some(format!("ks-{seed}")),
+                })
+                .unwrap();
+            let file_id = store
+                .create_file(
+                    keyspace_id,
+                    CreateFileRequest {
+                        spec: FileSpec {
+                            name: Some(format!("file-{seed}")),
+                        },
+                    },
+                )
+                .unwrap();
+            let ids = ModelIds {
+                device_id,
+                keyspace_id,
+                file_id,
+            };
+
+            let mut live_blocks = vec![0u8; 16];
+            let mut durable_blocks = live_blocks.clone();
+            let mut live_file = Vec::new();
+            let mut durable_file = live_file.clone();
+            for step in 0..18 {
+                match rng.next_u64() % 6 {
+                    0 => {
+                        let block = rng.next_u64() as usize % live_blocks.len();
+                        let byte = (1 + rng.next_u64() % 254) as u8;
+                        store
+                            .write_device(
+                                device_id,
+                                (block * 4096) as u64,
+                                &[byte; 4096],
+                                WriteDurability::Acknowledged,
+                            )
+                            .unwrap();
+                        live_blocks[block] = byte;
+                        trace.push(format!("step={step} block_ack block={block} byte={byte}"));
+                    }
+                    1 => {
+                        let block = rng.next_u64() as usize % live_blocks.len();
+                        let byte = (1 + rng.next_u64() % 254) as u8;
+                        store
+                            .write_device(
+                                device_id,
+                                (block * 4096) as u64,
+                                &[byte; 4096],
+                                WriteDurability::Flushed,
+                            )
+                            .unwrap();
+                        live_blocks[block] = byte;
+                        durable_blocks = live_blocks.clone();
+                        durable_file = live_file.clone();
+                        trace.push(format!(
+                            "step={step} block_flushed block={block} byte={byte}"
+                        ));
+                    }
+                    2 => {
+                        let byte = (1 + rng.next_u64() % 254) as u8;
+                        durable_blocks = live_blocks.clone();
+                        durable_file = live_file.clone();
+                        let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                        store
+                            .append_file(lease, &[byte; 4096], WriteDurability::Acknowledged)
+                            .unwrap();
+                        live_file.push(byte);
+                        trace.push(format!("step={step} append_ack byte={byte}"));
+                    }
+                    3 => {
+                        let byte = (1 + rng.next_u64() % 254) as u8;
+                        let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                        store
+                            .append_file(lease, &[byte; 4096], WriteDurability::Flushed)
+                            .unwrap();
+                        live_file.push(byte);
+                        durable_blocks = live_blocks.clone();
+                        durable_file = live_file.clone();
+                        trace.push(format!("step={step} append_flushed byte={byte}"));
+                    }
+                    4 => {
+                        store.flush_device(device_id).unwrap();
+                        store.flush_file(keyspace_id, file_id).unwrap();
+                        durable_blocks = live_blocks.clone();
+                        durable_file = live_file.clone();
+                        trace.push(format!("step={step} flush"));
+                    }
+                    _ => {
+                        drop(store);
+                        store = DurableObjectStore::open(&root, cfg).unwrap();
+                        live_blocks = durable_blocks.clone();
+                        live_file = durable_file.clone();
+                        trace.push(format!("step={step} crash_reopen"));
+                    }
+                }
+                assert_models(&store, ids, &live_blocks, &live_file, seed, &trace);
+            }
+
+            store.flush_device(device_id).unwrap();
+            store.flush_file(keyspace_id, file_id).unwrap();
+            durable_blocks = live_blocks;
+            durable_file = live_file;
+            drop(store);
+            let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+            trace.push("final_reopen".to_string());
+            assert_models(&reopened, ids, &durable_blocks, &durable_file, seed, &trace);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -11785,12 +12609,6 @@ mod tests {
     fn durable_provider_persists_storage_node_custodian_deletions() {
         let root = durable_temp_dir("custodian-restart");
         let cfg = config();
-        let node_dir = root
-            .join("storage-nodes")
-            .join(format!("node-{:032x}", cfg.storage_node.raw()));
-        let segment_path = node_dir
-            .join("segments")
-            .join(format!("{:032x}.seg", SegmentId::from_raw(1).raw()));
         let store = DurableObjectStore::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
@@ -11809,18 +12627,33 @@ mod tests {
                 WriteDurability::Flushed,
             )
             .unwrap();
-        assert!(segment_path.exists());
+        assert!(
+            store
+                .segment_store()
+                .contains_segment(SegmentId::from_raw(1))
+                .unwrap()
+        );
 
         store.delete_device(device_id).unwrap();
         store
             .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
             .unwrap();
         store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
-        assert!(!segment_path.exists());
+        assert!(
+            !store
+                .segment_store()
+                .contains_segment(SegmentId::from_raw(1))
+                .unwrap()
+        );
 
         drop(store);
-        DurableObjectStore::open(&root, cfg).unwrap();
-        assert!(!segment_path.exists());
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        assert!(
+            !reopened
+                .segment_store()
+                .contains_segment(SegmentId::from_raw(1))
+                .unwrap()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
