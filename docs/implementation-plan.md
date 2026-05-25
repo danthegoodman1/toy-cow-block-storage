@@ -707,7 +707,7 @@ Exit gate:
 
 ## Phase 18: Durable Fault-Injection Matrix
 
-Status: not started.
+Status: complete.
 
 Harden the snapshot-based durable provider by testing every durable boundary as
 an explicit crash/restart point. This phase either proves the simple atomic
@@ -721,47 +721,47 @@ crash matrix is treated as production-grade evidence.
 
 Deliverables:
 
-- [ ] Reusable durable provider conformance harness that can run against the
+- [x] Reusable durable provider conformance harness that can run against the
   in-memory model, the snapshot durable provider, and any future journal or
   database-backed provider where applicable.
-- [ ] Crate-owned durable snapshot codec with explicit magic, schema version,
+- [x] Crate-owned durable snapshot codec with explicit magic, schema version,
   record kind, enum tags, fixed integer endianness, bounded collection/string
   lengths, trailing-byte rejection, and deterministic map ordering.
-- [ ] Durable codec tests for round trips, stable golden bytes, unsupported
+- [x] Durable codec tests for round trips, stable golden bytes, unsupported
   versions, invalid tags, truncated payloads, trailing bytes, oversized lengths,
   and length-prefix overflow.
-- [ ] Fault-injected segment file I/O backend that can fail or crash at temp
+- [x] Fault-injected segment file I/O backend that can fail or crash at temp
   file create/write, temp file sync, atomic rename, final directory sync, and
   tmp cleanup.
-- [ ] Fault-injected snapshot writer for segment-store snapshots, storage-node
+- [x] Fault-injected snapshot writer for segment-store snapshots, storage-node
   catalog snapshots, and metadata snapshots.
-- [ ] Crash/reopen matrix for block writes, multi-shard commit groups, forks,
+- [x] Crash/reopen matrix for block writes, multi-shard commit groups, forks,
   deletes, PITR checkpoints/restores, native writes, native appends, native
   keyspace checkpoints, and native keyspace snapshots/restores.
-- [ ] Decision record for keeping atomic binary snapshots or replacing them
+- [x] Decision record for keeping atomic binary snapshots or replacing them
   with a journal/database-backed metadata provider.
-- [ ] If a journal/database provider is required, implement it behind the same
-  provider contracts and remove any obsolete snapshot-only compatibility path
-  from production use.
-- [ ] Remove `bincode` from durable snapshot persistence. Keeping serde/bincode
+- [x] The Phase 18 decision keeps atomic binary snapshots for this toy durable
+  provider; no journal/database provider is required yet, so there is no second
+  production durable path to remove.
+- [x] Remove `bincode` from durable snapshot persistence. Keeping serde/bincode
   only for test fixtures or debug helpers is allowed if it is not a production
   durable or wire format.
 
 Exit gate:
 
-- [ ] Every injected crash point reopens as either the old committed state or
+- [x] Every injected crash point reopens as either the old committed state or
   the complete new committed state; no partial commit group, partial keyspace
   commit, or metadata reference to missing segment bytes is observable.
-- [ ] Replaying after repeated crashes is idempotent and does not leak write
+- [x] Replaying after repeated crashes is idempotent and does not leak write
   intents, append leases, temporary segment files, or durable-pending catalog
   entries.
-- [ ] `flush` reports only commit sequences whose segment bytes, storage-node
+- [x] `flush` reports only commit sequences whose segment bytes, storage-node
   catalog state, segment descriptors, and metadata state survive reopen.
-- [ ] Storage-node custodian and metadata custodian can resume after crashes
+- [x] Storage-node custodian and metadata custodian can resume after crashes
   without freeing live or retained-PITR data.
-- [ ] The chosen durable metadata format has no untested compatibility shim left
+- [x] The chosen durable metadata format has no untested compatibility shim left
   behind.
-- [ ] Durable reopen never depends on serde-derived struct layout or bincode
+- [x] Durable reopen never depends on serde-derived struct layout or bincode
   defaults; every persisted byte is accepted or rejected by crate-owned codec
   rules.
 

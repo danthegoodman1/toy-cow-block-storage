@@ -547,13 +547,12 @@ store/
 
 The Phase 16 metadata provider uses atomic binary snapshots written with the
 same temp-file, file-sync, atomic-rename, and directory-sync discipline as
-segment files. The current implementation uses `bincode` as scaffolding for
-those snapshots so the durable boundary can be tested before the format is
-designed. `bincode` is not the durable format. The durable fault-injection
-phase must replace it with a crate-owned codec or choose a journal/database
-provider. A later provider may use SQLite, RocksDB, or another database, but it
-must preserve the same provider contracts and keep metadata state separate from
-storage-node local segment catalogs.
+segment files. Phase 16 temporarily used `bincode` as scaffolding for those
+snapshots so the durable boundary could be tested before the format was
+designed. Phase 18 replaced that scaffolding with the crate-owned codec
+described below. A later provider may use SQLite, RocksDB, or another database,
+but it must preserve the same provider contracts and keep metadata state
+separate from storage-node local segment catalogs.
 
 The snapshot provider is the first durable implementation, not the final answer
 for every crash-recovery shape. The durable fault-injection phase must either
@@ -564,6 +563,29 @@ kept as a compatibility layer. If snapshots remain, their codec must have
 explicit magic, schema version, record kind, fixed integer endianness, bounded
 lengths, deterministic map ordering, and strict malformed/trailing-byte
 rejection.
+
+### Phase 18 Durable Format Decision
+
+Phase 18 keeps atomic binary snapshots for the local durable provider. The
+reason is deliberately small: the current toy provider has one local writer,
+rewrites compact metadata snapshots, and can prove the restart contract with
+explicit temp-write, file-sync, rename, directory-sync, and malformed-codec
+tests. A journal or database provider would be justified when snapshot rewrite
+cost, multi-process writers, partial replay, or larger metadata sets become the
+measured bottleneck.
+
+The durable snapshot format is now crate-owned rather than serde/bincode-owned:
+
+```text
+magic("TCOWSNAP"), version, snapshot_kind, payload
+```
+
+The payload uses fixed big-endian integers, explicit enum tags, bounded
+collection and string lengths, deterministic `BTreeMap` ordering, duplicate-key
+rejection on decode, and trailing-byte rejection. There is no compatibility
+reader for the temporary Phase 16 bincode snapshots. That is intentional under
+the project's no-tombstones rule: the toy system has no external format promise
+yet, so the old scaffolding was replaced instead of retained.
 
 Segment files are storage-node-local immutable payloads. `catalog.bin` records
 local reservation, durable-pending, referenced, released, and freed lifecycle

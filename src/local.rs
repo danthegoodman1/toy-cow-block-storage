@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1257,12 +1258,53 @@ impl Default for LocalObjectStore {
 /// This sits below `SegmentStore` and `LocalSegmentCatalog`; changing the file
 /// I/O engine must not change block, native, metadata, PITR, or GC semantics.
 pub trait SegmentFileIo: Send + Sync {
+    /// Return whether the final immutable segment file exists on this storage
+    /// node.
+    ///
+    /// Success does not make the file durable by itself; it is only an
+    /// existence probe. Implementations must surface real metadata/read errors
+    /// instead of treating them as absence.
+    fn segment_file_exists(&self, segment_id: SegmentId) -> Result<bool>;
+
+    /// Write or replace the temporary segment payload.
+    ///
+    /// Success makes the temp path visible to this I/O implementation, but not
+    /// durable or readable as a final segment.
     fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()>;
+
+    /// Flush the temporary segment payload before rename.
+    ///
+    /// Success means the temp file contents have been asked to reach stable
+    /// storage according to the backend's local durability mechanism.
     fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Atomically move the synced temp payload to its final immutable path.
+    ///
+    /// Success may make the segment readable, but callers must still sync the
+    /// containing directory before catalog state can claim durable visibility.
     fn rename_temp_to_final(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Flush final-path directory metadata after a rename or delete.
+    ///
+    /// Success is the storage-node boundary after which catalog metadata may
+    /// reference or forget the final file path.
     fn sync_segment_dir(&self) -> Result<()>;
+
+    /// Read immutable final segment bytes.
+    ///
+    /// Missing, partial, or unreadable final files must be reported as errors.
     fn read_segment_file(&self, segment_id: SegmentId) -> Result<Vec<u8>>;
+
+    /// Remove a final segment file and sync the containing directory.
+    ///
+    /// Success means the local storage node has durable deletion evidence for
+    /// that final path. Missing files are treated as already deleted.
     fn delete_segment_file(&self, segment_id: SegmentId) -> Result<()>;
+
+    /// Remove temporary payloads that were never promoted to final files.
+    ///
+    /// Success means temp cleanup itself has been durably reflected in the temp
+    /// directory.
     fn cleanup_tmp(&self) -> Result<()>;
 }
 
@@ -1297,21 +1339,7 @@ impl PortableSegmentFileIo {
     }
 
     pub fn write_synced_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
-        let final_path = self.segment_path(segment_id);
-        if final_path.exists() {
-            let existing = fs::read(&final_path).map_err(fs_error)?;
-            if existing == bytes {
-                return Ok(());
-            }
-            return Err(StorageError::conflict(
-                "durable segment file already exists with different bytes",
-            ));
-        }
-
-        self.write_temp_segment(segment_id, bytes)?;
-        self.sync_temp_segment(segment_id)?;
-        self.rename_temp_to_final(segment_id)?;
-        self.sync_segment_dir()
+        write_synced_segment_with_io(self, segment_id, bytes)
     }
 
     fn prune_unlisted_segments(&self, keep: &BTreeSet<SegmentId>) -> Result<()> {
@@ -1347,7 +1375,37 @@ impl PortableSegmentFileIo {
     }
 }
 
+fn write_synced_segment_with_io(
+    io: &dyn SegmentFileIo,
+    segment_id: SegmentId,
+    bytes: &[u8],
+) -> Result<()> {
+    if io.segment_file_exists(segment_id)? {
+        let existing = io.read_segment_file(segment_id)?;
+        if existing == bytes {
+            return Ok(());
+        } else {
+            return Err(StorageError::conflict(
+                "durable segment file already exists with different bytes",
+            ));
+        }
+    }
+
+    io.write_temp_segment(segment_id, bytes)?;
+    io.sync_temp_segment(segment_id)?;
+    io.rename_temp_to_final(segment_id)?;
+    io.sync_segment_dir()
+}
+
 impl SegmentFileIo for PortableSegmentFileIo {
+    fn segment_file_exists(&self, segment_id: SegmentId) -> Result<bool> {
+        match fs::metadata(self.segment_path(segment_id)) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(fs_error(error)),
+        }
+    }
+
     fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(&self.tmp_dir).map_err(fs_error)?;
         let mut file = File::create(self.tmp_path(segment_id)).map_err(fs_error)?;
@@ -1809,7 +1867,7 @@ pub struct StorageNodeCustodianReport {
     pub deleted_released_segments: Vec<SegmentId>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct DurableStoreSnapshot {
     config: LocalStoreConfig,
     metadata: MetadataInner,
@@ -1819,20 +1877,20 @@ struct DurableStoreSnapshot {
     next_extent_id: u128,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct DurableSegmentStoreSnapshot {
     config: LocalStoreConfig,
     next_offset: u64,
     records: BTreeMap<SegmentId, DurableSegmentRecord>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct DurableSegmentRecord {
     synced: bool,
     commit: SegmentReplicaCommit,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct DurableMetadataSnapshot {
     config: LocalStoreConfig,
     metadata: MetadataInner,
@@ -1840,7 +1898,7 @@ struct DurableMetadataSnapshot {
     next_extent_id: u128,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct DurableCatalogSnapshot {
     config: LocalStoreConfig,
     catalog: CatalogInner,
@@ -6253,26 +6311,1263 @@ fn fs_error(error: std::io::Error) -> StorageError {
 }
 
 fn serde_error(error: impl std::fmt::Display) -> StorageError {
-    StorageError::corrupt(format!("durable provider snapshot codec failed: {error}"))
+    StorageError::corrupt(format!("binary envelope codec failed: {error}"))
 }
 
-fn read_snapshot<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let file = File::open(path).map_err(fs_error)?;
-    bincode::deserialize_from(file).map_err(serde_error)
+fn durable_codec_error(reason: impl Into<String>) -> StorageError {
+    StorageError::corrupt(format!("durable snapshot codec failed: {}", reason.into()))
 }
 
-fn write_snapshot_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+const DURABLE_SNAPSHOT_MAGIC: &[u8; 8] = b"TCOWSNAP";
+const DURABLE_SNAPSHOT_VERSION: u16 = 1;
+const DURABLE_SNAPSHOT_METADATA: u8 = 1;
+const DURABLE_SNAPSHOT_CATALOG: u8 = 2;
+const DURABLE_SNAPSHOT_SEGMENT_STORE: u8 = 3;
+const MAX_DURABLE_COLLECTION_LEN: u64 = 1_000_000;
+const MAX_DURABLE_STRING_LEN: u64 = 1_048_576;
+
+trait DurableCodec: Sized {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()>;
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self>;
+}
+
+trait DurableSnapshotCodec: DurableCodec {
+    const SNAPSHOT_KIND: u8;
+}
+
+#[derive(Debug, Default)]
+struct DurableEncoder {
+    bytes: Vec<u8>,
+}
+
+impl DurableEncoder {
+    fn new(kind: u8) -> Self {
+        let mut encoder = Self { bytes: Vec::new() };
+        encoder.bytes.extend_from_slice(DURABLE_SNAPSHOT_MAGIC);
+        encoder.put_u16(DURABLE_SNAPSHOT_VERSION);
+        encoder.put_u8(kind);
+        encoder
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    fn put_u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn put_u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn put_u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn put_u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn put_u128(&mut self, value: u128) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+}
+
+struct DurableDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DurableDecoder<'a> {
+    fn new(bytes: &'a [u8], expected_kind: u8) -> Result<Self> {
+        let mut decoder = Self { bytes, offset: 0 };
+        let magic = decoder.take(DURABLE_SNAPSHOT_MAGIC.len())?;
+        if magic != DURABLE_SNAPSHOT_MAGIC {
+            return Err(durable_codec_error("bad snapshot magic"));
+        }
+        let version = decoder.u16()?;
+        if version != DURABLE_SNAPSHOT_VERSION {
+            return Err(durable_codec_error("unsupported snapshot version"));
+        }
+        let kind = decoder.u8()?;
+        if kind != expected_kind {
+            return Err(durable_codec_error("snapshot kind mismatch"));
+        }
+        Ok(decoder)
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(durable_codec_error("trailing bytes in snapshot"))
+        }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| durable_codec_error("snapshot offset overflow"))?;
+        if end > self.bytes.len() {
+            return Err(durable_codec_error("unexpected end of snapshot"));
+        }
+        let out = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(*self
+            .take(1)?
+            .first()
+            .ok_or_else(|| durable_codec_error("unexpected end of snapshot"))?)
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        let bytes: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| durable_codec_error("invalid u16"))?;
+        Ok(u16::from_be_bytes(bytes))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| durable_codec_error("invalid u32"))?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        let bytes: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| durable_codec_error("invalid u64"))?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn u128(&mut self) -> Result<u128> {
+        let bytes: [u8; 16] = self
+            .take(16)?
+            .try_into()
+            .map_err(|_| durable_codec_error("invalid u128"))?;
+        Ok(u128::from_be_bytes(bytes))
+    }
+}
+
+impl DurableCodec for bool {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        out.put_u8(u8::from(*self));
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match input.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(durable_codec_error("invalid bool tag")),
+        }
+    }
+}
+
+impl DurableCodec for u8 {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        out.put_u8(*self);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        input.u8()
+    }
+}
+
+impl DurableCodec for u32 {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        out.put_u32(*self);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        input.u32()
+    }
+}
+
+impl DurableCodec for u64 {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        out.put_u64(*self);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        input.u64()
+    }
+}
+
+impl DurableCodec for u128 {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        out.put_u128(*self);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        input.u128()
+    }
+}
+
+impl DurableCodec for usize {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        let value =
+            u64::try_from(*self).map_err(|_| durable_codec_error("usize value exceeds u64"))?;
+        value.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        usize::try_from(u64::decode(input)?)
+            .map_err(|_| durable_codec_error("usize value exceeds platform size"))
+    }
+}
+
+impl<T: DurableCodec> DurableCodec for Option<T> {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Some(value) => {
+                out.put_u8(1);
+                value.encode(out)
+            }
+            None => {
+                out.put_u8(0);
+                Ok(())
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match input.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(T::decode(input)?)),
+            _ => Err(durable_codec_error("invalid option tag")),
+        }
+    }
+}
+
+impl<T: DurableCodec> DurableCodec for Vec<T> {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        let len = u64::try_from(self.len())
+            .map_err(|_| durable_codec_error("vector length exceeds u64"))?;
+        len.encode(out)?;
+        for value in self {
+            value.encode(out)?;
+        }
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        let len = u64::decode(input)?;
+        if len > MAX_DURABLE_COLLECTION_LEN {
+            return Err(durable_codec_error("vector length exceeds durable limit"));
+        }
+        let len =
+            usize::try_from(len).map_err(|_| durable_codec_error("vector length overflow"))?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(T::decode(input)?);
+        }
+        Ok(values)
+    }
+}
+
+impl<K, V> DurableCodec for BTreeMap<K, V>
+where
+    K: DurableCodec + Ord,
+    V: DurableCodec,
+{
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        let len =
+            u64::try_from(self.len()).map_err(|_| durable_codec_error("map length exceeds u64"))?;
+        len.encode(out)?;
+        for (key, value) in self {
+            key.encode(out)?;
+            value.encode(out)?;
+        }
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        let len = u64::decode(input)?;
+        if len > MAX_DURABLE_COLLECTION_LEN {
+            return Err(durable_codec_error("map length exceeds durable limit"));
+        }
+        let mut values = BTreeMap::new();
+        for _ in 0..len {
+            let key = K::decode(input)?;
+            let value = V::decode(input)?;
+            if values.insert(key, value).is_some() {
+                return Err(durable_codec_error("duplicate key in durable map"));
+            }
+        }
+        Ok(values)
+    }
+}
+
+impl DurableCodec for String {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        let bytes = self.as_bytes();
+        let len = u64::try_from(bytes.len())
+            .map_err(|_| durable_codec_error("string length exceeds u64"))?;
+        len.encode(out)?;
+        out.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        let len = u64::decode(input)?;
+        if len > MAX_DURABLE_STRING_LEN {
+            return Err(durable_codec_error("string length exceeds durable limit"));
+        }
+        let len =
+            usize::try_from(len).map_err(|_| durable_codec_error("string length overflow"))?;
+        let bytes = input.take(len)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| durable_codec_error("invalid UTF-8 string"))
+    }
+}
+
+impl DurableCodec for (KeyspaceId, FileId) {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.0.encode(out)?;
+        self.1.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok((KeyspaceId::decode(input)?, FileId::decode(input)?))
+    }
+}
+
+macro_rules! durable_id_codec_u128 {
+    ($($name:ty),+ $(,)?) => {
+        $(
+            impl DurableCodec for $name {
+                fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+                    self.raw().encode(out)
+                }
+
+                fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+                    Ok(Self::from_raw(u128::decode(input)?))
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! durable_id_codec_u64 {
+    ($($name:ty),+ $(,)?) => {
+        $(
+            impl DurableCodec for $name {
+                fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+                    self.raw().encode(out)
+                }
+
+                fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+                    Ok(Self::from_raw(u64::decode(input)?))
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! durable_id_codec_u32 {
+    ($($name:ty),+ $(,)?) => {
+        $(
+            impl DurableCodec for $name {
+                fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+                    self.raw().encode(out)
+                }
+
+                fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+                    Ok(Self::from_raw(u32::decode(input)?))
+                }
+            }
+        )+
+    };
+}
+
+durable_id_codec_u128!(
+    AppendLeaseId,
+    CheckpointId,
+    CommitGroupId,
+    DeviceId,
+    ExtentId,
+    FileId,
+    KeyspaceCatalogShardId,
+    KeyspaceId,
+    KeyspaceRootId,
+    MetadataNodeId,
+    SegmentId,
+    StorageNodeId,
+    WriteIntentId,
+);
+
+durable_id_codec_u64!(
+    BlockCount,
+    BlockIndex,
+    CommitSeq,
+    DeviceGeneration,
+    FileVersion,
+    KeyspaceGeneration,
+    LogicalTime,
+    WriterEpoch,
+);
+
+durable_id_codec_u32!(crate::id::ShardId);
+
+impl DurableCodec for LocalStoreConfig {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.shard_count.encode(out)?;
+        self.block_size.encode(out)?;
+        self.file_root_blocks.encode(out)?;
+        self.metadata_fanout.encode(out)?;
+        self.metadata_leaf_blocks.encode(out)?;
+        self.storage_node.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            shard_count: usize::decode(input)?,
+            block_size: u32::decode(input)?,
+            file_root_blocks: u64::decode(input)?,
+            metadata_fanout: usize::decode(input)?,
+            metadata_leaf_blocks: u64::decode(input)?,
+            storage_node: StorageNodeId::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for crate::api::DeviceSpec {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.logical_blocks.encode(out)?;
+        self.block_size.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            logical_blocks: u64::decode(input)?,
+            block_size: u32::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for ByteRange {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.offset.encode(out)?;
+        self.len.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            offset: u64::decode(input)?,
+            len: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for crate::api::BlockRange {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.start.encode(out)?;
+        self.blocks.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            start: BlockIndex::decode(input)?,
+            blocks: BlockCount::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for MappingOwner {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::BlockDevice(device_id) => {
+                1u8.encode(out)?;
+                device_id.encode(out)
+            }
+            Self::NativeKeyspace(keyspace_id) => {
+                2u8.encode(out)?;
+                keyspace_id.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::BlockDevice(DeviceId::decode(input)?)),
+            2 => Ok(Self::NativeKeyspace(KeyspaceId::decode(input)?)),
+            _ => Err(durable_codec_error("invalid mapping owner tag")),
+        }
+    }
+}
+
+impl DurableCodec for DeviceHead {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.generation.encode(out)?;
+        self.shard_roots.encode(out)?;
+        self.latest_commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            generation: DeviceGeneration::decode(input)?,
+            shard_roots: Vec::decode(input)?,
+            latest_commit: CommitSeq::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for KeyspaceHead {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.generation.encode(out)?;
+        self.root.encode(out)?;
+        self.latest_commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            generation: KeyspaceGeneration::decode(input)?,
+            root: KeyspaceRootId::decode(input)?,
+            latest_commit: CommitSeq::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for FileHead {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.file_id.encode(out)?;
+        self.version.encode(out)?;
+        self.root.encode(out)?;
+        self.size.encode(out)?;
+        self.latest_commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            file_id: FileId::decode(input)?,
+            version: FileVersion::decode(input)?,
+            root: MetadataNodeId::decode(input)?,
+            size: u64::decode(input)?,
+            latest_commit: CommitSeq::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for KeyspaceFile {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.name.encode(out)?;
+        self.head.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            name: Option::decode(input)?,
+            head: FileHead::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for KeyspaceCatalogShard {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.shard_id.encode(out)?;
+        self.files.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            shard_id: KeyspaceCatalogShardId::decode(input)?,
+            files: BTreeMap::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for KeyspaceRoot {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.root_id.encode(out)?;
+        self.shard_roots.encode(out)?;
+        self.file_count.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            root_id: KeyspaceRootId::decode(input)?,
+            shard_roots: Vec::decode(input)?,
+            file_count: usize::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for MetadataChild {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.range.encode(out)?;
+        self.node_id.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            range: crate::api::BlockRange::decode(input)?,
+            node_id: MetadataNodeId::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for LeafEntry {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.logical_start.encode(out)?;
+        self.blocks.encode(out)?;
+        self.segment_id.encode(out)?;
+        self.segment_offset.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            logical_start: BlockIndex::decode(input)?,
+            blocks: BlockCount::decode(input)?,
+            segment_id: SegmentId::decode(input)?,
+            segment_offset: BlockIndex::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for MetadataNodeKind {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Internal { children } => {
+                1u8.encode(out)?;
+                children.encode(out)
+            }
+            Self::Leaf { entries } => {
+                2u8.encode(out)?;
+                entries.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Internal {
+                children: Vec::decode(input)?,
+            }),
+            2 => Ok(Self::Leaf {
+                entries: Vec::decode(input)?,
+            }),
+            _ => Err(durable_codec_error("invalid metadata node kind tag")),
+        }
+    }
+}
+
+impl DurableCodec for MetadataNode {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.node_id.encode(out)?;
+        self.covered_range.encode(out)?;
+        self.kind.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            node_id: MetadataNodeId::decode(input)?,
+            covered_range: crate::api::BlockRange::decode(input)?,
+            kind: MetadataNodeKind::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for SegmentDescriptor {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.segment_id.encode(out)?;
+        self.blocks.encode(out)?;
+        self.bytes.encode(out)?;
+        self.checksum.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            segment_id: SegmentId::decode(input)?,
+            blocks: BlockCount::decode(input)?,
+            bytes: u64::decode(input)?,
+            checksum: Option::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for ShardRootUpdate {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.shard_id.encode(out)?;
+        self.old_root.encode(out)?;
+        self.new_root.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            shard_id: crate::id::ShardId::decode(input)?,
+            old_root: MetadataNodeId::decode(input)?,
+            new_root: MetadataNodeId::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for RootUpdate {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::BlockShard(update) => {
+                1u8.encode(out)?;
+                update.encode(out)
+            }
+            Self::FileCreated {
+                file_id,
+                new_root,
+                new_size,
+            } => {
+                2u8.encode(out)?;
+                file_id.encode(out)?;
+                new_root.encode(out)?;
+                new_size.encode(out)
+            }
+            Self::FileRoot {
+                file_id,
+                old_root,
+                new_root,
+                new_size,
+            } => {
+                3u8.encode(out)?;
+                file_id.encode(out)?;
+                old_root.encode(out)?;
+                new_root.encode(out)?;
+                new_size.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::BlockShard(ShardRootUpdate::decode(input)?)),
+            2 => Ok(Self::FileCreated {
+                file_id: FileId::decode(input)?,
+                new_root: MetadataNodeId::decode(input)?,
+                new_size: u64::decode(input)?,
+            }),
+            3 => Ok(Self::FileRoot {
+                file_id: FileId::decode(input)?,
+                old_root: MetadataNodeId::decode(input)?,
+                new_root: MetadataNodeId::decode(input)?,
+                new_size: u64::decode(input)?,
+            }),
+            _ => Err(durable_codec_error("invalid root update tag")),
+        }
+    }
+}
+
+impl DurableCodec for CommitGroup {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.commit_group.encode(out)?;
+        self.commit_seq.encode(out)?;
+        self.owner.encode(out)?;
+        self.updates.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            commit_group: CommitGroupId::decode(input)?,
+            commit_seq: CommitSeq::decode(input)?,
+            owner: MappingOwner::decode(input)?,
+            updates: Vec::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for ForkRecord {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.commit_seq.encode(out)?;
+        self.source.encode(out)?;
+        self.target.encode(out)?;
+        self.shard_roots.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            commit_seq: CommitSeq::decode(input)?,
+            source: DeviceId::decode(input)?,
+            target: DeviceId::decode(input)?,
+            shard_roots: Vec::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for ShardCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.commit_seq.encode(out)?;
+        self.commit_group.encode(out)?;
+        self.time.encode(out)?;
+        self.device_id.encode(out)?;
+        self.shard_id.encode(out)?;
+        self.old_root.encode(out)?;
+        self.new_root.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            commit_seq: CommitSeq::decode(input)?,
+            commit_group: CommitGroupId::decode(input)?,
+            time: LogicalTime::decode(input)?,
+            device_id: DeviceId::decode(input)?,
+            shard_id: crate::id::ShardId::decode(input)?,
+            old_root: MetadataNodeId::decode(input)?,
+            new_root: MetadataNodeId::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for KeyspaceCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.commit_seq.encode(out)?;
+        self.commit_group.encode(out)?;
+        self.time.encode(out)?;
+        self.keyspace_id.encode(out)?;
+        self.old_root.encode(out)?;
+        self.new_root.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            commit_seq: CommitSeq::decode(input)?,
+            commit_group: CommitGroupId::decode(input)?,
+            time: LogicalTime::decode(input)?,
+            keyspace_id: KeyspaceId::decode(input)?,
+            old_root: KeyspaceRootId::decode(input)?,
+            new_root: KeyspaceRootId::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for FileCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.commit_seq.encode(out)?;
+        self.commit_group.encode(out)?;
+        self.time.encode(out)?;
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.old_root.encode(out)?;
+        self.new_root.encode(out)?;
+        self.old_version.encode(out)?;
+        self.new_version.encode(out)?;
+        self.old_size.encode(out)?;
+        self.new_size.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            commit_seq: CommitSeq::decode(input)?,
+            commit_group: CommitGroupId::decode(input)?,
+            time: LogicalTime::decode(input)?,
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            old_root: Option::decode(input)?,
+            new_root: MetadataNodeId::decode(input)?,
+            old_version: Option::decode(input)?,
+            new_version: FileVersion::decode(input)?,
+            old_size: u64::decode(input)?,
+            new_size: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DeleteRecord {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.commit_seq.encode(out)?;
+        self.time.encode(out)?;
+        self.device_id.encode(out)?;
+        self.shard_roots.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            commit_seq: CommitSeq::decode(input)?,
+            time: LogicalTime::decode(input)?,
+            device_id: DeviceId::decode(input)?,
+            shard_roots: Vec::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for CheckpointRoots {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::BlockShard(roots) => {
+                1u8.encode(out)?;
+                roots.encode(out)
+            }
+            Self::NativeKeyspace(root) => {
+                2u8.encode(out)?;
+                root.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::BlockShard(Vec::decode(input)?)),
+            2 => Ok(Self::NativeKeyspace(KeyspaceRootId::decode(input)?)),
+            _ => Err(durable_codec_error("invalid checkpoint roots tag")),
+        }
+    }
+}
+
+impl DurableCodec for Checkpoint {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.checkpoint_id.encode(out)?;
+        self.commit_seq.encode(out)?;
+        self.time.encode(out)?;
+        self.owner.encode(out)?;
+        self.roots.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            checkpoint_id: CheckpointId::decode(input)?,
+            commit_seq: CommitSeq::decode(input)?,
+            time: LogicalTime::decode(input)?,
+            owner: MappingOwner::decode(input)?,
+            roots: CheckpointRoots::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for SegmentReservationIntent {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.write_intent.encode(out)?;
+        self.owner.encode(out)?;
+        self.bytes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            write_intent: WriteIntentId::decode(input)?,
+            owner: MappingOwner::decode(input)?,
+            bytes: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for SegmentReservation {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.segment_id.encode(out)?;
+        self.bytes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            segment_id: SegmentId::decode(input)?,
+            bytes: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for SegmentReplicaPlacement {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.segment_id.encode(out)?;
+        self.storage_node.encode(out)?;
+        self.offset.encode(out)?;
+        self.bytes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            segment_id: SegmentId::decode(input)?,
+            storage_node: StorageNodeId::decode(input)?,
+            offset: u64::decode(input)?,
+            bytes: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for SegmentReplicaCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.descriptor.encode(out)?;
+        self.placement.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            descriptor: SegmentDescriptor::decode(input)?,
+            placement: SegmentReplicaPlacement::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for SegmentLifecycleState {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        let tag: u8 = match self {
+            Self::Reserved => 1,
+            Self::Writing => 2,
+            Self::DurablePendingMetadata => 3,
+            Self::Referenced => 4,
+            Self::Released => 5,
+            Self::Freed => 6,
+        };
+        tag.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Reserved),
+            2 => Ok(Self::Writing),
+            3 => Ok(Self::DurablePendingMetadata),
+            4 => Ok(Self::Referenced),
+            5 => Ok(Self::Released),
+            6 => Ok(Self::Freed),
+            _ => Err(durable_codec_error("invalid segment lifecycle tag")),
+        }
+    }
+}
+
+impl DurableCodec for CatalogEntry {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.intent.encode(out)?;
+        self.reservation.encode(out)?;
+        self.state.encode(out)?;
+        self.commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            intent: SegmentReservationIntent::decode(input)?,
+            reservation: SegmentReservation::decode(input)?,
+            state: SegmentLifecycleState::decode(input)?,
+            commit: Option::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for CatalogInner {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.next_segment_id.encode(out)?;
+        self.entries.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            next_segment_id: u128::decode(input)?,
+            entries: BTreeMap::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableSegmentRecord {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.synced.encode(out)?;
+        self.commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            synced: bool::decode(input)?,
+            commit: SegmentReplicaCommit::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableSegmentStoreSnapshot {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.config.encode(out)?;
+        self.next_offset.encode(out)?;
+        self.records.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            config: LocalStoreConfig::decode(input)?,
+            next_offset: u64::decode(input)?,
+            records: BTreeMap::decode(input)?,
+        })
+    }
+}
+
+impl DurableSnapshotCodec for DurableSegmentStoreSnapshot {
+    const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_SEGMENT_STORE;
+}
+
+impl DurableCodec for DurableCatalogSnapshot {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.config.encode(out)?;
+        self.catalog.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            config: LocalStoreConfig::decode(input)?,
+            catalog: CatalogInner::decode(input)?,
+        })
+    }
+}
+
+impl DurableSnapshotCodec for DurableCatalogSnapshot {
+    const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_CATALOG;
+}
+
+impl DurableCodec for MetadataInner {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.next_device_id.encode(out)?;
+        self.next_keyspace_id.encode(out)?;
+        self.next_file_id.encode(out)?;
+        self.next_metadata_node_id.encode(out)?;
+        self.next_keyspace_root_id.encode(out)?;
+        self.next_keyspace_catalog_shard_id.encode(out)?;
+        self.next_commit_group_id.encode(out)?;
+        self.next_commit_seq.encode(out)?;
+        self.next_checkpoint_id.encode(out)?;
+        self.next_gc_epoch.encode(out)?;
+        self.device_heads.encode(out)?;
+        self.deleted_device_heads.encode(out)?;
+        self.device_specs.encode(out)?;
+        self.keyspace_heads.encode(out)?;
+        self.keyspace_roots.encode(out)?;
+        self.keyspace_catalog_shards.encode(out)?;
+        self.file_writer_epochs.encode(out)?;
+        self.metadata_nodes.encode(out)?;
+        self.commit_groups.encode(out)?;
+        self.shard_commits.encode(out)?;
+        self.keyspace_commits.encode(out)?;
+        self.file_commits.encode(out)?;
+        self.fork_records.encode(out)?;
+        self.delete_records.encode(out)?;
+        self.checkpoints.encode(out)?;
+        self.metadata_last_mark_epoch.encode(out)?;
+        self.segment_last_mark_epoch.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            next_device_id: u128::decode(input)?,
+            next_keyspace_id: u128::decode(input)?,
+            next_file_id: u128::decode(input)?,
+            next_metadata_node_id: u128::decode(input)?,
+            next_keyspace_root_id: u128::decode(input)?,
+            next_keyspace_catalog_shard_id: u128::decode(input)?,
+            next_commit_group_id: u128::decode(input)?,
+            next_commit_seq: u64::decode(input)?,
+            next_checkpoint_id: u128::decode(input)?,
+            next_gc_epoch: u64::decode(input)?,
+            device_heads: BTreeMap::decode(input)?,
+            deleted_device_heads: BTreeMap::decode(input)?,
+            device_specs: BTreeMap::decode(input)?,
+            keyspace_heads: BTreeMap::decode(input)?,
+            keyspace_roots: BTreeMap::decode(input)?,
+            keyspace_catalog_shards: BTreeMap::decode(input)?,
+            file_writer_epochs: BTreeMap::decode(input)?,
+            metadata_nodes: BTreeMap::decode(input)?,
+            commit_groups: BTreeMap::decode(input)?,
+            shard_commits: Vec::decode(input)?,
+            keyspace_commits: Vec::decode(input)?,
+            file_commits: Vec::decode(input)?,
+            fork_records: BTreeMap::decode(input)?,
+            delete_records: BTreeMap::decode(input)?,
+            checkpoints: BTreeMap::decode(input)?,
+            metadata_last_mark_epoch: BTreeMap::decode(input)?,
+            segment_last_mark_epoch: BTreeMap::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableMetadataSnapshot {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.config.encode(out)?;
+        self.metadata.encode(out)?;
+        self.next_write_intent.encode(out)?;
+        self.next_extent_id.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            config: LocalStoreConfig::decode(input)?,
+            metadata: MetadataInner::decode(input)?,
+            next_write_intent: u128::decode(input)?,
+            next_extent_id: u128::decode(input)?,
+        })
+    }
+}
+
+impl DurableSnapshotCodec for DurableMetadataSnapshot {
+    const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_METADATA;
+}
+
+fn encode_snapshot<T: DurableSnapshotCodec>(value: &T) -> Result<Vec<u8>> {
+    let mut out = DurableEncoder::new(T::SNAPSHOT_KIND);
+    value.encode(&mut out)?;
+    Ok(out.finish())
+}
+
+fn decode_snapshot<T: DurableSnapshotCodec>(bytes: &[u8]) -> Result<T> {
+    let mut input = DurableDecoder::new(bytes, T::SNAPSHOT_KIND)?;
+    let value = T::decode(&mut input)?;
+    input.finish()?;
+    Ok(value)
+}
+
+fn read_snapshot<T: DurableSnapshotCodec>(path: &Path) -> Result<T> {
+    let mut file = File::open(path).map_err(fs_error)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(fs_error)?;
+    decode_snapshot(&bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotWriteFault {
+    TempWrite,
+    TempSync,
+    Rename,
+    DirSync,
+}
+
+fn maybe_snapshot_write_fault(
+    fault: Option<SnapshotWriteFault>,
+    point: SnapshotWriteFault,
+) -> Result<()> {
+    if fault == Some(point) {
+        Err(StorageError::unavailable(format!(
+            "injected snapshot write fault at {point:?}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn write_snapshot_atomic<T: DurableSnapshotCodec>(path: &Path, value: &T) -> Result<()> {
+    write_snapshot_atomic_with_fault(path, value, None)
+}
+
+fn write_snapshot_atomic_with_fault<T: DurableSnapshotCodec>(
+    path: &Path,
+    value: &T,
+    fault: Option<SnapshotWriteFault>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| StorageError::invalid_argument("snapshot path has no parent"))?;
     fs::create_dir_all(parent).map_err(fs_error)?;
     let tmp = path.with_extension("tmp");
+    let bytes = encode_snapshot(value)?;
+    maybe_snapshot_write_fault(fault, SnapshotWriteFault::TempWrite)?;
     {
         let mut file = File::create(&tmp).map_err(fs_error)?;
-        bincode::serialize_into(&mut file, value).map_err(serde_error)?;
+        file.write_all(&bytes).map_err(fs_error)?;
+        maybe_snapshot_write_fault(fault, SnapshotWriteFault::TempSync)?;
         file.sync_all().map_err(fs_error)?;
     }
+    maybe_snapshot_write_fault(fault, SnapshotWriteFault::Rename)?;
     fs::rename(&tmp, path).map_err(fs_error)?;
+    maybe_snapshot_write_fault(fault, SnapshotWriteFault::DirSync)?;
     File::open(parent)
         .map_err(fs_error)?
         .sync_all()
@@ -6462,6 +7757,504 @@ mod tests {
             write_intent: WriteIntentId::from_raw(1),
             owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
             bytes: 4096,
+        }
+    }
+
+    fn bytes_to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn durable_snapshots_from_store(
+        store: &LocalObjectStore,
+    ) -> (
+        DurableMetadataSnapshot,
+        DurableCatalogSnapshot,
+        DurableSegmentStoreSnapshot,
+    ) {
+        let snapshot = store.snapshot().unwrap();
+        let metadata = DurableMetadataSnapshot {
+            config: snapshot.config,
+            metadata: snapshot.metadata,
+            next_write_intent: snapshot.next_write_intent,
+            next_extent_id: snapshot.next_extent_id,
+        };
+        let catalog = DurableCatalogSnapshot {
+            config: snapshot.config,
+            catalog: snapshot.segment_catalog,
+        };
+        let segment_store = DurableSegmentStoreSnapshot {
+            config: snapshot.config,
+            next_offset: snapshot.segment_store.next_offset,
+            records: snapshot
+                .segment_store
+                .segments
+                .iter()
+                .map(|(segment_id, record)| {
+                    (
+                        *segment_id,
+                        DurableSegmentRecord {
+                            synced: record.synced,
+                            commit: record.commit.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        (metadata, catalog, segment_store)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SegmentIoFault {
+        WriteTemp,
+        SyncTemp,
+        Rename,
+        SyncDir,
+        CleanupTmp,
+    }
+
+    #[derive(Debug)]
+    struct FaultingSegmentFileIo {
+        inner: PortableSegmentFileIo,
+        next_fault: Mutex<Option<SegmentIoFault>>,
+    }
+
+    impl FaultingSegmentFileIo {
+        fn new(inner: PortableSegmentFileIo) -> Self {
+            Self {
+                inner,
+                next_fault: Mutex::new(None),
+            }
+        }
+
+        fn fail_next(&self, fault: SegmentIoFault) {
+            *self.next_fault.lock().unwrap() = Some(fault);
+        }
+
+        fn maybe_fail(&self, fault: SegmentIoFault) -> Result<()> {
+            let mut next_fault = self.next_fault.lock().unwrap();
+            if *next_fault == Some(fault) {
+                *next_fault = None;
+                Err(StorageError::unavailable(format!(
+                    "injected segment I/O fault at {fault:?}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl SegmentFileIo for FaultingSegmentFileIo {
+        fn segment_file_exists(&self, segment_id: SegmentId) -> Result<bool> {
+            self.inner.segment_file_exists(segment_id)
+        }
+
+        fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
+            self.maybe_fail(SegmentIoFault::WriteTemp)?;
+            self.inner.write_temp_segment(segment_id, bytes)
+        }
+
+        fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()> {
+            self.maybe_fail(SegmentIoFault::SyncTemp)?;
+            self.inner.sync_temp_segment(segment_id)
+        }
+
+        fn rename_temp_to_final(&self, segment_id: SegmentId) -> Result<()> {
+            self.maybe_fail(SegmentIoFault::Rename)?;
+            self.inner.rename_temp_to_final(segment_id)
+        }
+
+        fn sync_segment_dir(&self) -> Result<()> {
+            self.maybe_fail(SegmentIoFault::SyncDir)?;
+            self.inner.sync_segment_dir()
+        }
+
+        fn read_segment_file(&self, segment_id: SegmentId) -> Result<Vec<u8>> {
+            self.inner.read_segment_file(segment_id)
+        }
+
+        fn delete_segment_file(&self, segment_id: SegmentId) -> Result<()> {
+            self.inner.delete_segment_file(segment_id)
+        }
+
+        fn cleanup_tmp(&self) -> Result<()> {
+            self.maybe_fail(SegmentIoFault::CleanupTmp)?;
+            self.inner.cleanup_tmp()
+        }
+    }
+
+    trait ProviderConformanceStore {
+        fn create_device_for_conformance(&self, request: CreateDeviceRequest) -> Result<DeviceId>;
+        fn checkpoint_device_for_conformance(&self, device_id: DeviceId) -> Result<CheckpointId>;
+        fn write_device_for_conformance(
+            &self,
+            device_id: DeviceId,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<WriteCommit>;
+        fn read_device_for_conformance(
+            &self,
+            device_id: DeviceId,
+            range: ByteRange,
+            buf: &mut [u8],
+        ) -> Result<()>;
+        fn create_keyspace_for_conformance(
+            &self,
+            request: CreateKeyspaceRequest,
+        ) -> Result<KeyspaceId>;
+        fn create_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            request: CreateFileRequest,
+        ) -> Result<FileId>;
+        fn checkpoint_keyspace_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+        ) -> Result<CheckpointId>;
+        fn snapshot_keyspace_for_conformance(
+            &self,
+            source: KeyspaceId,
+            request: SnapshotKeyspaceRequest,
+        ) -> Result<KeyspaceId>;
+        fn write_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<FileWriteCommit>;
+        fn acquire_append_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+        ) -> Result<AppendLease>;
+        fn append_file_for_conformance(
+            &self,
+            lease: AppendLease,
+            data: &[u8],
+        ) -> Result<AppendCommit>;
+        fn read_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+            range: ByteRange,
+            buf: &mut [u8],
+        ) -> Result<()>;
+    }
+
+    impl ProviderConformanceStore for LocalObjectStore {
+        fn create_device_for_conformance(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
+            self.metadata()
+                .create_device(MetadataCreateDeviceRequest::from(request))
+                .map(|head| head.device_id)
+        }
+
+        fn checkpoint_device_for_conformance(&self, device_id: DeviceId) -> Result<CheckpointId> {
+            self.metadata().checkpoint(device_id)
+        }
+
+        fn write_device_for_conformance(
+            &self,
+            device_id: DeviceId,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<WriteCommit> {
+            self.write_device(device_id, offset, data, WriteDurability::Acknowledged)
+        }
+
+        fn read_device_for_conformance(
+            &self,
+            device_id: DeviceId,
+            range: ByteRange,
+            buf: &mut [u8],
+        ) -> Result<()> {
+            self.read_device(device_id, range, buf)
+        }
+
+        fn create_keyspace_for_conformance(
+            &self,
+            request: CreateKeyspaceRequest,
+        ) -> Result<KeyspaceId> {
+            self.metadata()
+                .create_keyspace(MetadataCreateKeyspaceRequest { request })
+                .map(|head| head.keyspace_id)
+        }
+
+        fn create_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            request: CreateFileRequest,
+        ) -> Result<FileId> {
+            self.metadata()
+                .create_file(MetadataCreateFileRequest {
+                    keyspace_id,
+                    request,
+                })
+                .map(|head| head.file_id)
+        }
+
+        fn checkpoint_keyspace_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+        ) -> Result<CheckpointId> {
+            self.metadata().checkpoint_keyspace(keyspace_id)
+        }
+
+        fn snapshot_keyspace_for_conformance(
+            &self,
+            source: KeyspaceId,
+            request: SnapshotKeyspaceRequest,
+        ) -> Result<KeyspaceId> {
+            self.metadata()
+                .snapshot_keyspace(MetadataSnapshotKeyspaceRequest {
+                    source,
+                    target: request.target,
+                    name: request.name,
+                })
+                .map(|head| head.keyspace_id)
+        }
+
+        fn write_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<FileWriteCommit> {
+            self.write_file_at(
+                keyspace_id,
+                file_id,
+                offset,
+                data,
+                WriteDurability::Acknowledged,
+            )
+        }
+
+        fn acquire_append_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+        ) -> Result<AppendLease> {
+            self.acquire_append_lease(keyspace_id, file_id)
+        }
+
+        fn append_file_for_conformance(
+            &self,
+            lease: AppendLease,
+            data: &[u8],
+        ) -> Result<AppendCommit> {
+            self.append_file(lease, data, WriteDurability::Acknowledged)
+        }
+
+        fn read_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+            range: ByteRange,
+            buf: &mut [u8],
+        ) -> Result<()> {
+            self.read_file(keyspace_id, file_id, range, buf)
+        }
+    }
+
+    impl ProviderConformanceStore for DurableObjectStore {
+        fn create_device_for_conformance(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
+            self.create_device(request)
+        }
+
+        fn checkpoint_device_for_conformance(&self, device_id: DeviceId) -> Result<CheckpointId> {
+            self.checkpoint(device_id)
+        }
+
+        fn write_device_for_conformance(
+            &self,
+            device_id: DeviceId,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<WriteCommit> {
+            self.write_device(device_id, offset, data, WriteDurability::Acknowledged)
+        }
+
+        fn read_device_for_conformance(
+            &self,
+            device_id: DeviceId,
+            range: ByteRange,
+            buf: &mut [u8],
+        ) -> Result<()> {
+            self.read_device(device_id, range, buf)
+        }
+
+        fn create_keyspace_for_conformance(
+            &self,
+            request: CreateKeyspaceRequest,
+        ) -> Result<KeyspaceId> {
+            self.create_keyspace(request)
+        }
+
+        fn create_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            request: CreateFileRequest,
+        ) -> Result<FileId> {
+            self.create_file(keyspace_id, request)
+        }
+
+        fn checkpoint_keyspace_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+        ) -> Result<CheckpointId> {
+            self.checkpoint_keyspace(keyspace_id)
+        }
+
+        fn snapshot_keyspace_for_conformance(
+            &self,
+            source: KeyspaceId,
+            request: SnapshotKeyspaceRequest,
+        ) -> Result<KeyspaceId> {
+            self.snapshot_keyspace(source, request)
+        }
+
+        fn write_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<FileWriteCommit> {
+            self.write_file_at(
+                keyspace_id,
+                file_id,
+                offset,
+                data,
+                WriteDurability::Acknowledged,
+            )
+        }
+
+        fn acquire_append_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+        ) -> Result<AppendLease> {
+            self.acquire_append_lease(keyspace_id, file_id)
+        }
+
+        fn append_file_for_conformance(
+            &self,
+            lease: AppendLease,
+            data: &[u8],
+        ) -> Result<AppendCommit> {
+            self.append_file(lease, data, WriteDurability::Acknowledged)
+        }
+
+        fn read_file_for_conformance(
+            &self,
+            keyspace_id: KeyspaceId,
+            file_id: FileId,
+            range: ByteRange,
+            buf: &mut [u8],
+        ) -> Result<()> {
+            self.read_file(keyspace_id, file_id, range, buf)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ProviderConformanceOutcome {
+        device_id: DeviceId,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        snapshot_keyspace: KeyspaceId,
+    }
+
+    fn run_provider_conformance(
+        store: &dyn ProviderConformanceStore,
+    ) -> ProviderConformanceOutcome {
+        let device_id = store
+            .create_device_for_conformance(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 32,
+                    block_size: 4096,
+                },
+                name: Some("conformance-device".to_string()),
+            })
+            .unwrap();
+        let first = store
+            .write_device_for_conformance(device_id, 0, &repeated_blocks(2, 3))
+            .unwrap();
+        let checkpoint = store.checkpoint_device_for_conformance(device_id).unwrap();
+        let second = store
+            .write_device_for_conformance(device_id, 4096, &repeated_blocks(2, 7))
+            .unwrap();
+        assert!(second.commit_seq.raw() > first.commit_seq.raw());
+
+        let mut device_bytes = vec![0; 3 * 4096];
+        store
+            .read_device_for_conformance(device_id, ByteRange::new(0, 3 * 4096), &mut device_bytes)
+            .unwrap();
+        assert_eq!(&device_bytes[0..4096], vec![3; 4096].as_slice());
+        assert_eq!(&device_bytes[4096..12288], repeated_blocks(2, 7).as_slice());
+        assert!(checkpoint.raw() > 0);
+
+        let keyspace_id = store
+            .create_keyspace_for_conformance(CreateKeyspaceRequest {
+                name: Some("conformance-keyspace".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file_for_conformance(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .write_file_for_conformance(keyspace_id, file_id, 0, b"alpha")
+            .unwrap();
+        let keyspace_checkpoint = store
+            .checkpoint_keyspace_for_conformance(keyspace_id)
+            .unwrap();
+        let snapshot_keyspace = store
+            .snapshot_keyspace_for_conformance(
+                keyspace_id,
+                SnapshotKeyspaceRequest {
+                    target: None,
+                    name: Some("snapshot".to_string()),
+                },
+            )
+            .unwrap();
+        let lease = store
+            .acquire_append_for_conformance(keyspace_id, file_id)
+            .unwrap();
+        store.append_file_for_conformance(lease, b"-beta").unwrap();
+
+        let mut source = vec![0; b"alpha-beta".len()];
+        store
+            .read_file_for_conformance(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, b"alpha-beta".len() as u64),
+                &mut source,
+            )
+            .unwrap();
+        assert_eq!(source, b"alpha-beta");
+
+        let mut snapshot = vec![0; b"alpha".len()];
+        store
+            .read_file_for_conformance(
+                snapshot_keyspace,
+                file_id,
+                ByteRange::new(0, b"alpha".len() as u64),
+                &mut snapshot,
+            )
+            .unwrap();
+        assert_eq!(snapshot, b"alpha");
+        assert!(keyspace_checkpoint.raw() > 0);
+        ProviderConformanceOutcome {
+            device_id,
+            keyspace_id,
+            file_id,
+            snapshot_keyspace,
         }
     }
 
@@ -7751,6 +9544,53 @@ mod tests {
     }
 
     #[test]
+    fn provider_conformance_harness_runs_against_memory_and_durable_stores() {
+        let memory = LocalObjectStore::with_config(tree_config()).unwrap();
+        run_provider_conformance(&memory);
+
+        let root = durable_temp_dir("provider-conformance");
+        let cfg = tree_config();
+        let durable = DurableObjectStore::open(&root, cfg).unwrap();
+        let durable_outcome = run_provider_conformance(&durable);
+        drop(durable);
+
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut device_bytes = vec![0; 3 * 4096];
+        reopened
+            .read_device(
+                durable_outcome.device_id,
+                ByteRange::new(0, 3 * 4096),
+                &mut device_bytes,
+            )
+            .unwrap();
+        assert_eq!(&device_bytes[0..4096], vec![3; 4096].as_slice());
+        assert_eq!(&device_bytes[4096..12288], repeated_blocks(2, 7).as_slice());
+
+        let mut source = vec![0; b"alpha-beta".len()];
+        reopened
+            .read_file(
+                durable_outcome.keyspace_id,
+                durable_outcome.file_id,
+                ByteRange::new(0, b"alpha-beta".len() as u64),
+                &mut source,
+            )
+            .unwrap();
+        assert_eq!(source, b"alpha-beta");
+
+        let mut snapshot = vec![0; b"alpha".len()];
+        reopened
+            .read_file(
+                durable_outcome.snapshot_keyspace,
+                durable_outcome.file_id,
+                ByteRange::new(0, b"alpha".len() as u64),
+                &mut snapshot,
+            )
+            .unwrap();
+        assert_eq!(snapshot, b"alpha");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn portable_segment_file_io_stages_syncs_renames_and_cleans_tmp() {
         let root = durable_temp_dir("segment-io");
         let node_dir = root.join("storage-nodes").join("node");
@@ -7772,6 +9612,273 @@ mod tests {
         assert!(!io.tmp_path(partial).exists());
         io.delete_segment_file(segment).unwrap();
         assert!(io.read_segment_file(segment).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fault_injected_segment_file_io_exposes_only_synced_renamed_segments() {
+        let root = durable_temp_dir("segment-io-faults");
+        let node_dir = root.join("storage-nodes").join("node");
+        let io = FaultingSegmentFileIo::new(PortableSegmentFileIo::new(&node_dir).unwrap());
+        let bytes = vec![4; 4096];
+
+        for (raw, fault) in [
+            (1, SegmentIoFault::WriteTemp),
+            (2, SegmentIoFault::SyncTemp),
+            (3, SegmentIoFault::Rename),
+        ] {
+            let segment = SegmentId::from_raw(raw);
+            io.fail_next(fault);
+            assert!(write_synced_segment_with_io(&io, segment, &bytes).is_err());
+            assert!(
+                io.read_segment_file(segment).is_err(),
+                "segment {raw} became visible before rename completed"
+            );
+            io.cleanup_tmp().unwrap();
+        }
+
+        let dir_sync_segment = SegmentId::from_raw(4);
+        io.fail_next(SegmentIoFault::SyncDir);
+        assert!(write_synced_segment_with_io(&io, dir_sync_segment, &bytes).is_err());
+        assert_eq!(io.read_segment_file(dir_sync_segment).unwrap(), bytes);
+        write_synced_segment_with_io(&io, dir_sync_segment, &bytes).unwrap();
+
+        let cleanup_segment = SegmentId::from_raw(5);
+        io.write_temp_segment(cleanup_segment, &[1; 4096]).unwrap();
+        io.fail_next(SegmentIoFault::CleanupTmp);
+        assert!(io.cleanup_tmp().is_err());
+        assert!(io.inner.tmp_path(cleanup_segment).exists());
+        io.cleanup_tmp().unwrap();
+        assert!(!io.inner.tmp_path(cleanup_segment).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_snapshot_codec_round_trips_real_block_and_native_state() {
+        let store = LocalObjectStore::with_config(tree_config()).unwrap();
+        let device = create_local_device(&store, 32);
+        device.write_at(7 * 4096, &repeated_blocks(3, 8)).unwrap();
+        store.metadata().checkpoint(device.device_id()).unwrap();
+        let forked = device
+            .fork(ForkRequest {
+                target: None,
+                name: Some("codec-fork".to_string()),
+            })
+            .unwrap();
+        store
+            .write_device(
+                forked,
+                8 * 4096,
+                &repeated_blocks(1, 9),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        let native = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&native);
+        let (_file_id, file) = create_local_file(&native, keyspace_id);
+        file.write_at(0, b"codec").unwrap();
+        file.append_with_lease(file.acquire_append().unwrap(), b"-state")
+            .unwrap();
+        native.checkpoint_keyspace(keyspace_id).unwrap();
+
+        let (metadata, catalog, segment_store) = durable_snapshots_from_store(&store);
+        for bytes in [
+            encode_snapshot(&metadata).unwrap(),
+            encode_snapshot(&catalog).unwrap(),
+            encode_snapshot(&segment_store).unwrap(),
+        ] {
+            assert!(bytes.starts_with(DURABLE_SNAPSHOT_MAGIC));
+        }
+
+        let metadata_bytes = encode_snapshot(&metadata).unwrap();
+        let catalog_bytes = encode_snapshot(&catalog).unwrap();
+        let segment_store_bytes = encode_snapshot(&segment_store).unwrap();
+        assert_eq!(
+            encode_snapshot(&decode_snapshot::<DurableMetadataSnapshot>(&metadata_bytes).unwrap())
+                .unwrap(),
+            metadata_bytes
+        );
+        assert_eq!(
+            encode_snapshot(&decode_snapshot::<DurableCatalogSnapshot>(&catalog_bytes).unwrap())
+                .unwrap(),
+            catalog_bytes
+        );
+        assert_eq!(
+            encode_snapshot(
+                &decode_snapshot::<DurableSegmentStoreSnapshot>(&segment_store_bytes).unwrap()
+            )
+            .unwrap(),
+            segment_store_bytes
+        );
+    }
+
+    #[test]
+    fn durable_snapshot_codec_has_stable_catalog_golden_bytes() {
+        let snapshot = DurableCatalogSnapshot {
+            config: LocalStoreConfig::default(),
+            catalog: CatalogInner {
+                next_segment_id: 1,
+                entries: BTreeMap::new(),
+            },
+        };
+
+        assert_eq!(
+            bytes_to_hex(&encode_snapshot(&snapshot).unwrap()),
+            concat!(
+                "54434f57534e4150",
+                "0001",
+                "02",
+                "0000000000000001",
+                "00001000",
+                "0000000000000001",
+                "0000000000000004",
+                "0000000000000400",
+                "00000000000000000000000000000001",
+                "00000000000000000000000000000001",
+                "0000000000000000",
+            )
+        );
+    }
+
+    #[test]
+    fn durable_snapshot_codec_rejects_malformed_inputs() {
+        let snapshot = DurableCatalogSnapshot {
+            config: LocalStoreConfig::default(),
+            catalog: CatalogInner {
+                next_segment_id: 1,
+                entries: BTreeMap::new(),
+            },
+        };
+        let bytes = encode_snapshot(&snapshot).unwrap();
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(decode_snapshot::<DurableCatalogSnapshot>(&bad_magic).is_err());
+
+        let mut bad_version = bytes.clone();
+        bad_version[9] = 2;
+        assert!(decode_snapshot::<DurableCatalogSnapshot>(&bad_version).is_err());
+
+        let mut bad_kind = bytes.clone();
+        bad_kind[10] = DURABLE_SNAPSHOT_METADATA;
+        assert!(decode_snapshot::<DurableCatalogSnapshot>(&bad_kind).is_err());
+        assert!(decode_snapshot::<DurableMetadataSnapshot>(&bytes).is_err());
+
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(decode_snapshot::<DurableCatalogSnapshot>(&truncated).is_err());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_snapshot::<DurableCatalogSnapshot>(&trailing).is_err());
+
+        let mut invalid_tag = DurableEncoder { bytes: Vec::new() };
+        99u8.encode(&mut invalid_tag).unwrap();
+        let mut invalid_tag = DurableDecoder {
+            bytes: &invalid_tag.bytes,
+            offset: 0,
+        };
+        assert!(SegmentLifecycleState::decode(&mut invalid_tag).is_err());
+
+        let mut oversized_vector = DurableEncoder { bytes: Vec::new() };
+        (MAX_DURABLE_COLLECTION_LEN + 1)
+            .encode(&mut oversized_vector)
+            .unwrap();
+        let mut oversized_vector = DurableDecoder {
+            bytes: &oversized_vector.bytes,
+            offset: 0,
+        };
+        assert!(Vec::<u8>::decode(&mut oversized_vector).is_err());
+
+        let mut oversized_string = DurableEncoder { bytes: Vec::new() };
+        (MAX_DURABLE_STRING_LEN + 1)
+            .encode(&mut oversized_string)
+            .unwrap();
+        let mut oversized_string = DurableDecoder {
+            bytes: &oversized_string.bytes,
+            offset: 0,
+        };
+        assert!(String::decode(&mut oversized_string).is_err());
+
+        let mut offset_overflow = DurableDecoder {
+            bytes: &[0],
+            offset: usize::MAX,
+        };
+        assert!(offset_overflow.take(1).is_err());
+    }
+
+    #[test]
+    fn fault_injected_snapshot_writer_reopens_old_or_complete_new_snapshot() {
+        fn assert_snapshot_faults<T: DurableSnapshotCodec + Clone>(path: &Path, old: T, new: T) {
+            write_snapshot_atomic(path, &old).unwrap();
+            let old_bytes = encode_snapshot(&old).unwrap();
+            let new_bytes = encode_snapshot(&new).unwrap();
+
+            for fault in [
+                SnapshotWriteFault::TempWrite,
+                SnapshotWriteFault::TempSync,
+                SnapshotWriteFault::Rename,
+                SnapshotWriteFault::DirSync,
+            ] {
+                write_snapshot_atomic(path, &old).unwrap();
+                assert!(write_snapshot_atomic_with_fault(path, &new, Some(fault)).is_err());
+                let visible = fs::read(path).unwrap();
+                assert!(
+                    visible == old_bytes || visible == new_bytes,
+                    "fault {fault:?} left a partial snapshot"
+                );
+                assert!(decode_snapshot::<T>(&visible).is_ok());
+            }
+
+            write_snapshot_atomic(path, &new).unwrap();
+            assert_eq!(fs::read(path).unwrap(), new_bytes);
+        }
+
+        let root = durable_temp_dir("snapshot-writer-faults");
+        let old_catalog = DurableCatalogSnapshot {
+            config: LocalStoreConfig::default(),
+            catalog: CatalogInner {
+                next_segment_id: 1,
+                entries: BTreeMap::new(),
+            },
+        };
+        let mut new_catalog = old_catalog.clone();
+        new_catalog.catalog.next_segment_id = 2;
+
+        let old_segment_store = DurableSegmentStoreSnapshot {
+            config: LocalStoreConfig::default(),
+            next_offset: 0,
+            records: BTreeMap::new(),
+        };
+        let mut new_segment_store = old_segment_store.clone();
+        new_segment_store.next_offset = 4096;
+
+        let old_metadata = DurableMetadataSnapshot {
+            config: LocalStoreConfig::default(),
+            metadata: MetadataInner::new(),
+            next_write_intent: 1,
+            next_extent_id: 1,
+        };
+        let mut new_metadata = old_metadata.clone();
+        new_metadata.next_write_intent = 2;
+
+        assert_snapshot_faults(
+            &root.join("metadata").join("catalog.bin"),
+            old_catalog,
+            new_catalog,
+        );
+        assert_snapshot_faults(
+            &root.join("storage-node").join("segment-store.bin"),
+            old_segment_store,
+            new_segment_store,
+        );
+        assert_snapshot_faults(
+            &root.join("metadata").join("metadata.bin"),
+            old_metadata,
+            new_metadata,
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7901,6 +10008,198 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes_after_restart, b"durable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_provider_reopen_matrix_covers_block_and_native_commit_shapes() {
+        let root = durable_temp_dir("durable-matrix");
+        let cfg = tree_config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 32,
+                    block_size: 4096,
+                },
+                name: Some("source".to_string()),
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                7 * 4096,
+                &repeated_blocks(3, 4),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let checkpoint = store.checkpoint(device_id).unwrap();
+        let forked = store
+            .fork_device(
+                device_id,
+                ForkRequest {
+                    target: None,
+                    name: Some("forked".to_string()),
+                },
+            )
+            .unwrap();
+        store
+            .write_device(
+                forked,
+                8 * 4096,
+                &repeated_blocks(1, 9),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let restored = store
+            .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+            .unwrap();
+        store.delete_device(device_id).unwrap();
+
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_a = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("a".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let file_b = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("b".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .write_file_at(
+                keyspace_id,
+                file_a,
+                0,
+                b"before",
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let keyspace_checkpoint = store.checkpoint_keyspace(keyspace_id).unwrap();
+        let snapshot_keyspace = store
+            .snapshot_keyspace(
+                keyspace_id,
+                SnapshotKeyspaceRequest {
+                    target: None,
+                    name: Some("snap".to_string()),
+                },
+            )
+            .unwrap();
+        store
+            .write_file_at(
+                keyspace_id,
+                file_a,
+                0,
+                b"after!",
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let lease = store.acquire_append_lease(keyspace_id, file_b).unwrap();
+        store
+            .append_file(lease, b"tail", WriteDurability::Acknowledged)
+            .unwrap();
+        let restored_keyspace = store
+            .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(keyspace_checkpoint))
+            .unwrap();
+
+        drop(store);
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        assert!(reopened.device_info(device_id).is_err());
+
+        let mut forked_bytes = vec![0; 3 * 4096];
+        reopened
+            .read_device(
+                forked,
+                ByteRange::new(7 * 4096, 3 * 4096),
+                &mut forked_bytes,
+            )
+            .unwrap();
+        assert_eq!(&forked_bytes[0..4096], vec![4; 4096].as_slice());
+        assert_eq!(&forked_bytes[4096..8192], vec![9; 4096].as_slice());
+        assert_eq!(&forked_bytes[8192..12288], vec![4; 4096].as_slice());
+
+        let mut restored_bytes = vec![0; 3 * 4096];
+        reopened
+            .read_device(
+                restored,
+                ByteRange::new(7 * 4096, 3 * 4096),
+                &mut restored_bytes,
+            )
+            .unwrap();
+        assert_eq!(restored_bytes, repeated_blocks(3, 4));
+
+        let mut source_file = vec![0; b"after!".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_a,
+                ByteRange::new(0, b"after!".len() as u64),
+                &mut source_file,
+            )
+            .unwrap();
+        assert_eq!(source_file, b"after!");
+
+        let mut snapshot_file = vec![0; b"before".len()];
+        reopened
+            .read_file(
+                snapshot_keyspace,
+                file_a,
+                ByteRange::new(0, b"before".len() as u64),
+                &mut snapshot_file,
+            )
+            .unwrap();
+        assert_eq!(snapshot_file, b"before");
+
+        let mut restored_file = vec![0; b"before".len()];
+        reopened
+            .read_file(
+                restored_keyspace,
+                file_a,
+                ByteRange::new(0, b"before".len() as u64),
+                &mut restored_file,
+            )
+            .unwrap();
+        assert_eq!(restored_file, b"before");
+
+        let mut appended = vec![0; b"tail".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_b,
+                ByteRange::new(0, b"tail".len() as u64),
+                &mut appended,
+            )
+            .unwrap();
+        assert_eq!(appended, b"tail");
+
+        reopened
+            .metadata()
+            .validate_keyspace_catalog_for_test(keyspace_id)
+            .unwrap();
+        reopened
+            .metadata()
+            .validate_keyspace_catalog_for_test(snapshot_keyspace)
+            .unwrap();
+        reopened
+            .metadata()
+            .validate_keyspace_catalog_for_test(restored_keyspace)
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
