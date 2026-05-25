@@ -1,9 +1,22 @@
 # toy-cow-block-storage
 
-Deterministic toy copy-on-write storage built in small, correctness-gated
-phases. The block device API is the compatibility surface; a native extent/file
-API develops beside it over the same segment substrate for append-heavy custom
-filesystem work.
+Deterministic toy copy-on-write storage, built in small correctness-gated
+phases. It is still a toy, but the shape is intentionally serious: immutable
+segments, cheap forks, point-in-time restore, explicit garbage collection, and
+APIs that can grow from local in-process storage to remote storage servers
+without changing how callers think about data.
+
+There are two main ways to use it:
+
+- Use the **block device API** when you want something that looks like a normal
+  disk.
+- Use the **native keyspace/file API** when your application can speak in files,
+  appends, snapshots, and writer fencing directly.
+
+The native path is where higher-performance custom storage ideas live. For
+example, if you are writing a large file, you can reserve a large append extent,
+fill it in chunks, and commit the whole thing as one segment instead of paying
+metadata cost for thousands of tiny appends.
 
 ## Two Public APIs
 
@@ -17,11 +30,34 @@ metadata substrate:
 - **Native keyspace/files**: `NativeKeyspaceClient` and `NativeFile`, shaped for
   custom filesystems or append-heavy users. Files live inside a keyspace so
   checkpoint, snapshot, and restore are filesystem-level operations, not
-  per-file snapshots. Appends are byte-oriented and fenced by append leases.
+  per-file snapshots. Appends are byte-oriented, fenced by append leases, and
+  can use large append reservations when the caller wants one big committed
+  extent.
 
 The local implementation runs in one process, but the API already goes through
 server and transport boundaries so durable or remote implementations can replace
 the adapters later.
+
+### Which One Should I Use?
+
+Use the block API for compatibility. It is the right shape for a future `ublk`
+adapter, for experiments with ext4/xfs on top, or for tests that just need
+fixed-size logical blocks.
+
+Use the native API when you control the caller and can give the storage layer
+more intent. It keeps snapshots at the keyspace level, rejects stale append
+writers, supports ordinary file writes, and has an explicit fast path for large
+append-heavy files.
+
+The practical rule of thumb is:
+
+- **Small or irregular edits**: use `write_at` or normal leased appends.
+- **Large streaming files**: reserve a large aligned piece, fill it in chunks,
+  commit it, then repeat until the file is done.
+- **Filesystem-like state**: put related files in one keyspace so snapshot and
+  restore happen at the filesystem boundary.
+- **Existing filesystem compatibility**: use the block API and let the
+  filesystem above it decide its own layout.
 
 ```rust
 use std::sync::Arc;
@@ -197,10 +233,58 @@ Native API guarantees to care about:
   transitions.
 - Append leases carry writer epochs so stale writers fail without partial file
   visibility.
+- Large append reservations let a caller fill an exact byte range in chunks and
+  commit it as one logical segment.
 - A successful non-empty file write publishes a new immutable keyspace catalog
   root.
 - Snapshot and restore copy retained keyspace-root pointers rather than walking
   file contents.
+
+### Large Append Reservations
+
+Normal appends are convenient and stay the right default for small payloads. But
+if your workload is "write this large file from a stream," doing thousands of
+tiny appends is the slow path: every append is its own file-version transition.
+
+The reservation API gives the caller a cleaner move:
+
+1. Pick a large piece size, such as 32 MiB.
+2. Acquire an append lease.
+3. Reserve exactly that many bytes.
+4. Fill the reservation in whatever chunks the producer naturally gives you.
+5. Commit once.
+6. Repeat for the next piece.
+
+In v1, the file size and reservation length must be block aligned. If the final
+tail is not aligned, use the normal append path for that tail.
+
+```rust
+use toy_cow_block_storage::{NativeFile, WriteDurability};
+
+fn append_large_piece(
+    file: &impl NativeFile,
+    piece: &[u8],
+) -> toy_cow_block_storage::Result<()> {
+    // V1 reservations require an aligned length. A caller can keep a small
+    // unaligned tail and write it later with a normal append.
+    assert_eq!(piece.len() % 4096, 0);
+
+    let lease = file.acquire_append()?;
+    let reservation = file.reserve_append_extent(lease, piece.len() as u64)?;
+
+    for (index, chunk) in piece.chunks(4 * 1024 * 1024).enumerate() {
+        let offset = (index * 4 * 1024 * 1024) as u64;
+        file.fill_reserved_append(reservation.clone(), offset, chunk)?;
+    }
+
+    file.commit_reserved_append(reservation, WriteDurability::Flushed)?;
+    Ok(())
+}
+```
+
+This does not expose storage nodes or physical offsets. The caller gets the
+performance shape it asked for, while placement, replication, and cleanup stay
+inside the provider.
 
 ## Phase Gates
 
