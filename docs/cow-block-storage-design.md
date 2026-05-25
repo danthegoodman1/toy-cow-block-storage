@@ -674,13 +674,12 @@ point, fork, or keyspace snapshot can reach it. Physical payload deletion is
 allowed only after reachability and retention say the logical segment is no
 longer needed.
 
-### Future Multi-Storage-Node Placement
+### Local Multi-Storage-Node Placement
 
-After partitioned logs exist, the local provider should support multiple
-storage-node endpoints in one process with exactly one committed replica per
-logical segment. This proves the important placement boundary without adding
-quorum behavior, repair, or remote failure modes, and avoids multiplying a
-known whole-node compaction problem.
+The local provider supports multiple storage-node endpoints in one process with
+exactly one committed replica per logical segment. This proves the important
+placement boundary without adding quorum behavior, repair, or remote failure
+modes, and avoids multiplying a known whole-node compaction problem.
 
 Placement is per segment:
 
@@ -697,8 +696,9 @@ not a metadata invariant and not a public API promise.
 
 The local multi-node write path is:
 
-1. Choose one storage node for each new logical segment through a deterministic
-   `PlacementPolicy`.
+1. Choose one storage node for each new logical segment through the deterministic
+   placement policy. The current policy is simple round-robin over the local
+   registry.
 2. Reserve that segment in the chosen node's `LocalSegmentCatalog`.
 3. Write and sync bytes through that node's `SegmentStore`.
 4. Commit the local placement as durable-pending-metadata.
@@ -714,6 +714,12 @@ per-node catalogs, and per-node segment bytes. A committed metadata reference to
 a segment with no committed placement, multiple conflicting one-replica
 placements, or missing/corrupt bytes is a provider error. It must not be treated
 as a sparse zero range.
+
+The local durable provider keeps the physical rolled data-log files behind the
+same SQLite placement table, with `storage_node_id` stored in each placement.
+That file layout remains implementation-private: public block/native APIs do
+not expose node choice, and logical metadata never records data-log offsets or
+storage-node-local paths.
 
 The metadata custodian still owns reachability. It emits release evidence keyed
 by logical segment and placement; storage-node custodians apply only evidence

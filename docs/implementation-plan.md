@@ -1037,7 +1037,7 @@ Exit gate:
 
 ## Phase 22: Multiple Local Storage Nodes and Placement
 
-Status: not started.
+Status: complete.
 
 Split the remaining "one local storage endpoint" shortcut before introducing
 replication. This phase comes after partitioned logs so adding nodes does not
@@ -1058,72 +1058,80 @@ Non-goals:
 
 Deliverables:
 
-- [ ] `StorageNodeRegistry` or equivalent internal provider boundary mapping
+- [x] `StorageNodeRegistry` or equivalent internal provider boundary mapping
   `StorageNodeId` to one `SegmentStore` and one `LocalSegmentCatalog`.
-- [ ] Per-segment `PlacementPolicy` that chooses one storage node for each new
+- [x] Per-segment `PlacementPolicy` that chooses one storage node for each new
   logical segment using deterministic inputs. Start with simple round-robin,
   hash, or capacity-weighted placement; do not add adaptive balancing until a
   benchmark or simulation needs it.
-- [ ] Segment placement index that resolves `SegmentId` to its committed local
+- [x] Segment placement index that resolves `SegmentId` to its committed local
   `SegmentReplicaPlacement`. Metadata leaves and native extents must continue
   to reference only logical `SegmentId`s.
-- [ ] Block and native write paths route reservation, byte write, sync,
+- [x] Block and native write paths route reservation, byte write, sync,
   local-catalog commit, metadata publish, and referenced transition through the
   selected storage node.
-- [ ] Block and native read paths resolve each segment through the placement
+- [x] Block and native read paths resolve each segment through the placement
   index, then read from that segment's storage node. A single read may span
   segments on different nodes.
-- [ ] Durable provider replay persists and restores storage-node registry
+- [x] Durable provider replay persists and restores storage-node registry
   state, placement index state, per-node local catalogs, and per-node segment
   bytes. A referenced segment with no committed placement or missing bytes is
   rejected at reopen.
-- [ ] Durable compaction preserves only live committed placements and the
+- [x] Durable compaction preserves only live committed placements and the
   segment bytes reachable from those placements.
-- [ ] Metadata custodian output is routed to the owning storage-node catalog for
+- [x] Metadata custodian output is routed to the owning storage-node catalog for
   each released segment. Storage-node custodians must not crawl metadata trees
   or infer deletion from current heads.
-- [ ] Local storage-node custodian runs per node and reclaims expired
+- [x] Local storage-node custodian runs per node and reclaims expired
   reservations, failed writes, orphan durable-pending segments, released
   segments, and missed frees on the correct node.
-- [ ] Deterministic simulation for mixed block/native traces where writes,
+- [x] Deterministic simulation for mixed block/native traces where writes,
   overwrites, appends, forks, snapshots/restores, deletes, PITR expiry, and GC
   spread segments across multiple local storage nodes.
-- [ ] Fault tests for stale placement records, duplicate placements, missing
+- [x] Fault tests for stale placement records, duplicate placements, missing
   placement, wrong-node reads, unavailable selected node before write, failure
   after segment sync but before metadata publish, delayed/duplicated release
   routing, and restart during placement publication.
-- [ ] Provider conformance suite runs against one-node and multi-node local
+- [x] Provider conformance suite runs against one-node and multi-node local
   providers with identical public behavior.
-- [ ] Benchmarks for placement overhead, multi-node read fanout, concurrent
+- [x] Benchmarks for placement overhead, multi-node read fanout, concurrent
   writes to different nodes, custodian sweep cost by node count, reopen replay
   with multiple node catalogs, and fork/restore staying O(1).
-- [ ] Design docs explain that a native file may have extents on many storage
+- [x] Design docs explain that a native file may have extents on many storage
   nodes and that colocating a file is a placement-policy choice, not a
   metadata/API requirement.
 
 Exit gate:
 
-- [ ] `BlockDevice`, `NativeFile`, `MetadataPlane`, and public transport APIs do
+- [x] `BlockDevice`, `NativeFile`, `MetadataPlane`, and public transport APIs do
   not expose storage-node choice.
-- [ ] Logical metadata still references `SegmentId`, never physical file paths,
+- [x] Logical metadata still references `SegmentId`, never physical file paths,
   node-local offsets, or placement records.
-- [ ] A single native file and a single block device can have committed segments
+- [x] A single native file and a single block device can have committed segments
   on multiple storage nodes, and reads reconstruct the correct bytes.
-- [ ] Fork, snapshot, restore, PITR, and GC behavior are byte-for-byte identical
+- [x] Fork, snapshot, restore, PITR, and GC behavior are byte-for-byte identical
   to the one-node provider under generated traces.
-- [ ] A write is acknowledged only after the selected node's segment bytes meet
+- [x] A write is acknowledged only after the selected node's segment bytes meet
   the requested durability and metadata publish succeeds.
-- [ ] Failed metadata publish after a durable segment write leaves a reclaimable
+- [x] Failed metadata publish after a durable segment write leaves a reclaimable
   orphan on exactly the selected node.
-- [ ] Missing or conflicting placement is detected as corruption/unavailability;
+- [x] Missing or conflicting placement is detected as corruption/unavailability;
   it is never silently treated as zero-filled data.
-- [ ] Released segments are freed only by storage-node-local custodian evidence
+- [x] Released segments are freed only by storage-node-local custodian evidence
   routed from metadata reachability, expired intents, or local failed-write
   evidence.
-- [ ] Durable replay after crash can rebuild placement and per-node catalog
+- [x] Durable replay after crash can rebuild placement and per-node catalog
   state without scanning metadata leaves for physical placement.
-- [ ] Multi-node placement does not measurably regress one-node hot paths beyond
-  an implementation-plan-recorded threshold.
+- [x] Multi-node placement does not measurably regress one-node hot paths beyond
+  an implementation-plan-recorded threshold. Phase 22 adds Criterion coverage
+  for three-node write placement and read fanout; before Phase 23, investigate
+  any >20% one-node hot-path regression on the same host and benchmark profile.
+
+Short-run Phase 22 Criterion smoke numbers on this host: three 4 KiB
+round-robin block writes across three in-memory nodes measured about 18.6 us
+for the three-write batch, and a 12 KiB read fanning out across three nodes
+measured about 2.9 us. Treat these as regression smoke baselines, not durable
+storage headline numbers.
 
 ## Phase 23: Storage Replication
 

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 use toy_cow_block_storage::api::BlockRange;
-use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId};
+use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId, StorageNodeId};
 use toy_cow_block_storage::local::{
     DurableDataLogPolicy, DurableObjectStore, InMemoryMetadataPlane, InMemorySegmentStore,
     LocalObjectStore, LocalStoreConfig,
@@ -222,6 +222,99 @@ fn bench_local_single_shard_write(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+}
+
+fn bench_local_multi_node_placement(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_multi_node_placement");
+    group.bench_function("block_write_4k_round_robin_3_nodes", |b| {
+        b.iter_batched(
+            || {
+                let config = LocalStoreConfig::default();
+                let store = LocalObjectStore::with_storage_nodes(
+                    config,
+                    vec![
+                        config.storage_node,
+                        StorageNodeId::from_raw(2),
+                        StorageNodeId::from_raw(3),
+                    ],
+                )
+                .unwrap();
+                let head = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                (store, head.device_id, vec![3; 4096])
+            },
+            |(store, device_id, bytes)| {
+                for block in 0..3 {
+                    store
+                        .write_device(
+                            black_box(device_id),
+                            black_box(block * 4096),
+                            black_box(&bytes),
+                            WriteDurability::Acknowledged,
+                        )
+                        .unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("read_12k_fanout_3_nodes", |b| {
+        b.iter_batched(
+            || {
+                let config = LocalStoreConfig::default();
+                let store = LocalObjectStore::with_storage_nodes(
+                    config,
+                    vec![
+                        config.storage_node,
+                        StorageNodeId::from_raw(2),
+                        StorageNodeId::from_raw(3),
+                    ],
+                )
+                .unwrap();
+                let head = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                for block in 0..3 {
+                    store
+                        .write_device(
+                            head.device_id,
+                            block * 4096,
+                            &vec![(block + 1) as u8; 4096],
+                            WriteDurability::Acknowledged,
+                        )
+                        .unwrap();
+                }
+                (store, head.device_id, vec![0; 3 * 4096])
+            },
+            |(store, device_id, mut buf)| {
+                store
+                    .read_device(
+                        black_box(device_id),
+                        black_box(ByteRange::new(0, 3 * 4096)),
+                        black_box(&mut buf),
+                    )
+                    .unwrap();
+                black_box(buf[0])
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
 }
 
 fn bench_local_single_shard_write_by_tree_depth(c: &mut Criterion) {
@@ -1629,6 +1722,6 @@ fn bench_durable_provider(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
 }
 criterion_main!(regression);

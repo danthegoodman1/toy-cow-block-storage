@@ -115,14 +115,251 @@ impl LocalStoreConfig {
 
         Ok(())
     }
+
+    fn for_storage_node(self, storage_node: StorageNodeId) -> Self {
+        Self {
+            storage_node,
+            ..self
+        }
+    }
+}
+
+fn normalize_storage_nodes(
+    primary: StorageNodeId,
+    storage_nodes: Vec<StorageNodeId>,
+) -> Vec<StorageNodeId> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for node_id in std::iter::once(primary).chain(storage_nodes.into_iter()) {
+        if seen.insert(node_id) {
+            out.push(node_id);
+        }
+    }
+    out
+}
+
+/// Shared local in-process provider bundle.
+#[derive(Debug, Clone)]
+struct LocalStorageNode {
+    segment_store: Arc<InMemorySegmentStore>,
+    segment_catalog: Arc<InMemoryLocalSegmentCatalog>,
+}
+
+#[derive(Debug, Clone)]
+struct StorageNodeRegistry {
+    config: LocalStoreConfig,
+    node_order: Arc<Vec<StorageNodeId>>,
+    nodes: Arc<BTreeMap<StorageNodeId, LocalStorageNode>>,
+    next_placement_index: Arc<Mutex<u64>>,
+    next_segment_id: Arc<Mutex<u128>>,
+}
+
+impl StorageNodeRegistry {
+    fn new(config: LocalStoreConfig, storage_nodes: Vec<StorageNodeId>) -> Result<Self> {
+        config.validate()?;
+        let node_order = normalize_storage_nodes(config.storage_node, storage_nodes);
+        let mut nodes = BTreeMap::new();
+        for node_id in &node_order {
+            let node_config = config.for_storage_node(*node_id);
+            nodes.insert(
+                *node_id,
+                LocalStorageNode {
+                    segment_store: Arc::new(InMemorySegmentStore::new(node_config)?),
+                    segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::new(node_config)?),
+                },
+            );
+        }
+        Ok(Self {
+            config,
+            node_order: Arc::new(node_order),
+            nodes: Arc::new(nodes),
+            next_placement_index: Arc::new(Mutex::new(0)),
+            next_segment_id: Arc::new(Mutex::new(1)),
+        })
+    }
+
+    fn from_inner(config: LocalStoreConfig, inner: StorageNodeRegistryInner) -> Result<Self> {
+        config.validate()?;
+        if inner.node_order.is_empty() {
+            return Err(StorageError::corrupt("storage node registry has no nodes"));
+        }
+        let mut seen = BTreeSet::new();
+        for node_id in &inner.node_order {
+            if !seen.insert(*node_id) {
+                return Err(StorageError::corrupt(
+                    "storage node registry has duplicate node IDs",
+                ));
+            }
+            if !inner.nodes.contains_key(node_id) {
+                return Err(StorageError::corrupt(
+                    "storage node registry order references missing node",
+                ));
+            }
+        }
+        for node_id in inner.nodes.keys() {
+            if !seen.contains(node_id) {
+                return Err(StorageError::corrupt(
+                    "storage node registry contains unordered node",
+                ));
+            }
+        }
+
+        let mut nodes = BTreeMap::new();
+        for node_id in &inner.node_order {
+            let image = inner
+                .nodes
+                .get(node_id)
+                .ok_or_else(|| StorageError::corrupt("storage node image missing"))?;
+            let node_config = config.for_storage_node(*node_id);
+            nodes.insert(
+                *node_id,
+                LocalStorageNode {
+                    segment_store: Arc::new(InMemorySegmentStore::from_inner(
+                        node_config,
+                        image.segment_store.clone(),
+                    )?),
+                    segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::from_inner(
+                        node_config,
+                        image.segment_catalog.clone(),
+                    )?),
+                },
+            );
+        }
+
+        Ok(Self {
+            config,
+            node_order: Arc::new(inner.node_order),
+            nodes: Arc::new(nodes),
+            next_placement_index: Arc::new(Mutex::new(inner.next_placement_index)),
+            next_segment_id: Arc::new(Mutex::new(inner.next_segment_id)),
+        })
+    }
+
+    fn state_inner(&self) -> Result<StorageNodeRegistryInner> {
+        let mut nodes = BTreeMap::new();
+        for (node_id, node) in self.nodes.iter() {
+            nodes.insert(
+                *node_id,
+                StorageNodeInner {
+                    segment_store: node.segment_store.state_inner()?,
+                    segment_catalog: node.segment_catalog.state_inner()?,
+                },
+            );
+        }
+        Ok(StorageNodeRegistryInner {
+            next_segment_id: *lock(&self.next_segment_id)?,
+            next_placement_index: *lock(&self.next_placement_index)?,
+            node_order: self.node_order.as_ref().clone(),
+            nodes,
+        })
+    }
+
+    fn primary_node(&self) -> Result<&LocalStorageNode> {
+        self.node(self.config.storage_node)
+    }
+
+    fn node(&self, storage_node: StorageNodeId) -> Result<&LocalStorageNode> {
+        self.nodes
+            .get(&storage_node)
+            .ok_or_else(|| StorageError::not_found("storage_node", storage_node.to_string()))
+    }
+
+    #[cfg(test)]
+    fn node_ids(&self) -> Vec<StorageNodeId> {
+        self.node_order.as_ref().clone()
+    }
+
+    fn choose_storage_node(&self) -> Result<StorageNodeId> {
+        let mut next = lock(&self.next_placement_index)?;
+        let index = usize::try_from(*next % self.node_order.len() as u64)
+            .map_err(|_| StorageError::invalid_argument("placement index overflows usize"))?;
+        let node_id = self.node_order[index];
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("placement index overflow"))?;
+        Ok(node_id)
+    }
+
+    fn reserve_segment(
+        &self,
+        storage_node: StorageNodeId,
+        intent: SegmentReservationIntent,
+    ) -> Result<SegmentReservation> {
+        let mut next = lock(&self.next_segment_id)?;
+        let segment_id = loop {
+            let candidate = SegmentId::from_raw(*next);
+            *next = next
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("segment id overflow"))?;
+            let mut exists = false;
+            for node in self.nodes.values() {
+                if node.segment_catalog.contains_segment(candidate)? {
+                    exists = true;
+                    break;
+                }
+            }
+            if !exists {
+                break candidate;
+            }
+        };
+        self.node(storage_node)?
+            .segment_catalog
+            .reserve_segment_with_id(segment_id, intent)
+    }
+
+    fn owner_node_for_segment(&self, segment_id: SegmentId) -> Result<&LocalStorageNode> {
+        let mut found = None;
+        for (node_id, node) in self.nodes.iter() {
+            if node.segment_catalog.contains_segment(segment_id)? {
+                if found.is_some() {
+                    return Err(StorageError::corrupt(
+                        "segment appears in multiple storage-node catalogs",
+                    ));
+                }
+                found = Some(*node_id);
+            }
+        }
+        let node_id =
+            found.ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+        self.node(node_id)
+    }
+
+    fn commit_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaCommit> {
+        self.owner_node_for_segment(segment_id)?
+            .segment_catalog
+            .commit_for_segment(segment_id)
+    }
+
+    fn state(&self, segment_id: SegmentId) -> Result<SegmentLifecycleState> {
+        self.owner_node_for_segment(segment_id)?
+            .segment_catalog
+            .state(segment_id)
+    }
+
+    fn mark_segment_referenced(&self, segment_id: SegmentId) -> Result<()> {
+        self.owner_node_for_segment(segment_id)?
+            .segment_catalog
+            .mark_segment_referenced(segment_id)
+    }
+
+    fn release_segment(&self, segment_id: SegmentId) -> Result<()> {
+        self.owner_node_for_segment(segment_id)?
+            .segment_catalog
+            .release_segment(segment_id)
+    }
+
+    fn read_segment(&self, segment_id: SegmentId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+        self.owner_node_for_segment(segment_id)?
+            .segment_store
+            .read_segment(segment_id, range, buf)
+    }
 }
 
 /// Shared local in-process provider bundle.
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
     metadata: Arc<InMemoryMetadataPlane>,
-    segment_store: Arc<InMemorySegmentStore>,
-    segment_catalog: Arc<InMemoryLocalSegmentCatalog>,
+    storage_nodes: StorageNodeRegistry,
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
 }
@@ -133,11 +370,17 @@ impl LocalObjectStore {
     }
 
     pub fn with_config(config: LocalStoreConfig) -> Result<Self> {
+        Self::with_storage_nodes(config, vec![config.storage_node])
+    }
+
+    pub fn with_storage_nodes(
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+    ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             metadata: Arc::new(InMemoryMetadataPlane::new(config)?),
-            segment_store: Arc::new(InMemorySegmentStore::new(config)?),
-            segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::new(config)?),
+            storage_nodes: StorageNodeRegistry::new(config, storage_nodes)?,
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
         })
@@ -150,14 +393,7 @@ impl LocalObjectStore {
                 image.config,
                 image.metadata,
             )?),
-            segment_store: Arc::new(InMemorySegmentStore::from_inner(
-                image.config,
-                image.segment_store,
-            )?),
-            segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::from_inner(
-                image.config,
-                image.segment_catalog,
-            )?),
+            storage_nodes: StorageNodeRegistry::from_inner(image.config, image.storage_nodes)?,
             next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
         })
@@ -167,8 +403,7 @@ impl LocalObjectStore {
         Ok(DurableStoreImage {
             config: self.metadata.config,
             metadata: self.metadata.state_inner()?,
-            segment_store: self.segment_store.state_inner()?,
-            segment_catalog: self.segment_catalog.state_inner()?,
+            storage_nodes: self.storage_nodes.state_inner()?,
             next_write_intent: *lock(&self.next_write_intent)?,
             next_extent_id: *lock(&self.next_extent_id)?,
         })
@@ -179,11 +414,48 @@ impl LocalObjectStore {
     }
 
     pub fn segment_store(&self) -> Arc<InMemorySegmentStore> {
-        Arc::clone(&self.segment_store)
+        Arc::clone(
+            &self
+                .storage_nodes
+                .primary_node()
+                .expect("primary storage node exists")
+                .segment_store,
+        )
     }
 
     pub fn segment_catalog(&self) -> Arc<InMemoryLocalSegmentCatalog> {
-        Arc::clone(&self.segment_catalog)
+        Arc::clone(
+            &self
+                .storage_nodes
+                .primary_node()
+                .expect("primary storage node exists")
+                .segment_catalog,
+        )
+    }
+
+    #[cfg(test)]
+    fn storage_node_ids_for_test(&self) -> Vec<StorageNodeId> {
+        self.storage_nodes.node_ids()
+    }
+
+    #[cfg(test)]
+    fn segment_catalog_for_node(
+        &self,
+        storage_node: StorageNodeId,
+    ) -> Result<Arc<InMemoryLocalSegmentCatalog>> {
+        Ok(Arc::clone(
+            &self.storage_nodes.node(storage_node)?.segment_catalog,
+        ))
+    }
+
+    #[cfg(test)]
+    fn segment_store_for_node(
+        &self,
+        storage_node: StorageNodeId,
+    ) -> Result<Arc<InMemorySegmentStore>> {
+        Ok(Arc::clone(
+            &self.storage_nodes.node(storage_node)?.segment_store,
+        ))
     }
 
     pub fn write_device(
@@ -268,7 +540,7 @@ impl LocalObjectStore {
         })?;
 
         for segment_id in segment_ids {
-            self.segment_catalog.mark_segment_referenced(segment_id)?;
+            self.storage_nodes.mark_segment_referenced(segment_id)?;
         }
 
         Ok(WriteCommit {
@@ -479,7 +751,7 @@ impl LocalObjectStore {
                 new_size,
             }],
         })?;
-        self.segment_catalog
+        self.storage_nodes
             .mark_segment_referenced(reservation.segment_id)?;
         let committed = self
             .metadata
@@ -597,7 +869,7 @@ impl LocalObjectStore {
                 new_size,
             }],
         })?;
-        self.segment_catalog
+        self.storage_nodes
             .mark_segment_referenced(reservation.segment_id)?;
         let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
 
@@ -640,8 +912,8 @@ impl LocalObjectStore {
     ) -> Result<MetadataSweepReport> {
         let sweep = self.metadata.sweep_unmarked_after_mark(policy, epoch)?;
         for segment_id in &sweep.released_segments {
-            if self.segment_catalog.state(*segment_id)? == SegmentLifecycleState::Referenced {
-                self.segment_catalog.release_segment(*segment_id)?;
+            if self.storage_nodes.state(*segment_id)? == SegmentLifecycleState::Referenced {
+                self.storage_nodes.release_segment(*segment_id)?;
             }
         }
         Ok(sweep)
@@ -655,7 +927,7 @@ impl LocalObjectStore {
         let sweep = self.sweep_metadata_after_mark(policy, mark.epoch)?;
         let mut catalog_released_segments = Vec::new();
         for segment_id in &sweep.released_segments {
-            if self.segment_catalog.state(*segment_id)? == SegmentLifecycleState::Released {
+            if self.storage_nodes.state(*segment_id)? == SegmentLifecycleState::Released {
                 catalog_released_segments.push(*segment_id);
             }
         }
@@ -677,33 +949,37 @@ impl LocalObjectStore {
             deleted_released_segments: Vec::new(),
         };
 
-        for (segment_id, state, write_intent) in self.segment_catalog.entries()? {
-            match state {
-                SegmentLifecycleState::Reserved
-                    if expired_write_intents.contains(&write_intent) =>
-                {
-                    self.segment_catalog.expire_reservation(segment_id)?;
-                    self.segment_store.delete_segment(segment_id)?;
-                    report.expired_reservations.push(segment_id);
+        for node in self.storage_nodes.nodes.values() {
+            for (segment_id, state, write_intent) in node.segment_catalog.entries()? {
+                match state {
+                    SegmentLifecycleState::Reserved
+                        if expired_write_intents.contains(&write_intent) =>
+                    {
+                        node.segment_catalog.expire_reservation(segment_id)?;
+                        node.segment_store.delete_segment(segment_id)?;
+                        report.expired_reservations.push(segment_id);
+                    }
+                    SegmentLifecycleState::Writing
+                        if expired_write_intents.contains(&write_intent) =>
+                    {
+                        node.segment_catalog.fail_write(segment_id)?;
+                        node.segment_store.delete_segment(segment_id)?;
+                        report.failed_writes.push(segment_id);
+                    }
+                    SegmentLifecycleState::DurablePendingMetadata
+                        if expired_write_intents.contains(&write_intent) =>
+                    {
+                        node.segment_catalog.free_orphan_segment(segment_id)?;
+                        node.segment_store.delete_segment(segment_id)?;
+                        report.orphan_segments.push(segment_id);
+                    }
+                    SegmentLifecycleState::Released => {
+                        node.segment_catalog.delete_segment(segment_id)?;
+                        node.segment_store.delete_segment(segment_id)?;
+                        report.deleted_released_segments.push(segment_id);
+                    }
+                    _ => {}
                 }
-                SegmentLifecycleState::Writing if expired_write_intents.contains(&write_intent) => {
-                    self.segment_catalog.fail_write(segment_id)?;
-                    self.segment_store.delete_segment(segment_id)?;
-                    report.failed_writes.push(segment_id);
-                }
-                SegmentLifecycleState::DurablePendingMetadata
-                    if expired_write_intents.contains(&write_intent) =>
-                {
-                    self.segment_catalog.free_orphan_segment(segment_id)?;
-                    self.segment_store.delete_segment(segment_id)?;
-                    report.orphan_segments.push(segment_id);
-                }
-                SegmentLifecycleState::Released => {
-                    self.segment_catalog.delete_segment(segment_id)?;
-                    self.segment_store.delete_segment(segment_id)?;
-                    report.deleted_released_segments.push(segment_id);
-                }
-                _ => {}
             }
         }
 
@@ -769,11 +1045,13 @@ impl LocalObjectStore {
                 StorageError::invalid_argument("segment reservation byte length overflows u64")
             })?,
         };
-        let reservation = self.segment_catalog.reserve_segment(intent)?;
-        self.segment_catalog.begin_write(&reservation)?;
-        let commit = self.segment_store.write_segment(&reservation, data)?;
-        self.segment_store.sync_segment(reservation.segment_id)?;
-        self.segment_catalog
+        let storage_node = self.storage_nodes.choose_storage_node()?;
+        let node = self.storage_nodes.node(storage_node)?;
+        let reservation = self.storage_nodes.reserve_segment(storage_node, intent)?;
+        node.segment_catalog.begin_write(&reservation)?;
+        let commit = node.segment_store.write_segment(&reservation, data)?;
+        node.segment_store.sync_segment(reservation.segment_id)?;
+        node.segment_catalog
             .commit_segment(reservation.clone(), commit)?;
         Ok(reservation)
     }
@@ -785,7 +1063,7 @@ impl LocalObjectStore {
                 descriptors.entry(entry.segment_id)
             {
                 vacant.insert(
-                    self.segment_catalog
+                    self.storage_nodes
                         .commit_for_segment(entry.segment_id)?
                         .descriptor,
                 );
@@ -1249,7 +1527,7 @@ impl LocalObjectStore {
                     let output = buf.get_mut(output_offset..output_end).ok_or_else(|| {
                         StorageError::corrupt("metadata read output range exceeds buffer")
                     })?;
-                    self.segment_store
+                    self.storage_nodes
                         .read_segment(entry.segment_id, segment_range, output)?;
                 }
                 Ok(())
@@ -1445,41 +1723,72 @@ impl DurableSqliteStore {
         let Some(blob) = blob else {
             return Ok(None);
         };
-        let commit = decode_state_commit(&blob)?;
-        if commit.metadata.config != expected_config
-            || commit.catalog.config != expected_config
-            || commit.segment_store.config != expected_config
-        {
+        let mut commit = decode_state_commit(&blob)?;
+        if commit.metadata.config != expected_config {
             return Err(StorageError::corrupt(
                 "durable SQLite state disagrees with open config",
             ));
         }
 
-        let mut records = BTreeMap::new();
-        for (segment_id, record) in commit.segment_store.records {
-            let placement = Self::placement_for_segment(&conn, segment_id)?;
-            validate_durable_segment_placement(segment_id, &record, &placement)?;
-            let bytes = self.read_segment_payload(&placement)?;
-            validate_durable_segment_bytes(segment_id, &record, &bytes)?;
-            records.insert(
-                segment_id,
-                SegmentRecord {
-                    bytes,
-                    synced: record.synced,
-                    commit: record.commit,
+        let mut nodes = BTreeMap::new();
+        for node_id in &commit.storage_nodes.node_order {
+            let node_image = commit
+                .storage_nodes
+                .nodes
+                .remove(node_id)
+                .ok_or_else(|| StorageError::corrupt("storage node image missing"))?;
+            let node_config = expected_config.for_storage_node(*node_id);
+            if node_image.segment_store.config != node_config
+                || node_image.catalog.config != node_config
+            {
+                return Err(StorageError::corrupt(
+                    "durable SQLite storage node config disagrees with open config",
+                ));
+            }
+
+            let mut records = BTreeMap::new();
+            for (segment_id, record) in node_image.segment_store.records {
+                let placement = Self::placement_for_segment(&conn, segment_id)?;
+                validate_durable_segment_placement(segment_id, &record, &placement)?;
+                let bytes = self.read_segment_payload(&placement)?;
+                validate_durable_segment_bytes(segment_id, &record, &bytes)?;
+                records.insert(
+                    segment_id,
+                    SegmentRecord {
+                        bytes,
+                        synced: record.synced,
+                        commit: record.commit,
+                    },
+                );
+            }
+
+            nodes.insert(
+                *node_id,
+                StorageNodeInner {
+                    segment_store: SegmentStoreInner {
+                        next_offset: node_image.segment_store.next_offset,
+                        segments: records,
+                    },
+                    segment_catalog: node_image.catalog.catalog,
                 },
             );
+        }
+        if !commit.storage_nodes.nodes.is_empty() {
+            return Err(StorageError::corrupt(
+                "durable SQLite storage registry contains unordered node",
+            ));
         }
 
         Ok(Some(LocalObjectStore::from_state_image(
             DurableStoreImage {
                 config: commit.metadata.config,
                 metadata: commit.metadata.metadata,
-                segment_store: SegmentStoreInner {
-                    next_offset: commit.segment_store.next_offset,
-                    segments: records,
+                storage_nodes: StorageNodeRegistryInner {
+                    next_segment_id: commit.storage_nodes.next_segment_id,
+                    next_placement_index: commit.storage_nodes.next_placement_index,
+                    node_order: commit.storage_nodes.node_order,
+                    nodes,
                 },
-                segment_catalog: commit.catalog.catalog,
                 next_write_intent: commit.metadata.next_write_intent,
                 next_extent_id: commit.metadata.next_extent_id,
             },
@@ -1489,15 +1798,17 @@ impl DurableSqliteStore {
     fn persist(&self, image: &DurableStoreImage) -> Result<BTreeSet<SegmentId>> {
         let mut conn = lock(&self.conn)?;
         let current = current_sqlite_placements(&conn)?;
-        let image_segments: BTreeSet<_> = image.segment_store.segments.keys().copied().collect();
+        let image_segments = image.storage_nodes.segment_ids();
         let mut new_segments = Vec::new();
-        for (segment_id, record) in &image.segment_store.segments {
-            if !current.contains_key(segment_id) {
-                new_segments.push((
-                    *segment_id,
-                    record.commit.placement.storage_node,
-                    record.bytes.clone(),
-                ));
+        for node in image.storage_nodes.nodes.values() {
+            for (segment_id, record) in &node.segment_store.segments {
+                if !current.contains_key(segment_id) {
+                    new_segments.push((
+                        *segment_id,
+                        record.commit.placement.storage_node,
+                        record.bytes.clone(),
+                    ));
+                }
             }
         }
 
@@ -1893,6 +2204,28 @@ fn decode_state_commit(bytes: &[u8]) -> Result<DurableStateCommit> {
 }
 
 fn state_commit_for_image(image: &DurableStoreImage) -> DurableStateCommit {
+    let mut nodes = BTreeMap::new();
+    for node_id in &image.storage_nodes.node_order {
+        let node = image
+            .storage_nodes
+            .nodes
+            .get(node_id)
+            .expect("storage node order references existing node");
+        let node_config = image.config.for_storage_node(*node_id);
+        nodes.insert(
+            *node_id,
+            DurableStorageNodeImage {
+                segment_store: DurableSegmentStoreImage::from_inner(
+                    node_config,
+                    node.segment_store.clone(),
+                ),
+                catalog: DurableCatalogImage {
+                    config: node_config,
+                    catalog: node.segment_catalog.clone(),
+                },
+            },
+        );
+    }
     DurableStateCommit {
         metadata: DurableMetadataImage {
             config: image.config,
@@ -1900,27 +2233,11 @@ fn state_commit_for_image(image: &DurableStoreImage) -> DurableStateCommit {
             next_write_intent: image.next_write_intent,
             next_extent_id: image.next_extent_id,
         },
-        catalog: DurableCatalogImage {
-            config: image.config,
-            catalog: image.segment_catalog.clone(),
-        },
-        segment_store: DurableSegmentStoreImage {
-            config: image.config,
-            next_offset: image.segment_store.next_offset,
-            records: image
-                .segment_store
-                .segments
-                .iter()
-                .map(|(segment_id, record)| {
-                    (
-                        *segment_id,
-                        DurableSegmentRecord {
-                            synced: record.synced,
-                            commit: record.commit.clone(),
-                        },
-                    )
-                })
-                .collect(),
+        storage_nodes: DurableStorageRegistryImage {
+            next_segment_id: image.storage_nodes.next_segment_id,
+            next_placement_index: image.storage_nodes.next_placement_index,
+            node_order: image.storage_nodes.node_order.clone(),
+            nodes,
         },
     }
 }
@@ -2279,20 +2596,28 @@ impl DurableObjectStore {
         config: LocalStoreConfig,
         policy: DurableDataLogPolicy,
     ) -> Result<Self> {
+        Self::open_with_storage_nodes_and_data_log_policy(
+            root,
+            config,
+            vec![config.storage_node],
+            policy,
+        )
+    }
+
+    pub fn open_with_storage_nodes_and_data_log_policy(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        policy: DurableDataLogPolicy,
+    ) -> Result<Self> {
         config.validate()?;
         let paths = DurableStorePaths::new(root, config.storage_node)?;
         let durable = DurableSqliteStore::open(paths, policy)?;
 
         let local = durable
             .load(config)?
-            .unwrap_or(LocalObjectStore::with_config(config)?);
-        let persisted_segments = local
-            .state_image()?
-            .segment_store
-            .segments
-            .keys()
-            .copied()
-            .collect();
+            .unwrap_or(LocalObjectStore::with_storage_nodes(config, storage_nodes)?);
+        let persisted_segments = local.state_image()?.storage_nodes.segment_ids();
 
         let store = Self {
             local,
@@ -2313,6 +2638,11 @@ impl DurableObjectStore {
 
     pub fn segment_store(&self) -> Arc<InMemorySegmentStore> {
         self.local.segment_store()
+    }
+
+    #[cfg(test)]
+    fn storage_node_ids_for_test(&self) -> Vec<StorageNodeId> {
+        self.local.storage_node_ids_for_test()
     }
 
     pub fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
@@ -2498,7 +2828,7 @@ impl DurableObjectStore {
         let _persist_guard = lock(&self.persist_lock)?;
         let report = self.durable.compact_data_logs(policy)?;
         let image = self.local.state_image()?;
-        *lock(&self.persisted_segments)? = image.segment_store.segments.keys().copied().collect();
+        *lock(&self.persisted_segments)? = image.storage_nodes.segment_ids();
         Ok(report)
     }
 
@@ -2612,10 +2942,33 @@ pub struct StorageNodeCustodianReport {
 struct DurableStoreImage {
     config: LocalStoreConfig,
     metadata: MetadataInner,
-    segment_store: SegmentStoreInner,
-    segment_catalog: CatalogInner,
+    storage_nodes: StorageNodeRegistryInner,
     next_write_intent: u128,
     next_extent_id: u128,
+}
+
+#[derive(Debug, Clone)]
+struct StorageNodeRegistryInner {
+    next_segment_id: u128,
+    next_placement_index: u64,
+    node_order: Vec<StorageNodeId>,
+    nodes: BTreeMap<StorageNodeId, StorageNodeInner>,
+}
+
+impl StorageNodeRegistryInner {
+    fn segment_ids(&self) -> BTreeSet<SegmentId> {
+        let mut out = BTreeSet::new();
+        for node in self.nodes.values() {
+            out.extend(node.segment_store.segments.keys().copied());
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StorageNodeInner {
+    segment_store: SegmentStoreInner,
+    segment_catalog: CatalogInner,
 }
 
 #[derive(Debug, Clone)]
@@ -2623,6 +2976,28 @@ struct DurableSegmentStoreImage {
     config: LocalStoreConfig,
     next_offset: u64,
     records: BTreeMap<SegmentId, DurableSegmentRecord>,
+}
+
+impl DurableSegmentStoreImage {
+    fn from_inner(config: LocalStoreConfig, inner: SegmentStoreInner) -> Self {
+        Self {
+            config,
+            next_offset: inner.next_offset,
+            records: inner
+                .segments
+                .into_iter()
+                .map(|(segment_id, record)| {
+                    (
+                        segment_id,
+                        DurableSegmentRecord {
+                            synced: record.synced,
+                            commit: record.commit,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2646,10 +3021,23 @@ struct DurableCatalogImage {
 }
 
 #[derive(Debug, Clone)]
+struct DurableStorageRegistryImage {
+    next_segment_id: u128,
+    next_placement_index: u64,
+    node_order: Vec<StorageNodeId>,
+    nodes: BTreeMap<StorageNodeId, DurableStorageNodeImage>,
+}
+
+#[derive(Debug, Clone)]
+struct DurableStorageNodeImage {
+    segment_store: DurableSegmentStoreImage,
+    catalog: DurableCatalogImage,
+}
+
+#[derive(Debug, Clone)]
 struct DurableStateCommit {
     metadata: DurableMetadataImage,
-    catalog: DurableCatalogImage,
-    segment_store: DurableSegmentStoreImage,
+    storage_nodes: DurableStorageRegistryImage,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5190,6 +5578,47 @@ impl InMemoryLocalSegmentCatalog {
         Ok(lock(&self.inner)?.clone())
     }
 
+    fn reserve_segment_with_id(
+        &self,
+        segment_id: SegmentId,
+        intent: SegmentReservationIntent,
+    ) -> Result<SegmentReservation> {
+        if intent.bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "segment reservation must contain bytes",
+            ));
+        }
+
+        let mut inner = lock(&self.inner)?;
+        if inner.entries.contains_key(&segment_id) {
+            return Err(StorageError::conflict("segment ID already exists"));
+        }
+        if segment_id.raw() >= inner.next_segment_id {
+            inner.next_segment_id = segment_id
+                .raw()
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("segment id overflow"))?;
+        }
+        let reservation = SegmentReservation {
+            segment_id,
+            bytes: intent.bytes,
+        };
+        inner.entries.insert(
+            segment_id,
+            CatalogEntry {
+                intent,
+                reservation: reservation.clone(),
+                state: SegmentLifecycleState::Reserved,
+                commit: None,
+            },
+        );
+        Ok(reservation)
+    }
+
+    pub fn contains_segment(&self, segment_id: SegmentId) -> Result<bool> {
+        Ok(lock(&self.inner)?.entries.contains_key(&segment_id))
+    }
+
     pub fn state(&self, segment_id: SegmentId) -> Result<SegmentLifecycleState> {
         let inner = lock(&self.inner)?;
         inner
@@ -5245,23 +5674,11 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
             ));
         }
 
-        let mut inner = lock(&self.inner)?;
-        let segment_id = SegmentId::from_raw(inner.next_segment_id);
-        inner.next_segment_id += 1;
-        let reservation = SegmentReservation {
-            segment_id,
-            bytes: intent.bytes,
+        let segment_id = {
+            let inner = lock(&self.inner)?;
+            SegmentId::from_raw(inner.next_segment_id)
         };
-        inner.entries.insert(
-            segment_id,
-            CatalogEntry {
-                intent,
-                reservation: reservation.clone(),
-                state: SegmentLifecycleState::Reserved,
-                commit: None,
-            },
-        );
-        Ok(reservation)
+        self.reserve_segment_with_id(segment_id, intent)
     }
 
     fn begin_write(&self, reservation: &SegmentReservation) -> Result<()> {
@@ -8814,6 +9231,38 @@ impl DurableTestImageCodec for DurableCatalogImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_CATALOG;
 }
 
+impl DurableCodec for DurableStorageNodeImage {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.segment_store.encode(out)?;
+        self.catalog.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            segment_store: DurableSegmentStoreImage::decode(input)?,
+            catalog: DurableCatalogImage::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableStorageRegistryImage {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.next_segment_id.encode(out)?;
+        self.next_placement_index.encode(out)?;
+        self.node_order.encode(out)?;
+        self.nodes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            next_segment_id: u128::decode(input)?,
+            next_placement_index: u64::decode(input)?,
+            node_order: Vec::decode(input)?,
+            nodes: BTreeMap::decode(input)?,
+        })
+    }
+}
+
 impl DurableCodec for MetadataInner {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.next_device_id.encode(out)?;
@@ -8904,15 +9353,13 @@ impl DurableTestImageCodec for DurableMetadataImage {
 impl DurableCodec for DurableStateCommit {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.metadata.encode(out)?;
-        self.catalog.encode(out)?;
-        self.segment_store.encode(out)
+        self.storage_nodes.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
         Ok(Self {
             metadata: DurableMetadataImage::decode(input)?,
-            catalog: DurableCatalogImage::decode(input)?,
-            segment_store: DurableSegmentStoreImage::decode(input)?,
+            storage_nodes: DurableStorageRegistryImage::decode(input)?,
         })
     }
 }
@@ -10039,28 +10486,18 @@ mod tests {
             next_write_intent: image.next_write_intent,
             next_extent_id: image.next_extent_id,
         };
+        let primary = image
+            .storage_nodes
+            .nodes
+            .get(&image.config.storage_node)
+            .unwrap();
+        let primary_config = image.config.for_storage_node(image.config.storage_node);
         let catalog = DurableCatalogImage {
-            config: image.config,
-            catalog: image.segment_catalog,
+            config: primary_config,
+            catalog: primary.segment_catalog.clone(),
         };
-        let segment_store = DurableSegmentStoreImage {
-            config: image.config,
-            next_offset: image.segment_store.next_offset,
-            records: image
-                .segment_store
-                .segments
-                .iter()
-                .map(|(segment_id, record)| {
-                    (
-                        *segment_id,
-                        DurableSegmentRecord {
-                            synced: record.synced,
-                            commit: record.commit.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        };
+        let segment_store =
+            DurableSegmentStoreImage::from_inner(primary_config, primary.segment_store.clone());
         (metadata, catalog, segment_store)
     }
 
@@ -12061,6 +12498,122 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restored_after_restart, repeated_blocks(2, 3));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_multi_node_reopens_block_and_native_placements() {
+        let root = durable_temp_dir("multi-node-restart");
+        let cfg = config();
+        let node_ids = vec![
+            cfg.storage_node,
+            StorageNodeId::from_raw(78),
+            StorageNodeId::from_raw(79),
+        ];
+        let store = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+            &root,
+            cfg,
+            node_ids.clone(),
+            DurableDataLogPolicy {
+                target_data_log_bytes: 4096,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        for block in 0..3 {
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, (block + 1) as u8),
+                    WriteDurability::Flushed,
+                )
+                .unwrap();
+        }
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest { name: None })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            )
+            .unwrap();
+        for byte in [4, 5, 6] {
+            let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+            store
+                .append_file(lease, &repeated_blocks(1, byte), WriteDurability::Flushed)
+                .unwrap();
+        }
+        assert_eq!(store.storage_node_ids_for_test(), node_ids);
+        assert_eq!(
+            segment_storage_nodes(
+                &store.local,
+                &device_segment_ids(&store.metadata(), device_id)
+            )
+            .len(),
+            3
+        );
+        assert_eq!(
+            segment_storage_nodes(
+                &store.local,
+                &file_segment_ids(&store.metadata(), keyspace_id, file_id),
+            )
+            .len(),
+            3
+        );
+
+        drop(store);
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        assert_eq!(reopened.storage_node_ids_for_test(), node_ids);
+        let mut device_bytes = vec![0; 3 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut device_bytes)
+            .unwrap();
+        assert_eq!(&device_bytes[0..4096], repeated_blocks(1, 1).as_slice());
+        assert_eq!(&device_bytes[4096..8192], repeated_blocks(1, 2).as_slice());
+        assert_eq!(&device_bytes[8192..12288], repeated_blocks(1, 3).as_slice());
+        let mut file_bytes = vec![0; 3 * 4096];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, 3 * 4096),
+                &mut file_bytes,
+            )
+            .unwrap();
+        assert_eq!(&file_bytes[0..4096], repeated_blocks(1, 4).as_slice());
+        assert_eq!(&file_bytes[4096..8192], repeated_blocks(1, 5).as_slice());
+        assert_eq!(&file_bytes[8192..12288], repeated_blocks(1, 6).as_slice());
+        assert_eq!(
+            segment_storage_nodes(
+                &reopened.local,
+                &device_segment_ids(&reopened.metadata(), device_id),
+            )
+            .len(),
+            3
+        );
+        assert_eq!(
+            segment_storage_nodes(
+                &reopened.local,
+                &file_segment_ids(&reopened.metadata(), keyspace_id, file_id),
+            )
+            .len(),
+            3
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -14128,17 +14681,26 @@ mod tests {
         };
         let store = LocalObjectStore::with_config(cfg).unwrap();
         let head = store.metadata().create_device(device_request()).unwrap();
-        let reservation = SegmentReservation {
-            segment_id: SegmentId::from_raw(500),
-            bytes: 4096,
-        };
-        store
+        let reservation = store
+            .segment_catalog()
+            .reserve_segment(reservation_intent())
+            .unwrap();
+        store.segment_catalog().begin_write(&reservation).unwrap();
+        let commit = store
             .segment_store()
             .write_segment(&reservation, &[7; 4096])
             .unwrap();
         store
             .segment_store()
             .sync_segment(reservation.segment_id)
+            .unwrap();
+        store
+            .segment_catalog()
+            .commit_segment(reservation.clone(), commit)
+            .unwrap();
+        store
+            .segment_catalog()
+            .mark_segment_referenced(reservation.segment_id)
             .unwrap();
 
         let node = MetadataNode {
@@ -16037,6 +16599,180 @@ mod tests {
     }
 
     #[test]
+    fn local_multi_node_placement_spreads_block_and_native_segments_without_api_leaks() {
+        let cfg = config();
+        let node_ids = vec![
+            cfg.storage_node,
+            StorageNodeId::from_raw(78),
+            StorageNodeId::from_raw(79),
+        ];
+        let store = LocalObjectStore::with_storage_nodes(cfg, node_ids.clone()).unwrap();
+        assert_eq!(store.storage_node_ids_for_test(), node_ids);
+
+        let device = store.metadata().create_device(device_request()).unwrap();
+        for block in 0..3 {
+            store
+                .write_device(
+                    device.device_id,
+                    block * 4096,
+                    &repeated_blocks(1, (block + 1) as u8),
+                    WriteDurability::Acknowledged,
+                )
+                .unwrap();
+        }
+        let mut device_bytes = vec![0; 3 * 4096];
+        store
+            .read_device(
+                device.device_id,
+                ByteRange::new(0, 3 * 4096),
+                &mut device_bytes,
+            )
+            .unwrap();
+        assert_eq!(&device_bytes[0..4096], repeated_blocks(1, 1).as_slice());
+        assert_eq!(&device_bytes[4096..8192], repeated_blocks(1, 2).as_slice());
+        assert_eq!(&device_bytes[8192..12288], repeated_blocks(1, 3).as_slice());
+        let device_segments = device_segment_ids(&store.metadata(), device.device_id);
+        assert_eq!(device_segments.len(), 3);
+        assert_eq!(segment_storage_nodes(&store, &device_segments).len(), 3);
+
+        let keyspace = store
+            .metadata()
+            .create_keyspace(MetadataCreateKeyspaceRequest {
+                request: CreateKeyspaceRequest { name: None },
+            })
+            .unwrap();
+        let file = store
+            .metadata()
+            .create_file(MetadataCreateFileRequest {
+                keyspace_id: keyspace.keyspace_id,
+                request: CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            })
+            .unwrap();
+        for byte in [4, 5, 6] {
+            let lease = store
+                .acquire_append_lease(keyspace.keyspace_id, file.file_id)
+                .unwrap();
+            store
+                .append_file(
+                    lease,
+                    &repeated_blocks(1, byte),
+                    WriteDurability::Acknowledged,
+                )
+                .unwrap();
+        }
+        let mut file_bytes = vec![0; 3 * 4096];
+        store
+            .read_file(
+                keyspace.keyspace_id,
+                file.file_id,
+                ByteRange::new(0, 3 * 4096),
+                &mut file_bytes,
+            )
+            .unwrap();
+        assert_eq!(&file_bytes[0..4096], repeated_blocks(1, 4).as_slice());
+        assert_eq!(&file_bytes[4096..8192], repeated_blocks(1, 5).as_slice());
+        assert_eq!(&file_bytes[8192..12288], repeated_blocks(1, 6).as_slice());
+        let file_segments = file_segment_ids(&store.metadata(), keyspace.keyspace_id, file.file_id);
+        assert_eq!(file_segments.len(), 3);
+        assert_eq!(segment_storage_nodes(&store, &file_segments).len(), 3);
+    }
+
+    #[test]
+    fn local_multi_node_custodian_reclaims_released_segments_on_owning_node_only() {
+        let cfg = config();
+        let store = LocalObjectStore::with_storage_nodes(
+            cfg,
+            vec![
+                cfg.storage_node,
+                StorageNodeId::from_raw(78),
+                StorageNodeId::from_raw(79),
+            ],
+        )
+        .unwrap();
+        let device = store.metadata().create_device(device_request()).unwrap();
+        for block in 0..3 {
+            store
+                .write_device(
+                    device.device_id,
+                    block * 4096,
+                    &repeated_blocks(1, (block + 1) as u8),
+                    WriteDurability::Acknowledged,
+                )
+                .unwrap();
+        }
+        let segments = device_segment_ids(&store.metadata(), device.device_id);
+        let released = segments[1];
+        let owner = store
+            .storage_nodes
+            .commit_for_segment(released)
+            .unwrap()
+            .placement
+            .storage_node;
+        let other_nodes: Vec<_> = store
+            .storage_node_ids_for_test()
+            .into_iter()
+            .filter(|node_id| *node_id != owner)
+            .collect();
+
+        store.delete_device(device.device_id).unwrap();
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        assert_eq!(
+            store
+                .segment_catalog_for_node(owner)
+                .unwrap()
+                .state(released)
+                .unwrap(),
+            SegmentLifecycleState::Released
+        );
+        let report = store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        assert!(report.deleted_released_segments.contains(&released));
+        assert!(
+            !store
+                .segment_store_for_node(owner)
+                .unwrap()
+                .contains_segment(released)
+                .unwrap()
+        );
+        for node_id in other_nodes {
+            assert!(
+                !store
+                    .segment_catalog_for_node(node_id)
+                    .unwrap()
+                    .contains_segment(released)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn local_multi_node_registry_rejects_duplicate_segment_ownership() {
+        let cfg = config();
+        let store = LocalObjectStore::with_storage_nodes(
+            cfg,
+            vec![cfg.storage_node, StorageNodeId::from_raw(78)],
+        )
+        .unwrap();
+        let segment_id = SegmentId::from_raw(900);
+        for node_id in [cfg.storage_node, StorageNodeId::from_raw(78)] {
+            store
+                .segment_catalog_for_node(node_id)
+                .unwrap()
+                .reserve_segment_with_id(segment_id, reservation_intent())
+                .unwrap();
+        }
+
+        let error = store
+            .storage_nodes
+            .commit_for_segment(segment_id)
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Corrupt { .. }));
+    }
+
+    #[test]
     fn leaf_entries_can_reference_local_segment_descriptors_for_validation() {
         let store = InMemorySegmentStore::new(config()).unwrap();
         let reservation = SegmentReservation {
@@ -16110,22 +16846,71 @@ mod tests {
     }
 
     fn first_device_segment(store: &DurableObjectStore, device_id: DeviceId) -> SegmentId {
-        store
-            .metadata()
-            .get_head(device_id)
+        device_segment_ids(&store.metadata(), device_id)
+            .into_iter()
+            .next()
             .unwrap()
-            .shard_roots
-            .iter()
-            .find_map(|root| {
-                let node = store.metadata().get_metadata_node(*root).unwrap();
-                match node.kind {
-                    MetadataNodeKind::Leaf { entries } => {
-                        entries.first().map(|entry| entry.segment_id)
-                    }
-                    _ => None,
+    }
+
+    fn device_segment_ids(
+        metadata: &Arc<InMemoryMetadataPlane>,
+        device_id: DeviceId,
+    ) -> Vec<SegmentId> {
+        let mut out = Vec::new();
+        for root in metadata.get_head(device_id).unwrap().shard_roots {
+            collect_tree_segments(metadata, root, &mut out);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn file_segment_ids(
+        metadata: &Arc<InMemoryMetadataPlane>,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Vec<SegmentId> {
+        let mut out = Vec::new();
+        let head = metadata.get_file_head(keyspace_id, file_id).unwrap();
+        collect_tree_segments(metadata, head.root, &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn collect_tree_segments(
+        metadata: &Arc<InMemoryMetadataPlane>,
+        node_id: MetadataNodeId,
+        out: &mut Vec<SegmentId>,
+    ) {
+        let node = metadata.get_metadata_node(node_id).unwrap();
+        match node.kind {
+            MetadataNodeKind::Leaf { entries } => {
+                out.extend(entries.into_iter().map(|entry| entry.segment_id));
+            }
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    collect_tree_segments(metadata, child.node_id, out);
                 }
+            }
+        }
+    }
+
+    fn segment_storage_nodes(
+        store: &LocalObjectStore,
+        segment_ids: &[SegmentId],
+    ) -> BTreeSet<StorageNodeId> {
+        segment_ids
+            .iter()
+            .map(|segment_id| {
+                store
+                    .storage_nodes
+                    .commit_for_segment(*segment_id)
+                    .unwrap()
+                    .placement
+                    .storage_node
             })
-            .unwrap()
+            .collect()
     }
 
     fn read_device_bytes(device: &LocalBlockDevice, blocks: u64) -> Vec<u8> {
