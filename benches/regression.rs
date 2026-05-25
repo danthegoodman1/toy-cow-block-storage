@@ -1,4 +1,5 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use rusqlite::Connection;
 use std::{
     fs,
     hint::black_box,
@@ -1282,6 +1283,7 @@ fn bench_native_concurrent_batches(c: &mut Criterion) {
 }
 
 static NEXT_DURABLE_BENCH_ROOT: AtomicU64 = AtomicU64::new(1);
+const LARGE_DURABLE_HISTORY_WRITES: u64 = 256;
 
 fn durable_bench_config() -> LocalStoreConfig {
     LocalStoreConfig {
@@ -1395,6 +1397,49 @@ fn seed_durable_native_history_with_durability(
             )
             .unwrap();
     }
+}
+
+fn durable_sqlite_operational_row_count(root: &Path) -> i64 {
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    let mut rows = 0;
+    for table in [
+        "store_meta",
+        "data_logs",
+        "segment_placements",
+        "storage_nodes",
+        "device_specs",
+        "device_heads",
+        "deleted_device_heads",
+        "keyspace_heads",
+        "keyspace_roots",
+        "keyspace_catalog_shards",
+        "file_writer_epochs",
+        "metadata_nodes",
+        "commit_groups",
+        "shard_commits",
+        "keyspace_commits",
+        "file_commits",
+        "fork_records",
+        "delete_records",
+        "checkpoints",
+        "metadata_gc_marks",
+        "segment_gc_marks",
+        "segment_records",
+        "segment_catalog_entries",
+    ] {
+        rows += conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+    }
+    rows
+}
+
+fn durable_sqlite_wal_bytes(root: &Path) -> u64 {
+    fs::metadata(root.join("metadata.sqlite-wal"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 fn bench_durable_provider(c: &mut Criterion) {
@@ -1540,6 +1585,182 @@ fn bench_durable_provider(c: &mut Criterion) {
                 black_box(reopened.device_info(device_id).unwrap());
                 drop(reopened);
                 cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("block_flush_after_256_acknowledged_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("block-flush-after-256");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history(&store, device_id, LARGE_DURABLE_HISTORY_WRITES);
+                let started = Instant::now();
+                store.flush_device(black_box(device_id)).unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("open_after_256_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("open-after-256-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    LARGE_DURABLE_HISTORY_WRITES,
+                    WriteDurability::Flushed,
+                );
+                drop(store);
+                let started = Instant::now();
+                let reopened = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let elapsed = started.elapsed();
+                black_box(reopened.device_info(device_id).unwrap());
+                drop(reopened);
+                cleanup_durable_bench_root(&root);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("checkpoint_after_256_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("checkpoint-after-256-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    LARGE_DURABLE_HISTORY_WRITES,
+                    WriteDurability::Flushed,
+                );
+                let started = Instant::now();
+                let checkpoint = store.checkpoint(black_box(device_id)).unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(checkpoint);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("fork_after_256_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("fork-after-256-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    LARGE_DURABLE_HISTORY_WRITES,
+                    WriteDurability::Flushed,
+                );
+                let started = Instant::now();
+                let forked = store
+                    .fork_device(
+                        black_box(device_id),
+                        ForkRequest {
+                            target: None,
+                            name: None,
+                        },
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(forked);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("restore_checkpoint_after_256_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("restore-after-256-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    LARGE_DURABLE_HISTORY_WRITES,
+                    WriteDurability::Flushed,
+                );
+                let checkpoint = store.checkpoint(device_id).unwrap();
+                store
+                    .write_device(device_id, 0, &[9; 4096], WriteDurability::Flushed)
+                    .unwrap();
+                let started = Instant::now();
+                let restored = store
+                    .restore_device(
+                        black_box(device_id),
+                        black_box(RestorePoint::Checkpoint(checkpoint)),
+                    )
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(restored);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("custodian_publish_after_256_deleted_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("custodian-after-256-deleted-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    LARGE_DURABLE_HISTORY_WRITES,
+                    WriteDurability::Flushed,
+                );
+                store.delete_device(device_id).unwrap();
+                let started = Instant::now();
+                let metadata = store
+                    .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+                    .unwrap();
+                let storage = store
+                    .run_storage_node_custodian(&std::collections::BTreeSet::new())
+                    .unwrap();
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box(metadata);
+                black_box(storage);
+                black_box(elapsed)
+            })
+        })
+    });
+
+    group.bench_function("sqlite_rows_and_wal_after_256_block_writes", |b| {
+        b.iter_custom(|iters| {
+            elapsed_durable_iters(iters, || {
+                let root = durable_bench_root("sqlite-rows-wal-after-256-block-writes");
+                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let device_id = create_durable_block_device(&store, 1024);
+                seed_durable_block_history_with_durability(
+                    &store,
+                    device_id,
+                    LARGE_DURABLE_HISTORY_WRITES,
+                    WriteDurability::Flushed,
+                );
+                drop(store);
+                let started = Instant::now();
+                let rows = durable_sqlite_operational_row_count(&root);
+                let wal_bytes = durable_sqlite_wal_bytes(&root);
+                let elapsed = started.elapsed();
+                cleanup_durable_bench_root(&root);
+                black_box((rows, wal_bytes));
                 black_box(elapsed)
             })
         })

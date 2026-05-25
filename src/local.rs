@@ -699,7 +699,7 @@ impl LocalObjectStore {
 
         let reservation = self.write_segment_for_owner_with_intent(
             owner,
-            WriteIntentId::from_raw(lease.lease_id.raw()),
+            self.next_write_intent()?,
             &segment_bytes,
         )?;
         let append_range = crate::api::BlockRange::new(
@@ -1649,6 +1649,47 @@ struct DataLogRow {
     dead_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableExportCursor {
+    config: LocalStoreConfig,
+    next_device_id: u128,
+    next_keyspace_id: u128,
+    next_file_id: u128,
+    next_metadata_node_id: u128,
+    next_keyspace_root_id: u128,
+    next_keyspace_catalog_shard_id: u128,
+    next_commit_group_id: u128,
+    next_commit_seq: u64,
+    next_checkpoint_id: u128,
+    next_gc_epoch: u64,
+    next_write_intent: u128,
+    next_extent_id: u128,
+    next_segment_id: u128,
+    next_placement_index: u64,
+}
+
+impl DurableExportCursor {
+    fn from_image(image: &DurableStoreImage) -> Self {
+        Self {
+            config: image.config,
+            next_device_id: image.metadata.next_device_id,
+            next_keyspace_id: image.metadata.next_keyspace_id,
+            next_file_id: image.metadata.next_file_id,
+            next_metadata_node_id: image.metadata.next_metadata_node_id,
+            next_keyspace_root_id: image.metadata.next_keyspace_root_id,
+            next_keyspace_catalog_shard_id: image.metadata.next_keyspace_catalog_shard_id,
+            next_commit_group_id: image.metadata.next_commit_group_id,
+            next_commit_seq: image.metadata.next_commit_seq,
+            next_checkpoint_id: image.metadata.next_checkpoint_id,
+            next_gc_epoch: image.metadata.next_gc_epoch,
+            next_write_intent: image.next_write_intent,
+            next_extent_id: image.next_extent_id,
+            next_segment_id: image.storage_nodes.next_segment_id,
+            next_placement_index: image.storage_nodes.next_placement_index,
+        }
+    }
+}
+
 const DATA_LOG_MAGIC: &[u8; 8] = b"TCOWDAT!";
 const DATA_LOG_VERSION: u16 = 1;
 const DATA_LOG_HEADER_LEN: usize = 8 + 2 + 16 + 8 + 8;
@@ -1680,9 +1721,23 @@ impl DurableSqliteStore {
     fn initialize_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS current_state (
+            CREATE TABLE IF NOT EXISTS store_meta (
               id INTEGER PRIMARY KEY CHECK (id = 1),
-              state_blob BLOB NOT NULL
+              config BLOB NOT NULL,
+              next_device_id TEXT NOT NULL,
+              next_keyspace_id TEXT NOT NULL,
+              next_file_id TEXT NOT NULL,
+              next_metadata_node_id TEXT NOT NULL,
+              next_keyspace_root_id TEXT NOT NULL,
+              next_keyspace_catalog_shard_id TEXT NOT NULL,
+              next_commit_group_id TEXT NOT NULL,
+              next_commit_seq INTEGER NOT NULL CHECK (next_commit_seq >= 0),
+              next_checkpoint_id TEXT NOT NULL,
+              next_gc_epoch INTEGER NOT NULL CHECK (next_gc_epoch >= 0),
+              next_write_intent TEXT NOT NULL,
+              next_extent_id TEXT NOT NULL,
+              next_segment_id TEXT NOT NULL,
+              next_placement_index INTEGER NOT NULL CHECK (next_placement_index >= 0)
             );
             CREATE TABLE IF NOT EXISTS data_logs (
               log_id INTEGER PRIMARY KEY,
@@ -1707,6 +1762,116 @@ impl DurableSqliteStore {
               ON segment_placements(data_log_id, current);
             CREATE INDEX IF NOT EXISTS idx_data_logs_state_dead
               ON data_logs(state, dead_bytes);
+            CREATE TABLE IF NOT EXISTS storage_nodes (
+              storage_node TEXT PRIMARY KEY,
+              ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+              next_catalog_segment_id TEXT NOT NULL,
+              segment_store_next_offset INTEGER NOT NULL CHECK (segment_store_next_offset >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS device_specs (
+              device_id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS device_heads (
+              device_id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deleted_device_heads (
+              device_id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS keyspace_heads (
+              keyspace_id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS keyspace_roots (
+              root_id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS keyspace_catalog_shards (
+              shard_id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS file_writer_epochs (
+              file_key TEXT PRIMARY KEY,
+              keyspace_id TEXT NOT NULL,
+              file_id TEXT NOT NULL,
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_writer_epochs_file
+              ON file_writer_epochs(keyspace_id, file_id);
+            CREATE TABLE IF NOT EXISTS metadata_nodes (
+              node_id TEXT PRIMARY KEY,
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS commit_groups (
+              commit_group_id TEXT PRIMARY KEY,
+              commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_commit_groups_seq
+              ON commit_groups(commit_seq, commit_group_id);
+            CREATE TABLE IF NOT EXISTS shard_commits (
+              row_key TEXT PRIMARY KEY,
+              commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
+              ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_shard_commits_order
+              ON shard_commits(commit_seq, ordinal);
+            CREATE TABLE IF NOT EXISTS keyspace_commits (
+              row_key TEXT PRIMARY KEY,
+              commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
+              ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_keyspace_commits_order
+              ON keyspace_commits(commit_seq, ordinal);
+            CREATE TABLE IF NOT EXISTS file_commits (
+              row_key TEXT PRIMARY KEY,
+              commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
+              ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_commits_order
+              ON file_commits(commit_seq, ordinal);
+            CREATE TABLE IF NOT EXISTS fork_records (
+              commit_seq INTEGER PRIMARY KEY CHECK (commit_seq >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS delete_records (
+              commit_seq INTEGER PRIMARY KEY CHECK (commit_seq >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+              checkpoint_id TEXT PRIMARY KEY,
+              commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_seq
+              ON checkpoints(commit_seq, checkpoint_id);
+            CREATE TABLE IF NOT EXISTS metadata_gc_marks (
+              node_id TEXT PRIMARY KEY,
+              epoch INTEGER NOT NULL CHECK (epoch >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS segment_gc_marks (
+              segment_id TEXT PRIMARY KEY,
+              epoch INTEGER NOT NULL CHECK (epoch >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS segment_records (
+              segment_id TEXT PRIMARY KEY,
+              storage_node TEXT NOT NULL,
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_segment_records_node
+              ON segment_records(storage_node, segment_id);
+            CREATE TABLE IF NOT EXISTS segment_catalog_entries (
+              segment_id TEXT PRIMARY KEY,
+              storage_node TEXT NOT NULL,
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_segment_catalog_entries_node
+              ON segment_catalog_entries(storage_node, segment_id);
             ",
         )
         .map_err(sqlite_error)
@@ -1714,42 +1879,36 @@ impl DurableSqliteStore {
 
     fn load(&self, expected_config: LocalStoreConfig) -> Result<Option<LocalObjectStore>> {
         let conn = lock(&self.conn)?;
-        let blob: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT state_blob FROM current_state WHERE id = 1",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .map_err(sqlite_error)?;
-        let Some(blob) = blob else {
+        let Some(cursor) = load_export_cursor(&conn)? else {
+            reject_legacy_current_state_if_present(&conn)?;
+            reject_orphan_row_native_rows_if_present(&conn)?;
             return Ok(None);
         };
-        let mut commit = decode_state_commit(&blob)?;
-        if commit.metadata.config != expected_config {
+        if cursor.config != expected_config {
             return Err(StorageError::corrupt(
                 "durable SQLite state disagrees with open config",
             ));
         }
 
-        let mut nodes = BTreeMap::new();
-        for node_id in &commit.storage_nodes.node_order {
-            let node_image = commit
-                .storage_nodes
-                .nodes
-                .remove(node_id)
-                .ok_or_else(|| StorageError::corrupt("storage node image missing"))?;
-            let node_config = expected_config.for_storage_node(*node_id);
-            if node_image.segment_store.config != node_config
-                || node_image.catalog.config != node_config
-            {
-                return Err(StorageError::corrupt(
-                    "durable SQLite storage node config disagrees with open config",
-                ));
-            }
+        let mut metadata = load_metadata_inner(&conn, &cursor)?;
+        let storage_registry_rows = load_storage_node_rows(&conn)?;
+        let node_order: Vec<_> = storage_registry_rows
+            .iter()
+            .map(|row| row.storage_node)
+            .collect();
+        if node_order.is_empty() {
+            return Err(StorageError::corrupt(
+                "durable SQLite store has no storage nodes",
+            ));
+        }
 
+        let mut nodes = BTreeMap::new();
+        for row in storage_registry_rows {
+            let catalog = load_catalog_inner(&conn, row.storage_node, row.next_catalog_segment_id)?;
+            let segment_records =
+                load_durable_segment_records(&conn, row.storage_node, &catalog.entries)?;
             let mut records = BTreeMap::new();
-            for (segment_id, record) in node_image.segment_store.records {
+            for (segment_id, record) in segment_records {
                 let placement = Self::placement_for_segment(&conn, segment_id)?;
                 validate_durable_segment_placement(segment_id, &record, &placement)?;
                 let bytes = self.read_segment_payload(&placement)?;
@@ -1765,46 +1924,56 @@ impl DurableSqliteStore {
             }
 
             nodes.insert(
-                *node_id,
+                row.storage_node,
                 StorageNodeInner {
                     segment_store: SegmentStoreInner {
-                        next_offset: node_image.segment_store.next_offset,
+                        next_offset: row.segment_store_next_offset,
                         segments: records,
                     },
-                    segment_catalog: node_image.catalog.catalog,
+                    segment_catalog: catalog,
                 },
             );
         }
-        if !commit.storage_nodes.nodes.is_empty() {
-            return Err(StorageError::corrupt(
-                "durable SQLite storage registry contains unordered node",
-            ));
-        }
 
-        Ok(Some(LocalObjectStore::from_state_image(
-            DurableStoreImage {
-                config: commit.metadata.config,
-                metadata: commit.metadata.metadata,
-                storage_nodes: StorageNodeRegistryInner {
-                    next_segment_id: commit.storage_nodes.next_segment_id,
-                    next_placement_index: commit.storage_nodes.next_placement_index,
-                    node_order: commit.storage_nodes.node_order,
-                    nodes,
-                },
-                next_write_intent: commit.metadata.next_write_intent,
-                next_extent_id: commit.metadata.next_extent_id,
+        metadata.next_device_id = cursor.next_device_id;
+        metadata.next_keyspace_id = cursor.next_keyspace_id;
+        metadata.next_file_id = cursor.next_file_id;
+        metadata.next_metadata_node_id = cursor.next_metadata_node_id;
+        metadata.next_keyspace_root_id = cursor.next_keyspace_root_id;
+        metadata.next_keyspace_catalog_shard_id = cursor.next_keyspace_catalog_shard_id;
+        metadata.next_commit_group_id = cursor.next_commit_group_id;
+        metadata.next_commit_seq = cursor.next_commit_seq;
+        metadata.next_checkpoint_id = cursor.next_checkpoint_id;
+        metadata.next_gc_epoch = cursor.next_gc_epoch;
+
+        let image = DurableStoreImage {
+            config: cursor.config,
+            metadata,
+            storage_nodes: StorageNodeRegistryInner {
+                next_segment_id: cursor.next_segment_id,
+                next_placement_index: cursor.next_placement_index,
+                node_order,
+                nodes,
             },
-        )?))
+            next_write_intent: cursor.next_write_intent,
+            next_extent_id: cursor.next_extent_id,
+        };
+        validate_row_native_image(&conn, &image)?;
+        Ok(Some(LocalObjectStore::from_state_image(image)?))
     }
 
-    fn persist(&self, image: &DurableStoreImage) -> Result<BTreeSet<SegmentId>> {
+    fn persist(
+        &self,
+        image: &DurableStoreImage,
+        previous_segments: &BTreeSet<SegmentId>,
+    ) -> Result<BTreeSet<SegmentId>> {
         let mut conn = lock(&self.conn)?;
-        let current = current_sqlite_placements(&conn)?;
+        let previous_cursor = load_export_cursor(&conn)?;
         let image_segments = image.storage_nodes.segment_ids();
         let mut new_segments = Vec::new();
         for node in image.storage_nodes.nodes.values() {
             for (segment_id, record) in &node.segment_store.segments {
-                if !current.contains_key(segment_id) {
+                if !previous_segments.contains(segment_id) {
                     new_segments.push((
                         *segment_id,
                         record.commit.placement.storage_node,
@@ -1815,7 +1984,6 @@ impl DurableSqliteStore {
         }
 
         let appended = self.append_segments(&conn, new_segments)?;
-        let state_blob = encode_state_commit(&state_commit_for_image(image))?;
         let tx = conn.transaction().map_err(sqlite_error)?;
         for log in appended.logs.into_values() {
             tx.execute(
@@ -1840,10 +2008,9 @@ impl DurableSqliteStore {
             .map_err(sqlite_error)?;
         }
 
-        for (segment_id, placement) in &current {
-            if !image_segments.contains(segment_id) {
-                mark_placement_dead(&tx, placement)?;
-            }
+        for segment_id in previous_segments.difference(&image_segments) {
+            let placement = Self::placement_for_segment(&tx, *segment_id)?;
+            mark_placement_dead(&tx, &placement)?;
         }
 
         for placement in appended.placements {
@@ -1875,12 +2042,7 @@ impl DurableSqliteStore {
             .map_err(sqlite_error)?;
         }
 
-        tx.execute(
-            "INSERT INTO current_state(id, state_blob) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET state_blob = excluded.state_blob",
-            params![state_blob],
-        )
-        .map_err(sqlite_error)?;
+        persist_row_native_state(&tx, previous_cursor.as_ref(), image)?;
         tx.commit().map_err(sqlite_error)?;
         Ok(image_segments)
     }
@@ -2194,10 +2356,1678 @@ struct PendingDataLogManifest {
     total_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableStorageNodeRow {
+    storage_node: StorageNodeId,
+    ordinal: u64,
+    next_catalog_segment_id: u128,
+    segment_store_next_offset: u64,
+}
+
 #[derive(Debug, Clone)]
 struct DataLogSegmentData {
     segment_id: SegmentId,
     bytes: Vec<u8>,
+}
+
+fn encode_row<T: DurableCodec>(value: &T) -> Result<Vec<u8>> {
+    let mut out = DurableEncoder::default();
+    value.encode(&mut out)?;
+    Ok(out.finish())
+}
+
+fn decode_row<T: DurableCodec>(bytes: &[u8]) -> Result<T> {
+    let mut input = DurableDecoder { bytes, offset: 0 };
+    let value = T::decode(&mut input)?;
+    input.finish()?;
+    Ok(value)
+}
+
+fn load_export_cursor(conn: &Connection) -> Result<Option<DurableExportCursor>> {
+    let row = conn
+        .query_row(
+            "SELECT config, next_device_id, next_keyspace_id, next_file_id,
+                next_metadata_node_id, next_keyspace_root_id,
+                next_keyspace_catalog_shard_id, next_commit_group_id,
+                next_commit_seq, next_checkpoint_id, next_gc_epoch,
+                next_write_intent, next_extent_id, next_segment_id,
+                next_placement_index
+         FROM store_meta
+         WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, i64>(14)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((
+        config,
+        next_device_id,
+        next_keyspace_id,
+        next_file_id,
+        next_metadata_node_id,
+        next_keyspace_root_id,
+        next_keyspace_catalog_shard_id,
+        next_commit_group_id,
+        next_commit_seq,
+        next_checkpoint_id,
+        next_gc_epoch,
+        next_write_intent,
+        next_extent_id,
+        next_segment_id,
+        next_placement_index,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(DurableExportCursor {
+        config: decode_row(&config)?,
+        next_device_id: parse_u128_key(&next_device_id).map_err(sqlite_error)?,
+        next_keyspace_id: parse_u128_key(&next_keyspace_id).map_err(sqlite_error)?,
+        next_file_id: parse_u128_key(&next_file_id).map_err(sqlite_error)?,
+        next_metadata_node_id: parse_u128_key(&next_metadata_node_id).map_err(sqlite_error)?,
+        next_keyspace_root_id: parse_u128_key(&next_keyspace_root_id).map_err(sqlite_error)?,
+        next_keyspace_catalog_shard_id: parse_u128_key(&next_keyspace_catalog_shard_id)
+            .map_err(sqlite_error)?,
+        next_commit_group_id: parse_u128_key(&next_commit_group_id).map_err(sqlite_error)?,
+        next_commit_seq: i64_to_u64(next_commit_seq).map_err(sqlite_error)?,
+        next_checkpoint_id: parse_u128_key(&next_checkpoint_id).map_err(sqlite_error)?,
+        next_gc_epoch: i64_to_u64(next_gc_epoch).map_err(sqlite_error)?,
+        next_write_intent: parse_u128_key(&next_write_intent).map_err(sqlite_error)?,
+        next_extent_id: parse_u128_key(&next_extent_id).map_err(sqlite_error)?,
+        next_segment_id: parse_u128_key(&next_segment_id).map_err(sqlite_error)?,
+        next_placement_index: i64_to_u64(next_placement_index).map_err(sqlite_error)?,
+    }))
+}
+
+fn reject_legacy_current_state_if_present(conn: &Connection) -> Result<()> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'current_state'
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if exists.is_none() {
+        return Ok(());
+    }
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM current_state", [], |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if count > 0 {
+        return Err(StorageError::unsupported(
+            "legacy current_state blob stores are not supported by the row-native provider",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_orphan_row_native_rows_if_present(conn: &Connection) -> Result<()> {
+    for table in [
+        "data_logs",
+        "segment_placements",
+        "storage_nodes",
+        "device_specs",
+        "device_heads",
+        "deleted_device_heads",
+        "keyspace_heads",
+        "keyspace_roots",
+        "keyspace_catalog_shards",
+        "file_writer_epochs",
+        "metadata_nodes",
+        "commit_groups",
+        "shard_commits",
+        "keyspace_commits",
+        "file_commits",
+        "fork_records",
+        "delete_records",
+        "checkpoints",
+        "metadata_gc_marks",
+        "segment_gc_marks",
+        "segment_records",
+        "segment_catalog_entries",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = conn
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(sqlite_error)?;
+        if count > 0 {
+            return Err(StorageError::corrupt(
+                "row-native SQLite rows exist without a durable export cursor",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn persist_row_native_state(
+    tx: &rusqlite::Transaction<'_>,
+    previous_cursor: Option<&DurableExportCursor>,
+    image: &DurableStoreImage,
+) -> Result<()> {
+    let previous_u128 = |cursor_value: fn(&DurableExportCursor) -> u128| {
+        previous_cursor.map(cursor_value).unwrap_or(0)
+    };
+    let previous_u64 = |cursor_value: fn(&DurableExportCursor) -> u64| {
+        previous_cursor.map(cursor_value).unwrap_or(0)
+    };
+    let prune_metadata_history = previous_cursor.is_none()
+        || previous_cursor
+            .is_some_and(|cursor| cursor.next_gc_epoch != image.metadata.next_gc_epoch);
+
+    sync_storage_node_rows(tx, &image.storage_nodes)?;
+    sync_payload_table(
+        tx,
+        "device_specs",
+        "device_id",
+        image
+            .metadata
+            .device_specs
+            .iter()
+            .map(|(id, spec)| Ok((id.raw().to_string(), encode_row(spec)?)))
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    sync_payload_table(
+        tx,
+        "device_heads",
+        "device_id",
+        image
+            .metadata
+            .device_heads
+            .iter()
+            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    sync_payload_table(
+        tx,
+        "deleted_device_heads",
+        "device_id",
+        image
+            .metadata
+            .deleted_device_heads
+            .iter()
+            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    sync_payload_table(
+        tx,
+        "keyspace_heads",
+        "keyspace_id",
+        image
+            .metadata
+            .keyspace_heads
+            .iter()
+            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    sync_u128_payload_map_since(
+        tx,
+        "keyspace_roots",
+        "root_id",
+        &image.metadata.keyspace_roots,
+        |id| id.raw(),
+        previous_u128(|cursor| cursor.next_keyspace_root_id),
+        prune_metadata_history,
+    )?;
+    sync_u128_payload_map_since(
+        tx,
+        "keyspace_catalog_shards",
+        "shard_id",
+        &image.metadata.keyspace_catalog_shards,
+        |id| id.raw(),
+        previous_u128(|cursor| cursor.next_keyspace_catalog_shard_id),
+        prune_metadata_history,
+    )?;
+    sync_file_writer_epochs(tx, &image.metadata.file_writer_epochs)?;
+    sync_u128_payload_map_since(
+        tx,
+        "metadata_nodes",
+        "node_id",
+        &image.metadata.metadata_nodes,
+        |id| id.raw(),
+        previous_u128(|cursor| cursor.next_metadata_node_id),
+        prune_metadata_history,
+    )?;
+    sync_commit_groups_since(
+        tx,
+        &image.metadata.commit_groups,
+        previous_u128(|cursor| cursor.next_commit_group_id),
+        prune_metadata_history,
+    )?;
+    sync_timeline_table_since(
+        tx,
+        "shard_commits",
+        &image.metadata.shard_commits,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        prune_metadata_history,
+    )?;
+    sync_timeline_table_since(
+        tx,
+        "keyspace_commits",
+        &image.metadata.keyspace_commits,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        prune_metadata_history,
+    )?;
+    sync_timeline_table_since(
+        tx,
+        "file_commits",
+        &image.metadata.file_commits,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        prune_metadata_history,
+    )?;
+    sync_commit_seq_payload_table_since(
+        tx,
+        "fork_records",
+        &image.metadata.fork_records,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        prune_metadata_history,
+    )?;
+    sync_commit_seq_payload_table_since(
+        tx,
+        "delete_records",
+        &image.metadata.delete_records,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        prune_metadata_history,
+    )?;
+    sync_checkpoints_since(
+        tx,
+        &image.metadata.checkpoints,
+        previous_u128(|cursor| cursor.next_checkpoint_id),
+        prune_metadata_history,
+    )?;
+    sync_epoch_table(
+        tx,
+        "metadata_gc_marks",
+        "node_id",
+        image
+            .metadata
+            .metadata_last_mark_epoch
+            .iter()
+            .map(|(id, epoch)| (id.raw().to_string(), *epoch))
+            .collect(),
+    )?;
+    sync_epoch_table(
+        tx,
+        "segment_gc_marks",
+        "segment_id",
+        image
+            .metadata
+            .segment_last_mark_epoch
+            .iter()
+            .map(|(id, epoch)| (id.raw().to_string(), *epoch))
+            .collect(),
+    )?;
+    sync_segment_records_since(
+        tx,
+        &image.storage_nodes,
+        previous_u128(|cursor| cursor.next_segment_id),
+    )?;
+    sync_segment_catalog_entries(tx, &image.storage_nodes)?;
+    persist_export_cursor(tx, &DurableExportCursor::from_image(image))
+}
+
+trait DurableTimelineRow: DurableCodec {
+    fn commit_seq_raw(&self) -> u64;
+    fn row_key(&self) -> String;
+}
+
+impl DurableTimelineRow for ShardCommit {
+    fn commit_seq_raw(&self) -> u64 {
+        self.commit_seq.raw()
+    }
+
+    fn row_key(&self) -> String {
+        format!(
+            "{:020}:{}:{}",
+            self.commit_seq.raw(),
+            self.device_id.raw(),
+            self.shard_id.raw()
+        )
+    }
+}
+
+impl DurableTimelineRow for KeyspaceCommit {
+    fn commit_seq_raw(&self) -> u64 {
+        self.commit_seq.raw()
+    }
+
+    fn row_key(&self) -> String {
+        format!("{:020}:{}", self.commit_seq.raw(), self.keyspace_id.raw())
+    }
+}
+
+impl DurableTimelineRow for FileCommit {
+    fn commit_seq_raw(&self) -> u64 {
+        self.commit_seq.raw()
+    }
+
+    fn row_key(&self) -> String {
+        format!(
+            "{:020}:{}:{}",
+            self.commit_seq.raw(),
+            self.keyspace_id.raw(),
+            self.file_id.raw()
+        )
+    }
+}
+
+fn persist_export_cursor(
+    tx: &rusqlite::Transaction<'_>,
+    cursor: &DurableExportCursor,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO store_meta(
+           id, config, next_device_id, next_keyspace_id, next_file_id,
+           next_metadata_node_id, next_keyspace_root_id,
+           next_keyspace_catalog_shard_id, next_commit_group_id,
+           next_commit_seq, next_checkpoint_id, next_gc_epoch,
+           next_write_intent, next_extent_id, next_segment_id,
+           next_placement_index
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                   ?12, ?13, ?14, ?15)
+         ON CONFLICT(id) DO UPDATE SET
+           config = excluded.config,
+           next_device_id = excluded.next_device_id,
+           next_keyspace_id = excluded.next_keyspace_id,
+           next_file_id = excluded.next_file_id,
+           next_metadata_node_id = excluded.next_metadata_node_id,
+           next_keyspace_root_id = excluded.next_keyspace_root_id,
+           next_keyspace_catalog_shard_id = excluded.next_keyspace_catalog_shard_id,
+           next_commit_group_id = excluded.next_commit_group_id,
+           next_commit_seq = excluded.next_commit_seq,
+           next_checkpoint_id = excluded.next_checkpoint_id,
+           next_gc_epoch = excluded.next_gc_epoch,
+           next_write_intent = excluded.next_write_intent,
+           next_extent_id = excluded.next_extent_id,
+           next_segment_id = excluded.next_segment_id,
+           next_placement_index = excluded.next_placement_index",
+        params![
+            encode_row(&cursor.config)?,
+            cursor.next_device_id.to_string(),
+            cursor.next_keyspace_id.to_string(),
+            cursor.next_file_id.to_string(),
+            cursor.next_metadata_node_id.to_string(),
+            cursor.next_keyspace_root_id.to_string(),
+            cursor.next_keyspace_catalog_shard_id.to_string(),
+            cursor.next_commit_group_id.to_string(),
+            u64_to_i64(cursor.next_commit_seq)?,
+            cursor.next_checkpoint_id.to_string(),
+            u64_to_i64(cursor.next_gc_epoch)?,
+            cursor.next_write_intent.to_string(),
+            cursor.next_extent_id.to_string(),
+            cursor.next_segment_id.to_string(),
+            u64_to_i64(cursor.next_placement_index)?,
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn sync_storage_node_rows(
+    tx: &rusqlite::Transaction<'_>,
+    registry: &StorageNodeRegistryInner,
+) -> Result<()> {
+    let desired: BTreeMap<String, DurableStorageNodeRow> = registry
+        .node_order
+        .iter()
+        .enumerate()
+        .map(|(ordinal, node_id)| {
+            let node = registry.nodes.get(node_id).ok_or_else(|| {
+                StorageError::corrupt("storage node order references missing node")
+            })?;
+            let ordinal = u64::try_from(ordinal).map_err(|_| {
+                StorageError::invalid_argument("storage node ordinal overflows u64")
+            })?;
+            Ok((
+                node_id.raw().to_string(),
+                DurableStorageNodeRow {
+                    storage_node: *node_id,
+                    ordinal,
+                    next_catalog_segment_id: node.segment_catalog.next_segment_id,
+                    segment_store_next_offset: node.segment_store.next_offset,
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
+    delete_missing_text_keys(tx, "storage_nodes", "storage_node", desired.keys())?;
+    for row in desired.values() {
+        tx.execute(
+            "INSERT INTO storage_nodes(
+               storage_node, ordinal, next_catalog_segment_id, segment_store_next_offset
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(storage_node) DO UPDATE SET
+               ordinal = excluded.ordinal,
+               next_catalog_segment_id = excluded.next_catalog_segment_id,
+               segment_store_next_offset = excluded.segment_store_next_offset
+             WHERE ordinal != excluded.ordinal
+                OR next_catalog_segment_id != excluded.next_catalog_segment_id
+                OR segment_store_next_offset != excluded.segment_store_next_offset",
+            params![
+                storage_node_key(row.storage_node),
+                u64_to_i64(row.ordinal)?,
+                row.next_catalog_segment_id.to_string(),
+                u64_to_i64(row.segment_store_next_offset)?,
+            ],
+        )
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_payload_table(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_col: &str,
+    rows: Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    let desired: BTreeMap<String, Vec<u8>> = rows.into_iter().collect();
+    delete_missing_text_keys(tx, table, key_col, desired.keys())?;
+    let sql = format!(
+        "INSERT INTO {table}({key_col}, payload) VALUES (?1, ?2)
+         ON CONFLICT({key_col}) DO UPDATE SET payload = excluded.payload
+         WHERE payload != excluded.payload"
+    );
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    for (key, payload) in desired {
+        stmt.execute(params![key, payload]).map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_u128_payload_map_since<K, V>(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_col: &str,
+    rows: &BTreeMap<K, V>,
+    raw_key: impl Fn(K) -> u128,
+    previous_next_id: u128,
+    prune_missing: bool,
+) -> Result<()>
+where
+    K: Copy + Ord,
+    V: DurableCodec,
+{
+    if prune_missing {
+        let desired: Vec<String> = rows.keys().map(|id| raw_key(*id).to_string()).collect();
+        delete_missing_text_keys(tx, table, key_col, desired.iter())?;
+    }
+    let sql = format!(
+        "INSERT INTO {table}({key_col}, payload) VALUES (?1, ?2)
+         ON CONFLICT({key_col}) DO UPDATE SET payload = excluded.payload
+         WHERE payload != excluded.payload"
+    );
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    for (id, payload) in rows {
+        let raw = raw_key(*id);
+        if raw < previous_next_id {
+            continue;
+        }
+        stmt.execute(params![raw.to_string(), encode_row(payload)?])
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_file_writer_epochs(
+    tx: &rusqlite::Transaction<'_>,
+    epochs: &BTreeMap<(KeyspaceId, FileId), WriterEpoch>,
+) -> Result<()> {
+    let desired: BTreeMap<String, (KeyspaceId, FileId, Vec<u8>)> = epochs
+        .iter()
+        .map(|((keyspace_id, file_id), epoch)| {
+            Ok((
+                file_writer_key(*keyspace_id, *file_id),
+                (*keyspace_id, *file_id, encode_row(epoch)?),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    delete_missing_text_keys(tx, "file_writer_epochs", "file_key", desired.keys())?;
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO file_writer_epochs(file_key, keyspace_id, file_id, payload)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_key) DO UPDATE SET
+               keyspace_id = excluded.keyspace_id,
+               file_id = excluded.file_id,
+               payload = excluded.payload
+             WHERE keyspace_id != excluded.keyspace_id
+                OR file_id != excluded.file_id
+                OR payload != excluded.payload",
+        )
+        .map_err(sqlite_error)?;
+    for (key, (keyspace_id, file_id, payload)) in desired {
+        stmt.execute(params![
+            key,
+            keyspace_id.raw().to_string(),
+            file_id.raw().to_string(),
+            payload,
+        ])
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_commit_groups_since(
+    tx: &rusqlite::Transaction<'_>,
+    groups: &BTreeMap<CommitGroupId, CommitGroup>,
+    previous_next_id: u128,
+    prune_missing: bool,
+) -> Result<()> {
+    if prune_missing {
+        let desired: Vec<String> = groups.keys().map(|id| id.raw().to_string()).collect();
+        delete_missing_text_keys(tx, "commit_groups", "commit_group_id", desired.iter())?;
+    }
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO commit_groups(commit_group_id, commit_seq, payload)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(commit_group_id) DO UPDATE SET
+               commit_seq = excluded.commit_seq,
+               payload = excluded.payload
+             WHERE commit_seq != excluded.commit_seq
+                OR payload != excluded.payload",
+        )
+        .map_err(sqlite_error)?;
+    for (id, group) in groups {
+        if id.raw() < previous_next_id {
+            continue;
+        }
+        stmt.execute(params![
+            id.raw().to_string(),
+            u64_to_i64(group.commit_seq.raw())?,
+            encode_row(group)?,
+        ])
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_timeline_table_since<T: DurableTimelineRow>(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    rows: &[T],
+    previous_next_commit_seq: u64,
+    prune_missing: bool,
+) -> Result<()> {
+    if prune_missing {
+        let desired: Vec<String> = rows.iter().map(DurableTimelineRow::row_key).collect();
+        delete_missing_text_keys(tx, table, "row_key", desired.iter())?;
+    }
+    let sql = format!(
+        "INSERT INTO {table}(row_key, commit_seq, ordinal, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(row_key) DO UPDATE SET
+           commit_seq = excluded.commit_seq,
+           ordinal = excluded.ordinal,
+           payload = excluded.payload
+         WHERE commit_seq != excluded.commit_seq
+            OR ordinal != excluded.ordinal
+            OR payload != excluded.payload"
+    );
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    for (ordinal, row) in rows.iter().enumerate() {
+        if row.commit_seq_raw() < previous_next_commit_seq {
+            continue;
+        }
+        let ordinal = u64::try_from(ordinal)
+            .map_err(|_| StorageError::invalid_argument("timeline ordinal overflows u64"))?;
+        stmt.execute(params![
+            row.row_key(),
+            u64_to_i64(row.commit_seq_raw())?,
+            u64_to_i64(ordinal)?,
+            encode_row(row)?,
+        ])
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_commit_seq_payload_table_since<T: DurableCodec>(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    rows: &BTreeMap<CommitSeq, T>,
+    previous_next_commit_seq: u64,
+    prune_missing: bool,
+) -> Result<()> {
+    if prune_missing {
+        delete_missing_u64_keys(tx, table, "commit_seq", rows.keys().map(|seq| seq.raw()))?;
+    }
+    let sql = format!(
+        "INSERT INTO {table}(commit_seq, payload) VALUES (?1, ?2)
+         ON CONFLICT(commit_seq) DO UPDATE SET payload = excluded.payload
+         WHERE payload != excluded.payload"
+    );
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    for (commit_seq, payload) in rows {
+        if commit_seq.raw() < previous_next_commit_seq {
+            continue;
+        }
+        stmt.execute(params![u64_to_i64(commit_seq.raw())?, encode_row(payload)?])
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_checkpoints_since(
+    tx: &rusqlite::Transaction<'_>,
+    checkpoints: &BTreeMap<CheckpointId, Checkpoint>,
+    previous_next_id: u128,
+    prune_missing: bool,
+) -> Result<()> {
+    if prune_missing {
+        let desired: Vec<String> = checkpoints.keys().map(|id| id.raw().to_string()).collect();
+        delete_missing_text_keys(tx, "checkpoints", "checkpoint_id", desired.iter())?;
+    }
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO checkpoints(checkpoint_id, commit_seq, payload)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(checkpoint_id) DO UPDATE SET
+               commit_seq = excluded.commit_seq,
+               payload = excluded.payload
+             WHERE commit_seq != excluded.commit_seq
+                OR payload != excluded.payload",
+        )
+        .map_err(sqlite_error)?;
+    for (id, checkpoint) in checkpoints {
+        if id.raw() < previous_next_id {
+            continue;
+        }
+        stmt.execute(params![
+            id.raw().to_string(),
+            u64_to_i64(checkpoint.commit_seq.raw())?,
+            encode_row(checkpoint)?,
+        ])
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_epoch_table(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_col: &str,
+    rows: BTreeMap<String, u64>,
+) -> Result<()> {
+    delete_missing_text_keys(tx, table, key_col, rows.keys())?;
+    let sql = format!(
+        "INSERT INTO {table}({key_col}, epoch) VALUES (?1, ?2)
+         ON CONFLICT({key_col}) DO UPDATE SET epoch = excluded.epoch
+         WHERE epoch != excluded.epoch"
+    );
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    for (key, epoch) in rows {
+        stmt.execute(params![key, u64_to_i64(epoch)?])
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_segment_records_since(
+    tx: &rusqlite::Transaction<'_>,
+    registry: &StorageNodeRegistryInner,
+    previous_next_segment_id: u128,
+) -> Result<()> {
+    let mut desired = BTreeMap::new();
+    for (node_id, node) in &registry.nodes {
+        for (segment_id, record) in &node.segment_store.segments {
+            desired.insert(
+                segment_id.raw().to_string(),
+                (
+                    *segment_id,
+                    *node_id,
+                    DurableSegmentRecord {
+                        synced: record.synced,
+                        commit: record.commit.clone(),
+                    },
+                ),
+            );
+        }
+    }
+    delete_missing_text_keys(tx, "segment_records", "segment_id", desired.keys())?;
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO segment_records(segment_id, storage_node, payload)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(segment_id) DO UPDATE SET
+               storage_node = excluded.storage_node,
+               payload = excluded.payload
+             WHERE storage_node != excluded.storage_node
+                OR payload != excluded.payload",
+        )
+        .map_err(sqlite_error)?;
+    for (segment_id, (raw_segment_id, storage_node, payload)) in desired {
+        if raw_segment_id.raw() < previous_next_segment_id {
+            continue;
+        }
+        stmt.execute(params![
+            segment_id,
+            storage_node_key(storage_node),
+            encode_row(&payload)?,
+        ])
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn sync_segment_catalog_entries(
+    tx: &rusqlite::Transaction<'_>,
+    registry: &StorageNodeRegistryInner,
+) -> Result<()> {
+    let mut desired = BTreeMap::new();
+    for (node_id, node) in &registry.nodes {
+        for (segment_id, entry) in &node.segment_catalog.entries {
+            desired.insert(segment_id.raw().to_string(), (*node_id, encode_row(entry)?));
+        }
+    }
+    delete_missing_text_keys(tx, "segment_catalog_entries", "segment_id", desired.keys())?;
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO segment_catalog_entries(segment_id, storage_node, payload)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(segment_id) DO UPDATE SET
+               storage_node = excluded.storage_node,
+               payload = excluded.payload
+             WHERE storage_node != excluded.storage_node
+                OR payload != excluded.payload",
+        )
+        .map_err(sqlite_error)?;
+    for (segment_id, (storage_node, payload)) in desired {
+        stmt.execute(params![segment_id, storage_node_key(storage_node), payload])
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn existing_text_keys(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_col: &str,
+) -> Result<BTreeSet<String>> {
+    let sql = format!("SELECT {key_col} FROM {table}");
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = BTreeSet::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        out.insert(row.get(0).map_err(sqlite_error)?);
+    }
+    Ok(out)
+}
+
+fn delete_missing_text_keys<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_col: &str,
+    desired: impl IntoIterator<Item = &'a String>,
+) -> Result<()> {
+    let desired: BTreeSet<String> = desired.into_iter().cloned().collect();
+    let existing = existing_text_keys(tx, table, key_col)?;
+    let sql = format!("DELETE FROM {table} WHERE {key_col} = ?1");
+    for key in existing.difference(&desired) {
+        tx.execute(&sql, params![key]).map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn delete_missing_u64_keys(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_col: &str,
+    desired: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    let desired: BTreeSet<u64> = desired.into_iter().collect();
+    let sql = format!("SELECT {key_col} FROM {table}");
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut existing = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let raw: i64 = row.get(0).map_err(sqlite_error)?;
+        existing.push(i64_to_u64(raw).map_err(sqlite_error)?);
+    }
+    let sql = format!("DELETE FROM {table} WHERE {key_col} = ?1");
+    for key in existing {
+        if !desired.contains(&key) {
+            tx.execute(&sql, params![u64_to_i64(key)?])
+                .map_err(sqlite_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn load_storage_node_rows(conn: &Connection) -> Result<Vec<DurableStorageNodeRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT storage_node, ordinal, next_catalog_segment_id,
+                    segment_store_next_offset
+             FROM storage_nodes
+             ORDER BY ordinal",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let storage_node: String = row.get(0).map_err(sqlite_error)?;
+        let next_catalog_segment_id: String = row.get(2).map_err(sqlite_error)?;
+        let storage_node =
+            StorageNodeId::from_raw(parse_u128_key(&storage_node).map_err(sqlite_error)?);
+        if !seen.insert(storage_node) {
+            return Err(StorageError::corrupt("duplicate storage node row"));
+        }
+        out.push(DurableStorageNodeRow {
+            storage_node,
+            ordinal: i64_to_u64(row.get(1).map_err(sqlite_error)?).map_err(sqlite_error)?,
+            next_catalog_segment_id: parse_u128_key(&next_catalog_segment_id)
+                .map_err(sqlite_error)?,
+            segment_store_next_offset: i64_to_u64(row.get(3).map_err(sqlite_error)?)
+                .map_err(sqlite_error)?,
+        });
+    }
+    for (index, row) in out.iter().enumerate() {
+        if row.ordinal
+            != u64::try_from(index)
+                .map_err(|_| StorageError::corrupt("storage node ordinal overflows u64"))?
+        {
+            return Err(StorageError::corrupt(
+                "storage node ordinals are not contiguous",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn load_metadata_inner(conn: &Connection, cursor: &DurableExportCursor) -> Result<MetadataInner> {
+    let mut metadata = MetadataInner::new();
+    metadata.next_device_id = cursor.next_device_id;
+    metadata.next_keyspace_id = cursor.next_keyspace_id;
+    metadata.next_file_id = cursor.next_file_id;
+    metadata.next_metadata_node_id = cursor.next_metadata_node_id;
+    metadata.next_keyspace_root_id = cursor.next_keyspace_root_id;
+    metadata.next_keyspace_catalog_shard_id = cursor.next_keyspace_catalog_shard_id;
+    metadata.next_commit_group_id = cursor.next_commit_group_id;
+    metadata.next_commit_seq = cursor.next_commit_seq;
+    metadata.next_checkpoint_id = cursor.next_checkpoint_id;
+    metadata.next_gc_epoch = cursor.next_gc_epoch;
+    metadata.device_specs = load_device_specs(conn)?;
+    metadata.device_heads = load_device_heads(conn, "device_heads")?;
+    metadata.deleted_device_heads = load_device_heads(conn, "deleted_device_heads")?;
+    metadata.keyspace_heads = load_keyspace_heads(conn)?;
+    metadata.keyspace_roots = load_keyspace_roots(conn)?;
+    metadata.keyspace_catalog_shards = load_keyspace_catalog_shards(conn)?;
+    metadata.file_writer_epochs = load_file_writer_epochs(conn)?;
+    metadata.metadata_nodes = load_metadata_nodes(conn)?;
+    metadata.commit_groups = load_commit_groups(conn)?;
+    metadata.shard_commits = load_timeline_rows(conn, "shard_commits")?;
+    metadata.keyspace_commits = load_timeline_rows(conn, "keyspace_commits")?;
+    metadata.file_commits = load_timeline_rows(conn, "file_commits")?;
+    metadata.fork_records = load_commit_seq_payload_map(conn, "fork_records")?;
+    metadata.delete_records = load_commit_seq_payload_map(conn, "delete_records")?;
+    metadata.checkpoints = load_checkpoints(conn)?;
+    metadata.metadata_last_mark_epoch = load_metadata_gc_marks(conn)?;
+    metadata.segment_last_mark_epoch = load_segment_gc_marks(conn)?;
+    Ok(metadata)
+}
+
+fn load_payload_rows(
+    conn: &Connection,
+    table: &str,
+    key_col: &str,
+    order_by: &str,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let sql = format!("SELECT {key_col}, payload FROM {table} ORDER BY {order_by}");
+    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        out.push((
+            row.get(0).map_err(sqlite_error)?,
+            row.get(1).map_err(sqlite_error)?,
+        ));
+    }
+    Ok(out)
+}
+
+fn load_device_specs(conn: &Connection) -> Result<BTreeMap<DeviceId, crate::api::DeviceSpec>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in load_payload_rows(conn, "device_specs", "device_id", "device_id")? {
+        let id = DeviceId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let spec = decode_row(&payload)?;
+        if out.insert(id, spec).is_some() {
+            return Err(StorageError::corrupt("duplicate device spec row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_device_heads(conn: &Connection, table: &str) -> Result<BTreeMap<DeviceId, DeviceHead>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in load_payload_rows(conn, table, "device_id", "device_id")? {
+        let id = DeviceId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let head: DeviceHead = decode_row(&payload)?;
+        if head.device_id != id {
+            return Err(StorageError::corrupt(
+                "device head row key disagrees with payload",
+            ));
+        }
+        if out.insert(id, head).is_some() {
+            return Err(StorageError::corrupt("duplicate device head row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_keyspace_heads(conn: &Connection) -> Result<BTreeMap<KeyspaceId, KeyspaceHead>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in load_payload_rows(conn, "keyspace_heads", "keyspace_id", "keyspace_id")? {
+        let id = KeyspaceId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let head: KeyspaceHead = decode_row(&payload)?;
+        if head.keyspace_id != id {
+            return Err(StorageError::corrupt(
+                "keyspace head row key disagrees with payload",
+            ));
+        }
+        if out.insert(id, head).is_some() {
+            return Err(StorageError::corrupt("duplicate keyspace head row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_keyspace_roots(conn: &Connection) -> Result<BTreeMap<KeyspaceRootId, KeyspaceRoot>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in load_payload_rows(conn, "keyspace_roots", "root_id", "root_id")? {
+        let id = KeyspaceRootId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let root: KeyspaceRoot = decode_row(&payload)?;
+        if root.root_id != id {
+            return Err(StorageError::corrupt(
+                "keyspace root row key disagrees with payload",
+            ));
+        }
+        if out.insert(id, root).is_some() {
+            return Err(StorageError::corrupt("duplicate keyspace root row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_keyspace_catalog_shards(
+    conn: &Connection,
+) -> Result<BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in
+        load_payload_rows(conn, "keyspace_catalog_shards", "shard_id", "shard_id")?
+    {
+        let id = KeyspaceCatalogShardId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let shard: KeyspaceCatalogShard = decode_row(&payload)?;
+        if shard.shard_id != id {
+            return Err(StorageError::corrupt(
+                "keyspace catalog shard row key disagrees with payload",
+            ));
+        }
+        if out.insert(id, shard).is_some() {
+            return Err(StorageError::corrupt(
+                "duplicate keyspace catalog shard row",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn load_file_writer_epochs(
+    conn: &Connection,
+) -> Result<BTreeMap<(KeyspaceId, FileId), WriterEpoch>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_key, keyspace_id, file_id, payload
+             FROM file_writer_epochs
+             ORDER BY keyspace_id, file_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let file_key: String = row.get(0).map_err(sqlite_error)?;
+        let keyspace_id: String = row.get(1).map_err(sqlite_error)?;
+        let file_id: String = row.get(2).map_err(sqlite_error)?;
+        let keyspace_id = KeyspaceId::from_raw(parse_u128_key(&keyspace_id).map_err(sqlite_error)?);
+        let file_id = FileId::from_raw(parse_u128_key(&file_id).map_err(sqlite_error)?);
+        if file_key != file_writer_key(keyspace_id, file_id) {
+            return Err(StorageError::corrupt(
+                "file writer epoch key is inconsistent",
+            ));
+        }
+        let payload: Vec<u8> = row.get(3).map_err(sqlite_error)?;
+        let epoch = decode_row(&payload)?;
+        if out.insert((keyspace_id, file_id), epoch).is_some() {
+            return Err(StorageError::corrupt("duplicate file writer epoch row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_metadata_nodes(conn: &Connection) -> Result<BTreeMap<MetadataNodeId, MetadataNode>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in load_payload_rows(conn, "metadata_nodes", "node_id", "node_id")? {
+        let id = MetadataNodeId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let node: MetadataNode = decode_row(&payload)?;
+        if node.node_id != id {
+            return Err(StorageError::corrupt(
+                "metadata node row key disagrees with payload",
+            ));
+        }
+        if out.insert(id, node).is_some() {
+            return Err(StorageError::corrupt("duplicate metadata node row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_commit_groups(conn: &Connection) -> Result<BTreeMap<CommitGroupId, CommitGroup>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in load_payload_rows(
+        conn,
+        "commit_groups",
+        "commit_group_id",
+        "commit_seq, commit_group_id",
+    )? {
+        let id = CommitGroupId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let group: CommitGroup = decode_row(&payload)?;
+        if group.commit_group != id {
+            return Err(StorageError::corrupt(
+                "commit group row key disagrees with payload",
+            ));
+        }
+        if out.insert(id, group).is_some() {
+            return Err(StorageError::corrupt("duplicate commit group row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_timeline_rows<T: DurableTimelineRow>(conn: &Connection, table: &str) -> Result<Vec<T>> {
+    let sql = format!("SELECT payload FROM {table} ORDER BY commit_seq, ordinal");
+    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    let mut last_commit_seq = None;
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let payload: Vec<u8> = row.get(0).map_err(sqlite_error)?;
+        let record: T = decode_row(&payload)?;
+        if let Some(last) = last_commit_seq {
+            if record.commit_seq_raw() < last {
+                return Err(StorageError::corrupt("timeline rows are not monotonic"));
+            }
+        }
+        last_commit_seq = Some(record.commit_seq_raw());
+        out.push(record);
+    }
+    Ok(out)
+}
+
+fn load_commit_seq_payload_map<T: DurableCodec>(
+    conn: &Connection,
+    table: &str,
+) -> Result<BTreeMap<CommitSeq, T>> {
+    let sql = format!("SELECT commit_seq, payload FROM {table} ORDER BY commit_seq");
+    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let seq = CommitSeq::from_raw(
+            i64_to_u64(row.get(0).map_err(sqlite_error)?).map_err(sqlite_error)?,
+        );
+        let payload: Vec<u8> = row.get(1).map_err(sqlite_error)?;
+        let record = decode_row(&payload)?;
+        if out.insert(seq, record).is_some() {
+            return Err(StorageError::corrupt("duplicate commit-seq row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_checkpoints(conn: &Connection) -> Result<BTreeMap<CheckpointId, Checkpoint>> {
+    let mut out = BTreeMap::new();
+    for (key, payload) in load_payload_rows(conn, "checkpoints", "checkpoint_id", "commit_seq")? {
+        let id = CheckpointId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
+        let checkpoint: Checkpoint = decode_row(&payload)?;
+        if checkpoint.checkpoint_id != id {
+            return Err(StorageError::corrupt(
+                "checkpoint row key disagrees with payload",
+            ));
+        }
+        if out.insert(id, checkpoint).is_some() {
+            return Err(StorageError::corrupt("duplicate checkpoint row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_metadata_gc_marks(conn: &Connection) -> Result<BTreeMap<MetadataNodeId, u64>> {
+    let rows = load_epoch_rows(conn, "metadata_gc_marks", "node_id")?;
+    let mut out = BTreeMap::new();
+    for (key, epoch) in rows {
+        out.insert(
+            MetadataNodeId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?),
+            epoch,
+        );
+    }
+    Ok(out)
+}
+
+fn load_segment_gc_marks(conn: &Connection) -> Result<BTreeMap<SegmentId, u64>> {
+    let rows = load_epoch_rows(conn, "segment_gc_marks", "segment_id")?;
+    let mut out = BTreeMap::new();
+    for (key, epoch) in rows {
+        out.insert(
+            SegmentId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?),
+            epoch,
+        );
+    }
+    Ok(out)
+}
+
+fn load_epoch_rows(conn: &Connection, table: &str, key_col: &str) -> Result<Vec<(String, u64)>> {
+    let sql = format!("SELECT {key_col}, epoch FROM {table} ORDER BY {key_col}");
+    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        out.push((
+            row.get(0).map_err(sqlite_error)?,
+            i64_to_u64(row.get(1).map_err(sqlite_error)?).map_err(sqlite_error)?,
+        ));
+    }
+    Ok(out)
+}
+
+fn load_catalog_inner(
+    conn: &Connection,
+    storage_node: StorageNodeId,
+    next_segment_id: u128,
+) -> Result<CatalogInner> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT segment_id, payload
+             FROM segment_catalog_entries
+             WHERE storage_node = ?1
+             ORDER BY segment_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt
+        .query(params![storage_node_key(storage_node)])
+        .map_err(sqlite_error)?;
+    let mut entries = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let segment_id: String = row.get(0).map_err(sqlite_error)?;
+        let segment_id = SegmentId::from_raw(parse_u128_key(&segment_id).map_err(sqlite_error)?);
+        let payload: Vec<u8> = row.get(1).map_err(sqlite_error)?;
+        let entry: CatalogEntry = decode_row(&payload)?;
+        if entry.reservation.segment_id != segment_id {
+            return Err(StorageError::corrupt(
+                "segment catalog row key disagrees with payload",
+            ));
+        }
+        if entry
+            .commit
+            .as_ref()
+            .map(|commit| commit.placement.storage_node)
+            != entry.commit.as_ref().map(|_| storage_node)
+        {
+            return Err(StorageError::corrupt(
+                "segment catalog commit storage node disagrees with row",
+            ));
+        }
+        if entries.insert(segment_id, entry).is_some() {
+            return Err(StorageError::corrupt("duplicate segment catalog row"));
+        }
+    }
+    Ok(CatalogInner {
+        next_segment_id,
+        entries,
+    })
+}
+
+fn load_durable_segment_records(
+    conn: &Connection,
+    storage_node: StorageNodeId,
+    catalog: &BTreeMap<SegmentId, CatalogEntry>,
+) -> Result<BTreeMap<SegmentId, DurableSegmentRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT segment_id, payload
+             FROM segment_records
+             WHERE storage_node = ?1
+             ORDER BY segment_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt
+        .query(params![storage_node_key(storage_node)])
+        .map_err(sqlite_error)?;
+    let mut records = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let segment_id: String = row.get(0).map_err(sqlite_error)?;
+        let segment_id = SegmentId::from_raw(parse_u128_key(&segment_id).map_err(sqlite_error)?);
+        let payload: Vec<u8> = row.get(1).map_err(sqlite_error)?;
+        let record: DurableSegmentRecord = decode_row(&payload)?;
+        if record.commit.placement.storage_node != storage_node {
+            return Err(StorageError::corrupt(
+                "segment record storage node disagrees with row",
+            ));
+        }
+        let catalog_entry = catalog
+            .get(&segment_id)
+            .ok_or_else(|| StorageError::corrupt("segment record exists without catalog entry"))?;
+        if catalog_entry.commit.as_ref() != Some(&record.commit) {
+            return Err(StorageError::corrupt(
+                "segment record disagrees with catalog commit",
+            ));
+        }
+        if records.insert(segment_id, record).is_some() {
+            return Err(StorageError::corrupt("duplicate segment record row"));
+        }
+    }
+    Ok(records)
+}
+
+fn validate_row_native_image(conn: &Connection, image: &DurableStoreImage) -> Result<()> {
+    validate_row_native_cursors(image)?;
+    let descriptors = row_native_segment_descriptors(image);
+    for (device_id, head) in &image.metadata.device_heads {
+        if *device_id != head.device_id {
+            return Err(StorageError::corrupt("live device head key mismatch"));
+        }
+        head.validate(image.config.shard_count)?;
+        if !image.metadata.device_specs.contains_key(device_id) {
+            return Err(StorageError::corrupt("live device head missing spec"));
+        }
+        for root in &head.shard_roots {
+            if !image.metadata.metadata_nodes.contains_key(root) {
+                return Err(StorageError::corrupt("live device head root missing"));
+            }
+        }
+    }
+    for (device_id, head) in &image.metadata.deleted_device_heads {
+        if *device_id != head.device_id {
+            return Err(StorageError::corrupt("deleted device head key mismatch"));
+        }
+        head.validate(image.config.shard_count)?;
+        if !image.metadata.device_specs.contains_key(device_id) {
+            return Err(StorageError::corrupt("deleted device head missing spec"));
+        }
+        for root in &head.shard_roots {
+            if !image.metadata.metadata_nodes.contains_key(root) {
+                return Err(StorageError::corrupt("deleted device head root missing"));
+            }
+        }
+    }
+    for (keyspace_id, head) in &image.metadata.keyspace_heads {
+        if *keyspace_id != head.keyspace_id {
+            return Err(StorageError::corrupt("keyspace head key mismatch"));
+        }
+        if !image.metadata.keyspace_roots.contains_key(&head.root) {
+            return Err(StorageError::corrupt("keyspace head root missing"));
+        }
+    }
+    for root in image.metadata.keyspace_roots.values() {
+        root.validate()?;
+        for shard_id in &root.shard_roots {
+            if !image
+                .metadata
+                .keyspace_catalog_shards
+                .contains_key(shard_id)
+            {
+                return Err(StorageError::corrupt("keyspace root shard missing"));
+            }
+        }
+    }
+    for shard in image.metadata.keyspace_catalog_shards.values() {
+        shard.validate()?;
+        for entry in shard.files.values() {
+            if !image.metadata.metadata_nodes.contains_key(&entry.head.root) {
+                return Err(StorageError::corrupt("file head root missing"));
+            }
+        }
+    }
+    for node in image.metadata.metadata_nodes.values() {
+        let mut node_descriptors = Vec::new();
+        if let MetadataNodeKind::Leaf { entries } = &node.kind {
+            for entry in entries {
+                let descriptor = descriptors.get(&entry.segment_id).ok_or_else(|| {
+                    StorageError::corrupt("metadata leaf references missing segment descriptor")
+                })?;
+                node_descriptors.push(descriptor.clone());
+            }
+        }
+        node.validate(&node_descriptors)?;
+    }
+    for checkpoint in image.metadata.checkpoints.values() {
+        match &checkpoint.roots {
+            CheckpointRoots::BlockShard(roots) => {
+                for root in roots {
+                    if !image.metadata.metadata_nodes.contains_key(root) {
+                        return Err(StorageError::corrupt("checkpoint block root missing"));
+                    }
+                }
+            }
+            CheckpointRoots::NativeKeyspace(root) => {
+                if !image.metadata.keyspace_roots.contains_key(root) {
+                    return Err(StorageError::corrupt("checkpoint keyspace root missing"));
+                }
+            }
+        }
+    }
+    for commit in &image.metadata.shard_commits {
+        if !image.metadata.device_specs.contains_key(&commit.device_id) {
+            return Err(StorageError::corrupt(
+                "shard commit references missing device spec",
+            ));
+        }
+        if !image.metadata.metadata_nodes.contains_key(&commit.old_root)
+            || !image.metadata.metadata_nodes.contains_key(&commit.new_root)
+        {
+            return Err(StorageError::corrupt(
+                "shard commit references missing metadata root",
+            ));
+        }
+    }
+    for commit in &image.metadata.keyspace_commits {
+        if !image.metadata.keyspace_roots.contains_key(&commit.old_root)
+            || !image.metadata.keyspace_roots.contains_key(&commit.new_root)
+        {
+            return Err(StorageError::corrupt(
+                "keyspace commit references missing catalog root",
+            ));
+        }
+    }
+    for commit in &image.metadata.file_commits {
+        if commit
+            .old_root
+            .is_some_and(|root| !image.metadata.metadata_nodes.contains_key(&root))
+            || !image.metadata.metadata_nodes.contains_key(&commit.new_root)
+        {
+            return Err(StorageError::corrupt(
+                "file commit references missing file root",
+            ));
+        }
+    }
+    for record in image.metadata.fork_records.values() {
+        for root in &record.shard_roots {
+            if !image.metadata.metadata_nodes.contains_key(root) {
+                return Err(StorageError::corrupt(
+                    "fork record references missing metadata root",
+                ));
+            }
+        }
+    }
+    for record in image.metadata.delete_records.values() {
+        for root in &record.shard_roots {
+            if !image.metadata.metadata_nodes.contains_key(root) {
+                return Err(StorageError::corrupt(
+                    "delete record references missing metadata root",
+                ));
+            }
+        }
+    }
+    validate_timeline_monotonic(&image.metadata.shard_commits)?;
+    validate_timeline_monotonic(&image.metadata.keyspace_commits)?;
+    validate_timeline_monotonic(&image.metadata.file_commits)?;
+    for (node_id, node) in &image.metadata.metadata_nodes {
+        if *node_id != node.node_id {
+            return Err(StorageError::corrupt("metadata node map key mismatch"));
+        }
+    }
+    for (node_id, node) in &image.storage_nodes.nodes {
+        for (segment_id, entry) in &node.segment_catalog.entries {
+            if entry.reservation.segment_id != *segment_id {
+                return Err(StorageError::corrupt("catalog segment key mismatch"));
+            }
+            if let Some(commit) = &entry.commit {
+                if commit.placement.storage_node != *node_id {
+                    return Err(StorageError::corrupt(
+                        "catalog commit storage node mismatch",
+                    ));
+                }
+                let record = node.segment_store.segments.get(segment_id);
+                if matches!(
+                    entry.state,
+                    SegmentLifecycleState::DurablePendingMetadata
+                        | SegmentLifecycleState::Referenced
+                ) && record.is_none()
+                {
+                    return Err(StorageError::corrupt(
+                        "referenced or durable-pending segment missing segment record",
+                    ));
+                }
+                if let Some(record) = record {
+                    if record.commit != *commit {
+                        return Err(StorageError::corrupt(
+                            "catalog commit disagrees with segment record",
+                        ));
+                    }
+                    DurableSqliteStore::placement_for_segment(conn, *segment_id)?;
+                }
+                if matches!(
+                    entry.state,
+                    SegmentLifecycleState::Reserved | SegmentLifecycleState::Writing
+                ) {
+                    return Err(StorageError::corrupt(
+                        "uncommitted catalog state has a segment commit",
+                    ));
+                }
+            }
+        }
+        for (segment_id, record) in &node.segment_store.segments {
+            let entry = node
+                .segment_catalog
+                .entries
+                .get(segment_id)
+                .ok_or_else(|| StorageError::corrupt("segment record missing catalog entry"))?;
+            if entry.commit.as_ref() != Some(&record.commit) {
+                return Err(StorageError::corrupt(
+                    "segment record disagrees with catalog entry",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_row_native_cursors(image: &DurableStoreImage) -> Result<()> {
+    ensure_next_u128_above(
+        "next_device_id",
+        image.metadata.next_device_id,
+        image
+            .metadata
+            .device_specs
+            .keys()
+            .chain(image.metadata.device_heads.keys())
+            .chain(image.metadata.deleted_device_heads.keys())
+            .map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_keyspace_id",
+        image.metadata.next_keyspace_id,
+        image.metadata.keyspace_heads.keys().map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_file_id",
+        image.metadata.next_file_id,
+        image
+            .metadata
+            .keyspace_catalog_shards
+            .values()
+            .flat_map(|shard| shard.files.keys().map(|id| id.raw())),
+    )?;
+    ensure_next_u128_above(
+        "next_metadata_node_id",
+        image.metadata.next_metadata_node_id,
+        image.metadata.metadata_nodes.keys().map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_keyspace_root_id",
+        image.metadata.next_keyspace_root_id,
+        image.metadata.keyspace_roots.keys().map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_keyspace_catalog_shard_id",
+        image.metadata.next_keyspace_catalog_shard_id,
+        image
+            .metadata
+            .keyspace_catalog_shards
+            .keys()
+            .map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_commit_group_id",
+        image.metadata.next_commit_group_id,
+        image.metadata.commit_groups.keys().map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_checkpoint_id",
+        image.metadata.next_checkpoint_id,
+        image.metadata.checkpoints.keys().map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_segment_id",
+        image.storage_nodes.next_segment_id,
+        image
+            .storage_nodes
+            .nodes
+            .values()
+            .flat_map(|node| node.segment_catalog.entries.keys())
+            .map(|id| id.raw()),
+    )?;
+    ensure_next_u128_above(
+        "next_write_intent",
+        image.next_write_intent,
+        image
+            .storage_nodes
+            .nodes
+            .values()
+            .flat_map(|node| node.segment_catalog.entries.values())
+            .map(|entry| entry.intent.write_intent.raw()),
+    )?;
+    let placement_count = image
+        .storage_nodes
+        .nodes
+        .values()
+        .try_fold(0_u64, |sum, node| {
+            let entries = u64::try_from(node.segment_catalog.entries.len())
+                .map_err(|_| StorageError::corrupt("segment catalog entry count overflows u64"))?;
+            sum.checked_add(entries)
+                .ok_or_else(|| StorageError::corrupt("segment catalog entry count overflows u64"))
+        })?;
+    if image.storage_nodes.next_placement_index < placement_count {
+        return Err(StorageError::corrupt(
+            "next_placement_index is behind persisted catalog rows",
+        ));
+    }
+    let max_commit_seq = image
+        .metadata
+        .commit_groups
+        .values()
+        .map(|group| group.commit_seq.raw())
+        .chain(
+            image
+                .metadata
+                .shard_commits
+                .iter()
+                .map(|commit| commit.commit_seq.raw()),
+        )
+        .chain(
+            image
+                .metadata
+                .keyspace_commits
+                .iter()
+                .map(|commit| commit.commit_seq.raw()),
+        )
+        .chain(
+            image
+                .metadata
+                .file_commits
+                .iter()
+                .map(|commit| commit.commit_seq.raw()),
+        )
+        .chain(image.metadata.fork_records.keys().map(|seq| seq.raw()))
+        .chain(image.metadata.delete_records.keys().map(|seq| seq.raw()))
+        .chain(
+            image
+                .metadata
+                .checkpoints
+                .values()
+                .map(|checkpoint| checkpoint.commit_seq.raw()),
+        )
+        .max()
+        .unwrap_or(0);
+    if image.metadata.next_commit_seq <= max_commit_seq {
+        return Err(StorageError::corrupt(
+            "next_commit_seq is behind persisted rows",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_next_u128_above(
+    name: &'static str,
+    next: u128,
+    values: impl IntoIterator<Item = u128>,
+) -> Result<()> {
+    let max = values.into_iter().max().unwrap_or(0);
+    if next <= max {
+        return Err(StorageError::corrupt(format!(
+            "{name} is behind persisted rows"
+        )));
+    }
+    Ok(())
+}
+
+fn row_native_segment_descriptors(
+    image: &DurableStoreImage,
+) -> BTreeMap<SegmentId, SegmentDescriptor> {
+    let mut out = BTreeMap::new();
+    for node in image.storage_nodes.nodes.values() {
+        for (segment_id, record) in &node.segment_store.segments {
+            out.insert(*segment_id, record.commit.descriptor.clone());
+        }
+    }
+    out
+}
+
+fn validate_timeline_monotonic<T: DurableTimelineRow>(rows: &[T]) -> Result<()> {
+    let mut last = None;
+    for row in rows {
+        if let Some(last) = last {
+            if row.commit_seq_raw() < last {
+                return Err(StorageError::corrupt("timeline commit sequence regressed"));
+            }
+        }
+        last = Some(row.commit_seq_raw());
+    }
+    Ok(())
+}
+
+fn file_writer_key(keyspace_id: KeyspaceId, file_id: FileId) -> String {
+    format!("{}:{}", keyspace_id.raw(), file_id.raw())
 }
 
 fn data_log_path(data_dir: &Path, log_id: u64) -> PathBuf {
@@ -2232,58 +4062,6 @@ fn sync_dir(path: &Path) -> Result<()> {
         .map_err(fs_error)?
         .sync_all()
         .map_err(fs_error)
-}
-
-fn encode_state_commit(commit: &DurableStateCommit) -> Result<Vec<u8>> {
-    let mut out = DurableEncoder::default();
-    commit.encode(&mut out)?;
-    Ok(out.finish())
-}
-
-fn decode_state_commit(bytes: &[u8]) -> Result<DurableStateCommit> {
-    let mut input = DurableDecoder { bytes, offset: 0 };
-    let commit = DurableStateCommit::decode(&mut input)?;
-    input.finish()?;
-    Ok(commit)
-}
-
-fn state_commit_for_image(image: &DurableStoreImage) -> DurableStateCommit {
-    let mut nodes = BTreeMap::new();
-    for node_id in &image.storage_nodes.node_order {
-        let node = image
-            .storage_nodes
-            .nodes
-            .get(node_id)
-            .expect("storage node order references existing node");
-        let node_config = image.config.for_storage_node(*node_id);
-        nodes.insert(
-            *node_id,
-            DurableStorageNodeImage {
-                segment_store: DurableSegmentStoreImage::from_inner(
-                    node_config,
-                    node.segment_store.clone(),
-                ),
-                catalog: DurableCatalogImage {
-                    config: node_config,
-                    catalog: node.segment_catalog.clone(),
-                },
-            },
-        );
-    }
-    DurableStateCommit {
-        metadata: DurableMetadataImage {
-            config: image.config,
-            metadata: image.metadata.clone(),
-            next_write_intent: image.next_write_intent,
-            next_extent_id: image.next_extent_id,
-        },
-        storage_nodes: DurableStorageRegistryImage {
-            next_segment_id: image.storage_nodes.next_segment_id,
-            next_placement_index: image.storage_nodes.next_placement_index,
-            node_order: image.storage_nodes.node_order.clone(),
-            nodes,
-        },
-    }
 }
 
 fn encode_data_log_record(segment_id: SegmentId, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -2346,26 +4124,6 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
         return Err(StorageError::corrupt("data-log checksum mismatch"));
     }
     Ok(DataLogSegmentData { segment_id, bytes })
-}
-
-fn current_sqlite_placements(
-    conn: &Connection,
-) -> Result<BTreeMap<SegmentId, SegmentPlacementRow>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT segment_id, storage_node, data_log_id, record_offset, record_bytes,
-                    payload_offset, payload_bytes, checksum
-             FROM segment_placements
-             WHERE current = 1",
-        )
-        .map_err(sqlite_error)?;
-    let mut rows = stmt.query([]).map_err(sqlite_error)?;
-    let mut out = BTreeMap::new();
-    while let Some(row) = rows.next().map_err(sqlite_error)? {
-        let placement = decode_placement_row(row).map_err(sqlite_error)?;
-        out.insert(placement.segment_id, placement);
-    }
-    Ok(out)
 }
 
 fn current_placements_for_log(conn: &Connection, log_id: u64) -> Result<Vec<SegmentPlacementRow>> {
@@ -2914,7 +4672,8 @@ impl DurableObjectStore {
     fn persist(&self) -> Result<()> {
         let _persist_guard = lock(&self.persist_lock)?;
         let image = self.local.state_image()?;
-        let kept_segments = self.durable.persist(&image)?;
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let kept_segments = self.durable.persist(&image, &previous_segments)?;
         *lock(&self.persisted_segments)? = kept_segments;
         Ok(())
     }
@@ -3015,6 +4774,7 @@ struct StorageNodeInner {
     segment_catalog: CatalogInner,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DurableSegmentStoreImage {
     config: LocalStoreConfig,
@@ -3022,6 +4782,7 @@ struct DurableSegmentStoreImage {
     records: BTreeMap<SegmentId, DurableSegmentRecord>,
 }
 
+#[cfg(test)]
 impl DurableSegmentStoreImage {
     fn from_inner(config: LocalStoreConfig, inner: SegmentStoreInner) -> Self {
         Self {
@@ -3050,6 +4811,7 @@ struct DurableSegmentRecord {
     commit: SegmentReplicaCommit,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DurableMetadataImage {
     config: LocalStoreConfig,
@@ -3058,30 +4820,11 @@ struct DurableMetadataImage {
     next_extent_id: u128,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DurableCatalogImage {
     config: LocalStoreConfig,
     catalog: CatalogInner,
-}
-
-#[derive(Debug, Clone)]
-struct DurableStorageRegistryImage {
-    next_segment_id: u128,
-    next_placement_index: u64,
-    node_order: Vec<StorageNodeId>,
-    nodes: BTreeMap<StorageNodeId, DurableStorageNodeImage>,
-}
-
-#[derive(Debug, Clone)]
-struct DurableStorageNodeImage {
-    segment_store: DurableSegmentStoreImage,
-    catalog: DurableCatalogImage,
-}
-
-#[derive(Debug, Clone)]
-struct DurableStateCommit {
-    metadata: DurableMetadataImage,
-    storage_nodes: DurableStorageRegistryImage,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -9235,6 +10978,7 @@ impl DurableCodec for DurableSegmentRecord {
     }
 }
 
+#[cfg(test)]
 impl DurableCodec for DurableSegmentStoreImage {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.config.encode(out)?;
@@ -9252,10 +10996,12 @@ impl DurableCodec for DurableSegmentStoreImage {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl DurableTestImageCodec for DurableSegmentStoreImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_SEGMENT_STORE;
 }
 
+#[cfg(test)]
 impl DurableCodec for DurableCatalogImage {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.config.encode(out)?;
@@ -9271,40 +11017,9 @@ impl DurableCodec for DurableCatalogImage {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl DurableTestImageCodec for DurableCatalogImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_CATALOG;
-}
-
-impl DurableCodec for DurableStorageNodeImage {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.segment_store.encode(out)?;
-        self.catalog.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            segment_store: DurableSegmentStoreImage::decode(input)?,
-            catalog: DurableCatalogImage::decode(input)?,
-        })
-    }
-}
-
-impl DurableCodec for DurableStorageRegistryImage {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.next_segment_id.encode(out)?;
-        self.next_placement_index.encode(out)?;
-        self.node_order.encode(out)?;
-        self.nodes.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            next_segment_id: u128::decode(input)?,
-            next_placement_index: u64::decode(input)?,
-            node_order: Vec::decode(input)?,
-            nodes: BTreeMap::decode(input)?,
-        })
-    }
 }
 
 impl DurableCodec for MetadataInner {
@@ -9371,6 +11086,7 @@ impl DurableCodec for MetadataInner {
     }
 }
 
+#[cfg(test)]
 impl DurableCodec for DurableMetadataImage {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.config.encode(out)?;
@@ -9390,22 +11106,9 @@ impl DurableCodec for DurableMetadataImage {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl DurableTestImageCodec for DurableMetadataImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_METADATA;
-}
-
-impl DurableCodec for DurableStateCommit {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.metadata.encode(out)?;
-        self.storage_nodes.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            metadata: DurableMetadataImage::decode(input)?,
-            storage_nodes: DurableStorageRegistryImage::decode(input)?,
-        })
-    }
 }
 
 impl DurableCodec for WriteDurability {
@@ -12743,6 +14446,401 @@ mod tests {
     }
 
     #[test]
+    fn durable_sqlite_uses_row_native_metadata_without_current_state_blob() {
+        let root = durable_temp_dir("row-native-no-current-state");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 11),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let current_state_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'current_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_state_tables, 0);
+        for table in [
+            "store_meta",
+            "device_heads",
+            "metadata_nodes",
+            "segment_records",
+            "segment_catalog_entries",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(count > 0, "{table} should have row-native rows");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_legacy_current_state_blob_store() {
+        let root = durable_temp_dir("legacy-current-state");
+        fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_state(
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               state_blob BLOB NOT NULL
+             );
+             INSERT INTO current_state(id, state_blob) VALUES (1, x'00');",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, config()).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_row_native_rows_without_cursor() {
+        let root = durable_temp_dir("row-native-without-cursor");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO device_specs(device_id, payload) VALUES ('1', x'00')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_missing_row_native_head_root() {
+        let root = durable_temp_dir("row-native-missing-root");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 12),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let head = store.metadata().get_head(device_id).unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "DELETE FROM metadata_nodes WHERE node_id = ?1",
+            params![head.shard_roots[0].raw().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_missing_row_native_segment_record() {
+        let root = durable_temp_dir("row-native-missing-segment-record");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 13),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let segment_id = first_device_segment(&store, device_id);
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "DELETE FROM segment_records WHERE segment_id = ?1",
+            params![segment_id.raw().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_missing_row_native_catalog_entry() {
+        let root = durable_temp_dir("row-native-missing-catalog-entry");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 14),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let segment_id = first_device_segment(&store, device_id);
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "DELETE FROM segment_catalog_entries WHERE segment_id = ?1",
+            params![segment_id.raw().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_corrupt_row_native_payload() {
+        let root = durable_temp_dir("row-native-corrupt-payload");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 15),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let head = store.metadata().get_head(device_id).unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE metadata_nodes SET payload = x'ff' WHERE node_id = ?1",
+            params![head.shard_roots[0].raw().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_missing_row_native_timeline_root() {
+        let root = durable_temp_dir("row-native-missing-timeline-root");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 16),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let second = store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 17),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let current = store.metadata().get_head(device_id).unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let payload: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM shard_commits WHERE commit_seq = ?1 LIMIT 1",
+                params![u64_to_i64(second.commit_seq.raw()).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let commit: ShardCommit = decode_row(&payload).unwrap();
+        assert_ne!(commit.old_root, current.shard_roots[0]);
+        conn.execute(
+            "DELETE FROM metadata_nodes WHERE node_id = ?1",
+            params![commit.old_root.raw().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_row_native_cursor_behind_rows() {
+        let root = durable_temp_dir("row-native-stale-cursor");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE store_meta SET next_device_id = '1' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_row_native_write_intent_cursor_behind_rows() {
+        let root = durable_temp_dir("row-native-stale-write-intent-cursor");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 18),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE store_meta
+             SET next_write_intent = '1'
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_rejects_row_native_placement_cursor_behind_rows() {
+        let root = durable_temp_dir("row-native-stale-placement-cursor");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 19),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE store_meta
+             SET next_placement_index = 0
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn data_log_checksum_uses_crc64_ecma_golden_value() {
         assert_eq!(data_log_checksum64(b"123456789"), 0x6c40_df5f_0b49_7347);
     }
@@ -15900,7 +17998,7 @@ mod tests {
 
         let first = file.acquire_append().unwrap();
         let stolen = file.acquire_append().unwrap();
-        let stolen_intent = WriteIntentId::from_raw(stolen.lease_id.raw());
+        let stolen_lease_id = stolen.lease_id;
         assert!(
             file.append_with_lease(first, &repeated_blocks(1, 1))
                 .is_err()
@@ -15933,7 +18031,10 @@ mod tests {
             .segment_catalog()
             .intent_for_segment(entries[0].segment_id)
             .unwrap();
-        assert_eq!(intent.write_intent, stolen_intent);
+        assert_ne!(
+            intent.write_intent,
+            WriteIntentId::from_raw(stolen_lease_id.raw())
+        );
     }
 
     #[test]

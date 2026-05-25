@@ -574,12 +574,13 @@ store/
 ```
 
 SQLite is the metadata publish boundary. Data-log files own large immutable
-segment payloads. The current local provider persists the deterministic
-metadata/catalog state as a SQLite blob, and separately stores indexed segment
-placement and data-log manifest rows so physical compaction does not need to
-inspect metadata leaves or native extents. Later phases may normalize more
-metadata tables if benchmarks or fault tests need direct SQLite queries, but
-they must not add a second production durable format beside this provider.
+segment payloads. The current local provider stores operational metadata in
+row-native SQLite tables: counters/config, live and deleted heads, immutable
+metadata object payloads keyed by stable IDs, commit timelines, checkpoints, GC
+mark epochs, storage-node catalogs, segment descriptors, placement rows, and
+data-log manifests. Complex immutable objects may remain crate-owned binary
+payloads inside rows where decomposing every field would add cost without a hot
+predicate. The old whole-state blob is not a production compatibility path.
 
 ### Phase 18 Durable Format Decision
 
@@ -597,17 +598,21 @@ runtime provider.
 
 ### Partitioned Durable Data Logs
 
-The active durable layout stores transactional metadata in SQLite and segment
-payloads in partitioned data logs. SQLite owns the committed state image,
-placement state, data-log manifests, and publish transaction. Plain data-log
-files own large immutable segment bytes. This keeps compaction focused on
-selected data files instead of rewriting every live byte on a storage node.
+The active durable layout stores transactional metadata in SQLite row tables
+and segment payloads in partitioned data logs. SQLite owns committed logical
+metadata rows, placement state, data-log manifests, and the publish
+transaction. Plain data-log files own large immutable segment bytes. This keeps
+compaction focused on selected data files instead of rewriting every live byte
+on a storage node.
 
 Data records live in rolled data-log files. The v1 SQLite schema has
-`current_state`, `segment_placements`, and `data_logs` tables. `current_state`
-contains the durable deterministic metadata/catalog image; `segment_placements`
-maps logical segments to current data-log records; `data_logs` tracks active,
-sealed, and deleted log files plus live/dead byte estimates.
+row-native metadata tables plus `segment_placements` and `data_logs`.
+`segment_placements` maps logical segments to current data-log records;
+`data_logs` tracks active, sealed, and deleted log files plus live/dead byte
+estimates. Reopen reconstructs the local object store from these rows and
+rejects missing heads, missing immutable object payloads, stale placements,
+catalog lifecycle gaps, or segment descriptors whose data-log bytes are missing
+or corrupt.
 
 Each data-log record carries a fixed magic, version, segment ID, payload length,
 CRC64-ECMA payload checksum, and payload bytes. Reopen rejects a current
@@ -630,7 +635,7 @@ Durable write ordering:
 ```text
 append segment bytes to data log(s)
 fsync each touched data log once for the publish batch
-SQLite transaction inserts placement and publishes current_state
+SQLite transaction inserts placements and row-native metadata
 commit SQLite transaction
 ```
 
@@ -650,9 +655,10 @@ sequence visible to the relevant device or native file as `durable_through`.
 
 Synchronous metadata operations that do not carry a `WriteDurability` argument
 -- create, checkpoint, fork, restore, delete, keyspace snapshot, and custodian
-operations -- persist before returning. Because `current_state` captures the
-live deterministic state, those operations also flush any earlier acknowledged
-writes in the same store instance.
+operations -- persist before returning. Because the row-native publish cursor
+captures the current durable high-water IDs and commit sequence, those
+operations also flush any earlier acknowledged writes in the same store
+instance.
 
 Incremental data-log compaction:
 

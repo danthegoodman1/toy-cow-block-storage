@@ -497,10 +497,13 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 22 owns multiple local storage-node endpoints and one-replica segment
   placement so file/block data can be partitioned by segment without changing
   public APIs.
-- Phase 23 owns deterministic background compaction scheduling, maintenance
+- Phase 23 owns row-native SQLite metadata publishing so durable writes,
+  forks, restores, PITR, GC, and reopen update/query operational rows instead
+  of replacing a whole logical state blob.
+- Phase 24 owns deterministic background compaction scheduling, maintenance
   budgets, and explicit write backpressure policy for the partitioned durable
   layout.
-- Phase 24 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 25 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -899,6 +902,10 @@ floor is dominated by host sync latency and full-state commit serialization; a
 batched flush now pays one data-log sync per touched log plus one SQLite publish
 transaction instead of one payload sync per segment.
 
+Phase 23 later removed the full-state SQLite blob from the production durable
+provider. The Phase 21 numbers remain useful as historical partitioned-log
+baselines, but current durable metadata publish uses row-native SQLite tables.
+
 ## Phase 21: Partitioned Durable Logs and Incremental Compaction
 
 Status: complete.
@@ -946,11 +953,10 @@ Deliverables:
 - [x] SQLite metadata store for device heads, native keyspace/file heads,
   commit groups, PITR/checkpoints, write-intent state, append leases, segment
   lifecycle state, placement index, data-log manifests, relocation state, and
-  custodian evidence. The v1 implementation keeps the deterministic
-  metadata/catalog state in one SQLite `current_state` blob while indexing
-  physical placement and data-log manifests in separate tables. Normalize more
-  logical metadata tables only when a deterministic test or benchmark needs
-  direct SQLite queries.
+  custodian evidence. Phase 21 initially used a whole-state SQLite blob for the
+  logical metadata image while indexing physical placement and data-log
+  manifests in separate tables. Phase 23 replaced that blob with row-native
+  operational metadata tables under the no-tombstones rule.
 - [x] SQLite schema with explicit tables, indexes, uniqueness constraints, and
   foreign-key or equivalent integrity checks for `segment_id`, `data_log_id`,
   placement state, owner/reachability state, and data-log accounting.
@@ -1140,7 +1146,107 @@ for the three-write batch, and a 12 KiB read fanning out across three nodes
 measured about 2.9 us. Treat these as regression smoke baselines, not durable
 storage headline numbers.
 
-## Phase 23: Background Compaction Scheduling and Backpressure Policy
+## Phase 23: Row-Native SQLite Metadata Publishing
+
+Status: complete.
+
+Replace the production `current_state` blob with row-native SQLite metadata for
+the durable provider. SQLite remains fully opaque behind the provider boundary;
+public block, native file, metadata, transport, and storage-node APIs do not
+change. The goal is performance and scale: durable publish updates the rows
+affected by new commits, roots, immutable metadata objects, segment lifecycle
+changes, checkpoints, and timelines instead of serializing and replacing the
+whole logical state.
+
+Non-goals:
+
+- No public API changes.
+- No compatibility reader for old blob-authoritative stores.
+- No SQL concepts exposed to `BlockDevice`, `NativeFile`, clients, or
+  transports.
+- No decomposition of metadata tree leaf ranges into SQL columns unless a later
+  benchmark proves that leaf-range predicates are hot.
+- No permanent dual representation. The old blob is not a production write path
+  or fallback.
+
+Operational SQLite metadata groups:
+
+- Singleton store counters/config: next IDs, next commit sequence, next GC
+  epoch, write-intent/extent counters, and storage registry cursors.
+- Block state: device specs, live heads, deleted heads, shard commits,
+  fork/delete records, and checkpoints.
+- Native state: keyspace heads, immutable keyspace roots, immutable catalog
+  shards, file writer epochs, keyspace commits, and file commit audit rows.
+- Shared state: immutable metadata node payloads, commit groups, checkpoint
+  payloads, and GC mark epochs.
+- Storage-node state: node ordering, per-node catalog cursors, segment
+  descriptor rows, segment catalog lifecycle rows, committed placements, and
+  data-log manifests.
+
+Deliverables:
+
+- [x] Row-native SQLite schema with identity/order columns for hot predicates
+  and crate-owned payload blobs for complex immutable objects where full
+  normalization would add cost without a query benefit.
+- [x] `DurableExportCursor` loaded from SQLite on open and advanced only after a
+  successful metadata publish transaction.
+- [x] Durable publish sequence: append/fsync new data-log records first, upsert
+  new placement/data-log rows, upsert row-native logical metadata, then advance
+  the durable cursor last in the same SQLite transaction.
+- [x] Flushed writes export only rows at or beyond the previous durable
+  high-water cursor for immutable ID/commit tables, while mutable head,
+  lifecycle, mark, and deletion-sensitive tables remain reconciled explicitly.
+- [x] Reopen rebuilds `LocalObjectStore` from row-native tables plus data-log
+  placement rows, then validates heads, checkpoints, metadata object
+  reachability, segment descriptors, placements, catalog lifecycle state,
+  readable data-log payloads, ID counters, and monotonic timelines.
+- [x] Old DBs that contain legacy `current_state` rows fail with an explicit
+  unsupported/corrupt error.
+- [x] Provider conformance keeps memory and durable providers byte-for-byte
+  equivalent for block writes, native writes/appends, forks,
+  snapshots/restores, PITR, deletes, GC, and custodians.
+- [x] Crash/corruption tests cover data-log metadata publish boundaries, missing
+  row-native head roots, missing segment descriptors, stale cursors, corrupt or
+  missing row payloads, timeline rows that reference missing roots, and
+  placement rows without required catalog/descriptor bytes.
+- [x] Row-native invariant checks ensure every live head and checkpoint root
+  exists, every referenced segment has placement/catalog/descriptor/readable
+  payload evidence, counters are above persisted IDs, and timelines are
+  monotonic.
+- [x] Criterion coverage for small-state durable headlines, large-state flush
+  after many acknowledged writes, large-state reopen, large-history
+  checkpoint/fork/restore, GC/custodian publish cost, and SQLite row/WAL smoke
+  metrics.
+
+Exit gate:
+
+- [x] No production write path serializes or replaces a whole logical
+  `current_state` blob.
+- [x] SQLite remains an implementation detail behind durable provider
+  contracts.
+- [x] Data-before-metadata ordering is preserved exactly: no metadata row can
+  make a segment visible before its data-log record reached the requested
+  durability boundary.
+- [x] A crash before durable cursor advancement reopens to the previous durable
+  cursor and rejects incomplete required rows rather than accepting a partially
+  published logical state.
+- [x] Reopen rejects missing rows, missing segment bytes, stale placements, bad
+  catalog lifecycle, and cursor/counter regressions.
+- [x] The no-tombstones rule is upheld: the old blob format is not a
+  compatibility layer.
+
+Short-run Phase 23 Criterion smoke numbers on this host with row-native SQLite
+metadata and partitioned data logs: block acknowledged 4 KiB write 13 us, block
+flushed 4 KiB write 5.9 ms, block flush after 32 acknowledged writes 7.7 ms,
+block flush after 256 acknowledged writes 15.7 ms, reopen after 32 block writes
+3.4 ms, reopen after 256 block writes 20 ms, checkpoint/fork/restore after 256
+block writes 1.4/1.5/1.4 ms, deleted-device custodian publish after 256 writes
+8.6 ms, native acknowledged append 13 us, native flushed append 5.9 ms, and
+native flush after 32 acknowledged writes about 10 ms with high host variance.
+Treat these as regression smoke baselines; the sync-heavy floor remains
+host/filesystem dependent.
+
+## Phase 24: Background Compaction Scheduling and Backpressure Policy
 
 Status: not started.
 
@@ -1217,7 +1323,7 @@ Exit gate:
 - [ ] The scheduler remains below the block/native public APIs and does not ask
   clients to choose storage nodes, compact logs, or fan out writes.
 
-## Phase 24: Storage Replication
+## Phase 25: Storage Replication
 
 Status: not started.
 
@@ -1277,7 +1383,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 25: Linux io_uring Storage Node Backend
+## Phase 26: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1318,7 +1424,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 26: Optional ublk Adapter
+## Phase 27: Optional ublk Adapter
 
 Status: not started.
 

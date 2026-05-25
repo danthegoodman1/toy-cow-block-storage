@@ -359,6 +359,10 @@ pub trait SegmentStore: Send + Sync {
 /// Segment reservation request for a specific write intent and mapping owner.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentReservationIntent {
+    /// Provider-unique write attempt ID used by custodians to expire failed or
+    /// abandoned segment writes. This is separate from file writer epochs or
+    /// append lease IDs so expiring one storage write cannot accidentally free
+    /// another owner that reused a higher-level fencing token.
     pub write_intent: WriteIntentId,
     pub owner: MappingOwner,
     pub bytes: u64,
