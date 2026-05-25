@@ -1287,6 +1287,11 @@ Deliverables:
   actually persisted segment bytes, not just segment ID high-water cursors, so
   segment IDs consumed by uncommitted reservations cannot make later commits
   unreopenable.
+- [x] Local append hot path avoids avoidable large-buffer duplication: aligned
+  normal appends move one owned segment buffer into the in-memory segment store,
+  reserved append commit consumes its staged buffer instead of cloning it, and
+  the in-memory descriptor checksum uses wide deterministic mixing. Durable
+  data-log CRC64 remains unchanged.
 - [x] Criterion coverage comparing one 32 MiB normal append, one 32 MiB
   reserved append filled in 4 KiB chunks, the regular many-small-append
   regression case, an optional long 8192 normal 4 KiB append case, and
@@ -1311,17 +1316,18 @@ Exit gate:
   extent. If it does not, optimize or remove it rather than leaving a decorative
   API.
 
-Short-run Phase 24 Criterion smoke numbers on this host: one normal 32 MiB
-append measured about 39 ms, one reserved 32 MiB append filled in 4 KiB chunks
-measured about 41 ms, 1024 normal 4 KiB appends measured about 114 ms, the
-optional long 8192 normal 4 KiB append case measured about 37 s, and three
-4 KiB reserved appends across three local nodes measured about 35 us. The
-regular regression target uses 1024 normal 4 KiB appends so the benchmark suite
-stays practical for routine gates; set `TOY_COW_LONG_BENCH` to include the
-8192-append headline run. The single-large-append path is roughly flat, while
-the intended many-small-append coalescing case is already meaningfully faster
-at the regular regression size and orders of magnitude faster in the optional
-8192-append headline run.
+Short-run Phase 24 Criterion smoke numbers on this host after append hot-path
+hardening: one normal 32 MiB append measured about 2.5 ms, one reserved 32 MiB
+append filled in 4 KiB chunks measured about 2.9 ms, 1024 normal 4 KiB appends
+measured about 109 ms, the optional long 8192 normal 4 KiB append case measured
+about 37 s before the hot-path hardening, and three 4 KiB reserved appends
+across three local nodes measured about 20 us. The regular regression target
+uses 1024 normal 4 KiB appends so the benchmark suite stays practical for
+routine gates; set `TOY_COW_LONG_BENCH` to include the 8192-append headline run.
+The single-large-append path is now in the low single-digit millisecond range,
+while the intended many-small-append coalescing case remains meaningfully
+faster at the regular regression size and orders of magnitude faster in the
+optional 8192-append headline run.
 
 ## Phase 25: Background Compaction Scheduling and Backpressure Policy
 

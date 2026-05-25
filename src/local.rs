@@ -710,35 +710,41 @@ impl LocalObjectStore {
         let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
             StorageError::invalid_argument("append segment byte length overflows usize")
         })?;
-        let mut segment_bytes = Vec::with_capacity(segment_len_usize);
+        let segment_bytes = if tail_bytes == 0 && data_len == segment_len {
+            data.to_vec()
+        } else {
+            let mut segment_bytes = Vec::with_capacity(segment_len_usize);
 
-        if tail_bytes != 0 {
-            let tail_range = crate::api::BlockRange::new(
-                BlockIndex::from_raw(segment_start_block),
-                BlockCount::from_raw(1),
-            );
-            if !self.tree_has_mappings(head.root, tail_range)? {
-                return Err(StorageError::corrupt(
-                    "unaligned native file size has no tail block mapping",
-                ));
+            if tail_bytes != 0 {
+                let tail_range = crate::api::BlockRange::new(
+                    BlockIndex::from_raw(segment_start_block),
+                    BlockCount::from_raw(1),
+                );
+                if !self.tree_has_mappings(head.root, tail_range)? {
+                    return Err(StorageError::corrupt(
+                        "unaligned native file size has no tail block mapping",
+                    ));
+                }
+                let block_size_usize = usize::try_from(block_size)
+                    .map_err(|_| StorageError::invalid_argument("block size overflows usize"))?;
+                let tail_bytes_usize = usize::try_from(tail_bytes).map_err(|_| {
+                    StorageError::invalid_argument("tail byte count overflows usize")
+                })?;
+                let mut tail_block = vec![0; block_size_usize];
+                let root = self.metadata.get_metadata_node(head.root)?;
+                self.read_metadata_node(&root, tail_range, block_size, &mut tail_block)?;
+                segment_bytes.extend_from_slice(&tail_block[..tail_bytes_usize]);
             }
-            let block_size_usize = usize::try_from(block_size)
-                .map_err(|_| StorageError::invalid_argument("block size overflows usize"))?;
-            let tail_bytes_usize = usize::try_from(tail_bytes)
-                .map_err(|_| StorageError::invalid_argument("tail byte count overflows usize"))?;
-            let mut tail_block = vec![0; block_size_usize];
-            let root = self.metadata.get_metadata_node(head.root)?;
-            self.read_metadata_node(&root, tail_range, block_size, &mut tail_block)?;
-            segment_bytes.extend_from_slice(&tail_block[..tail_bytes_usize]);
-        }
 
-        segment_bytes.extend_from_slice(data);
-        segment_bytes.resize(segment_len_usize, 0);
+            segment_bytes.extend_from_slice(data);
+            segment_bytes.resize(segment_len_usize, 0);
+            segment_bytes
+        };
 
-        let reservation = self.write_segment_for_owner_with_intent(
+        let reservation = self.write_segment_for_owner_with_intent_owned(
             owner,
             self.next_write_intent()?,
-            &segment_bytes,
+            segment_bytes,
         )?;
         let append_range = crate::api::BlockRange::new(
             BlockIndex::from_raw(segment_start_block),
@@ -973,11 +979,7 @@ impl LocalObjectStore {
                 .expect("reservation was just observed")
         };
 
-        let result = self.commit_staged_append_reservation(staged.clone(), durability);
-        if result.is_err() {
-            let _ = self.cleanup_unwritten_staged_reservation(&staged);
-        }
-        result
+        self.commit_staged_append_reservation(staged, durability)
     }
 
     pub fn abort_reserved_append(
@@ -1276,6 +1278,15 @@ impl LocalObjectStore {
         write_intent: WriteIntentId,
         data: &[u8],
     ) -> Result<SegmentReservation> {
+        self.write_segment_for_owner_with_intent_owned(owner, write_intent, data.to_vec())
+    }
+
+    fn write_segment_for_owner_with_intent_owned(
+        &self,
+        owner: MappingOwner,
+        write_intent: WriteIntentId,
+        data: Vec<u8>,
+    ) -> Result<SegmentReservation> {
         let intent = SegmentReservationIntent {
             write_intent,
             owner,
@@ -1287,7 +1298,7 @@ impl LocalObjectStore {
         let node = self.storage_nodes.node(storage_node)?;
         let reservation = self.storage_nodes.reserve_segment(storage_node, intent)?;
         node.segment_catalog.begin_write(&reservation)?;
-        let commit = node.segment_store.write_segment(&reservation, data)?;
+        let commit = node.segment_store.write_segment_owned(&reservation, data)?;
         node.segment_store.sync_segment(reservation.segment_id)?;
         node.segment_catalog
             .commit_segment(reservation.clone(), commit)?;
@@ -1342,41 +1353,82 @@ impl LocalObjectStore {
         staged: StagedAppendReservation,
         durability: crate::api::WriteDurability,
     ) -> Result<AppendCommit> {
-        let reservation = &staged.public;
-        let head = self
-            .metadata
-            .get_file_head(reservation.keyspace_id, reservation.file_id)?;
-        if head.version != reservation.lease.base_version || head.size != reservation.base_size {
-            return Err(StorageError::conflict("stale append reservation"));
-        }
-        self.metadata.validate_writer_epoch(
-            reservation.keyspace_id,
-            reservation.file_id,
-            reservation.lease.writer_epoch,
-        )?;
+        let preflight = (|| {
+            let reservation = &staged.public;
+            let head = self
+                .metadata
+                .get_file_head(reservation.keyspace_id, reservation.file_id)?;
+            if head.version != reservation.lease.base_version || head.size != reservation.base_size
+            {
+                return Err(StorageError::conflict("stale append reservation"));
+            }
+            self.metadata.validate_writer_epoch(
+                reservation.keyspace_id,
+                reservation.file_id,
+                reservation.lease.writer_epoch,
+            )?;
 
-        let block_size = u64::from(self.metadata.config.block_size);
-        let segment_blocks = reservation.exact_bytes / block_size;
-        let append_range = crate::api::BlockRange::new(
-            BlockIndex::from_raw(reservation.base_size / block_size),
-            BlockCount::from_raw(segment_blocks),
-        );
-        if self.tree_has_mappings(head.root, append_range)? {
-            return Err(StorageError::conflict(
-                "reserved append range overlaps existing file metadata",
-            ));
-        }
+            let block_size = u64::from(self.metadata.config.block_size);
+            let segment_blocks = reservation.exact_bytes / block_size;
+            let append_range = crate::api::BlockRange::new(
+                BlockIndex::from_raw(reservation.base_size / block_size),
+                BlockCount::from_raw(segment_blocks),
+            );
+            if self.tree_has_mappings(head.root, append_range)? {
+                return Err(StorageError::conflict(
+                    "reserved append range overlaps existing file metadata",
+                ));
+            }
+            Ok((head, append_range))
+        })();
+        let (head, append_range) = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                let _ = self.cleanup_unwritten_staged_reservation(&staged);
+                return Err(error);
+            }
+        };
 
-        let node = self.storage_nodes.node(staged.storage_node)?;
+        let StagedAppendReservation {
+            public: reservation,
+            segment_reservation,
+            storage_node,
+            bytes,
+            filled: _,
+        } = staged;
+        let node = match self.storage_nodes.node(storage_node) {
+            Ok(node) => node,
+            Err(error) => {
+                let _ =
+                    self.cleanup_unwritten_segment_reservation(storage_node, &segment_reservation);
+                return Err(error);
+            }
+        };
         node.segment_catalog
-            .begin_write(&staged.segment_reservation)?;
+            .begin_write(&segment_reservation)
+            .inspect_err(|_| {
+                let _ =
+                    self.cleanup_unwritten_segment_reservation(storage_node, &segment_reservation);
+            })?;
         let commit = node
             .segment_store
-            .write_segment(&staged.segment_reservation, &staged.bytes)?;
+            .write_segment_owned(&segment_reservation, bytes)
+            .inspect_err(|_| {
+                let _ =
+                    self.cleanup_unwritten_segment_reservation(storage_node, &segment_reservation);
+            })?;
         node.segment_store
-            .sync_segment(staged.segment_reservation.segment_id)?;
+            .sync_segment(segment_reservation.segment_id)
+            .inspect_err(|_| {
+                let _ =
+                    self.cleanup_unwritten_segment_reservation(storage_node, &segment_reservation);
+            })?;
         node.segment_catalog
-            .commit_segment(staged.segment_reservation.clone(), commit)?;
+            .commit_segment(segment_reservation.clone(), commit)
+            .inspect_err(|_| {
+                let _ =
+                    self.cleanup_unwritten_segment_reservation(storage_node, &segment_reservation);
+            })?;
 
         let owner = MappingOwner::NativeKeyspace(reservation.keyspace_id);
         let new_root = self
@@ -1385,7 +1437,7 @@ impl LocalObjectStore {
                 TreeRangeEdit {
                     range: append_range,
                     replacement: Some(SegmentReplacement {
-                        segment_id: staged.segment_reservation.segment_id,
+                        segment_id: segment_reservation.segment_id,
                         segment_base: append_range.start,
                     }),
                 },
@@ -1410,7 +1462,7 @@ impl LocalObjectStore {
             }],
         })?;
         self.storage_nodes
-            .mark_segment_referenced(staged.segment_reservation.segment_id)?;
+            .mark_segment_referenced(segment_reservation.segment_id)?;
         let committed = self
             .metadata
             .get_file_head(reservation.keyspace_id, reservation.file_id)?;
@@ -1427,23 +1479,28 @@ impl LocalObjectStore {
     }
 
     fn cleanup_unwritten_staged_reservation(&self, staged: &StagedAppendReservation) -> Result<()> {
-        let node = self.storage_nodes.node(staged.storage_node)?;
-        match node
-            .segment_catalog
-            .state(staged.segment_reservation.segment_id)?
-        {
+        self.cleanup_unwritten_segment_reservation(staged.storage_node, &staged.segment_reservation)
+    }
+
+    fn cleanup_unwritten_segment_reservation(
+        &self,
+        storage_node: StorageNodeId,
+        segment_reservation: &SegmentReservation,
+    ) -> Result<()> {
+        let node = self.storage_nodes.node(storage_node)?;
+        match node.segment_catalog.state(segment_reservation.segment_id)? {
             SegmentLifecycleState::Reserved => {
                 node.segment_catalog
-                    .expire_reservation(staged.segment_reservation.segment_id)?;
+                    .expire_reservation(segment_reservation.segment_id)?;
                 node.segment_store
-                    .delete_segment(staged.segment_reservation.segment_id)?;
+                    .delete_segment(segment_reservation.segment_id)?;
                 Ok(())
             }
             SegmentLifecycleState::Writing => {
                 node.segment_catalog
-                    .fail_write(staged.segment_reservation.segment_id)?;
+                    .fail_write(segment_reservation.segment_id)?;
                 node.segment_store
-                    .delete_segment(staged.segment_reservation.segment_id)?;
+                    .delete_segment(segment_reservation.segment_id)?;
                 Ok(())
             }
             SegmentLifecycleState::DurablePendingMetadata
@@ -7598,13 +7655,11 @@ impl InMemorySegmentStore {
     pub fn contains_segment(&self, segment_id: SegmentId) -> Result<bool> {
         Ok(lock(&self.inner)?.segments.contains_key(&segment_id))
     }
-}
 
-impl SegmentStore for InMemorySegmentStore {
-    fn write_segment(
+    fn write_segment_owned(
         &self,
         reservation: &SegmentReservation,
-        bytes: &[u8],
+        bytes: Vec<u8>,
     ) -> Result<SegmentReplicaCommit> {
         self.config.validate()?;
 
@@ -7649,7 +7704,7 @@ impl SegmentStore for InMemorySegmentStore {
                 segment_id: reservation.segment_id,
                 blocks: BlockCount::from_raw(blocks),
                 bytes: reservation.bytes,
-                checksum: Some(checksum64(bytes)),
+                checksum: Some(checksum64(&bytes)),
             },
             placement: SegmentReplicaPlacement {
                 segment_id: reservation.segment_id,
@@ -7661,12 +7716,22 @@ impl SegmentStore for InMemorySegmentStore {
         inner.segments.insert(
             reservation.segment_id,
             SegmentRecord {
-                bytes: bytes.to_vec(),
+                bytes,
                 synced: false,
                 commit: commit.clone(),
             },
         );
         Ok(commit)
+    }
+}
+
+impl SegmentStore for InMemorySegmentStore {
+    fn write_segment(
+        &self,
+        reservation: &SegmentReservation,
+        bytes: &[u8],
+    ) -> Result<SegmentReplicaCommit> {
+        self.write_segment_owned(reservation, bytes.to_vec())
     }
 
     fn read_segment(&self, segment_id: SegmentId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
@@ -12909,12 +12974,34 @@ fn next_request_id(next: &Mutex<u128>) -> Result<RequestId> {
 }
 
 fn checksum64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let mut a = 0xcbf2_9ce4_8422_2325u64 ^ (bytes.len() as u64);
+    let mut b = 0x9e37_79b1_85eb_ca87u64.wrapping_add(bytes.len() as u64);
+
+    let mut chunks = bytes.chunks_exact(32);
+    for chunk in &mut chunks {
+        let w0 = u64::from_le_bytes(chunk[0..8].try_into().expect("fixed chunk width"));
+        let w1 = u64::from_le_bytes(chunk[8..16].try_into().expect("fixed chunk width"));
+        let w2 = u64::from_le_bytes(chunk[16..24].try_into().expect("fixed chunk width"));
+        let w3 = u64::from_le_bytes(chunk[24..32].try_into().expect("fixed chunk width"));
+        a = a.wrapping_add(w0).rotate_left(5) ^ w2;
+        b = b.wrapping_add(w1).rotate_left(17) ^ w3;
     }
-    hash
+
+    let mut words = chunks.remainder().chunks_exact(8);
+    for word in &mut words {
+        let value = u64::from_le_bytes(word.try_into().expect("chunks_exact yields 8 bytes"));
+        a = a.wrapping_add(value).rotate_left(9) ^ b;
+    }
+    for byte in words.remainder() {
+        b ^= u64::from(*byte);
+        b = b.rotate_left(3).wrapping_add(0x100);
+    }
+
+    a ^= b.rotate_left(31);
+    a ^= a >> 33;
+    a = a.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    a ^= a >> 33;
+    a
 }
 
 fn data_log_checksum64(bytes: &[u8]) -> u64 {
