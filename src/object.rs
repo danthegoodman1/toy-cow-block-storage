@@ -13,7 +13,7 @@ use crate::id::{
 /// Commit groups, checkpoints, and GC roots should be keyed by mapping owner so
 /// block and native file mapping layers can share substrate machinery without
 /// being implemented on top of each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MappingOwner {
     BlockDevice(DeviceId),
     NativeKeyspace(KeyspaceId),
@@ -24,7 +24,7 @@ pub enum MappingOwner {
 /// A `DeviceHead` is the durable publication unit for a block device. Providers
 /// must treat `generation`, `latest_commit`, and all `shard_roots` as one
 /// committed view: readers should never observe only part of a newer root set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceHead {
     pub device_id: DeviceId,
     pub generation: DeviceGeneration,
@@ -37,7 +37,7 @@ pub struct DeviceHead {
 /// A `KeyspaceHead` is the durable publication unit for the native
 /// filesystem-like API. Snapshots and restores copy its immutable catalog root
 /// pointer, not individual file metadata roots.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceHead {
     pub keyspace_id: KeyspaceId,
     pub generation: KeyspaceGeneration,
@@ -71,7 +71,7 @@ impl DeviceHead {
 /// `KeyspaceRoot`. Providers must advance `version`, `root`, `size`, and
 /// `latest_commit` together so stale append writers can be rejected by
 /// version/epoch fencing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileHead {
     pub file_id: FileId,
     pub version: FileVersion,
@@ -142,7 +142,7 @@ impl FileHead {
 /// File creation metadata lives with the committed file head in the immutable
 /// keyspace catalog. Snapshots and restores therefore copy the entire namespace
 /// view by root pointer, not by consulting side tables.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceFile {
     pub name: Option<String>,
     pub head: FileHead,
@@ -153,7 +153,7 @@ pub struct KeyspaceFile {
 /// A shard owns a deterministic subset of the files in one immutable keyspace
 /// root. Updating one file creates one fresh shard body and one fresh
 /// `KeyspaceRoot`; untouched shard bodies remain shared by root ID.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceCatalogShard {
     pub shard_id: KeyspaceCatalogShardId,
     pub files: BTreeMap<FileId, KeyspaceFile>,
@@ -179,7 +179,7 @@ impl KeyspaceCatalogShard {
 /// still depends only on the immutable catalog root boundary: snapshots and
 /// restores copy one `KeyspaceRootId`, while file creates/writes/appends publish
 /// one new root plus one changed shard.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceRoot {
     pub root_id: KeyspaceRootId,
     pub shard_roots: Vec<KeyspaceCatalogShardId>,
@@ -202,7 +202,7 @@ impl KeyspaceRoot {
 ///
 /// A node ID names exactly one node body. Providers may accept an identical
 /// duplicate persist, but different content for an existing ID must fail.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataNode {
     pub node_id: MetadataNodeId,
     pub covered_range: BlockRange,
@@ -233,14 +233,14 @@ impl MetadataNode {
 ///
 /// Internal children and leaf entries are immutable after publication. Phase 2
 /// validation will enforce ordering, coverage, and overlap invariants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetadataNodeKind {
     Internal { children: Vec<MetadataChild> },
     Leaf { entries: Vec<LeafEntry> },
 }
 
 /// Child pointer in an internal metadata node.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataChild {
     pub range: BlockRange,
     pub node_id: MetadataNodeId,
@@ -250,7 +250,7 @@ pub struct MetadataChild {
 ///
 /// Leaf entries must be sorted, non-overlapping, non-empty, and bounded by the
 /// referenced segment descriptor once validation is implemented.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeafEntry {
     pub logical_start: BlockIndex,
     pub blocks: BlockCount,
@@ -306,7 +306,7 @@ impl LeafEntry {
 /// bytes behind an existing segment ID. This is logical segment identity, not
 /// physical placement; one segment may have one local replica in v1 and many
 /// replica placements in a later replicated implementation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentDescriptor {
     pub segment_id: SegmentId,
     pub blocks: BlockCount,
@@ -351,7 +351,7 @@ impl SegmentDescriptor {
 }
 
 /// Single shard-root replacement in a block-device commit group.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShardRootUpdate {
     pub shard_id: ShardId,
     pub old_root: MetadataNodeId,
@@ -359,7 +359,7 @@ pub struct ShardRootUpdate {
 }
 
 /// Metadata root update inside a commit group.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RootUpdate {
     BlockShard(ShardRootUpdate),
     FileCreated {
@@ -379,7 +379,7 @@ pub enum RootUpdate {
 ///
 /// A commit group records the root updates that became visible atomically for a
 /// single mapping owner. It is the replay/PITR unit for committed root changes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitGroup {
     pub commit_group: CommitGroupId,
     pub commit_seq: CommitSeq,
@@ -392,7 +392,7 @@ pub struct CommitGroup {
 /// Fork records capture the O(1) root-pointer copy that created a child device.
 /// They are intentionally separate from shard-root commit groups because a fork
 /// creates a new owner without changing the source device's roots.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForkRecord {
     pub commit_seq: CommitSeq,
     pub source: DeviceId,
@@ -405,7 +405,7 @@ pub struct ForkRecord {
 /// A multi-shard public write creates one `ShardCommit` per changed shard, all
 /// sharing the same commit sequence and commit-group identity. PITR replay
 /// starts from a checkpoint and applies these records in commit order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShardCommit {
     pub commit_seq: CommitSeq,
     pub commit_group: CommitGroupId,
@@ -421,7 +421,7 @@ pub struct ShardCommit {
 /// A native file create or append publishes a new immutable keyspace catalog
 /// root. PITR replay starts from a native keyspace checkpoint and applies these
 /// records in commit order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceCommit {
     pub commit_seq: CommitSeq,
     pub commit_group: CommitGroupId,
@@ -432,7 +432,7 @@ pub struct KeyspaceCommit {
 }
 
 /// Append-only native file-root audit record inside a keyspace commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileCommit {
     pub commit_seq: CommitSeq,
     pub commit_group: CommitGroupId,
@@ -452,7 +452,7 @@ pub struct FileCommit {
 /// Deleting a device removes it from the live catalog but records the roots
 /// that were live at the deletion point. GC policy decides whether those roots
 /// remain retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeleteRecord {
     pub commit_seq: CommitSeq,
     pub time: LogicalTime,
@@ -461,7 +461,7 @@ pub struct DeleteRecord {
 }
 
 /// Root payload for a durable PITR checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CheckpointRoots {
     BlockShard(Vec<MetadataNodeId>),
     NativeKeyspace(KeyspaceRootId),
@@ -471,7 +471,7 @@ pub enum CheckpointRoots {
 ///
 /// Checkpoints summarize owner roots at a commit sequence so restore can replay
 /// only later append-only commit records.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     pub checkpoint_id: CheckpointId,
     pub commit_seq: CommitSeq,

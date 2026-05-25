@@ -606,56 +606,56 @@ Exit gate:
 
 ## Phase 16: Durable Provider
 
-Status: not started.
+Status: complete.
 
 Add a durable provider only after the local in-memory model, conformance suite,
 and native keyspace scaling characterization are boringly correct.
 
 Deliverables:
 
-- [ ] Provider choice documented in the spec.
-- [ ] Durable segment, local segment catalog, metadata plane, device catalog, and
+- [x] Provider choice documented in the spec.
+- [x] Durable segment, local segment catalog, metadata plane, device catalog, and
   timeline implementations.
-- [ ] Internal `SegmentFileIo` or equivalent storage-node file I/O boundary
+- [x] Internal `SegmentFileIo` or equivalent storage-node file I/O boundary
   below `SegmentStore` and `LocalSegmentCatalog`.
-- [ ] Portable blocking filesystem segment I/O backend used by the durable
+- [x] Portable blocking filesystem segment I/O backend used by the durable
   storage node by default.
-- [ ] Crash-consistent `sync_segment` and `flush` definitions, including exact
+- [x] Crash-consistent `sync_segment` and `flush` definitions, including exact
   `durable_through` semantics.
-- [ ] Durable metadata transaction or WAL records for commit groups, checkpoints,
+- [x] Durable metadata transaction or WAL records for commit groups, checkpoints,
   delete records, fork records, native keyspace commits, and native file-root
   audit commits.
-- [ ] Durable write-intent table with logical expiration, cancellation/failure
+- [x] Durable write-intent table with logical expiration, cancellation/failure
   evidence, and restart recovery scan.
-- [ ] Durable native append lease/session records with restart-safe writer
+- [x] Durable native append lease/session records with restart-safe writer
   epochs and stale-writer rejection after recovery.
-- [ ] Cache coherence rules for hot heads, metadata nodes, checkpoints, and
+- [x] Cache coherence rules for hot heads, metadata nodes, checkpoints, and
   segment descriptors after restart.
-- [ ] Crash/restart tests using the provider conformance suite.
-- [ ] Fault-injected crash tests at each segment file I/O boundary: temp write,
+- [x] Crash/restart tests using the provider conformance suite.
+- [x] Fault-injected crash tests at each segment file I/O boundary: temp write,
   temp file sync, atomic rename, final directory sync, catalog transition, and
   restart recovery.
-- [ ] PITR and GC tests against the durable provider.
+- [x] PITR and GC tests against the durable provider.
 
 Exit gate:
 
-- [ ] Durable provider passes the same conformance suite as the in-memory
+- [x] Durable provider passes the same conformance suite as the in-memory
   provider.
-- [ ] Crash/restart tests preserve committed device contents.
-- [ ] Partial writes do not expose uncommitted roots.
-- [ ] Partial metadata publishes replay as either the old roots or the complete
+- [x] Crash/restart tests preserve committed device contents.
+- [x] Partial writes do not expose uncommitted roots.
+- [x] Partial metadata publishes replay as either the old roots or the complete
   committed root set, never a partial commit group.
-- [ ] Pending segment writes left by crashed, expired, or fenced write intents
+- [x] Pending segment writes left by crashed, expired, or fenced write intents
   become reclaimable without exposing data.
-- [ ] The portable segment file I/O backend preserves the documented durability
+- [x] The portable segment file I/O backend preserves the documented durability
   sequence: payload bytes are durable before final segment visibility, and final
   path visibility is durable before catalog state can claim the segment is
   durable.
-- [ ] Flush reports only commit sequences whose segment bytes and metadata
+- [x] Flush reports only commit sequences whose segment bytes and metadata
   records satisfy the provider's documented durability contract.
-- [ ] Cached reads after restart or stale cache invalidation cannot observe roots
+- [x] Cached reads after restart or stale cache invalidation cannot observe roots
   older than the accepted fence/version.
-- [ ] No provider-specific behavior leaks into core metadata logic.
+- [x] No provider-specific behavior leaks into core metadata logic.
 
 ## Phase 17: Remote Transport
 

@@ -37,11 +37,11 @@ pub use id::{
     WriteIntentId, WriterEpoch,
 };
 pub use local::{
-    InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
+    DurableObjectStore, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
     LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer, LocalObjectStore,
     LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
-    SegmentLifecycleState, StorageNodeCustodianReport,
+    PortableSegmentFileIo, SegmentFileIo, SegmentLifecycleState, StorageNodeCustodianReport,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

@@ -489,6 +489,47 @@ global metadata says which logical segment is referenced; local segment metadata
 says where that segment's bytes live on a particular storage node. A logical
 segment may have one local replica in v1 and multiple replicas later.
 
+### Phase 16 Durable Provider Choice
+
+The first durable provider remains local and single-process, but persists the
+metadata service and storage-node state as separate planes:
+
+```text
+store/
+  metadata/
+    metadata.bin
+  storage-nodes/
+    node-<storage-node-id>/
+      catalog.bin
+      segment-store.bin
+      segments/
+      tmp/
+```
+
+The Phase 16 metadata provider uses crate-owned binary snapshots written with
+the same temp-file, file-sync, atomic-rename, and directory-sync discipline as
+segment files. This deliberately avoids choosing SQLite, RocksDB, or another
+database before the crash/restart contract is proven. A later provider may use
+a database, but it must preserve the same provider contracts and keep metadata
+state separate from storage-node local segment catalogs.
+
+Segment files are storage-node-local immutable payloads. `catalog.bin` records
+local reservation, durable-pending, referenced, released, and freed lifecycle
+state for that node. `segment-store.bin` records the durable segment descriptors
+and placement metadata needed to validate segment files at restart. The
+metadata snapshot records globally meaningful heads, roots, timelines,
+checkpoints, write-intent counters, and native writer epochs; it does not store
+storage-node file paths as metadata truth.
+
+Because Phase 16 uses synchronous provider persistence, a successful public
+write, checkpoint, fork, restore, delete, native write, or native append has
+already persisted its segment files, storage-node catalog snapshot, segment
+descriptor snapshot, and metadata snapshot before the call returns. `flush`
+therefore reports the latest committed sequence visible to the relevant device
+or native file as `durable_through`; it must not report a sequence whose
+metadata snapshot can reference segment bytes that failed the storage-node
+durability sequence.
+
 ### Future Storage Replication
 
 Replication belongs below the public block/native APIs and above individual

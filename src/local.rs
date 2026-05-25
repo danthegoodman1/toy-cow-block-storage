@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::api::{
@@ -35,7 +39,7 @@ use crate::provider::{
 const KEYSPACE_CATALOG_SHARD_COUNT: usize = 256;
 
 /// Local provider configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalStoreConfig {
     pub shard_count: usize,
     pub block_size: u32,
@@ -123,6 +127,37 @@ impl LocalObjectStore {
             segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::new(config)?),
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
+        })
+    }
+
+    fn from_snapshot(snapshot: DurableStoreSnapshot) -> Result<Self> {
+        snapshot.config.validate()?;
+        Ok(Self {
+            metadata: Arc::new(InMemoryMetadataPlane::from_inner(
+                snapshot.config,
+                snapshot.metadata,
+            )?),
+            segment_store: Arc::new(InMemorySegmentStore::from_inner(
+                snapshot.config,
+                snapshot.segment_store,
+            )?),
+            segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::from_inner(
+                snapshot.config,
+                snapshot.segment_catalog,
+            )?),
+            next_write_intent: Arc::new(Mutex::new(snapshot.next_write_intent)),
+            next_extent_id: Arc::new(Mutex::new(snapshot.next_extent_id)),
+        })
+    }
+
+    fn snapshot(&self) -> Result<DurableStoreSnapshot> {
+        Ok(DurableStoreSnapshot {
+            config: self.metadata.config,
+            metadata: self.metadata.snapshot_inner()?,
+            segment_store: self.segment_store.snapshot_inner()?,
+            segment_catalog: self.segment_catalog.snapshot_inner()?,
+            next_write_intent: *lock(&self.next_write_intent)?,
+            next_extent_id: *lock(&self.next_extent_id)?,
         })
     }
 
@@ -1216,6 +1251,501 @@ impl Default for LocalObjectStore {
     }
 }
 
+/// Internal storage-node file I/O boundary used by durable segment providers.
+///
+/// This sits below `SegmentStore` and `LocalSegmentCatalog`; changing the file
+/// I/O engine must not change block, native, metadata, PITR, or GC semantics.
+pub trait SegmentFileIo: Send + Sync {
+    fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()>;
+    fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()>;
+    fn rename_temp_to_final(&self, segment_id: SegmentId) -> Result<()>;
+    fn sync_segment_dir(&self) -> Result<()>;
+    fn read_segment_file(&self, segment_id: SegmentId) -> Result<Vec<u8>>;
+    fn delete_segment_file(&self, segment_id: SegmentId) -> Result<()>;
+    fn cleanup_tmp(&self) -> Result<()>;
+}
+
+/// Portable blocking filesystem implementation of `SegmentFileIo`.
+#[derive(Debug, Clone)]
+pub struct PortableSegmentFileIo {
+    segments_dir: PathBuf,
+    tmp_dir: PathBuf,
+}
+
+impl PortableSegmentFileIo {
+    pub fn new(node_dir: impl AsRef<Path>) -> Result<Self> {
+        let node_dir = node_dir.as_ref();
+        let segments_dir = node_dir.join("segments");
+        let tmp_dir = node_dir.join("tmp");
+        fs::create_dir_all(&segments_dir).map_err(fs_error)?;
+        fs::create_dir_all(&tmp_dir).map_err(fs_error)?;
+        Ok(Self {
+            segments_dir,
+            tmp_dir,
+        })
+    }
+
+    fn segment_path(&self, segment_id: SegmentId) -> PathBuf {
+        self.segments_dir
+            .join(format!("{:032x}.seg", segment_id.raw()))
+    }
+
+    fn tmp_path(&self, segment_id: SegmentId) -> PathBuf {
+        self.tmp_dir
+            .join(format!("{:032x}.partial", segment_id.raw()))
+    }
+
+    pub fn write_synced_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
+        let final_path = self.segment_path(segment_id);
+        if final_path.exists() {
+            let existing = fs::read(&final_path).map_err(fs_error)?;
+            if existing == bytes {
+                return Ok(());
+            }
+            return Err(StorageError::conflict(
+                "durable segment file already exists with different bytes",
+            ));
+        }
+
+        self.write_temp_segment(segment_id, bytes)?;
+        self.sync_temp_segment(segment_id)?;
+        self.rename_temp_to_final(segment_id)?;
+        self.sync_segment_dir()
+    }
+
+    fn prune_unlisted_segments(&self, keep: &BTreeSet<SegmentId>) -> Result<()> {
+        fs::create_dir_all(&self.segments_dir).map_err(fs_error)?;
+        let mut deleted = false;
+        for entry in fs::read_dir(&self.segments_dir).map_err(fs_error)? {
+            let entry = entry.map_err(fs_error)?;
+            if !entry.file_type().map_err(fs_error)?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return Err(StorageError::corrupt(
+                    "durable segment file name is not valid UTF-8",
+                ));
+            };
+            let Some(raw) = name.strip_suffix(".seg") else {
+                return Err(StorageError::corrupt(
+                    "unknown file in durable segment directory",
+                ));
+            };
+            let raw = u128::from_str_radix(raw, 16)
+                .map_err(|_| StorageError::corrupt("durable segment file name is invalid"))?;
+            if !keep.contains(&SegmentId::from_raw(raw)) {
+                fs::remove_file(path).map_err(fs_error)?;
+                deleted = true;
+            }
+        }
+        if deleted {
+            self.sync_segment_dir()?;
+        }
+        Ok(())
+    }
+}
+
+impl SegmentFileIo for PortableSegmentFileIo {
+    fn write_temp_segment(&self, segment_id: SegmentId, bytes: &[u8]) -> Result<()> {
+        fs::create_dir_all(&self.tmp_dir).map_err(fs_error)?;
+        let mut file = File::create(self.tmp_path(segment_id)).map_err(fs_error)?;
+        file.write_all(bytes).map_err(fs_error)?;
+        Ok(())
+    }
+
+    fn sync_temp_segment(&self, segment_id: SegmentId) -> Result<()> {
+        File::open(self.tmp_path(segment_id))
+            .map_err(fs_error)?
+            .sync_all()
+            .map_err(fs_error)
+    }
+
+    fn rename_temp_to_final(&self, segment_id: SegmentId) -> Result<()> {
+        fs::create_dir_all(&self.segments_dir).map_err(fs_error)?;
+        fs::rename(self.tmp_path(segment_id), self.segment_path(segment_id)).map_err(fs_error)
+    }
+
+    fn sync_segment_dir(&self) -> Result<()> {
+        File::open(&self.segments_dir)
+            .map_err(fs_error)?
+            .sync_all()
+            .map_err(fs_error)
+    }
+
+    fn read_segment_file(&self, segment_id: SegmentId) -> Result<Vec<u8>> {
+        fs::read(self.segment_path(segment_id)).map_err(fs_error)
+    }
+
+    fn delete_segment_file(&self, segment_id: SegmentId) -> Result<()> {
+        let path = self.segment_path(segment_id);
+        match fs::remove_file(path) {
+            Ok(()) => self.sync_segment_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(fs_error(error)),
+        }
+    }
+
+    fn cleanup_tmp(&self) -> Result<()> {
+        fs::create_dir_all(&self.tmp_dir).map_err(fs_error)?;
+        for entry in fs::read_dir(&self.tmp_dir).map_err(fs_error)? {
+            let entry = entry.map_err(fs_error)?;
+            let file_type = entry.file_type().map_err(fs_error)?;
+            if file_type.is_file() {
+                fs::remove_file(entry.path()).map_err(fs_error)?;
+            }
+        }
+        File::open(&self.tmp_dir)
+            .map_err(fs_error)?
+            .sync_all()
+            .map_err(fs_error)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DurableStorePaths {
+    metadata_snapshot: PathBuf,
+    catalog_snapshot: PathBuf,
+    segment_store_snapshot: PathBuf,
+}
+
+impl DurableStorePaths {
+    fn new(root: impl AsRef<Path>, storage_node: StorageNodeId) -> Result<(Self, PathBuf)> {
+        let root = root.as_ref();
+        let metadata_dir = root.join("metadata");
+        let node_dir = root
+            .join("storage-nodes")
+            .join(format!("node-{:032x}", storage_node.raw()));
+        fs::create_dir_all(&metadata_dir).map_err(fs_error)?;
+        fs::create_dir_all(&node_dir).map_err(fs_error)?;
+        Ok((
+            Self {
+                metadata_snapshot: metadata_dir.join("metadata.bin"),
+                catalog_snapshot: node_dir.join("catalog.bin"),
+                segment_store_snapshot: node_dir.join("segment-store.bin"),
+            },
+            node_dir,
+        ))
+    }
+}
+
+/// Local durable provider bundle using separated metadata and storage-node
+/// files.
+#[derive(Debug, Clone)]
+pub struct DurableObjectStore {
+    local: LocalObjectStore,
+    paths: Arc<DurableStorePaths>,
+    segment_io: Arc<PortableSegmentFileIo>,
+}
+
+impl DurableObjectStore {
+    pub fn open(root: impl AsRef<Path>, config: LocalStoreConfig) -> Result<Self> {
+        config.validate()?;
+        let (paths, node_dir) = DurableStorePaths::new(root, config.storage_node)?;
+        let segment_io = Arc::new(PortableSegmentFileIo::new(&node_dir)?);
+        segment_io.cleanup_tmp()?;
+
+        let local = if paths.metadata_snapshot.exists()
+            || paths.catalog_snapshot.exists()
+            || paths.segment_store_snapshot.exists()
+        {
+            Self::load_local_store(&paths, segment_io.as_ref())?
+        } else {
+            LocalObjectStore::with_config(config)?
+        };
+
+        let store = Self {
+            local,
+            paths: Arc::new(paths),
+            segment_io,
+        };
+        store.persist()?;
+        Ok(store)
+    }
+
+    pub fn metadata(&self) -> Arc<InMemoryMetadataPlane> {
+        self.local.metadata()
+    }
+
+    pub fn segment_catalog(&self) -> Arc<InMemoryLocalSegmentCatalog> {
+        self.local.segment_catalog()
+    }
+
+    pub fn segment_store(&self) -> Arc<InMemorySegmentStore> {
+        self.local.segment_store()
+    }
+
+    pub fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
+        self.run_and_persist(|local| {
+            local
+                .metadata
+                .create_device(MetadataCreateDeviceRequest::from(request))
+                .map(|head| head.device_id)
+        })
+    }
+
+    pub fn device_info(&self, device_id: DeviceId) -> Result<DeviceInfo> {
+        self.local.metadata.device_info(device_id)
+    }
+
+    pub fn create_keyspace(&self, request: CreateKeyspaceRequest) -> Result<KeyspaceId> {
+        self.run_and_persist(|local| {
+            local
+                .metadata
+                .create_keyspace(MetadataCreateKeyspaceRequest { request })
+                .map(|head| head.keyspace_id)
+        })
+    }
+
+    pub fn create_file(
+        &self,
+        keyspace_id: KeyspaceId,
+        request: CreateFileRequest,
+    ) -> Result<FileId> {
+        self.run_and_persist(|local| {
+            local
+                .metadata
+                .create_file(MetadataCreateFileRequest {
+                    keyspace_id,
+                    request,
+                })
+                .map(|head| head.file_id)
+        })
+    }
+
+    pub fn acquire_append_lease(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<AppendLease> {
+        self.run_and_persist(|local| local.acquire_append_lease(keyspace_id, file_id))
+    }
+
+    pub fn checkpoint(&self, device_id: DeviceId) -> Result<CheckpointId> {
+        self.run_and_persist(|local| local.metadata.checkpoint(device_id))
+    }
+
+    pub fn checkpoint_keyspace(&self, keyspace_id: KeyspaceId) -> Result<CheckpointId> {
+        self.run_and_persist(|local| local.metadata.checkpoint_keyspace(keyspace_id))
+    }
+
+    pub fn snapshot_keyspace(
+        &self,
+        source: KeyspaceId,
+        request: SnapshotKeyspaceRequest,
+    ) -> Result<KeyspaceId> {
+        self.run_and_persist(|local| {
+            local
+                .metadata
+                .snapshot_keyspace(MetadataSnapshotKeyspaceRequest {
+                    source,
+                    target: request.target,
+                    name: request.name,
+                })
+                .map(|head| head.keyspace_id)
+        })
+    }
+
+    pub fn restore_keyspace(&self, source: KeyspaceId, point: RestorePoint) -> Result<KeyspaceId> {
+        self.run_and_persist(|local| {
+            local
+                .metadata
+                .restore_keyspace(source, point)
+                .map(|head| head.keyspace_id)
+        })
+    }
+
+    pub fn write_device(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+    ) -> Result<WriteCommit> {
+        self.run_and_persist(|local| local.write_device(device_id, offset, data, durability))
+    }
+
+    pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+        self.local.read_device(device_id, range, buf)
+    }
+
+    pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
+        self.run_and_persist(|local| local.write_zeroes(device_id, offset, len))
+    }
+
+    pub fn discard_device(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
+        self.run_and_persist(|local| local.discard_device(device_id, offset, len))
+    }
+
+    pub fn write_file_at(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+    ) -> Result<FileWriteCommit> {
+        self.run_and_persist(|local| {
+            local.write_file_at(keyspace_id, file_id, offset, data, durability)
+        })
+    }
+
+    pub fn append_file(
+        &self,
+        lease: AppendLease,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+    ) -> Result<AppendCommit> {
+        self.run_and_persist(|local| local.append_file(lease, data, durability))
+    }
+
+    pub fn read_file(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        self.local.read_file(keyspace_id, file_id, range, buf)
+    }
+
+    pub fn fork_device(&self, source: DeviceId, request: ForkRequest) -> Result<DeviceId> {
+        self.run_and_persist(|local| local.fork_device(source, request))
+    }
+
+    pub fn restore_device(&self, source: DeviceId, point: RestorePoint) -> Result<DeviceId> {
+        self.run_and_persist(|local| local.restore_device(source, point))
+    }
+
+    pub fn delete_device(&self, device_id: DeviceId) -> Result<DeleteResult> {
+        self.run_and_persist(|local| local.delete_device(device_id))
+    }
+
+    pub fn run_metadata_custodian(
+        &self,
+        policy: RetentionPolicy,
+    ) -> Result<MetadataCustodianReport> {
+        self.run_and_persist(|local| local.run_metadata_custodian(policy))
+    }
+
+    pub fn run_storage_node_custodian(
+        &self,
+        expired_write_intents: &BTreeSet<WriteIntentId>,
+    ) -> Result<StorageNodeCustodianReport> {
+        self.run_and_persist(|local| local.run_storage_node_custodian(expired_write_intents))
+    }
+
+    fn run_and_persist<T>(&self, op: impl FnOnce(&LocalObjectStore) -> Result<T>) -> Result<T> {
+        let result = op(&self.local);
+        let persist = self.persist();
+        match (result, persist) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) | (Err(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn load_local_store(
+        paths: &DurableStorePaths,
+        io: &PortableSegmentFileIo,
+    ) -> Result<LocalObjectStore> {
+        let metadata: DurableMetadataSnapshot = read_snapshot(&paths.metadata_snapshot)?;
+        let catalog: DurableCatalogSnapshot = read_snapshot(&paths.catalog_snapshot)?;
+        let segment_store: DurableSegmentStoreSnapshot =
+            read_snapshot(&paths.segment_store_snapshot)?;
+        if metadata.config != catalog.config || metadata.config != segment_store.config {
+            return Err(StorageError::corrupt(
+                "durable provider snapshots disagree on store config",
+            ));
+        }
+
+        let mut records = BTreeMap::new();
+        for (segment_id, record) in segment_store.records {
+            let bytes = io.read_segment_file(segment_id)?;
+            let bytes_len = u64::try_from(bytes.len())
+                .map_err(|_| StorageError::corrupt("durable segment length overflows u64"))?;
+            if bytes_len != record.commit.descriptor.bytes {
+                return Err(StorageError::corrupt(
+                    "durable segment file length does not match catalog",
+                ));
+            }
+            if record.commit.descriptor.checksum != Some(checksum64(&bytes)) {
+                return Err(StorageError::corrupt(
+                    "durable segment file checksum does not match catalog",
+                ));
+            }
+            records.insert(
+                segment_id,
+                SegmentRecord {
+                    bytes,
+                    synced: record.synced,
+                    commit: record.commit,
+                },
+            );
+        }
+
+        LocalObjectStore::from_snapshot(DurableStoreSnapshot {
+            config: metadata.config,
+            metadata: metadata.metadata,
+            segment_store: SegmentStoreInner {
+                next_offset: segment_store.next_offset,
+                segments: records,
+            },
+            segment_catalog: catalog.catalog,
+            next_write_intent: metadata.next_write_intent,
+            next_extent_id: metadata.next_extent_id,
+        })
+    }
+
+    fn persist(&self) -> Result<()> {
+        let snapshot = self.local.snapshot()?;
+        for (segment_id, record) in &snapshot.segment_store.segments {
+            self.segment_io
+                .write_synced_segment(*segment_id, &record.bytes)?;
+        }
+        let kept_segments: BTreeSet<_> = snapshot.segment_store.segments.keys().copied().collect();
+        self.segment_io.prune_unlisted_segments(&kept_segments)?;
+
+        let segment_store_snapshot = DurableSegmentStoreSnapshot {
+            config: snapshot.config,
+            next_offset: snapshot.segment_store.next_offset,
+            records: snapshot
+                .segment_store
+                .segments
+                .iter()
+                .map(|(segment_id, record)| {
+                    (
+                        *segment_id,
+                        DurableSegmentRecord {
+                            synced: record.synced,
+                            commit: record.commit.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let catalog_snapshot = DurableCatalogSnapshot {
+            config: snapshot.config,
+            catalog: snapshot.segment_catalog,
+        };
+        let metadata_snapshot = DurableMetadataSnapshot {
+            config: snapshot.config,
+            metadata: snapshot.metadata,
+            next_write_intent: snapshot.next_write_intent,
+            next_extent_id: snapshot.next_extent_id,
+        };
+
+        write_snapshot_atomic(&self.paths.segment_store_snapshot, &segment_store_snapshot)?;
+        write_snapshot_atomic(&self.paths.catalog_snapshot, &catalog_snapshot)?;
+        write_snapshot_atomic(&self.paths.metadata_snapshot, &metadata_snapshot)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeviceWriteChunk {
     shard_id: crate::id::ShardId,
@@ -1278,7 +1808,44 @@ pub struct StorageNodeCustodianReport {
     pub deleted_released_segments: Vec<SegmentId>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DurableStoreSnapshot {
+    config: LocalStoreConfig,
+    metadata: MetadataInner,
+    segment_store: SegmentStoreInner,
+    segment_catalog: CatalogInner,
+    next_write_intent: u128,
+    next_extent_id: u128,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DurableSegmentStoreSnapshot {
+    config: LocalStoreConfig,
+    next_offset: u64,
+    records: BTreeMap<SegmentId, DurableSegmentRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DurableSegmentRecord {
+    synced: bool,
+    commit: SegmentReplicaCommit,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DurableMetadataSnapshot {
+    config: LocalStoreConfig,
+    metadata: MetadataInner,
+    next_write_intent: u128,
+    next_extent_id: u128,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DurableCatalogSnapshot {
+    config: LocalStoreConfig,
+    catalog: CatalogInner,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct MetadataInner {
     next_device_id: u128,
     next_keyspace_id: u128,
@@ -1461,6 +2028,18 @@ impl InMemoryMetadataPlane {
             config,
             inner: Mutex::new(MetadataInner::new()),
         })
+    }
+
+    fn from_inner(config: LocalStoreConfig, inner: MetadataInner) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            inner: Mutex::new(inner),
+        })
+    }
+
+    fn snapshot_inner(&self) -> Result<MetadataInner> {
+        Ok(lock(&self.inner)?.clone())
     }
 
     pub fn device_info(&self, device_id: DeviceId) -> Result<DeviceInfo> {
@@ -3568,14 +4147,14 @@ impl MetadataPlane for InMemoryMetadataPlane {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SegmentRecord {
     bytes: Vec<u8>,
     synced: bool,
     commit: SegmentReplicaCommit,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SegmentStoreInner {
     next_offset: u64,
     segments: BTreeMap<SegmentId, SegmentRecord>,
@@ -3598,6 +4177,18 @@ impl InMemorySegmentStore {
                 segments: BTreeMap::new(),
             }),
         })
+    }
+
+    fn from_inner(config: LocalStoreConfig, inner: SegmentStoreInner) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            inner: Mutex::new(inner),
+        })
+    }
+
+    fn snapshot_inner(&self) -> Result<SegmentStoreInner> {
+        Ok(lock(&self.inner)?.clone())
     }
 
     pub fn is_synced(&self, segment_id: SegmentId) -> Result<bool> {
@@ -3737,7 +4328,7 @@ impl SegmentStore for InMemorySegmentStore {
 }
 
 /// Local segment lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SegmentLifecycleState {
     Reserved,
     Writing,
@@ -3747,7 +4338,7 @@ pub enum SegmentLifecycleState {
     Freed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CatalogEntry {
     intent: SegmentReservationIntent,
     reservation: SegmentReservation,
@@ -3755,7 +4346,7 @@ struct CatalogEntry {
     commit: Option<SegmentReplicaCommit>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CatalogInner {
     next_segment_id: u128,
     entries: BTreeMap<SegmentId, CatalogEntry>,
@@ -3778,6 +4369,18 @@ impl InMemoryLocalSegmentCatalog {
                 entries: BTreeMap::new(),
             }),
         })
+    }
+
+    fn from_inner(config: LocalStoreConfig, inner: CatalogInner) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            inner: Mutex::new(inner),
+        })
+    }
+
+    fn snapshot_inner(&self) -> Result<CatalogInner> {
+        Ok(lock(&self.inner)?.clone())
     }
 
     pub fn state(&self, segment_id: SegmentId) -> Result<SegmentLifecycleState> {
@@ -4937,6 +5540,37 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
 }
 
+fn fs_error(error: std::io::Error) -> StorageError {
+    StorageError::unavailable(format!("filesystem operation failed: {error}"))
+}
+
+fn serde_error(error: impl std::fmt::Display) -> StorageError {
+    StorageError::corrupt(format!("durable provider snapshot codec failed: {error}"))
+}
+
+fn read_snapshot<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let file = File::open(path).map_err(fs_error)?;
+    bincode::deserialize_from(file).map_err(serde_error)
+}
+
+fn write_snapshot_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| StorageError::invalid_argument("snapshot path has no parent"))?;
+    fs::create_dir_all(parent).map_err(fs_error)?;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp).map_err(fs_error)?;
+        bincode::serialize_into(&mut file, value).map_err(serde_error)?;
+        file.sync_all().map_err(fs_error)?;
+    }
+    fs::rename(&tmp, path).map_err(fs_error)?;
+    File::open(parent)
+        .map_err(fs_error)?
+        .sync_all()
+        .map_err(fs_error)
+}
+
 fn next_request_id(next: &Mutex<u128>) -> Result<RequestId> {
     let mut next = lock(next)?;
     let request_id = RequestId::from_raw(*next);
@@ -5055,9 +5689,12 @@ fn blocks_for_bytes(bytes: u64, block_size: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::api::{BlockRequest, CreateDeviceRequest, DeviceSpec, FlushScope, WriteDurability};
-    use crate::extent::{CreateFileRequest, FileSpec};
+    use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileSpec};
     use crate::id::{ClientEpoch, LogicalDeadline, ShardId, WriteIntentId};
     use crate::object::{LeafEntry, ShardRootUpdate};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(1);
 
     fn config() -> LocalStoreConfig {
         LocalStoreConfig {
@@ -5077,6 +5714,16 @@ mod tests {
             file_root_blocks: 32,
             ..config()
         }
+    }
+
+    fn durable_temp_dir(name: &str) -> PathBuf {
+        let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "toy-cow-block-storage-{name}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        path
     }
 
     fn device_request() -> MetadataCreateDeviceRequest {
@@ -6393,6 +7040,203 @@ mod tests {
                 .read_segment(SegmentId::from_raw(404), ByteRange::new(0, 1), &mut [0])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn portable_segment_file_io_stages_syncs_renames_and_cleans_tmp() {
+        let root = durable_temp_dir("segment-io");
+        let node_dir = root.join("storage-nodes").join("node");
+        let io = PortableSegmentFileIo::new(&node_dir).unwrap();
+        let segment = SegmentId::from_raw(7);
+        let bytes = vec![9; 4096];
+
+        io.write_temp_segment(segment, &bytes).unwrap();
+        assert!(io.read_segment_file(segment).is_err());
+        assert!(io.tmp_path(segment).exists());
+        io.sync_temp_segment(segment).unwrap();
+        io.rename_temp_to_final(segment).unwrap();
+        io.sync_segment_dir().unwrap();
+        assert_eq!(io.read_segment_file(segment).unwrap(), bytes);
+
+        let partial = SegmentId::from_raw(8);
+        io.write_temp_segment(partial, &[1; 4096]).unwrap();
+        io.cleanup_tmp().unwrap();
+        assert!(!io.tmp_path(partial).exists());
+        io.delete_segment_file(segment).unwrap();
+        assert!(io.read_segment_file(segment).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_provider_reopens_committed_block_contents_and_restore_points() {
+        let root = durable_temp_dir("block-restart");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: Some("durable".to_string()),
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(2, 3),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let checkpoint = store.checkpoint(device_id).unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(2, 4),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        assert!(root.join("metadata").join("metadata.bin").exists());
+        assert!(
+            root.join("storage-nodes")
+                .join(format!("node-{:032x}", cfg.storage_node.raw()))
+                .join("catalog.bin")
+                .exists()
+        );
+
+        drop(store);
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut current = vec![0; 2 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut current)
+            .unwrap();
+        assert_eq!(current, repeated_blocks(2, 4));
+
+        let restored = reopened
+            .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+            .unwrap();
+        let mut restored_bytes = vec![0; 2 * 4096];
+        reopened
+            .read_device(restored, ByteRange::new(0, 2 * 4096), &mut restored_bytes)
+            .unwrap();
+        assert_eq!(restored_bytes, repeated_blocks(2, 3));
+
+        drop(reopened);
+        let reopened_again = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut restored_after_restart = vec![0; 2 * 4096];
+        reopened_again
+            .read_device(
+                restored,
+                ByteRange::new(0, 2 * 4096),
+                &mut restored_after_restart,
+            )
+            .unwrap();
+        assert_eq!(restored_after_restart, repeated_blocks(2, 3));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_provider_reopens_native_keyspace_and_writer_epochs() {
+        let root = durable_temp_dir("native-restart");
+        let cfg = config();
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let stale = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+        let fresh = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+
+        drop(store);
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        assert!(
+            reopened
+                .append_file(stale, b"stale", WriteDurability::Acknowledged)
+                .is_err()
+        );
+        reopened
+            .append_file(fresh, b"durable", WriteDurability::Acknowledged)
+            .unwrap();
+        let mut bytes = vec![0; b"durable".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, b"durable".len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"durable");
+
+        drop(reopened);
+        let reopened_again = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut bytes_after_restart = vec![0; b"durable".len()];
+        reopened_again
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, b"durable".len() as u64),
+                &mut bytes_after_restart,
+            )
+            .unwrap();
+        assert_eq!(bytes_after_restart, b"durable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_provider_persists_storage_node_custodian_deletions() {
+        let root = durable_temp_dir("custodian-restart");
+        let cfg = config();
+        let node_dir = root
+            .join("storage-nodes")
+            .join(format!("node-{:032x}", cfg.storage_node.raw()));
+        let segment_path = node_dir
+            .join("segments")
+            .join(format!("{:032x}.seg", SegmentId::from_raw(1).raw()));
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 8),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        assert!(segment_path.exists());
+
+        store.delete_device(device_id).unwrap();
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        assert!(!segment_path.exists());
+
+        drop(store);
+        DurableObjectStore::open(&root, cfg).unwrap();
+        assert!(!segment_path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

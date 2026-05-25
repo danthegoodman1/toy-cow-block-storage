@@ -5,12 +5,12 @@ use crate::id::{
     KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateKeyspaceRequest {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceInfo {
     pub keyspace_id: KeyspaceId,
     pub generation: KeyspaceGeneration,
@@ -18,23 +18,23 @@ pub struct KeyspaceInfo {
     pub file_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotKeyspaceRequest {
     pub target: Option<KeyspaceId>,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileSpec {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateFileRequest {
     pub spec: FileSpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileInfo {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
@@ -42,7 +42,7 @@ pub struct FileInfo {
     pub version: FileVersion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendLease {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
@@ -51,7 +51,7 @@ pub struct AppendLease {
     pub base_version: FileVersion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendCommit {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
@@ -62,7 +62,7 @@ pub struct AppendCommit {
     pub durability: WriteDurability,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileWriteCommit {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
@@ -72,7 +72,7 @@ pub struct FileWriteCommit {
     pub durability: WriteDurability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NativeOperation {
     CreateKeyspace,
     KeyspaceInfo,
@@ -202,7 +202,7 @@ pub trait NativeKeyspaceClient: Send + Sync {
     fn restore_keyspace(&self, source: KeyspaceId, point: RestorePoint) -> Result<KeyspaceId>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NativeRequest {
     CreateKeyspace {
         request: CreateKeyspaceRequest,
@@ -412,7 +412,7 @@ impl NativeRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NativeResponse {
     KeyspaceCreated(KeyspaceId),
     KeyspaceInfo(KeyspaceInfo),
@@ -428,7 +428,7 @@ pub enum NativeResponse {
     KeyspaceRestored(KeyspaceId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeRequestEnvelope {
     /// Caller-chosen request identity used to match responses and retries.
     pub request_id: RequestId,
@@ -463,7 +463,7 @@ impl NativeRequestEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeResponseEnvelope {
     pub request_id: RequestId,
     pub response: NativeResponse,

@@ -4,7 +4,7 @@ use crate::id::{
     LogicalDeadline, LogicalTime, RequestId,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceSpec {
     pub logical_blocks: u64,
     pub block_size: u32,
@@ -41,7 +41,7 @@ impl DeviceSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceInfo {
     pub device_id: DeviceId,
     pub generation: DeviceGeneration,
@@ -49,7 +49,7 @@ pub struct DeviceInfo {
     pub latest_commit: CommitSeq,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateDeviceRequest {
     pub spec: DeviceSpec,
     pub name: Option<String>,
@@ -61,7 +61,7 @@ impl CreateDeviceRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ByteRange {
     pub offset: u64,
     pub len: u64,
@@ -102,7 +102,7 @@ impl ByteRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlockOperation {
     Create,
     Info,
@@ -116,7 +116,7 @@ pub enum BlockOperation {
     Delete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockRange {
     pub start: BlockIndex,
     pub blocks: BlockCount,
@@ -219,19 +219,19 @@ impl BlockRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WriteDurability {
     Acknowledged,
     Flushed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FlushScope {
     Device,
     All,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WriteCommit {
     pub device_id: DeviceId,
     pub commit_seq: CommitSeq,
@@ -239,25 +239,25 @@ pub struct WriteCommit {
     pub durability: WriteDurability,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FlushResult {
     pub device_id: DeviceId,
     pub durable_through: CommitSeq,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeleteResult {
     pub device_id: DeviceId,
     pub commit_seq: CommitSeq,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForkRequest {
     pub target: Option<DeviceId>,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RestorePoint {
     Commit(CommitSeq),
     Checkpoint(CheckpointId),
@@ -362,7 +362,7 @@ pub trait BlockClient: Send + Sync {
     fn device_info(&self, device_id: DeviceId) -> Result<DeviceInfo>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlockRequest {
     Create {
         request: CreateDeviceRequest,
@@ -497,12 +497,12 @@ impl BlockRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReadResponse {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlockResponse {
     Created(DeviceId),
     Info(DeviceInfo),
@@ -514,7 +514,7 @@ pub enum BlockResponse {
     Deleted(DeleteResult),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockRequestEnvelope {
     /// Caller-chosen request identity used to match responses and retries.
     pub request_id: RequestId,
@@ -549,7 +549,7 @@ impl BlockRequestEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockResponseEnvelope {
     pub request_id: RequestId,
     pub response: BlockResponse,

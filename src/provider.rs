@@ -17,7 +17,7 @@ use crate::object::{
 /// together or none do. For native keyspaces, the catalog-root transition and
 /// enclosed file root/version transition become visible together or none does.
 /// Successful publishes must be durably replayable before success is returned.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitGroupIntent {
     pub owner: MappingOwner,
     pub fence: MetadataFence,
@@ -29,7 +29,7 @@ pub struct CommitGroupIntent {
 /// Implementors must reject a publish when the current owner state no longer
 /// matches the supplied fence. Rejection must not partially apply any root
 /// update. A stale native writer should be rejected through `WriterEpoch`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetadataFence {
     DeviceGeneration(DeviceGeneration),
     FileVersion(FileVersion),
@@ -43,20 +43,20 @@ pub enum MetadataFence {
 ///
 /// The metadata plane may choose internal shard layout. The public `DeviceSpec`
 /// intentionally carries only user-visible shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataCreateDeviceRequest {
     pub spec: DeviceSpec,
     pub name: Option<String>,
 }
 
 /// Internal create-file request accepted by the metadata plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataCreateFileRequest {
     pub keyspace_id: KeyspaceId,
     pub request: CreateFileRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataCreateKeyspaceRequest {
     pub request: CreateKeyspaceRequest,
 }
@@ -70,14 +70,14 @@ impl From<CreateDeviceRequest> for MetadataCreateDeviceRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataForkRequest {
     pub source: DeviceId,
     pub target: Option<DeviceId>,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataSnapshotKeyspaceRequest {
     pub source: KeyspaceId,
     pub target: Option<KeyspaceId>,
@@ -88,7 +88,7 @@ pub struct MetadataSnapshotKeyspaceRequest {
 ///
 /// The policy is deliberately expressed in commit-age terms instead of wall
 /// clock time so retention can be simulated and replayed deterministically.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RetentionPolicy {
     /// Retain every deleted device root indefinitely.
     pub retain_deleted_devices: bool,
@@ -357,7 +357,7 @@ pub trait SegmentStore: Send + Sync {
 }
 
 /// Segment reservation request for a specific write intent and mapping owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentReservationIntent {
     pub write_intent: WriteIntentId,
     pub owner: MappingOwner,
@@ -365,7 +365,7 @@ pub struct SegmentReservationIntent {
 }
 
 /// Reserved local segment space on one storage endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentReservation {
     pub segment_id: SegmentId,
     pub bytes: u64,
@@ -376,7 +376,7 @@ pub struct SegmentReservation {
 /// A logical segment may have one placement in local v1 and many placements in
 /// a later replicated implementation. Metadata leaf entries reference the
 /// logical `SegmentId`; replica selection remains below the metadata tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentReplicaPlacement {
     pub segment_id: SegmentId,
     pub storage_node: StorageNodeId,
@@ -388,7 +388,7 @@ pub struct SegmentReplicaPlacement {
 ///
 /// A future replicated coordinator can collect multiple replica commits for the
 /// same logical segment before publishing metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentReplicaCommit {
     pub descriptor: SegmentDescriptor,
     pub placement: SegmentReplicaPlacement,
