@@ -670,6 +670,8 @@ Deliverables:
 - [x] Serialization format for request and response envelopes.
 - [x] Retry, deadline, duplicate-request, duplicate-response, and stale-response
   tests.
+- [x] Deterministic chaos wire transport for request drops, response drops,
+  duplicate deliveries, delayed responses, and reordered response bytes.
 - [x] Bounded request deduplication keyed by request ID, client epoch, and server
   incarnation.
 - [x] Server actor mailbox, backpressure, and shutdown semantics.
@@ -689,7 +691,7 @@ Exit gate:
 - [x] Non-conflicting operations are not forced through a whole-server global
   lock by the interface.
 - [x] Deterministic transport simulation covers delay, duplication, drop, and
-  reorder faults.
+  reorder faults for both block and native APIs.
 
 ## Phase 18: Storage Replication
 

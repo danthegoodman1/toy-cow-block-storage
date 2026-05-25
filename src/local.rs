@@ -5004,6 +5004,248 @@ impl NativeTransport for InProcessNativeTransport {
     }
 }
 
+/// Serialized wire boundary used by remote-shaped transports.
+///
+/// Minimal implementor guarantees:
+///
+/// - Accept exactly one encoded request envelope and return exactly one encoded
+///   response envelope, or report a transport-level failure.
+/// - Preserve request bytes as opaque data; block/native semantics are enforced
+///   above this trait by the typed transport and below it by the endpoint.
+/// - Failures, dropped responses, delayed responses, and reordered responses
+///   must be surfaced as errors or bytes for the typed transport to validate;
+///   they must not mutate request IDs or response IDs.
+pub trait RemoteWireTransport: Send + Sync {
+    /// Send one encoded request and return encoded response bytes.
+    fn call_wire(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>>;
+}
+
+/// Deterministic counters for chaos wire transport fault injection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChaosTransportMetrics {
+    pub request_drops: u64,
+    pub response_drops: u64,
+    pub duplicated_requests: u64,
+    pub delayed_responses: u64,
+    pub reordered_responses: u64,
+    pub injected_failures: u64,
+}
+
+#[derive(Debug)]
+struct ChaosWireState {
+    delayed: VecDeque<Result<Vec<u8>>>,
+    trace: Vec<String>,
+    metrics: ChaosTransportMetrics,
+    fail_next_call: bool,
+    drop_next_request: bool,
+    drop_next_response: bool,
+    duplicate_next_request: bool,
+    delay_next_response: bool,
+    return_delayed_next: bool,
+    reorder_next_response: bool,
+}
+
+impl ChaosWireState {
+    fn new() -> Self {
+        Self {
+            delayed: VecDeque::new(),
+            trace: Vec::new(),
+            metrics: ChaosTransportMetrics::default(),
+            fail_next_call: false,
+            drop_next_request: false,
+            drop_next_response: false,
+            duplicate_next_request: false,
+            delay_next_response: false,
+            return_delayed_next: false,
+            reorder_next_response: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChaosWireAction {
+    Pass,
+    Fail,
+    DropRequest,
+    DropResponse,
+    DuplicateRequest,
+    DelayResponse,
+    ReturnDelayed,
+    ReorderWithDelayed,
+}
+
+/// Deterministic chaos wrapper for serialized remote transports.
+///
+/// The wrapper is intentionally scriptable instead of wall-clock or thread
+/// driven. Tests can force the next request or response to be dropped,
+/// duplicated, delayed, or reordered and then assert that the typed transport
+/// rejects stale bytes or retries safely with the same request identity.
+#[derive(Clone)]
+pub struct ChaosRemoteWireTransport {
+    inner: Arc<dyn RemoteWireTransport>,
+    state: Arc<Mutex<ChaosWireState>>,
+}
+
+impl ChaosRemoteWireTransport {
+    pub fn new(inner: Arc<dyn RemoteWireTransport>) -> Self {
+        Self {
+            inner,
+            state: Arc::new(Mutex::new(ChaosWireState::new())),
+        }
+    }
+
+    pub fn trace(&self) -> Result<Vec<String>> {
+        Ok(lock(&self.state)?.trace.clone())
+    }
+
+    pub fn metrics(&self) -> Result<ChaosTransportMetrics> {
+        Ok(lock(&self.state)?.metrics)
+    }
+
+    pub fn delayed_len(&self) -> Result<usize> {
+        Ok(lock(&self.state)?.delayed.len())
+    }
+
+    pub fn fail_next_call(&self) -> Result<()> {
+        lock(&self.state)?.fail_next_call = true;
+        Ok(())
+    }
+
+    pub fn drop_next_request(&self) -> Result<()> {
+        lock(&self.state)?.drop_next_request = true;
+        Ok(())
+    }
+
+    pub fn drop_next_response(&self) -> Result<()> {
+        lock(&self.state)?.drop_next_response = true;
+        Ok(())
+    }
+
+    pub fn duplicate_next_request(&self) -> Result<()> {
+        lock(&self.state)?.duplicate_next_request = true;
+        Ok(())
+    }
+
+    pub fn delay_next_response(&self) -> Result<()> {
+        lock(&self.state)?.delay_next_response = true;
+        Ok(())
+    }
+
+    pub fn return_delayed_response_next_call(&self) -> Result<()> {
+        lock(&self.state)?.return_delayed_next = true;
+        Ok(())
+    }
+
+    pub fn reorder_next_response_with_delayed(&self) -> Result<()> {
+        lock(&self.state)?.reorder_next_response = true;
+        Ok(())
+    }
+
+    fn take_action(&self) -> Result<ChaosWireAction> {
+        let mut state = lock(&self.state)?;
+        if state.fail_next_call {
+            state.fail_next_call = false;
+            state.metrics.injected_failures = state.metrics.injected_failures.saturating_add(1);
+            state.trace.push("fail call before send".to_string());
+            return Ok(ChaosWireAction::Fail);
+        }
+        if state.drop_next_request {
+            state.drop_next_request = false;
+            state.metrics.request_drops = state.metrics.request_drops.saturating_add(1);
+            state.trace.push("drop request before send".to_string());
+            return Ok(ChaosWireAction::DropRequest);
+        }
+        if state.return_delayed_next {
+            state.return_delayed_next = false;
+            state
+                .trace
+                .push("return delayed response before sending request".to_string());
+            return Ok(ChaosWireAction::ReturnDelayed);
+        }
+        if state.reorder_next_response {
+            state.reorder_next_response = false;
+            state.metrics.reordered_responses = state.metrics.reordered_responses.saturating_add(1);
+            state
+                .trace
+                .push("reorder current response behind delayed response".to_string());
+            return Ok(ChaosWireAction::ReorderWithDelayed);
+        }
+        if state.drop_next_response {
+            state.drop_next_response = false;
+            state.metrics.response_drops = state.metrics.response_drops.saturating_add(1);
+            state.trace.push("drop response after send".to_string());
+            return Ok(ChaosWireAction::DropResponse);
+        }
+        if state.duplicate_next_request {
+            state.duplicate_next_request = false;
+            state.metrics.duplicated_requests = state.metrics.duplicated_requests.saturating_add(1);
+            state.trace.push("duplicate request delivery".to_string());
+            return Ok(ChaosWireAction::DuplicateRequest);
+        }
+        if state.delay_next_response {
+            state.delay_next_response = false;
+            state.metrics.delayed_responses = state.metrics.delayed_responses.saturating_add(1);
+            state.trace.push("delay response after send".to_string());
+            return Ok(ChaosWireAction::DelayResponse);
+        }
+        Ok(ChaosWireAction::Pass)
+    }
+
+    fn pop_delayed(&self) -> Result<Result<Vec<u8>>> {
+        let mut state = lock(&self.state)?;
+        state
+            .delayed
+            .pop_front()
+            .ok_or_else(|| StorageError::unavailable("chaos transport has no delayed response"))
+    }
+
+    fn push_delayed(&self, response: Result<Vec<u8>>) -> Result<()> {
+        lock(&self.state)?.delayed.push_back(response);
+        Ok(())
+    }
+}
+
+impl RemoteWireTransport for ChaosRemoteWireTransport {
+    fn call_wire(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        match self.take_action()? {
+            ChaosWireAction::Pass => self.inner.call_wire(request_bytes),
+            ChaosWireAction::Fail => Err(StorageError::unavailable("chaos transport failed call")),
+            ChaosWireAction::DropRequest => Err(StorageError::unavailable(
+                "chaos transport dropped request before send",
+            )),
+            ChaosWireAction::DropResponse => {
+                let _ = self.inner.call_wire(request_bytes);
+                Err(StorageError::unavailable(
+                    "chaos transport dropped response after send",
+                ))
+            }
+            ChaosWireAction::DuplicateRequest => {
+                let first = self.inner.call_wire(request_bytes.clone());
+                let second = self.inner.call_wire(request_bytes);
+                match (first, second) {
+                    (Ok(response), Ok(_)) => Ok(response),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
+            }
+            ChaosWireAction::DelayResponse => {
+                let response = self.inner.call_wire(request_bytes);
+                self.push_delayed(response)?;
+                Err(StorageError::unavailable(
+                    "chaos transport delayed response after send",
+                ))
+            }
+            ChaosWireAction::ReturnDelayed => self.pop_delayed()?,
+            ChaosWireAction::ReorderWithDelayed => {
+                let delayed = self.pop_delayed()?;
+                let current = self.inner.call_wire(request_bytes);
+                self.push_delayed(current)?;
+                delayed
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RemoteWireRequest<T> {
     incarnation: ServerIncarnation,
@@ -5173,19 +5415,26 @@ impl RemoteBlockEndpoint {
     }
 }
 
+impl RemoteWireTransport for RemoteBlockEndpoint {
+    fn call_wire(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        self.handle_wire(&request_bytes)
+    }
+}
+
 /// Serialized block transport over a deterministic remote endpoint.
 #[derive(Clone)]
 pub struct RemoteBlockTransport {
-    endpoint: Arc<RemoteBlockEndpoint>,
+    wire: Arc<dyn RemoteWireTransport>,
     incarnation: ServerIncarnation,
 }
 
 impl RemoteBlockTransport {
     pub fn new(endpoint: Arc<RemoteBlockEndpoint>) -> Self {
-        Self {
-            incarnation: endpoint.incarnation(),
-            endpoint,
-        }
+        Self::with_wire(endpoint.clone(), endpoint.incarnation())
+    }
+
+    pub fn with_wire(wire: Arc<dyn RemoteWireTransport>, incarnation: ServerIncarnation) -> Self {
+        Self { wire, incarnation }
     }
 
     fn encode_request(&self, request: BlockRequestEnvelope) -> Result<Vec<u8>> {
@@ -5231,7 +5480,7 @@ impl BlockTransport for RemoteBlockTransport {
     fn call(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope> {
         let request_id = request.request_id;
         let request_bytes = self.encode_request(request)?;
-        let response_bytes = self.endpoint.handle_wire(&request_bytes)?;
+        let response_bytes = self.wire.call_wire(request_bytes)?;
         self.decode_response(request_id, &response_bytes)
     }
 }
@@ -5358,19 +5607,26 @@ impl RemoteNativeEndpoint {
     }
 }
 
+impl RemoteWireTransport for RemoteNativeEndpoint {
+    fn call_wire(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        self.handle_wire(&request_bytes)
+    }
+}
+
 /// Serialized native transport over a deterministic remote endpoint.
 #[derive(Clone)]
 pub struct RemoteNativeTransport {
-    endpoint: Arc<RemoteNativeEndpoint>,
+    wire: Arc<dyn RemoteWireTransport>,
     incarnation: ServerIncarnation,
 }
 
 impl RemoteNativeTransport {
     pub fn new(endpoint: Arc<RemoteNativeEndpoint>) -> Self {
-        Self {
-            incarnation: endpoint.incarnation(),
-            endpoint,
-        }
+        Self::with_wire(endpoint.clone(), endpoint.incarnation())
+    }
+
+    pub fn with_wire(wire: Arc<dyn RemoteWireTransport>, incarnation: ServerIncarnation) -> Self {
+        Self { wire, incarnation }
     }
 
     fn encode_request(&self, request: NativeRequestEnvelope) -> Result<Vec<u8>> {
@@ -5416,7 +5672,7 @@ impl NativeTransport for RemoteNativeTransport {
     fn call(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope> {
         let request_id = request.request_id;
         let request_bytes = self.encode_request(request)?;
-        let response_bytes = self.endpoint.handle_wire(&request_bytes)?;
+        let response_bytes = self.wire.call_wire(request_bytes)?;
         self.decode_response(request_id, &response_bytes)
     }
 }
@@ -8055,6 +8311,171 @@ mod tests {
     }
 
     #[test]
+    fn chaos_block_wire_transport_covers_drop_delay_duplicate_and_reorder() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let block_server = Arc::new(LocalBlockServer::new(store));
+        let endpoint = Arc::new(RemoteBlockEndpoint::new(
+            block_server.clone(),
+            ServerIncarnation::from_raw(11),
+            32,
+            4,
+        ));
+        let chaos = Arc::new(ChaosRemoteWireTransport::new(endpoint.clone()));
+        let transport = RemoteBlockTransport::with_wire(chaos.clone(), endpoint.incarnation());
+        let create = BlockRequestEnvelope::new(
+            RequestId::from_raw(1),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Create {
+                request: CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 16,
+                        block_size: 4096,
+                    },
+                    name: None,
+                },
+            },
+        );
+        let created = transport.call(create).unwrap();
+        let device_id = match created.response {
+            BlockResponse::Created(device_id) => device_id,
+            _ => panic!("unexpected block response"),
+        };
+
+        chaos.duplicate_next_request().unwrap();
+        let info = BlockRequestEnvelope::new(
+            RequestId::from_raw(2),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Info { device_id },
+        );
+        transport.call(info).unwrap();
+        assert_eq!(
+            block_server
+                .request_log()
+                .unwrap()
+                .iter()
+                .filter(|request_id| **request_id == RequestId::from_raw(2))
+                .count(),
+            1
+        );
+
+        chaos.drop_next_request().unwrap();
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(3),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Info { device_id },
+                ))
+                .is_err()
+        );
+        assert!(
+            !block_server
+                .request_log()
+                .unwrap()
+                .contains(&RequestId::from_raw(3))
+        );
+
+        let write = BlockRequestEnvelope::new(
+            RequestId::from_raw(4),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Write {
+                device_id,
+                offset: 0,
+                bytes: vec![7; 4096],
+                durability: WriteDurability::Acknowledged,
+            },
+        );
+        chaos.drop_next_response().unwrap();
+        assert!(transport.call(write.clone()).is_err());
+        let retry = transport.call(write).unwrap();
+        assert_eq!(retry.request_id, RequestId::from_raw(4));
+        assert_eq!(
+            block_server
+                .request_log()
+                .unwrap()
+                .iter()
+                .filter(|request_id| **request_id == RequestId::from_raw(4))
+                .count(),
+            1
+        );
+
+        let read = BlockRequestEnvelope::new(
+            RequestId::from_raw(5),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Read {
+                device_id,
+                range: ByteRange::new(0, 4096),
+            },
+        );
+        chaos.delay_next_response().unwrap();
+        assert!(transport.call(read.clone()).is_err());
+        assert_eq!(chaos.delayed_len().unwrap(), 1);
+        chaos.return_delayed_response_next_call().unwrap();
+        let delayed = transport.call(read).unwrap();
+        match delayed.response {
+            BlockResponse::Read(response) => assert_eq!(response.bytes, vec![7; 4096]),
+            _ => panic!("unexpected block response"),
+        }
+
+        let stale_read = BlockRequestEnvelope::new(
+            RequestId::from_raw(6),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Read {
+                device_id,
+                range: ByteRange::new(0, 4096),
+            },
+        );
+        chaos.delay_next_response().unwrap();
+        assert!(transport.call(stale_read).is_err());
+        let current_info = BlockRequestEnvelope::new(
+            RequestId::from_raw(7),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Info { device_id },
+        );
+        chaos.reorder_next_response_with_delayed().unwrap();
+        assert!(matches!(
+            transport.call(current_info.clone()),
+            Err(StorageError::Corrupt { .. })
+        ));
+        chaos.return_delayed_response_next_call().unwrap();
+        let recovered = transport.call(current_info).unwrap();
+        assert_eq!(recovered.request_id, RequestId::from_raw(7));
+
+        chaos.fail_next_call().unwrap();
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(8),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Info { device_id },
+                ))
+                .is_err()
+        );
+        assert!(
+            !block_server
+                .request_log()
+                .unwrap()
+                .contains(&RequestId::from_raw(8))
+        );
+
+        let metrics = chaos.metrics().unwrap();
+        assert_eq!(metrics.request_drops, 1);
+        assert_eq!(metrics.response_drops, 1);
+        assert_eq!(metrics.duplicated_requests, 1);
+        assert_eq!(metrics.delayed_responses, 2);
+        assert_eq!(metrics.reordered_responses, 1);
+        assert_eq!(metrics.injected_failures, 1);
+    }
+
+    #[test]
     fn server_lock_striping_does_not_force_unrelated_targets_through_one_lock() {
         let device_a = BlockRequest::Info {
             device_id: DeviceId::from_raw(1),
@@ -8079,6 +8500,195 @@ mod tests {
             native_request_stripe(&file_a),
             native_request_stripe(&file_b)
         );
+    }
+
+    #[test]
+    fn chaos_native_wire_transport_covers_drop_delay_duplicate_and_reorder() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let native_server = Arc::new(LocalNativeServer::new(store));
+        let endpoint = Arc::new(RemoteNativeEndpoint::new(
+            native_server.clone(),
+            ServerIncarnation::from_raw(12),
+            32,
+            4,
+        ));
+        let chaos = Arc::new(ChaosRemoteWireTransport::new(endpoint.clone()));
+        let transport = RemoteNativeTransport::with_wire(chaos.clone(), endpoint.incarnation());
+        let keyspace_id = match transport
+            .call(NativeRequestEnvelope::new(
+                RequestId::from_raw(1),
+                ClientEpoch::from_raw(1),
+                None,
+                NativeRequest::CreateKeyspace {
+                    request: CreateKeyspaceRequest { name: None },
+                },
+            ))
+            .unwrap()
+            .response
+        {
+            NativeResponse::KeyspaceCreated(keyspace_id) => keyspace_id,
+            _ => panic!("unexpected native response"),
+        };
+        let file_id = match transport
+            .call(NativeRequestEnvelope::new(
+                RequestId::from_raw(2),
+                ClientEpoch::from_raw(1),
+                None,
+                NativeRequest::CreateFile {
+                    keyspace_id,
+                    request: CreateFileRequest {
+                        spec: FileSpec { name: None },
+                    },
+                },
+            ))
+            .unwrap()
+            .response
+        {
+            NativeResponse::FileCreated(file_id) => file_id,
+            _ => panic!("unexpected native response"),
+        };
+
+        chaos.duplicate_next_request().unwrap();
+        transport
+            .call(NativeRequestEnvelope::new(
+                RequestId::from_raw(3),
+                ClientEpoch::from_raw(1),
+                None,
+                NativeRequest::FileInfo {
+                    keyspace_id,
+                    file_id,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            native_server
+                .request_log()
+                .unwrap()
+                .iter()
+                .filter(|request_id| **request_id == RequestId::from_raw(3))
+                .count(),
+            1
+        );
+
+        chaos.drop_next_request().unwrap();
+        assert!(
+            transport
+                .call(NativeRequestEnvelope::new(
+                    RequestId::from_raw(4),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    NativeRequest::FileInfo {
+                        keyspace_id,
+                        file_id,
+                    },
+                ))
+                .is_err()
+        );
+        assert!(
+            !native_server
+                .request_log()
+                .unwrap()
+                .contains(&RequestId::from_raw(4))
+        );
+
+        let write = NativeRequestEnvelope::new(
+            RequestId::from_raw(5),
+            ClientEpoch::from_raw(1),
+            None,
+            NativeRequest::Write {
+                keyspace_id,
+                file_id,
+                offset: 0,
+                bytes: b"native".to_vec(),
+                durability: WriteDurability::Acknowledged,
+            },
+        );
+        chaos.drop_next_response().unwrap();
+        assert!(transport.call(write.clone()).is_err());
+        transport.call(write).unwrap();
+        assert_eq!(
+            native_server
+                .request_log()
+                .unwrap()
+                .iter()
+                .filter(|request_id| **request_id == RequestId::from_raw(5))
+                .count(),
+            1
+        );
+
+        let read = NativeRequestEnvelope::new(
+            RequestId::from_raw(6),
+            ClientEpoch::from_raw(1),
+            None,
+            NativeRequest::Read {
+                keyspace_id,
+                file_id,
+                range: ByteRange::new(0, b"native".len() as u64),
+            },
+        );
+        chaos.delay_next_response().unwrap();
+        assert!(transport.call(read.clone()).is_err());
+        chaos.return_delayed_response_next_call().unwrap();
+        let delayed = transport.call(read).unwrap();
+        match delayed.response {
+            NativeResponse::Read(response) => assert_eq!(response.bytes, b"native"),
+            _ => panic!("unexpected native response"),
+        }
+
+        let stale_info = NativeRequestEnvelope::new(
+            RequestId::from_raw(7),
+            ClientEpoch::from_raw(1),
+            None,
+            NativeRequest::FileInfo {
+                keyspace_id,
+                file_id,
+            },
+        );
+        chaos.delay_next_response().unwrap();
+        assert!(transport.call(stale_info).is_err());
+        let current_keyspace = NativeRequestEnvelope::new(
+            RequestId::from_raw(8),
+            ClientEpoch::from_raw(1),
+            None,
+            NativeRequest::KeyspaceInfo { keyspace_id },
+        );
+        chaos.reorder_next_response_with_delayed().unwrap();
+        assert!(matches!(
+            transport.call(current_keyspace.clone()),
+            Err(StorageError::Corrupt { .. })
+        ));
+        chaos.return_delayed_response_next_call().unwrap();
+        let recovered = transport.call(current_keyspace).unwrap();
+        assert_eq!(recovered.request_id, RequestId::from_raw(8));
+
+        chaos.fail_next_call().unwrap();
+        assert!(
+            transport
+                .call(NativeRequestEnvelope::new(
+                    RequestId::from_raw(9),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    NativeRequest::FileInfo {
+                        keyspace_id,
+                        file_id,
+                    },
+                ))
+                .is_err()
+        );
+        assert!(
+            !native_server
+                .request_log()
+                .unwrap()
+                .contains(&RequestId::from_raw(9))
+        );
+
+        let metrics = chaos.metrics().unwrap();
+        assert_eq!(metrics.request_drops, 1);
+        assert_eq!(metrics.response_drops, 1);
+        assert_eq!(metrics.duplicated_requests, 1);
+        assert_eq!(metrics.delayed_responses, 2);
+        assert_eq!(metrics.reordered_responses, 1);
+        assert_eq!(metrics.injected_failures, 1);
     }
 
     #[test]

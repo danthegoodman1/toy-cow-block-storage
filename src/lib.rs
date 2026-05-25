@@ -37,12 +37,14 @@ pub use id::{
     StorageNodeId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
-    DurableObjectStore, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
+    ChaosRemoteWireTransport, ChaosTransportMetrics, DurableObjectStore,
+    InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
     LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer, LocalObjectStore,
     LocalStoreConfig, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
     PortableSegmentFileIo, RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint,
-    RemoteNativeTransport, SegmentFileIo, SegmentLifecycleState, StorageNodeCustodianReport,
+    RemoteNativeTransport, RemoteWireTransport, SegmentFileIo, SegmentLifecycleState,
+    StorageNodeCustodianReport,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

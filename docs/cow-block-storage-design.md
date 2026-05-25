@@ -466,6 +466,15 @@ and injected logical-time deadline behavior so delay, retry, stale
 incarnation, stale response, and backpressure cases can be tested without real
 network nondeterminism.
 
+The deterministic chaos transport wraps the serialized wire boundary below the
+typed block/native transports. It can drop requests, drop responses after the
+server has applied them, duplicate request delivery, delay response bytes, and
+reorder delayed response bytes in front of newer responses. This is the Phase
+17 correctness harness: stale or mismatched response bytes must be rejected by
+the typed transport, while retries with the same request identity must remain
+safe and idempotent. A real TCP, HTTP, gRPC, or QUIC transport is a later
+implementation of the same wire contract, not part of Phase 17.
+
 The remote transport does not change the public block or native APIs. Existing
 clients can be constructed over any `BlockTransport` or `NativeTransport`,
 including the in-process transport and the serialized remote transport.
