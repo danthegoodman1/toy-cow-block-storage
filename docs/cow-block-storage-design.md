@@ -488,6 +488,29 @@ must use a crate-owned codec with explicit magic, version, frame kind, tags,
 fixed endianness, bounded lengths, and deterministic rejection of malformed or
 trailing bytes.
 
+### Phase 19 Network Protocol Choice
+
+The first real network adapter uses blocking TCP with one request/response per
+connection. This is intentionally conservative: reconnect behavior is the
+default because every call opens a fresh connection, there are no hidden
+background retries, and endpoint backpressure remains the same bounded mailbox
+contract proven by the serialized remote endpoint.
+
+TCP carries a 4-byte big-endian frame length followed by a crate-owned frame:
+
+```text
+magic("TCOWWIRE"), version, frame_kind, payload
+```
+
+Frame kinds distinguish block requests, block responses, native requests, and
+native responses. Payloads use the same explicit binary rules as the durable
+snapshot codec: fixed big-endian integers, explicit enum tags, bounded
+collections/strings, and strict rejection of malformed, oversized, mismatched,
+or trailing bytes. Server incarnation is inside the payload so stale clients and
+responses are rejected deterministically. The TCP layer is only a byte pipe; it
+does not choose storage nodes, fan out replicas, or change block/native request
+semantics.
+
 ### `MetadataPlane`
 
 `MetadataPlane` owns globally meaningful metadata durability:

@@ -5,25 +5,31 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::api::{
     BlockClient, BlockDevice, BlockRequest, BlockRequestEnvelope, BlockResponse,
     BlockResponseEnvelope, BlockServer, BlockTransport, ByteRange, CreateDeviceRequest,
-    DeleteResult, DeviceInfo, FlushResult, ForkRequest, ReadResponse, RestorePoint, WriteCommit,
+    DeleteResult, DeviceInfo, FlushResult, FlushScope, ForkRequest, ReadResponse, RestorePoint,
+    WriteCommit, WriteDurability,
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
-    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, FileWriteCommit,
-    KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope,
-    NativeResponse, NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
+    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, FileSpec,
+    FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeRequest,
+    NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer, NativeTransport,
+    SnapshotKeyspaceRequest,
 };
 use crate::id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
     DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId,
-    KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalTime, MetadataNodeId, RequestId,
-    SegmentId, ServerIncarnation, StorageNodeId, WriteIntentId, WriterEpoch,
+    KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, MetadataNodeId,
+    RequestId, SegmentId, ServerIncarnation, StorageNodeId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
@@ -5083,6 +5089,7 @@ pub trait RemoteWireTransport: Send + Sync {
 pub struct ChaosTransportMetrics {
     pub request_drops: u64,
     pub response_drops: u64,
+    pub corrupted_responses: u64,
     pub duplicated_requests: u64,
     pub delayed_responses: u64,
     pub reordered_responses: u64,
@@ -5097,6 +5104,7 @@ struct ChaosWireState {
     fail_next_call: bool,
     drop_next_request: bool,
     drop_next_response: bool,
+    corrupt_next_response: bool,
     duplicate_next_request: bool,
     delay_next_response: bool,
     return_delayed_next: bool,
@@ -5112,6 +5120,7 @@ impl ChaosWireState {
             fail_next_call: false,
             drop_next_request: false,
             drop_next_response: false,
+            corrupt_next_response: false,
             duplicate_next_request: false,
             delay_next_response: false,
             return_delayed_next: false,
@@ -5126,6 +5135,7 @@ enum ChaosWireAction {
     Fail,
     DropRequest,
     DropResponse,
+    CorruptResponse,
     DuplicateRequest,
     DelayResponse,
     ReturnDelayed,
@@ -5176,6 +5186,11 @@ impl ChaosRemoteWireTransport {
 
     pub fn drop_next_response(&self) -> Result<()> {
         lock(&self.state)?.drop_next_response = true;
+        Ok(())
+    }
+
+    pub fn corrupt_next_response(&self) -> Result<()> {
+        lock(&self.state)?.corrupt_next_response = true;
         Ok(())
     }
 
@@ -5234,6 +5249,12 @@ impl ChaosRemoteWireTransport {
             state.trace.push("drop response after send".to_string());
             return Ok(ChaosWireAction::DropResponse);
         }
+        if state.corrupt_next_response {
+            state.corrupt_next_response = false;
+            state.metrics.corrupted_responses = state.metrics.corrupted_responses.saturating_add(1);
+            state.trace.push("corrupt response after send".to_string());
+            return Ok(ChaosWireAction::CorruptResponse);
+        }
         if state.duplicate_next_request {
             state.duplicate_next_request = false;
             state.metrics.duplicated_requests = state.metrics.duplicated_requests.saturating_add(1);
@@ -5276,6 +5297,15 @@ impl RemoteWireTransport for ChaosRemoteWireTransport {
                 Err(StorageError::unavailable(
                     "chaos transport dropped response after send",
                 ))
+            }
+            ChaosWireAction::CorruptResponse => {
+                let mut response = self.inner.call_wire(request_bytes)?;
+                if let Some(first) = response.first_mut() {
+                    *first ^= 0xff;
+                } else {
+                    response.push(0xff);
+                }
+                Ok(response)
             }
             ChaosWireAction::DuplicateRequest => {
                 let first = self.inner.call_wire(request_bytes.clone());
@@ -5733,6 +5763,604 @@ impl NativeTransport for RemoteNativeTransport {
         let response_bytes = self.wire.call_wire(request_bytes)?;
         self.decode_response(request_id, &response_bytes)
     }
+}
+
+const NETWORK_WIRE_MAGIC: &[u8; 8] = b"TCOWWIRE";
+const NETWORK_WIRE_VERSION: u16 = 1;
+const NETWORK_BLOCK_REQUEST: u8 = 1;
+const NETWORK_BLOCK_RESPONSE: u8 = 2;
+const NETWORK_NATIVE_REQUEST: u8 = 3;
+const NETWORK_NATIVE_RESPONSE: u8 = 4;
+const DEFAULT_NETWORK_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+fn network_codec_error(reason: impl Into<String>) -> StorageError {
+    StorageError::corrupt(format!("network wire codec failed: {}", reason.into()))
+}
+
+fn encode_network_frame<T: DurableCodec>(kind: u8, value: &T) -> Result<Vec<u8>> {
+    let mut out = DurableEncoder { bytes: Vec::new() };
+    out.bytes.extend_from_slice(NETWORK_WIRE_MAGIC);
+    out.put_u16(NETWORK_WIRE_VERSION);
+    out.put_u8(kind);
+    value.encode(&mut out)?;
+    Ok(out.finish())
+}
+
+fn decode_network_frame<T: DurableCodec>(expected_kind: u8, bytes: &[u8]) -> Result<T> {
+    let mut input = DurableDecoder { bytes, offset: 0 };
+    let magic = input.take(NETWORK_WIRE_MAGIC.len())?;
+    if magic != NETWORK_WIRE_MAGIC {
+        return Err(network_codec_error("bad frame magic"));
+    }
+    let version = input.u16()?;
+    if version != NETWORK_WIRE_VERSION {
+        return Err(network_codec_error("unsupported frame version"));
+    }
+    let kind = input.u8()?;
+    if kind != expected_kind {
+        return Err(network_codec_error("frame kind mismatch"));
+    }
+    let value = T::decode(&mut input)?;
+    input
+        .finish()
+        .map_err(|_| network_codec_error("trailing bytes in frame"))?;
+    Ok(value)
+}
+
+fn encode_network_block_error(
+    incarnation: ServerIncarnation,
+    reason: impl Into<String>,
+) -> Result<Vec<u8>> {
+    encode_network_frame(
+        NETWORK_BLOCK_RESPONSE,
+        &RemoteWireReply::<BlockResponseEnvelope>::Err {
+            incarnation,
+            reason: reason.into(),
+        },
+    )
+}
+
+fn encode_network_native_error(
+    incarnation: ServerIncarnation,
+    reason: impl Into<String>,
+) -> Result<Vec<u8>> {
+    encode_network_frame(
+        NETWORK_NATIVE_RESPONSE,
+        &RemoteWireReply::<NativeResponseEnvelope>::Err {
+            incarnation,
+            reason: reason.into(),
+        },
+    )
+}
+
+/// Network block endpoint using the crate-owned Phase 19 wire codec.
+#[derive(Clone)]
+pub struct NetworkBlockEndpoint {
+    inner: RemoteBlockEndpoint,
+}
+
+impl NetworkBlockEndpoint {
+    pub fn new(
+        server: Arc<dyn BlockServer>,
+        incarnation: ServerIncarnation,
+        dedupe_capacity: usize,
+        mailbox_capacity: usize,
+    ) -> Self {
+        Self {
+            inner: RemoteBlockEndpoint::new(server, incarnation, dedupe_capacity, mailbox_capacity),
+        }
+    }
+
+    pub fn incarnation(&self) -> ServerIncarnation {
+        self.inner.incarnation()
+    }
+
+    pub fn set_shutdown(&self, shutdown: bool) -> Result<()> {
+        self.inner.set_shutdown(shutdown)
+    }
+
+    pub fn set_logical_time(&self, logical_time: LogicalTime) -> Result<()> {
+        self.inner.set_logical_time(logical_time)
+    }
+
+    pub fn handle_wire(&self, request_bytes: &[u8]) -> Result<Vec<u8>> {
+        let wire: RemoteWireRequest<BlockRequestEnvelope> =
+            match decode_network_frame(NETWORK_BLOCK_REQUEST, request_bytes) {
+                Ok(wire) => wire,
+                Err(error) => {
+                    return encode_network_block_error(self.inner.incarnation, error.to_string());
+                }
+            };
+        if wire.incarnation != self.inner.incarnation {
+            return encode_network_block_error(
+                self.inner.incarnation,
+                "stale block server incarnation",
+            );
+        }
+        if let Some(deadline) = wire.envelope.deadline
+            && deadline.raw() < lock(&self.inner.state)?.logical_time.raw()
+        {
+            return encode_network_block_error(
+                self.inner.incarnation,
+                "block request deadline expired",
+            );
+        }
+        let key = (
+            self.inner.incarnation,
+            wire.envelope.client_epoch,
+            wire.envelope.request_id,
+        );
+
+        {
+            let mut state = lock(&self.inner.state)?;
+            if state.shutdown {
+                return encode_network_block_error(
+                    self.inner.incarnation,
+                    "block endpoint is shut down",
+                );
+            }
+            if let Some(entry) = state.cache.get(&key) {
+                if entry.request_bytes == request_bytes {
+                    return Ok(entry.response_bytes.clone());
+                }
+                return encode_network_block_error(
+                    self.inner.incarnation,
+                    "request ID and client epoch reused for a different network block request",
+                );
+            }
+            if state.in_flight >= self.inner.mailbox_capacity {
+                return encode_network_block_error(
+                    self.inner.incarnation,
+                    "block endpoint mailbox is full",
+                );
+            }
+            state.in_flight += 1;
+        }
+
+        let response = self.inner.server.handle(wire.envelope);
+        {
+            let mut state = lock(&self.inner.state)?;
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        let response_bytes = match response {
+            Ok(envelope) => encode_network_frame(
+                NETWORK_BLOCK_RESPONSE,
+                &RemoteWireReply::Ok {
+                    incarnation: self.inner.incarnation,
+                    envelope,
+                },
+            )?,
+            Err(error) => encode_network_block_error(self.inner.incarnation, error.to_string())?,
+        };
+
+        let mut state = lock(&self.inner.state)?;
+        if self.inner.dedupe_capacity != 0 {
+            state.cache.insert(
+                key,
+                RemoteCacheEntry {
+                    request_bytes: request_bytes.to_vec(),
+                    response_bytes: response_bytes.clone(),
+                },
+            );
+            state.order.push_back(key);
+            while state.order.len() > self.inner.dedupe_capacity {
+                if let Some(evicted) = state.order.pop_front() {
+                    state.cache.remove(&evicted);
+                }
+            }
+        }
+        Ok(response_bytes)
+    }
+}
+
+impl RemoteWireTransport for NetworkBlockEndpoint {
+    fn call_wire(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        self.handle_wire(&request_bytes)
+    }
+}
+
+/// Network native endpoint using the crate-owned Phase 19 wire codec.
+#[derive(Clone)]
+pub struct NetworkNativeEndpoint {
+    inner: RemoteNativeEndpoint,
+}
+
+impl NetworkNativeEndpoint {
+    pub fn new(
+        server: Arc<dyn NativeServer>,
+        incarnation: ServerIncarnation,
+        dedupe_capacity: usize,
+        mailbox_capacity: usize,
+    ) -> Self {
+        Self {
+            inner: RemoteNativeEndpoint::new(
+                server,
+                incarnation,
+                dedupe_capacity,
+                mailbox_capacity,
+            ),
+        }
+    }
+
+    pub fn incarnation(&self) -> ServerIncarnation {
+        self.inner.incarnation()
+    }
+
+    pub fn set_shutdown(&self, shutdown: bool) -> Result<()> {
+        self.inner.set_shutdown(shutdown)
+    }
+
+    pub fn set_logical_time(&self, logical_time: LogicalTime) -> Result<()> {
+        self.inner.set_logical_time(logical_time)
+    }
+
+    pub fn handle_wire(&self, request_bytes: &[u8]) -> Result<Vec<u8>> {
+        let wire: RemoteWireRequest<NativeRequestEnvelope> =
+            match decode_network_frame(NETWORK_NATIVE_REQUEST, request_bytes) {
+                Ok(wire) => wire,
+                Err(error) => {
+                    return encode_network_native_error(self.inner.incarnation, error.to_string());
+                }
+            };
+        if wire.incarnation != self.inner.incarnation {
+            return encode_network_native_error(
+                self.inner.incarnation,
+                "stale native server incarnation",
+            );
+        }
+        if let Some(deadline) = wire.envelope.deadline
+            && deadline.raw() < lock(&self.inner.state)?.logical_time.raw()
+        {
+            return encode_network_native_error(
+                self.inner.incarnation,
+                "native request deadline expired",
+            );
+        }
+        let key = (
+            self.inner.incarnation,
+            wire.envelope.client_epoch,
+            wire.envelope.request_id,
+        );
+
+        {
+            let mut state = lock(&self.inner.state)?;
+            if state.shutdown {
+                return encode_network_native_error(
+                    self.inner.incarnation,
+                    "native endpoint is shut down",
+                );
+            }
+            if let Some(entry) = state.cache.get(&key) {
+                if entry.request_bytes == request_bytes {
+                    return Ok(entry.response_bytes.clone());
+                }
+                return encode_network_native_error(
+                    self.inner.incarnation,
+                    "request ID and client epoch reused for a different network native request",
+                );
+            }
+            if state.in_flight >= self.inner.mailbox_capacity {
+                return encode_network_native_error(
+                    self.inner.incarnation,
+                    "native endpoint mailbox is full",
+                );
+            }
+            state.in_flight += 1;
+        }
+
+        let response = self.inner.server.handle(wire.envelope);
+        {
+            let mut state = lock(&self.inner.state)?;
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        let response_bytes = match response {
+            Ok(envelope) => encode_network_frame(
+                NETWORK_NATIVE_RESPONSE,
+                &RemoteWireReply::Ok {
+                    incarnation: self.inner.incarnation,
+                    envelope,
+                },
+            )?,
+            Err(error) => encode_network_native_error(self.inner.incarnation, error.to_string())?,
+        };
+
+        let mut state = lock(&self.inner.state)?;
+        if self.inner.dedupe_capacity != 0 {
+            state.cache.insert(
+                key,
+                RemoteCacheEntry {
+                    request_bytes: request_bytes.to_vec(),
+                    response_bytes: response_bytes.clone(),
+                },
+            );
+            state.order.push_back(key);
+            while state.order.len() > self.inner.dedupe_capacity {
+                if let Some(evicted) = state.order.pop_front() {
+                    state.cache.remove(&evicted);
+                }
+            }
+        }
+        Ok(response_bytes)
+    }
+}
+
+impl RemoteWireTransport for NetworkNativeEndpoint {
+    fn call_wire(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        self.handle_wire(&request_bytes)
+    }
+}
+
+/// Block transport over a real network-capable wire transport.
+#[derive(Clone)]
+pub struct NetworkBlockTransport {
+    wire: Arc<dyn RemoteWireTransport>,
+    incarnation: ServerIncarnation,
+}
+
+impl NetworkBlockTransport {
+    pub fn new(wire: Arc<dyn RemoteWireTransport>, incarnation: ServerIncarnation) -> Self {
+        Self { wire, incarnation }
+    }
+
+    pub fn tcp(addr: SocketAddr, incarnation: ServerIncarnation) -> Self {
+        Self::new(
+            Arc::new(TcpRemoteWireTransport::new(
+                addr,
+                DEFAULT_NETWORK_MAX_FRAME_BYTES,
+            )),
+            incarnation,
+        )
+    }
+
+    fn encode_request(&self, request: BlockRequestEnvelope) -> Result<Vec<u8>> {
+        encode_network_frame(
+            NETWORK_BLOCK_REQUEST,
+            &RemoteWireRequest {
+                incarnation: self.incarnation,
+                envelope: request,
+            },
+        )
+    }
+
+    fn decode_response(
+        &self,
+        request_id: RequestId,
+        bytes: &[u8],
+    ) -> Result<BlockResponseEnvelope> {
+        let reply: RemoteWireReply<BlockResponseEnvelope> =
+            decode_network_frame(NETWORK_BLOCK_RESPONSE, bytes)?;
+        match reply {
+            RemoteWireReply::Ok {
+                incarnation,
+                envelope,
+            } if incarnation == self.incarnation && envelope.request_id == request_id => {
+                Ok(envelope)
+            }
+            RemoteWireReply::Ok { incarnation, .. } if incarnation != self.incarnation => {
+                Err(StorageError::conflict("stale block server incarnation"))
+            }
+            RemoteWireReply::Ok { .. } => Err(StorageError::corrupt(
+                "network block response request ID does not match request",
+            )),
+            RemoteWireReply::Err {
+                incarnation,
+                reason,
+            } if incarnation == self.incarnation => Err(StorageError::unavailable(reason)),
+            RemoteWireReply::Err { .. } => {
+                Err(StorageError::conflict("stale block server incarnation"))
+            }
+        }
+    }
+}
+
+impl BlockTransport for NetworkBlockTransport {
+    fn call(&self, request: BlockRequestEnvelope) -> Result<BlockResponseEnvelope> {
+        let request_id = request.request_id;
+        let request_bytes = self.encode_request(request)?;
+        let response_bytes = self.wire.call_wire(request_bytes)?;
+        self.decode_response(request_id, &response_bytes)
+    }
+}
+
+/// Native transport over a real network-capable wire transport.
+#[derive(Clone)]
+pub struct NetworkNativeTransport {
+    wire: Arc<dyn RemoteWireTransport>,
+    incarnation: ServerIncarnation,
+}
+
+impl NetworkNativeTransport {
+    pub fn new(wire: Arc<dyn RemoteWireTransport>, incarnation: ServerIncarnation) -> Self {
+        Self { wire, incarnation }
+    }
+
+    pub fn tcp(addr: SocketAddr, incarnation: ServerIncarnation) -> Self {
+        Self::new(
+            Arc::new(TcpRemoteWireTransport::new(
+                addr,
+                DEFAULT_NETWORK_MAX_FRAME_BYTES,
+            )),
+            incarnation,
+        )
+    }
+
+    fn encode_request(&self, request: NativeRequestEnvelope) -> Result<Vec<u8>> {
+        encode_network_frame(
+            NETWORK_NATIVE_REQUEST,
+            &RemoteWireRequest {
+                incarnation: self.incarnation,
+                envelope: request,
+            },
+        )
+    }
+
+    fn decode_response(
+        &self,
+        request_id: RequestId,
+        bytes: &[u8],
+    ) -> Result<NativeResponseEnvelope> {
+        let reply: RemoteWireReply<NativeResponseEnvelope> =
+            decode_network_frame(NETWORK_NATIVE_RESPONSE, bytes)?;
+        match reply {
+            RemoteWireReply::Ok {
+                incarnation,
+                envelope,
+            } if incarnation == self.incarnation && envelope.request_id == request_id => {
+                Ok(envelope)
+            }
+            RemoteWireReply::Ok { incarnation, .. } if incarnation != self.incarnation => {
+                Err(StorageError::conflict("stale native server incarnation"))
+            }
+            RemoteWireReply::Ok { .. } => Err(StorageError::corrupt(
+                "network native response request ID does not match request",
+            )),
+            RemoteWireReply::Err {
+                incarnation,
+                reason,
+            } if incarnation == self.incarnation => Err(StorageError::unavailable(reason)),
+            RemoteWireReply::Err { .. } => {
+                Err(StorageError::conflict("stale native server incarnation"))
+            }
+        }
+    }
+}
+
+impl NativeTransport for NetworkNativeTransport {
+    fn call(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope> {
+        let request_id = request.request_id;
+        let request_bytes = self.encode_request(request)?;
+        let response_bytes = self.wire.call_wire(request_bytes)?;
+        self.decode_response(request_id, &response_bytes)
+    }
+}
+
+/// TCP implementation of the opaque `RemoteWireTransport` byte pipe.
+#[derive(Clone)]
+pub struct TcpRemoteWireTransport {
+    addr: SocketAddr,
+    max_frame_bytes: usize,
+    timeout: Duration,
+}
+
+impl TcpRemoteWireTransport {
+    pub fn new(addr: SocketAddr, max_frame_bytes: usize) -> Self {
+        Self {
+            addr,
+            max_frame_bytes,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+impl RemoteWireTransport for TcpRemoteWireTransport {
+    fn call_wire(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        let mut stream =
+            TcpStream::connect_timeout(&self.addr, self.timeout).map_err(network_io_error)?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(network_io_error)?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(network_io_error)?;
+        write_tcp_frame(&mut stream, &request_bytes, self.max_frame_bytes)?;
+        read_tcp_frame(&mut stream, self.max_frame_bytes)
+    }
+}
+
+/// Small blocking TCP server for Phase 19 loopback/network testing.
+pub struct TcpRemoteWireServer {
+    local_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TcpRemoteWireServer {
+    pub fn start(
+        listener: TcpListener,
+        endpoint: Arc<dyn RemoteWireTransport>,
+        max_frame_bytes: usize,
+    ) -> Result<Self> {
+        let local_addr = listener.local_addr().map_err(network_io_error)?;
+        listener.set_nonblocking(true).map_err(network_io_error)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let response = read_tcp_frame(&mut stream, max_frame_bytes)
+                            .and_then(|request| endpoint.call_wire(request));
+                        if let Ok(response) = response {
+                            let _ = write_tcp_frame(&mut stream, &response, max_frame_bytes);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            local_addr,
+            shutdown,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn shutdown(&self) -> Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.local_addr);
+        if let Some(handle) = lock(&self.handle)?.take() {
+            handle
+                .join()
+                .map_err(|_| StorageError::unavailable("network server thread panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TcpRemoteWireServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn write_tcp_frame(stream: &mut TcpStream, bytes: &[u8], max_frame_bytes: usize) -> Result<()> {
+    if bytes.len() > max_frame_bytes {
+        return Err(StorageError::invalid_argument(
+            "network frame exceeds limit",
+        ));
+    }
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| StorageError::invalid_argument("network frame length exceeds u32"))?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .map_err(network_io_error)?;
+    stream.write_all(bytes).map_err(network_io_error)
+}
+
+fn read_tcp_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).map_err(network_io_error)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > max_frame_bytes {
+        return Err(StorageError::invalid_argument(
+            "network frame exceeds limit",
+        ));
+    }
+    let mut bytes = vec![0; len];
+    stream.read_exact(&mut bytes).map_err(network_io_error)?;
+    Ok(bytes)
 }
 
 /// Local `BlockClient` backed by a block transport.
@@ -6310,6 +6938,10 @@ fn fs_error(error: std::io::Error) -> StorageError {
     StorageError::unavailable(format!("filesystem operation failed: {error}"))
 }
 
+fn network_io_error(error: std::io::Error) -> StorageError {
+    StorageError::unavailable(format!("network I/O failed: {error}"))
+}
+
 fn serde_error(error: impl std::fmt::Display) -> StorageError {
     StorageError::corrupt(format!("binary envelope codec failed: {error}"))
 }
@@ -6704,6 +7336,7 @@ durable_id_codec_u128!(
     KeyspaceId,
     KeyspaceRootId,
     MetadataNodeId,
+    RequestId,
     SegmentId,
     StorageNodeId,
     WriteIntentId,
@@ -6712,11 +7345,14 @@ durable_id_codec_u128!(
 durable_id_codec_u64!(
     BlockCount,
     BlockIndex,
+    ClientEpoch,
     CommitSeq,
     DeviceGeneration,
     FileVersion,
     KeyspaceGeneration,
+    LogicalDeadline,
     LogicalTime,
+    ServerIncarnation,
     WriterEpoch,
 );
 
@@ -7502,6 +8138,828 @@ impl DurableSnapshotCodec for DurableMetadataSnapshot {
     const SNAPSHOT_KIND: u8 = DURABLE_SNAPSHOT_METADATA;
 }
 
+impl DurableCodec for WriteDurability {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Acknowledged => 1u8.encode(out),
+            Self::Flushed => 2u8.encode(out),
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Acknowledged),
+            2 => Ok(Self::Flushed),
+            _ => Err(durable_codec_error("invalid write durability tag")),
+        }
+    }
+}
+
+impl DurableCodec for FlushScope {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Device => 1u8.encode(out),
+            Self::All => 2u8.encode(out),
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Device),
+            2 => Ok(Self::All),
+            _ => Err(durable_codec_error("invalid flush scope tag")),
+        }
+    }
+}
+
+impl DurableCodec for RestorePoint {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Commit(commit) => {
+                1u8.encode(out)?;
+                commit.encode(out)
+            }
+            Self::Checkpoint(checkpoint) => {
+                2u8.encode(out)?;
+                checkpoint.encode(out)
+            }
+            Self::Time(time) => {
+                3u8.encode(out)?;
+                time.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Commit(CommitSeq::decode(input)?)),
+            2 => Ok(Self::Checkpoint(CheckpointId::decode(input)?)),
+            3 => Ok(Self::Time(LogicalTime::decode(input)?)),
+            _ => Err(durable_codec_error("invalid restore point tag")),
+        }
+    }
+}
+
+impl DurableCodec for DeviceInfo {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.generation.encode(out)?;
+        self.spec.encode(out)?;
+        self.latest_commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            generation: DeviceGeneration::decode(input)?,
+            spec: crate::api::DeviceSpec::decode(input)?,
+            latest_commit: CommitSeq::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for CreateDeviceRequest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.spec.encode(out)?;
+        self.name.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            spec: crate::api::DeviceSpec::decode(input)?,
+            name: Option::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for WriteCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.commit_seq.encode(out)?;
+        self.range.encode(out)?;
+        self.durability.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            commit_seq: CommitSeq::decode(input)?,
+            range: ByteRange::decode(input)?,
+            durability: WriteDurability::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for FlushResult {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.durable_through.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            durable_through: CommitSeq::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DeleteResult {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.commit_seq.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            commit_seq: CommitSeq::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for ForkRequest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.target.encode(out)?;
+        self.name.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            target: Option::decode(input)?,
+            name: Option::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for ReadResponse {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.bytes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            bytes: Vec::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for BlockRequest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Create { request } => {
+                1u8.encode(out)?;
+                request.encode(out)
+            }
+            Self::Info { device_id } => {
+                2u8.encode(out)?;
+                device_id.encode(out)
+            }
+            Self::Read { device_id, range } => {
+                3u8.encode(out)?;
+                device_id.encode(out)?;
+                range.encode(out)
+            }
+            Self::Write {
+                device_id,
+                offset,
+                bytes,
+                durability,
+            } => {
+                4u8.encode(out)?;
+                device_id.encode(out)?;
+                offset.encode(out)?;
+                bytes.encode(out)?;
+                durability.encode(out)
+            }
+            Self::Flush { device_id, scope } => {
+                5u8.encode(out)?;
+                device_id.encode(out)?;
+                scope.encode(out)
+            }
+            Self::WriteZeroes { device_id, range } => {
+                6u8.encode(out)?;
+                device_id.encode(out)?;
+                range.encode(out)
+            }
+            Self::Discard { device_id, range } => {
+                7u8.encode(out)?;
+                device_id.encode(out)?;
+                range.encode(out)
+            }
+            Self::Fork { source, request } => {
+                8u8.encode(out)?;
+                source.encode(out)?;
+                request.encode(out)
+            }
+            Self::Restore { source, point } => {
+                9u8.encode(out)?;
+                source.encode(out)?;
+                point.encode(out)
+            }
+            Self::Delete { device_id } => {
+                10u8.encode(out)?;
+                device_id.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Create {
+                request: CreateDeviceRequest::decode(input)?,
+            }),
+            2 => Ok(Self::Info {
+                device_id: DeviceId::decode(input)?,
+            }),
+            3 => Ok(Self::Read {
+                device_id: DeviceId::decode(input)?,
+                range: ByteRange::decode(input)?,
+            }),
+            4 => Ok(Self::Write {
+                device_id: DeviceId::decode(input)?,
+                offset: u64::decode(input)?,
+                bytes: Vec::decode(input)?,
+                durability: WriteDurability::decode(input)?,
+            }),
+            5 => Ok(Self::Flush {
+                device_id: DeviceId::decode(input)?,
+                scope: FlushScope::decode(input)?,
+            }),
+            6 => Ok(Self::WriteZeroes {
+                device_id: DeviceId::decode(input)?,
+                range: ByteRange::decode(input)?,
+            }),
+            7 => Ok(Self::Discard {
+                device_id: DeviceId::decode(input)?,
+                range: ByteRange::decode(input)?,
+            }),
+            8 => Ok(Self::Fork {
+                source: DeviceId::decode(input)?,
+                request: ForkRequest::decode(input)?,
+            }),
+            9 => Ok(Self::Restore {
+                source: DeviceId::decode(input)?,
+                point: RestorePoint::decode(input)?,
+            }),
+            10 => Ok(Self::Delete {
+                device_id: DeviceId::decode(input)?,
+            }),
+            _ => Err(durable_codec_error("invalid block request tag")),
+        }
+    }
+}
+
+impl DurableCodec for BlockResponse {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Created(device_id) => {
+                1u8.encode(out)?;
+                device_id.encode(out)
+            }
+            Self::Info(info) => {
+                2u8.encode(out)?;
+                info.encode(out)
+            }
+            Self::Read(read) => {
+                3u8.encode(out)?;
+                read.encode(out)
+            }
+            Self::Write(commit) => {
+                4u8.encode(out)?;
+                commit.encode(out)
+            }
+            Self::Flush(flush) => {
+                5u8.encode(out)?;
+                flush.encode(out)
+            }
+            Self::Forked(device_id) => {
+                6u8.encode(out)?;
+                device_id.encode(out)
+            }
+            Self::Restored(device_id) => {
+                7u8.encode(out)?;
+                device_id.encode(out)
+            }
+            Self::Deleted(delete) => {
+                8u8.encode(out)?;
+                delete.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Created(DeviceId::decode(input)?)),
+            2 => Ok(Self::Info(DeviceInfo::decode(input)?)),
+            3 => Ok(Self::Read(ReadResponse::decode(input)?)),
+            4 => Ok(Self::Write(WriteCommit::decode(input)?)),
+            5 => Ok(Self::Flush(FlushResult::decode(input)?)),
+            6 => Ok(Self::Forked(DeviceId::decode(input)?)),
+            7 => Ok(Self::Restored(DeviceId::decode(input)?)),
+            8 => Ok(Self::Deleted(DeleteResult::decode(input)?)),
+            _ => Err(durable_codec_error("invalid block response tag")),
+        }
+    }
+}
+
+impl DurableCodec for BlockRequestEnvelope {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.request_id.encode(out)?;
+        self.client_epoch.encode(out)?;
+        self.deadline.encode(out)?;
+        self.request.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            request_id: RequestId::decode(input)?,
+            client_epoch: ClientEpoch::decode(input)?,
+            deadline: Option::decode(input)?,
+            request: BlockRequest::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for BlockResponseEnvelope {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.request_id.encode(out)?;
+        self.response.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            request_id: RequestId::decode(input)?,
+            response: BlockResponse::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for CreateKeyspaceRequest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.name.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            name: Option::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for KeyspaceInfo {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.generation.encode(out)?;
+        self.latest_commit.encode(out)?;
+        self.file_count.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            generation: KeyspaceGeneration::decode(input)?,
+            latest_commit: CommitSeq::decode(input)?,
+            file_count: usize::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for SnapshotKeyspaceRequest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.target.encode(out)?;
+        self.name.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            target: Option::decode(input)?,
+            name: Option::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for FileSpec {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.name.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            name: Option::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for CreateFileRequest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.spec.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            spec: FileSpec::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for FileInfo {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.size.encode(out)?;
+        self.version.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            size: u64::decode(input)?,
+            version: FileVersion::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendLease {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.lease_id.encode(out)?;
+        self.writer_epoch.encode(out)?;
+        self.base_version.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            lease_id: AppendLeaseId::decode(input)?,
+            writer_epoch: WriterEpoch::decode(input)?,
+            base_version: FileVersion::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.extent_id.encode(out)?;
+        self.range.encode(out)?;
+        self.version.encode(out)?;
+        self.commit_seq.encode(out)?;
+        self.durability.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            extent_id: ExtentId::decode(input)?,
+            range: ByteRange::decode(input)?,
+            version: FileVersion::decode(input)?,
+            commit_seq: CommitSeq::decode(input)?,
+            durability: WriteDurability::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for FileWriteCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.range.encode(out)?;
+        self.version.encode(out)?;
+        self.commit_seq.encode(out)?;
+        self.durability.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            range: ByteRange::decode(input)?,
+            version: FileVersion::decode(input)?,
+            commit_seq: CommitSeq::decode(input)?,
+            durability: WriteDurability::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for NativeRequest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::CreateKeyspace { request } => {
+                1u8.encode(out)?;
+                request.encode(out)
+            }
+            Self::KeyspaceInfo { keyspace_id } => {
+                2u8.encode(out)?;
+                keyspace_id.encode(out)
+            }
+            Self::CreateFile {
+                keyspace_id,
+                request,
+            } => {
+                3u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                request.encode(out)
+            }
+            Self::FileInfo {
+                keyspace_id,
+                file_id,
+            } => {
+                4u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)
+            }
+            Self::Read {
+                keyspace_id,
+                file_id,
+                range,
+            } => {
+                5u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                range.encode(out)
+            }
+            Self::Write {
+                keyspace_id,
+                file_id,
+                offset,
+                bytes,
+                durability,
+            } => {
+                6u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                offset.encode(out)?;
+                bytes.encode(out)?;
+                durability.encode(out)
+            }
+            Self::AcquireAppend {
+                keyspace_id,
+                file_id,
+            } => {
+                7u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)
+            }
+            Self::Append {
+                keyspace_id,
+                file_id,
+                lease,
+                bytes,
+                durability,
+            } => {
+                8u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                lease.encode(out)?;
+                bytes.encode(out)?;
+                durability.encode(out)
+            }
+            Self::Flush {
+                keyspace_id,
+                file_id,
+            } => {
+                9u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)
+            }
+            Self::CheckpointKeyspace { keyspace_id } => {
+                10u8.encode(out)?;
+                keyspace_id.encode(out)
+            }
+            Self::SnapshotKeyspace { source, request } => {
+                11u8.encode(out)?;
+                source.encode(out)?;
+                request.encode(out)
+            }
+            Self::RestoreKeyspace { source, point } => {
+                12u8.encode(out)?;
+                source.encode(out)?;
+                point.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::CreateKeyspace {
+                request: CreateKeyspaceRequest::decode(input)?,
+            }),
+            2 => Ok(Self::KeyspaceInfo {
+                keyspace_id: KeyspaceId::decode(input)?,
+            }),
+            3 => Ok(Self::CreateFile {
+                keyspace_id: KeyspaceId::decode(input)?,
+                request: CreateFileRequest::decode(input)?,
+            }),
+            4 => Ok(Self::FileInfo {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+            }),
+            5 => Ok(Self::Read {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                range: ByteRange::decode(input)?,
+            }),
+            6 => Ok(Self::Write {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                offset: u64::decode(input)?,
+                bytes: Vec::decode(input)?,
+                durability: WriteDurability::decode(input)?,
+            }),
+            7 => Ok(Self::AcquireAppend {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+            }),
+            8 => Ok(Self::Append {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                lease: AppendLease::decode(input)?,
+                bytes: Vec::decode(input)?,
+                durability: WriteDurability::decode(input)?,
+            }),
+            9 => Ok(Self::Flush {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+            }),
+            10 => Ok(Self::CheckpointKeyspace {
+                keyspace_id: KeyspaceId::decode(input)?,
+            }),
+            11 => Ok(Self::SnapshotKeyspace {
+                source: KeyspaceId::decode(input)?,
+                request: SnapshotKeyspaceRequest::decode(input)?,
+            }),
+            12 => Ok(Self::RestoreKeyspace {
+                source: KeyspaceId::decode(input)?,
+                point: RestorePoint::decode(input)?,
+            }),
+            _ => Err(durable_codec_error("invalid native request tag")),
+        }
+    }
+}
+
+impl DurableCodec for NativeResponse {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::KeyspaceCreated(keyspace_id) => {
+                1u8.encode(out)?;
+                keyspace_id.encode(out)
+            }
+            Self::KeyspaceInfo(info) => {
+                2u8.encode(out)?;
+                info.encode(out)
+            }
+            Self::FileCreated(file_id) => {
+                3u8.encode(out)?;
+                file_id.encode(out)
+            }
+            Self::FileInfo(info) => {
+                4u8.encode(out)?;
+                info.encode(out)
+            }
+            Self::Read(read) => {
+                5u8.encode(out)?;
+                read.encode(out)
+            }
+            Self::Write(commit) => {
+                6u8.encode(out)?;
+                commit.encode(out)
+            }
+            Self::Append(commit) => {
+                7u8.encode(out)?;
+                commit.encode(out)
+            }
+            Self::AppendLease(lease) => {
+                8u8.encode(out)?;
+                lease.encode(out)
+            }
+            Self::Flush(flush) => {
+                9u8.encode(out)?;
+                flush.encode(out)
+            }
+            Self::KeyspaceCheckpointed(checkpoint_id) => {
+                10u8.encode(out)?;
+                checkpoint_id.encode(out)
+            }
+            Self::KeyspaceSnapshotted(keyspace_id) => {
+                11u8.encode(out)?;
+                keyspace_id.encode(out)
+            }
+            Self::KeyspaceRestored(keyspace_id) => {
+                12u8.encode(out)?;
+                keyspace_id.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::KeyspaceCreated(KeyspaceId::decode(input)?)),
+            2 => Ok(Self::KeyspaceInfo(KeyspaceInfo::decode(input)?)),
+            3 => Ok(Self::FileCreated(FileId::decode(input)?)),
+            4 => Ok(Self::FileInfo(FileInfo::decode(input)?)),
+            5 => Ok(Self::Read(ReadResponse::decode(input)?)),
+            6 => Ok(Self::Write(FileWriteCommit::decode(input)?)),
+            7 => Ok(Self::Append(AppendCommit::decode(input)?)),
+            8 => Ok(Self::AppendLease(AppendLease::decode(input)?)),
+            9 => Ok(Self::Flush(FlushResult::decode(input)?)),
+            10 => Ok(Self::KeyspaceCheckpointed(CheckpointId::decode(input)?)),
+            11 => Ok(Self::KeyspaceSnapshotted(KeyspaceId::decode(input)?)),
+            12 => Ok(Self::KeyspaceRestored(KeyspaceId::decode(input)?)),
+            _ => Err(durable_codec_error("invalid native response tag")),
+        }
+    }
+}
+
+impl DurableCodec for NativeRequestEnvelope {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.request_id.encode(out)?;
+        self.client_epoch.encode(out)?;
+        self.deadline.encode(out)?;
+        self.request.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            request_id: RequestId::decode(input)?,
+            client_epoch: ClientEpoch::decode(input)?,
+            deadline: Option::decode(input)?,
+            request: NativeRequest::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for NativeResponseEnvelope {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.request_id.encode(out)?;
+        self.response.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            request_id: RequestId::decode(input)?,
+            response: NativeResponse::decode(input)?,
+        })
+    }
+}
+
+impl<T: DurableCodec> DurableCodec for RemoteWireRequest<T> {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.incarnation.encode(out)?;
+        self.envelope.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            incarnation: ServerIncarnation::decode(input)?,
+            envelope: T::decode(input)?,
+        })
+    }
+}
+
+impl<T: DurableCodec> DurableCodec for RemoteWireReply<T> {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Ok {
+                incarnation,
+                envelope,
+            } => {
+                1u8.encode(out)?;
+                incarnation.encode(out)?;
+                envelope.encode(out)
+            }
+            Self::Err {
+                incarnation,
+                reason,
+            } => {
+                2u8.encode(out)?;
+                incarnation.encode(out)?;
+                reason.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Ok {
+                incarnation: ServerIncarnation::decode(input)?,
+                envelope: T::decode(input)?,
+            }),
+            2 => Ok(Self::Err {
+                incarnation: ServerIncarnation::decode(input)?,
+                reason: String::decode(input)?,
+            }),
+            _ => Err(durable_codec_error("invalid remote wire reply tag")),
+        }
+    }
+}
+
 fn encode_snapshot<T: DurableSnapshotCodec>(value: &T) -> Result<Vec<u8>> {
     let mut out = DurableEncoder::new(T::SNAPSHOT_KIND);
     value.encode(&mut out)?;
@@ -8256,6 +9714,11 @@ mod tests {
             file_id,
             snapshot_keyspace,
         }
+    }
+
+    fn start_tcp_wire_server(endpoint: Arc<dyn RemoteWireTransport>) -> TcpRemoteWireServer {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        TcpRemoteWireServer::start(listener, endpoint, DEFAULT_NETWORK_MAX_FRAME_BYTES).unwrap()
     }
 
     #[test]
@@ -11129,6 +12592,354 @@ mod tests {
                 .unwrap()
                 .contains(&RequestId::from_raw(50))
         );
+    }
+
+    #[test]
+    fn network_wire_codec_round_trips_rejects_malformed_frames_and_has_golden_bytes() {
+        let request = RemoteWireRequest {
+            incarnation: ServerIncarnation::from_raw(3),
+            envelope: BlockRequestEnvelope::new(
+                RequestId::from_raw(1),
+                ClientEpoch::from_raw(2),
+                None,
+                BlockRequest::Info {
+                    device_id: DeviceId::from_raw(4),
+                },
+            ),
+        };
+        let frame = encode_network_frame(NETWORK_BLOCK_REQUEST, &request).unwrap();
+        assert_eq!(
+            bytes_to_hex(&frame),
+            concat!(
+                "54434f5757495245",
+                "0001",
+                "01",
+                "0000000000000003",
+                "00000000000000000000000000000001",
+                "0000000000000002",
+                "00",
+                "02",
+                "00000000000000000000000000000004",
+            )
+        );
+        let decoded: RemoteWireRequest<BlockRequestEnvelope> =
+            decode_network_frame(NETWORK_BLOCK_REQUEST, &frame).unwrap();
+        assert_eq!(decoded.incarnation, request.incarnation);
+        assert_eq!(decoded.envelope, request.envelope);
+
+        let mut bad_magic = frame.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(
+            decode_network_frame::<RemoteWireRequest<BlockRequestEnvelope>>(
+                NETWORK_BLOCK_REQUEST,
+                &bad_magic,
+            )
+            .is_err()
+        );
+
+        let mut bad_version = frame.clone();
+        bad_version[9] = 2;
+        assert!(
+            decode_network_frame::<RemoteWireRequest<BlockRequestEnvelope>>(
+                NETWORK_BLOCK_REQUEST,
+                &bad_version,
+            )
+            .is_err()
+        );
+
+        let mut bad_kind = frame.clone();
+        bad_kind[10] = NETWORK_NATIVE_REQUEST;
+        assert!(
+            decode_network_frame::<RemoteWireRequest<BlockRequestEnvelope>>(
+                NETWORK_BLOCK_REQUEST,
+                &bad_kind,
+            )
+            .is_err()
+        );
+
+        let mut truncated = frame.clone();
+        truncated.pop();
+        assert!(
+            decode_network_frame::<RemoteWireRequest<BlockRequestEnvelope>>(
+                NETWORK_BLOCK_REQUEST,
+                &truncated,
+            )
+            .is_err()
+        );
+
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(
+            decode_network_frame::<RemoteWireRequest<BlockRequestEnvelope>>(
+                NETWORK_BLOCK_REQUEST,
+                &trailing,
+            )
+            .is_err()
+        );
+
+        let mismatched = encode_network_frame(
+            NETWORK_BLOCK_RESPONSE,
+            &RemoteWireReply::Ok {
+                incarnation: ServerIncarnation::from_raw(3),
+                envelope: BlockResponseEnvelope {
+                    request_id: RequestId::from_raw(99),
+                    response: BlockResponse::Created(DeviceId::from_raw(4)),
+                },
+            },
+        )
+        .unwrap();
+        let transport = NetworkBlockTransport::new(
+            Arc::new(NetworkBlockEndpoint::new(
+                Arc::new(LocalBlockServer::new(LocalObjectStore::new())),
+                ServerIncarnation::from_raw(3),
+                8,
+                4,
+            )),
+            ServerIncarnation::from_raw(3),
+        );
+        assert!(
+            transport
+                .decode_response(RequestId::from_raw(1), &mismatched)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn network_block_transport_loopback_retries_and_rejects_corrupt_frames() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let block_server = Arc::new(LocalBlockServer::new(store));
+        let endpoint = Arc::new(NetworkBlockEndpoint::new(
+            block_server.clone(),
+            ServerIncarnation::from_raw(21),
+            32,
+            4,
+        ));
+        let tcp_server = start_tcp_wire_server(endpoint);
+        let tcp = Arc::new(TcpRemoteWireTransport::new(
+            tcp_server.local_addr(),
+            DEFAULT_NETWORK_MAX_FRAME_BYTES,
+        ));
+        let chaos = Arc::new(ChaosRemoteWireTransport::new(tcp));
+        let transport = NetworkBlockTransport::new(chaos.clone(), ServerIncarnation::from_raw(21));
+
+        let create = BlockRequestEnvelope::new(
+            RequestId::from_raw(1),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Create {
+                request: CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 16,
+                        block_size: 4096,
+                    },
+                    name: None,
+                },
+            },
+        );
+        let created = transport.call(create).unwrap();
+        let device_id = match created.response {
+            BlockResponse::Created(device_id) => device_id,
+            _ => panic!("unexpected block response"),
+        };
+
+        let write = BlockRequestEnvelope::new(
+            RequestId::from_raw(2),
+            ClientEpoch::from_raw(1),
+            None,
+            BlockRequest::Write {
+                device_id,
+                offset: 0,
+                bytes: vec![8; 4096],
+                durability: WriteDurability::Acknowledged,
+            },
+        );
+        chaos.drop_next_response().unwrap();
+        assert!(transport.call(write.clone()).is_err());
+        transport.call(write).unwrap();
+        assert_eq!(
+            block_server
+                .request_log()
+                .unwrap()
+                .iter()
+                .filter(|request_id| **request_id == RequestId::from_raw(2))
+                .count(),
+            1
+        );
+
+        chaos.corrupt_next_response().unwrap();
+        assert!(matches!(
+            transport.call(BlockRequestEnvelope::new(
+                RequestId::from_raw(3),
+                ClientEpoch::from_raw(1),
+                None,
+                BlockRequest::Info { device_id },
+            )),
+            Err(StorageError::Corrupt { .. })
+        ));
+
+        let read = transport
+            .call(BlockRequestEnvelope::new(
+                RequestId::from_raw(4),
+                ClientEpoch::from_raw(1),
+                None,
+                BlockRequest::Read {
+                    device_id,
+                    range: ByteRange::new(0, 4096),
+                },
+            ))
+            .unwrap();
+        match read.response {
+            BlockResponse::Read(read) => assert_eq!(read.bytes, vec![8; 4096]),
+            _ => panic!("unexpected block response"),
+        }
+
+        let stale = NetworkBlockTransport::new(
+            Arc::new(TcpRemoteWireTransport::new(
+                tcp_server.local_addr(),
+                DEFAULT_NETWORK_MAX_FRAME_BYTES,
+            )),
+            ServerIncarnation::from_raw(99),
+        );
+        assert!(
+            stale
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(5),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Info { device_id },
+                ))
+                .is_err()
+        );
+
+        let tiny = TcpRemoteWireTransport::new(tcp_server.local_addr(), 4);
+        assert!(tiny.call_wire(vec![0; 8]).is_err());
+        tcp_server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_native_transport_loopback_preserves_file_semantics() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let native_server = Arc::new(LocalNativeServer::new(store));
+        let endpoint = Arc::new(NetworkNativeEndpoint::new(
+            native_server,
+            ServerIncarnation::from_raw(22),
+            32,
+            4,
+        ));
+        let tcp_server = start_tcp_wire_server(endpoint);
+        let transport =
+            NetworkNativeTransport::tcp(tcp_server.local_addr(), ServerIncarnation::from_raw(22));
+        let client = LocalNativeClient::with_transport(Arc::new(transport));
+        let keyspace_id = client
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("net".to_string()),
+            })
+            .unwrap();
+        let file_id = client
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let file = client.open_file(keyspace_id, file_id).unwrap();
+        file.write_at(0, b"alpha").unwrap();
+        file.append_with_lease(file.acquire_append().unwrap(), b"-beta")
+            .unwrap();
+        let mut bytes = vec![0; b"alpha-beta".len()];
+        file.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, b"alpha-beta");
+        tcp_server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_endpoints_enforce_backpressure_and_deadlines() {
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let block_server = Arc::new(LocalBlockServer::new(store));
+        let endpoint = Arc::new(NetworkBlockEndpoint::new(
+            block_server,
+            ServerIncarnation::from_raw(23),
+            8,
+            0,
+        ));
+        let tcp_server = start_tcp_wire_server(endpoint.clone());
+        let transport =
+            NetworkBlockTransport::tcp(tcp_server.local_addr(), ServerIncarnation::from_raw(23));
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(1),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Create {
+                        request: CreateDeviceRequest {
+                            spec: DeviceSpec {
+                                logical_blocks: 16,
+                                block_size: 4096,
+                            },
+                            name: None,
+                        },
+                    },
+                ))
+                .is_err()
+        );
+        tcp_server.shutdown().unwrap();
+
+        let store = LocalObjectStore::with_config(config()).unwrap();
+        let block_server = Arc::new(LocalBlockServer::new(store));
+        let endpoint = Arc::new(NetworkBlockEndpoint::new(
+            block_server,
+            ServerIncarnation::from_raw(24),
+            8,
+            4,
+        ));
+        endpoint
+            .set_logical_time(LogicalTime::from_raw(10))
+            .unwrap();
+        let tcp_server = start_tcp_wire_server(endpoint.clone());
+        let transport =
+            NetworkBlockTransport::tcp(tcp_server.local_addr(), ServerIncarnation::from_raw(24));
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(2),
+                    ClientEpoch::from_raw(1),
+                    Some(LogicalDeadline::from_raw(9)),
+                    BlockRequest::Create {
+                        request: CreateDeviceRequest {
+                            spec: DeviceSpec {
+                                logical_blocks: 16,
+                                block_size: 4096,
+                            },
+                            name: None,
+                        },
+                    },
+                ))
+                .is_err()
+        );
+        endpoint.set_shutdown(true).unwrap();
+        assert!(
+            transport
+                .call(BlockRequestEnvelope::new(
+                    RequestId::from_raw(3),
+                    ClientEpoch::from_raw(1),
+                    None,
+                    BlockRequest::Create {
+                        request: CreateDeviceRequest {
+                            spec: DeviceSpec {
+                                logical_blocks: 16,
+                                block_size: 4096,
+                            },
+                            name: None,
+                        },
+                    },
+                ))
+                .is_err()
+        );
+        tcp_server.shutdown().unwrap();
     }
 
     #[test]

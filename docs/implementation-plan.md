@@ -767,7 +767,7 @@ Exit gate:
 
 ## Phase 19: Real Network Transport
 
-Status: not started.
+Status: complete.
 
 Implement an actual network adapter for the Phase 17 serialized wire contract.
 This phase is about crossing a process or host boundary, not changing storage
@@ -776,40 +776,40 @@ temporary local scaffolding; real network frames must use a crate-owned codec.
 
 Deliverables:
 
-- [ ] Protocol choice documented in the spec, including framing, maximum frame
+- [x] Protocol choice documented in the spec, including framing, maximum frame
   size, request/response envelope codec, and server incarnation handshake.
-- [ ] Crate-owned wire codec with explicit magic, protocol version, frame kind,
+- [x] Crate-owned wire codec with explicit magic, protocol version, frame kind,
   request/response kind tags, fixed integer endianness, bounded payload lengths,
   and trailing-byte rejection.
-- [ ] Wire codec tests for round trips, stable golden frames, unsupported
+- [x] Wire codec tests for round trips, stable golden frames, unsupported
   versions, invalid tags, truncated frames, oversized frames, trailing bytes,
   corrupt length prefixes, and mismatched request/response IDs.
-- [ ] Network block transport that implements `BlockTransport` without changing
+- [x] Network block transport that implements `BlockTransport` without changing
   `BlockDevice` callers.
-- [ ] Network native transport that implements `NativeTransport` without
+- [x] Network native transport that implements `NativeTransport` without
   changing `NativeFile` callers.
-- [ ] Network server endpoint for block and native request envelopes over the
+- [x] Network server endpoint for block and native request envelopes over the
   shared `RemoteWireTransport` contract.
-- [ ] Bounded connection queues, explicit backpressure, timeout/deadline
+- [x] Bounded connection queues, explicit backpressure, timeout/deadline
   behavior, reconnect behavior, and shutdown behavior.
-- [ ] Loopback integration tests plus deterministic chaos tests that reuse the
+- [x] Loopback integration tests plus deterministic chaos tests that reuse the
   Phase 17 drop, duplicate, delay, reorder, stale-response, and corrupt-frame
   cases.
 
 Exit gate:
 
-- [ ] In-process, serialized remote, chaos-wrapped, and real network transports
+- [x] In-process, serialized remote, chaos-wrapped, and real network transports
   pass the same block and native transport conformance tests.
-- [ ] Network failures surface as transport errors; callers can retry with the
+- [x] Network failures surface as transport errors; callers can retry with the
   same request identity without double-applying successful server mutations.
-- [ ] Stale server incarnations, mismatched response IDs, oversized frames, and
+- [x] Stale server incarnations, mismatched response IDs, oversized frames, and
   malformed frames are rejected deterministically.
-- [ ] No production network path uses serde/bincode-derived framing or enum
+- [x] No production network path uses serde/bincode-derived framing or enum
   layout.
-- [ ] Backpressure is bounded and observable; the network adapter does not hide
+- [x] Backpressure is bounded and observable; the network adapter does not hide
   unbounded queues or background retries.
-- [ ] Public block/native APIs and provider contracts do not change.
-- [ ] The network adapter does not choose storage nodes or fan out replicas.
+- [x] Public block/native APIs and provider contracts do not change.
+- [x] The network adapter does not choose storage nodes or fan out replicas.
 
 ## Phase 20: Storage Replication
 
