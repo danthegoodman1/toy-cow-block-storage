@@ -25,16 +25,18 @@ use crate::api::{
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
-    AppendCommit, AppendLease, CreateFileRequest, CreateKeyspaceRequest, FileInfo, FileSpec,
-    FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient, NativeRequest,
-    NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer, NativeTransport,
-    SnapshotKeyspaceRequest,
+    AppendCommit, AppendExtentReservation, AppendLease, AppendReservationAbort,
+    AppendReservationFill, AppendReservationPlacement, CreateFileRequest, CreateKeyspaceRequest,
+    FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient,
+    NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer,
+    NativeTransport, SnapshotKeyspaceRequest,
 };
 use crate::id::{
-    AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
-    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId,
-    KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, MetadataNodeId,
-    RequestId, SegmentId, ServerIncarnation, StorageNodeId, WriteIntentId, WriterEpoch,
+    AppendLeaseId, AppendReservationId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
+    CommitGroupId, CommitSeq, DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion,
+    KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline,
+    LogicalTime, MetadataNodeId, RequestId, SegmentId, ServerIncarnation, StorageNodeId,
+    WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
@@ -60,6 +62,7 @@ pub struct LocalStoreConfig {
     pub metadata_fanout: usize,
     pub metadata_leaf_blocks: u64,
     pub storage_node: StorageNodeId,
+    pub max_append_reservation_bytes: u64,
 }
 
 impl Default for LocalStoreConfig {
@@ -71,6 +74,7 @@ impl Default for LocalStoreConfig {
             metadata_fanout: 4,
             metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(1),
+            max_append_reservation_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -110,6 +114,24 @@ impl LocalStoreConfig {
         if self.metadata_leaf_blocks == 0 {
             return Err(StorageError::invalid_argument(
                 "metadata_leaf_blocks must be greater than zero",
+            ));
+        }
+
+        if self.max_append_reservation_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "max_append_reservation_bytes must be greater than zero",
+            ));
+        }
+
+        if self.max_append_reservation_bytes < u64::from(self.block_size) {
+            return Err(StorageError::invalid_argument(
+                "max_append_reservation_bytes must be at least one block",
+            ));
+        }
+
+        if self.max_append_reservation_bytes % u64::from(self.block_size) != 0 {
+            return Err(StorageError::invalid_argument(
+                "max_append_reservation_bytes must be block aligned",
             ));
         }
 
@@ -362,6 +384,17 @@ pub struct LocalObjectStore {
     storage_nodes: StorageNodeRegistry,
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
+    next_append_reservation_id: Arc<Mutex<u128>>,
+    append_reservations: Arc<Mutex<BTreeMap<AppendReservationId, StagedAppendReservation>>>,
+}
+
+#[derive(Debug, Clone)]
+struct StagedAppendReservation {
+    public: AppendExtentReservation,
+    segment_reservation: SegmentReservation,
+    storage_node: StorageNodeId,
+    bytes: Vec<u8>,
+    filled: Vec<ByteRange>,
 }
 
 impl LocalObjectStore {
@@ -383,6 +416,8 @@ impl LocalObjectStore {
             storage_nodes: StorageNodeRegistry::new(config, storage_nodes)?,
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
+            next_append_reservation_id: Arc::new(Mutex::new(1)),
+            append_reservations: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -396,6 +431,8 @@ impl LocalObjectStore {
             storage_nodes: StorageNodeRegistry::from_inner(image.config, image.storage_nodes)?,
             next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
+            next_append_reservation_id: Arc::new(Mutex::new(image.next_append_reservation_id)),
+            append_reservations: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -406,6 +443,7 @@ impl LocalObjectStore {
             storage_nodes: self.storage_nodes.state_inner()?,
             next_write_intent: *lock(&self.next_write_intent)?,
             next_extent_id: *lock(&self.next_extent_id)?,
+            next_append_reservation_id: *lock(&self.next_append_reservation_id)?,
         })
     }
 
@@ -768,6 +806,206 @@ impl LocalObjectStore {
         })
     }
 
+    pub fn reserve_append_extent(
+        &self,
+        lease: AppendLease,
+        exact_bytes: u64,
+        placement: AppendReservationPlacement,
+    ) -> Result<AppendExtentReservation> {
+        match placement {
+            AppendReservationPlacement::SingleSegmentRequired => {}
+        }
+        if exact_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "reserved append length must not be zero",
+            ));
+        }
+        if exact_bytes > self.metadata.config.max_append_reservation_bytes {
+            return Err(StorageError::invalid_argument(
+                "reserved append length exceeds configured maximum",
+            ));
+        }
+        let block_size = u64::from(self.metadata.config.block_size);
+        if exact_bytes % block_size != 0 {
+            return Err(StorageError::invalid_argument(
+                "reserved append length must be block aligned",
+            ));
+        }
+
+        let head = self
+            .metadata
+            .get_file_head(lease.keyspace_id, lease.file_id)?;
+        if head.version != lease.base_version {
+            return Err(StorageError::conflict("stale append lease"));
+        }
+        self.metadata.validate_writer_epoch(
+            lease.keyspace_id,
+            lease.file_id,
+            lease.writer_epoch,
+        )?;
+        if head.size % block_size != 0 {
+            return Err(StorageError::invalid_argument(
+                "reserved append requires block-aligned file size",
+            ));
+        }
+        let segment_blocks = exact_bytes / block_size;
+        let append_start_block = head.size / block_size;
+        let append_range = crate::api::BlockRange::new(
+            BlockIndex::from_raw(append_start_block),
+            BlockCount::from_raw(segment_blocks),
+        );
+        let root = self.metadata.get_metadata_node(head.root)?;
+        if !root.covered_range.contains_range(append_range)? {
+            return Err(StorageError::invalid_argument(
+                "reserved append exceeds file root coverage",
+            ));
+        }
+        if self.tree_has_mappings(head.root, append_range)? {
+            return Err(StorageError::conflict(
+                "reserved append range overlaps existing file metadata",
+            ));
+        }
+
+        let write_intent = self.next_write_intent()?;
+        let reservation_id = self.next_append_reservation_id()?;
+        let owner = MappingOwner::NativeKeyspace(lease.keyspace_id);
+        let storage_node = self.storage_nodes.choose_storage_node()?;
+        let segment_reservation = self.storage_nodes.reserve_segment(
+            storage_node,
+            SegmentReservationIntent {
+                write_intent,
+                owner,
+                bytes: exact_bytes,
+            },
+        )?;
+        let bytes_len = usize::try_from(exact_bytes).map_err(|_| {
+            StorageError::invalid_argument("reserved append length overflows usize")
+        })?;
+        let public = AppendExtentReservation {
+            reservation_id,
+            keyspace_id: lease.keyspace_id,
+            file_id: lease.file_id,
+            lease,
+            base_size: head.size,
+            exact_bytes,
+            placement,
+        };
+        let staged = StagedAppendReservation {
+            public: public.clone(),
+            segment_reservation,
+            storage_node,
+            bytes: vec![0; bytes_len],
+            filled: Vec::new(),
+        };
+        lock(&self.append_reservations)?.insert(reservation_id, staged);
+        Ok(public)
+    }
+
+    pub fn fill_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<AppendReservationFill> {
+        validate_reservation_target(&reservation)?;
+        let len = u64::try_from(data.len()).map_err(|_| {
+            StorageError::invalid_argument("reserved append fill length overflows u64")
+        })?;
+        let range = ByteRange::new(offset, len);
+        let end = range.end_exclusive()?;
+        if end > reservation.exact_bytes {
+            return Err(StorageError::invalid_argument(
+                "reserved append fill exceeds reservation length",
+            ));
+        }
+
+        let mut reservations = lock(&self.append_reservations)?;
+        let staged = reservations
+            .get_mut(&reservation.reservation_id)
+            .ok_or_else(|| {
+                StorageError::not_found(
+                    "append_reservation",
+                    reservation.reservation_id.to_string(),
+                )
+            })?;
+        if staged.public != reservation {
+            return Err(StorageError::conflict(
+                "append reservation does not match staged state",
+            ));
+        }
+        apply_reserved_append_fill(staged, range, data)?;
+        Ok(AppendReservationFill {
+            reservation_id: reservation.reservation_id,
+            range,
+            filled_bytes: filled_bytes(&staged.filled)?,
+            complete: reservation_is_complete(staged)?,
+        })
+    }
+
+    pub fn commit_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+        durability: crate::api::WriteDurability,
+    ) -> Result<AppendCommit> {
+        validate_reservation_target(&reservation)?;
+        let staged = {
+            let mut reservations = lock(&self.append_reservations)?;
+            let staged = reservations
+                .get(&reservation.reservation_id)
+                .ok_or_else(|| {
+                    StorageError::not_found(
+                        "append_reservation",
+                        reservation.reservation_id.to_string(),
+                    )
+                })?;
+            if staged.public != reservation {
+                return Err(StorageError::conflict(
+                    "append reservation does not match staged state",
+                ));
+            }
+            if !reservation_is_complete(staged)? {
+                return Err(StorageError::conflict(
+                    "reserved append cannot commit before all bytes are filled",
+                ));
+            }
+            reservations
+                .remove(&reservation.reservation_id)
+                .expect("reservation was just observed")
+        };
+
+        let result = self.commit_staged_append_reservation(staged.clone(), durability);
+        if result.is_err() {
+            let _ = self.cleanup_unwritten_staged_reservation(&staged);
+        }
+        result
+    }
+
+    pub fn abort_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+    ) -> Result<AppendReservationAbort> {
+        validate_reservation_target(&reservation)?;
+        let staged = lock(&self.append_reservations)?
+            .remove(&reservation.reservation_id)
+            .ok_or_else(|| {
+                StorageError::not_found(
+                    "append_reservation",
+                    reservation.reservation_id.to_string(),
+                )
+            })?;
+        if staged.public != reservation {
+            return Err(StorageError::conflict(
+                "append reservation does not match staged state",
+            ));
+        }
+        self.cleanup_unwritten_staged_reservation(&staged)?;
+        Ok(AppendReservationAbort {
+            reservation_id: reservation.reservation_id,
+            keyspace_id: reservation.keyspace_id,
+            file_id: reservation.file_id,
+        })
+    }
+
     pub fn write_file_at(
         &self,
         keyspace_id: KeyspaceId,
@@ -1088,6 +1326,131 @@ impl LocalObjectStore {
             .checked_add(1)
             .ok_or_else(|| StorageError::conflict("extent id overflow"))?;
         Ok(id)
+    }
+
+    fn next_append_reservation_id(&self) -> Result<AppendReservationId> {
+        let mut next = lock(&self.next_append_reservation_id)?;
+        let id = AppendReservationId::from_raw(*next);
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("append reservation id overflow"))?;
+        Ok(id)
+    }
+
+    fn commit_staged_append_reservation(
+        &self,
+        staged: StagedAppendReservation,
+        durability: crate::api::WriteDurability,
+    ) -> Result<AppendCommit> {
+        let reservation = &staged.public;
+        let head = self
+            .metadata
+            .get_file_head(reservation.keyspace_id, reservation.file_id)?;
+        if head.version != reservation.lease.base_version || head.size != reservation.base_size {
+            return Err(StorageError::conflict("stale append reservation"));
+        }
+        self.metadata.validate_writer_epoch(
+            reservation.keyspace_id,
+            reservation.file_id,
+            reservation.lease.writer_epoch,
+        )?;
+
+        let block_size = u64::from(self.metadata.config.block_size);
+        let segment_blocks = reservation.exact_bytes / block_size;
+        let append_range = crate::api::BlockRange::new(
+            BlockIndex::from_raw(reservation.base_size / block_size),
+            BlockCount::from_raw(segment_blocks),
+        );
+        if self.tree_has_mappings(head.root, append_range)? {
+            return Err(StorageError::conflict(
+                "reserved append range overlaps existing file metadata",
+            ));
+        }
+
+        let node = self.storage_nodes.node(staged.storage_node)?;
+        node.segment_catalog
+            .begin_write(&staged.segment_reservation)?;
+        let commit = node
+            .segment_store
+            .write_segment(&staged.segment_reservation, &staged.bytes)?;
+        node.segment_store
+            .sync_segment(staged.segment_reservation.segment_id)?;
+        node.segment_catalog
+            .commit_segment(staged.segment_reservation.clone(), commit)?;
+
+        let owner = MappingOwner::NativeKeyspace(reservation.keyspace_id);
+        let new_root = self
+            .replace_tree_range(
+                head.root,
+                TreeRangeEdit {
+                    range: append_range,
+                    replacement: Some(SegmentReplacement {
+                        segment_id: staged.segment_reservation.segment_id,
+                        segment_base: append_range.start,
+                    }),
+                },
+            )?
+            .root;
+        let new_size = reservation
+            .base_size
+            .checked_add(reservation.exact_bytes)
+            .ok_or_else(|| StorageError::invalid_argument("file size overflows u64"))?;
+
+        self.metadata.publish_commit_group(CommitGroupIntent {
+            owner,
+            fence: MetadataFence::WriterEpoch {
+                base_version: reservation.lease.base_version,
+                writer_epoch: reservation.lease.writer_epoch,
+            },
+            updates: vec![RootUpdate::FileRoot {
+                file_id: reservation.file_id,
+                old_root: head.root,
+                new_root,
+                new_size,
+            }],
+        })?;
+        self.storage_nodes
+            .mark_segment_referenced(staged.segment_reservation.segment_id)?;
+        let committed = self
+            .metadata
+            .get_file_head(reservation.keyspace_id, reservation.file_id)?;
+
+        Ok(AppendCommit {
+            keyspace_id: reservation.keyspace_id,
+            file_id: reservation.file_id,
+            extent_id: self.next_extent_id()?,
+            range: ByteRange::new(reservation.base_size, reservation.exact_bytes),
+            version: committed.version,
+            commit_seq: committed.latest_commit,
+            durability,
+        })
+    }
+
+    fn cleanup_unwritten_staged_reservation(&self, staged: &StagedAppendReservation) -> Result<()> {
+        let node = self.storage_nodes.node(staged.storage_node)?;
+        match node
+            .segment_catalog
+            .state(staged.segment_reservation.segment_id)?
+        {
+            SegmentLifecycleState::Reserved => {
+                node.segment_catalog
+                    .expire_reservation(staged.segment_reservation.segment_id)?;
+                node.segment_store
+                    .delete_segment(staged.segment_reservation.segment_id)?;
+                Ok(())
+            }
+            SegmentLifecycleState::Writing => {
+                node.segment_catalog
+                    .fail_write(staged.segment_reservation.segment_id)?;
+                node.segment_store
+                    .delete_segment(staged.segment_reservation.segment_id)?;
+                Ok(())
+            }
+            SegmentLifecycleState::DurablePendingMetadata
+            | SegmentLifecycleState::Referenced
+            | SegmentLifecycleState::Released
+            | SegmentLifecycleState::Freed => Ok(()),
+        }
     }
 
     fn replace_tree_range(
@@ -1664,6 +2027,7 @@ struct DurableExportCursor {
     next_gc_epoch: u64,
     next_write_intent: u128,
     next_extent_id: u128,
+    next_append_reservation_id: u128,
     next_segment_id: u128,
     next_placement_index: u64,
 }
@@ -1684,6 +2048,7 @@ impl DurableExportCursor {
             next_gc_epoch: image.metadata.next_gc_epoch,
             next_write_intent: image.next_write_intent,
             next_extent_id: image.next_extent_id,
+            next_append_reservation_id: image.next_append_reservation_id,
             next_segment_id: image.storage_nodes.next_segment_id,
             next_placement_index: image.storage_nodes.next_placement_index,
         }
@@ -1736,6 +2101,7 @@ impl DurableSqliteStore {
               next_gc_epoch INTEGER NOT NULL CHECK (next_gc_epoch >= 0),
               next_write_intent TEXT NOT NULL,
               next_extent_id TEXT NOT NULL,
+              next_append_reservation_id TEXT NOT NULL,
               next_segment_id TEXT NOT NULL,
               next_placement_index INTEGER NOT NULL CHECK (next_placement_index >= 0)
             );
@@ -1957,6 +2323,7 @@ impl DurableSqliteStore {
             },
             next_write_intent: cursor.next_write_intent,
             next_extent_id: cursor.next_extent_id,
+            next_append_reservation_id: cursor.next_append_reservation_id,
         };
         validate_row_native_image(&conn, &image)?;
         Ok(Some(LocalObjectStore::from_state_image(image)?))
@@ -2042,7 +2409,7 @@ impl DurableSqliteStore {
             .map_err(sqlite_error)?;
         }
 
-        persist_row_native_state(&tx, previous_cursor.as_ref(), image)?;
+        persist_row_native_state(&tx, previous_cursor.as_ref(), previous_segments, image)?;
         tx.commit().map_err(sqlite_error)?;
         Ok(image_segments)
     }
@@ -2390,8 +2757,8 @@ fn load_export_cursor(conn: &Connection) -> Result<Option<DurableExportCursor>> 
                 next_metadata_node_id, next_keyspace_root_id,
                 next_keyspace_catalog_shard_id, next_commit_group_id,
                 next_commit_seq, next_checkpoint_id, next_gc_epoch,
-                next_write_intent, next_extent_id, next_segment_id,
-                next_placement_index
+                next_write_intent, next_extent_id, next_append_reservation_id,
+                next_segment_id, next_placement_index
          FROM store_meta
          WHERE id = 1",
             [],
@@ -2411,7 +2778,8 @@ fn load_export_cursor(conn: &Connection) -> Result<Option<DurableExportCursor>> 
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
-                    row.get::<_, i64>(14)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, i64>(15)?,
                 ))
             },
         )
@@ -2431,6 +2799,7 @@ fn load_export_cursor(conn: &Connection) -> Result<Option<DurableExportCursor>> 
         next_gc_epoch,
         next_write_intent,
         next_extent_id,
+        next_append_reservation_id,
         next_segment_id,
         next_placement_index,
     )) = row
@@ -2452,6 +2821,8 @@ fn load_export_cursor(conn: &Connection) -> Result<Option<DurableExportCursor>> 
         next_gc_epoch: i64_to_u64(next_gc_epoch).map_err(sqlite_error)?,
         next_write_intent: parse_u128_key(&next_write_intent).map_err(sqlite_error)?,
         next_extent_id: parse_u128_key(&next_extent_id).map_err(sqlite_error)?,
+        next_append_reservation_id: parse_u128_key(&next_append_reservation_id)
+            .map_err(sqlite_error)?,
         next_segment_id: parse_u128_key(&next_segment_id).map_err(sqlite_error)?,
         next_placement_index: i64_to_u64(next_placement_index).map_err(sqlite_error)?,
     }))
@@ -2523,6 +2894,7 @@ fn reject_orphan_row_native_rows_if_present(conn: &Connection) -> Result<()> {
 fn persist_row_native_state(
     tx: &rusqlite::Transaction<'_>,
     previous_cursor: Option<&DurableExportCursor>,
+    previous_segments: &BTreeSet<SegmentId>,
     image: &DurableStoreImage,
 ) -> Result<()> {
     let previous_u128 = |cursor_value: fn(&DurableExportCursor) -> u128| {
@@ -2677,11 +3049,7 @@ fn persist_row_native_state(
             .map(|(id, epoch)| (id.raw().to_string(), *epoch))
             .collect(),
     )?;
-    sync_segment_records_since(
-        tx,
-        &image.storage_nodes,
-        previous_u128(|cursor| cursor.next_segment_id),
-    )?;
+    sync_segment_records_since(tx, &image.storage_nodes, previous_segments)?;
     sync_segment_catalog_entries(tx, &image.storage_nodes)?;
     persist_export_cursor(tx, &DurableExportCursor::from_image(image))
 }
@@ -2741,10 +3109,10 @@ fn persist_export_cursor(
            next_metadata_node_id, next_keyspace_root_id,
            next_keyspace_catalog_shard_id, next_commit_group_id,
            next_commit_seq, next_checkpoint_id, next_gc_epoch,
-           next_write_intent, next_extent_id, next_segment_id,
-           next_placement_index
+           next_write_intent, next_extent_id, next_append_reservation_id,
+           next_segment_id, next_placement_index
          ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                   ?12, ?13, ?14, ?15)
+                   ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id) DO UPDATE SET
            config = excluded.config,
            next_device_id = excluded.next_device_id,
@@ -2759,6 +3127,7 @@ fn persist_export_cursor(
            next_gc_epoch = excluded.next_gc_epoch,
            next_write_intent = excluded.next_write_intent,
            next_extent_id = excluded.next_extent_id,
+           next_append_reservation_id = excluded.next_append_reservation_id,
            next_segment_id = excluded.next_segment_id,
            next_placement_index = excluded.next_placement_index",
         params![
@@ -2775,6 +3144,7 @@ fn persist_export_cursor(
             u64_to_i64(cursor.next_gc_epoch)?,
             cursor.next_write_intent.to_string(),
             cursor.next_extent_id.to_string(),
+            cursor.next_append_reservation_id.to_string(),
             cursor.next_segment_id.to_string(),
             u64_to_i64(cursor.next_placement_index)?,
         ],
@@ -3086,7 +3456,7 @@ fn sync_epoch_table(
 fn sync_segment_records_since(
     tx: &rusqlite::Transaction<'_>,
     registry: &StorageNodeRegistryInner,
-    previous_next_segment_id: u128,
+    previous_segments: &BTreeSet<SegmentId>,
 ) -> Result<()> {
     let mut desired = BTreeMap::new();
     for (node_id, node) in &registry.nodes {
@@ -3117,7 +3487,7 @@ fn sync_segment_records_since(
         )
         .map_err(sqlite_error)?;
     for (segment_id, (raw_segment_id, storage_node, payload)) in desired {
-        if raw_segment_id.raw() < previous_next_segment_id {
+        if previous_segments.contains(&raw_segment_id) {
             continue;
         }
         stmt.execute(params![
@@ -3473,10 +3843,10 @@ fn load_timeline_rows<T: DurableTimelineRow>(conn: &Connection, table: &str) -> 
     while let Some(row) = rows.next().map_err(sqlite_error)? {
         let payload: Vec<u8> = row.get(0).map_err(sqlite_error)?;
         let record: T = decode_row(&payload)?;
-        if let Some(last) = last_commit_seq {
-            if record.commit_seq_raw() < last {
-                return Err(StorageError::corrupt("timeline rows are not monotonic"));
-            }
+        if let Some(last) = last_commit_seq
+            && record.commit_seq_raw() < last
+        {
+            return Err(StorageError::corrupt("timeline rows are not monotonic"));
         }
         last_commit_seq = Some(record.commit_seq_raw());
         out.push(record);
@@ -3927,6 +4297,11 @@ fn validate_row_native_cursors(image: &DurableStoreImage) -> Result<()> {
             .flat_map(|node| node.segment_catalog.entries.values())
             .map(|entry| entry.intent.write_intent.raw()),
     )?;
+    ensure_next_u128_above(
+        "next_append_reservation_id",
+        image.next_append_reservation_id,
+        std::iter::empty::<u128>(),
+    )?;
     let placement_count = image
         .storage_nodes
         .nodes
@@ -4016,10 +4391,10 @@ fn row_native_segment_descriptors(
 fn validate_timeline_monotonic<T: DurableTimelineRow>(rows: &[T]) -> Result<()> {
     let mut last = None;
     for row in rows {
-        if let Some(last) = last {
-            if row.commit_seq_raw() < last {
-                return Err(StorageError::corrupt("timeline commit sequence regressed"));
-            }
+        if let Some(last) = last
+            && row.commit_seq_raw() < last
+        {
+            return Err(StorageError::corrupt("timeline commit sequence regressed"));
         }
         last = Some(row.commit_seq_raw());
     }
@@ -4583,6 +4958,42 @@ impl DurableObjectStore {
         )
     }
 
+    pub fn reserve_append_extent(
+        &self,
+        lease: AppendLease,
+        exact_bytes: u64,
+        placement: AppendReservationPlacement,
+    ) -> Result<AppendExtentReservation> {
+        self.run_and_persist(|local| local.reserve_append_extent(lease, exact_bytes, placement))
+    }
+
+    pub fn fill_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<AppendReservationFill> {
+        self.local.fill_reserved_append(reservation, offset, data)
+    }
+
+    pub fn commit_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+        durability: crate::api::WriteDurability,
+    ) -> Result<AppendCommit> {
+        self.run_and_maybe_persist(
+            matches!(durability, crate::api::WriteDurability::Flushed),
+            |local| local.commit_reserved_append(reservation, durability),
+        )
+    }
+
+    pub fn abort_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+    ) -> Result<AppendReservationAbort> {
+        self.run_and_persist(|local| local.abort_reserved_append(reservation))
+    }
+
     pub fn read_file(
         &self,
         keyspace_id: KeyspaceId,
@@ -4748,6 +5159,7 @@ struct DurableStoreImage {
     storage_nodes: StorageNodeRegistryInner,
     next_write_intent: u128,
     next_extent_id: u128,
+    next_append_reservation_id: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -4818,6 +5230,7 @@ struct DurableMetadataImage {
     metadata: MetadataInner,
     next_write_intent: u128,
     next_extent_id: u128,
+    next_append_reservation_id: u128,
 }
 
 #[cfg(test)]
@@ -7934,6 +8347,73 @@ impl NativeServer for LocalNativeServer {
                         ))
                     }
                 }
+                NativeRequest::ReserveAppend {
+                    keyspace_id,
+                    file_id,
+                    lease,
+                    exact_bytes,
+                    placement,
+                } => {
+                    if keyspace_id != lease.keyspace_id || file_id != lease.file_id {
+                        Err(StorageError::invalid_argument(
+                            "append lease target does not match reservation target",
+                        ))
+                    } else {
+                        Ok(NativeResponse::AppendReserved(
+                            self.store
+                                .reserve_append_extent(lease, exact_bytes, placement)?,
+                        ))
+                    }
+                }
+                NativeRequest::FillReservedAppend {
+                    keyspace_id,
+                    file_id,
+                    reservation,
+                    offset,
+                    bytes,
+                } => {
+                    if keyspace_id != reservation.keyspace_id || file_id != reservation.file_id {
+                        Err(StorageError::invalid_argument(
+                            "reserved append target does not match request target",
+                        ))
+                    } else {
+                        Ok(NativeResponse::AppendReservationFilled(
+                            self.store
+                                .fill_reserved_append(reservation, offset, &bytes)?,
+                        ))
+                    }
+                }
+                NativeRequest::CommitReservedAppend {
+                    keyspace_id,
+                    file_id,
+                    reservation,
+                    durability,
+                } => {
+                    if keyspace_id != reservation.keyspace_id || file_id != reservation.file_id {
+                        Err(StorageError::invalid_argument(
+                            "reserved append target does not match request target",
+                        ))
+                    } else {
+                        Ok(NativeResponse::AppendReservationCommitted(
+                            self.store.commit_reserved_append(reservation, durability)?,
+                        ))
+                    }
+                }
+                NativeRequest::AbortReservedAppend {
+                    keyspace_id,
+                    file_id,
+                    reservation,
+                } => {
+                    if keyspace_id != reservation.keyspace_id || file_id != reservation.file_id {
+                        Err(StorageError::invalid_argument(
+                            "reserved append target does not match request target",
+                        ))
+                    } else {
+                        Ok(NativeResponse::AppendReservationAborted(
+                            self.store.abort_reserved_append(reservation)?,
+                        ))
+                    }
+                }
                 NativeRequest::Flush {
                     keyspace_id,
                     file_id,
@@ -9315,6 +9795,121 @@ fn read_tcp_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> Result<Vec<
     Ok(bytes)
 }
 
+fn validate_reservation_target(reservation: &AppendExtentReservation) -> Result<()> {
+    if reservation.keyspace_id != reservation.lease.keyspace_id
+        || reservation.file_id != reservation.lease.file_id
+    {
+        return Err(StorageError::invalid_argument(
+            "append reservation lease target does not match reservation target",
+        ));
+    }
+    if reservation.exact_bytes == 0 {
+        return Err(StorageError::invalid_argument(
+            "append reservation length must not be zero",
+        ));
+    }
+    match reservation.placement {
+        AppendReservationPlacement::SingleSegmentRequired => Ok(()),
+    }
+}
+
+fn apply_reserved_append_fill(
+    staged: &mut StagedAppendReservation,
+    range: ByteRange,
+    data: &[u8],
+) -> Result<()> {
+    let start = usize::try_from(range.offset)
+        .map_err(|_| StorageError::invalid_argument("reserved append offset overflows usize"))?;
+    let len = usize::try_from(range.len)
+        .map_err(|_| StorageError::invalid_argument("reserved append length overflows usize"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| StorageError::invalid_argument("reserved append range overflows"))?;
+    if end > staged.bytes.len() {
+        return Err(StorageError::invalid_argument(
+            "reserved append fill exceeds reservation length",
+        ));
+    }
+    if data.len() != len {
+        return Err(StorageError::invalid_argument(
+            "reserved append fill length does not match range",
+        ));
+    }
+
+    for existing in &staged.filled {
+        let overlap_start = range.offset.max(existing.offset);
+        let overlap_end = range.end_exclusive()?.min(existing.end_exclusive()?);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let new_start = usize::try_from(overlap_start - range.offset).map_err(|_| {
+            StorageError::invalid_argument("reserved append overlap offset overflows usize")
+        })?;
+        let old_start = usize::try_from(overlap_start).map_err(|_| {
+            StorageError::invalid_argument("reserved append overlap offset overflows usize")
+        })?;
+        let overlap_len = usize::try_from(overlap_end - overlap_start).map_err(|_| {
+            StorageError::invalid_argument("reserved append overlap length overflows usize")
+        })?;
+        if data[new_start..new_start + overlap_len]
+            != staged.bytes[old_start..old_start + overlap_len]
+        {
+            return Err(StorageError::conflict(
+                "reserved append fill overlaps existing bytes with different data",
+            ));
+        }
+    }
+
+    if len != 0 {
+        staged.bytes[start..end].copy_from_slice(data);
+        merge_filled_range(&mut staged.filled, range)?;
+    }
+    Ok(())
+}
+
+fn merge_filled_range(filled: &mut Vec<ByteRange>, range: ByteRange) -> Result<()> {
+    if range.len == 0 {
+        return Ok(());
+    }
+    let mut start = range.offset;
+    let mut end = range.end_exclusive()?;
+    let mut out = Vec::with_capacity(filled.len() + 1);
+    let mut inserted = false;
+    for existing in filled.iter().copied() {
+        let existing_end = existing.end_exclusive()?;
+        if existing_end < start {
+            out.push(existing);
+        } else if end < existing.offset {
+            if !inserted {
+                out.push(ByteRange::new(start, end - start));
+                inserted = true;
+            }
+            out.push(existing);
+        } else {
+            start = start.min(existing.offset);
+            end = end.max(existing_end);
+        }
+    }
+    if !inserted {
+        out.push(ByteRange::new(start, end - start));
+    }
+    *filled = out;
+    Ok(())
+}
+
+fn filled_bytes(filled: &[ByteRange]) -> Result<u64> {
+    filled.iter().try_fold(0u64, |sum, range| {
+        sum.checked_add(range.len)
+            .ok_or_else(|| StorageError::invalid_argument("filled byte count overflows"))
+    })
+}
+
+fn reservation_is_complete(staged: &StagedAppendReservation) -> Result<bool> {
+    Ok(staged.filled.len() == 1
+        && staged.filled[0].offset == 0
+        && staged.filled[0].len == staged.public.exact_bytes)
+}
+
 /// Local `BlockClient` backed by a block transport.
 #[derive(Clone)]
 pub struct LocalBlockClient {
@@ -9838,6 +10433,101 @@ impl NativeFile for LocalNativeFile {
         }
     }
 
+    fn reserve_append_extent(
+        &self,
+        lease: AppendLease,
+        exact_bytes: u64,
+    ) -> Result<AppendExtentReservation> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::ReserveAppend {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                lease,
+                exact_bytes,
+                placement: AppendReservationPlacement::SingleSegmentRequired,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendReserved(reservation) => Ok(reservation),
+            _ => Err(StorageError::corrupt("unexpected reserved-append response")),
+        }
+    }
+
+    fn fill_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<AppendReservationFill> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::FillReservedAppend {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                reservation,
+                offset,
+                bytes: data.to_vec(),
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendReservationFilled(fill) => Ok(fill),
+            _ => Err(StorageError::corrupt(
+                "unexpected reserved-append-fill response",
+            )),
+        }
+    }
+
+    fn commit_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+        durability: WriteDurability,
+    ) -> Result<AppendCommit> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::CommitReservedAppend {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                reservation,
+                durability,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendReservationCommitted(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt(
+                "unexpected reserved-append-commit response",
+            )),
+        }
+    }
+
+    fn abort_reserved_append(
+        &self,
+        reservation: AppendExtentReservation,
+    ) -> Result<AppendReservationAbort> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::AbortReservedAppend {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                reservation,
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendReservationAborted(abort) => Ok(abort),
+            _ => Err(StorageError::corrupt(
+                "unexpected reserved-append-abort response",
+            )),
+        }
+    }
+
     fn flush(&self) -> Result<FlushResult> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
@@ -10291,6 +10981,7 @@ macro_rules! durable_id_codec_u32 {
 
 durable_id_codec_u128!(
     AppendLeaseId,
+    AppendReservationId,
     CheckpointId,
     CommitGroupId,
     DeviceId,
@@ -10329,7 +11020,8 @@ impl DurableCodec for LocalStoreConfig {
         self.file_root_blocks.encode(out)?;
         self.metadata_fanout.encode(out)?;
         self.metadata_leaf_blocks.encode(out)?;
-        self.storage_node.encode(out)
+        self.storage_node.encode(out)?;
+        self.max_append_reservation_bytes.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -10340,6 +11032,7 @@ impl DurableCodec for LocalStoreConfig {
             metadata_fanout: usize::decode(input)?,
             metadata_leaf_blocks: u64::decode(input)?,
             storage_node: StorageNodeId::decode(input)?,
+            max_append_reservation_bytes: u64::decode(input)?,
         })
     }
 }
@@ -10996,7 +11689,6 @@ impl DurableCodec for DurableSegmentStoreImage {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 impl DurableTestImageCodec for DurableSegmentStoreImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_SEGMENT_STORE;
 }
@@ -11016,7 +11708,6 @@ impl DurableCodec for DurableCatalogImage {
     }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl DurableTestImageCodec for DurableCatalogImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_CATALOG;
@@ -11092,7 +11783,8 @@ impl DurableCodec for DurableMetadataImage {
         self.config.encode(out)?;
         self.metadata.encode(out)?;
         self.next_write_intent.encode(out)?;
-        self.next_extent_id.encode(out)
+        self.next_extent_id.encode(out)?;
+        self.next_append_reservation_id.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -11101,11 +11793,11 @@ impl DurableCodec for DurableMetadataImage {
             metadata: MetadataInner::decode(input)?,
             next_write_intent: u128::decode(input)?,
             next_extent_id: u128::decode(input)?,
+            next_append_reservation_id: u128::decode(input)?,
         })
     }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl DurableTestImageCodec for DurableMetadataImage {
     const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_METADATA;
@@ -11574,6 +12266,81 @@ impl DurableCodec for AppendLease {
     }
 }
 
+impl DurableCodec for AppendReservationPlacement {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::SingleSegmentRequired => 1u8.encode(out),
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::SingleSegmentRequired),
+            _ => Err(durable_codec_error(
+                "invalid append reservation placement tag",
+            )),
+        }
+    }
+}
+
+impl DurableCodec for AppendExtentReservation {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.reservation_id.encode(out)?;
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.lease.encode(out)?;
+        self.base_size.encode(out)?;
+        self.exact_bytes.encode(out)?;
+        self.placement.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            reservation_id: AppendReservationId::decode(input)?,
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            lease: AppendLease::decode(input)?,
+            base_size: u64::decode(input)?,
+            exact_bytes: u64::decode(input)?,
+            placement: AppendReservationPlacement::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendReservationFill {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.reservation_id.encode(out)?;
+        self.range.encode(out)?;
+        self.filled_bytes.encode(out)?;
+        self.complete.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            reservation_id: AppendReservationId::decode(input)?,
+            range: ByteRange::decode(input)?,
+            filled_bytes: u64::decode(input)?,
+            complete: bool::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendReservationAbort {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.reservation_id.encode(out)?;
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            reservation_id: AppendReservationId::decode(input)?,
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+        })
+    }
+}
+
 impl DurableCodec for AppendCommit {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.keyspace_id.encode(out)?;
@@ -11693,6 +12460,56 @@ impl DurableCodec for NativeRequest {
                 bytes.encode(out)?;
                 durability.encode(out)
             }
+            Self::ReserveAppend {
+                keyspace_id,
+                file_id,
+                lease,
+                exact_bytes,
+                placement,
+            } => {
+                13u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                lease.encode(out)?;
+                exact_bytes.encode(out)?;
+                placement.encode(out)
+            }
+            Self::FillReservedAppend {
+                keyspace_id,
+                file_id,
+                reservation,
+                offset,
+                bytes,
+            } => {
+                14u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                reservation.encode(out)?;
+                offset.encode(out)?;
+                bytes.encode(out)
+            }
+            Self::CommitReservedAppend {
+                keyspace_id,
+                file_id,
+                reservation,
+                durability,
+            } => {
+                15u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                reservation.encode(out)?;
+                durability.encode(out)
+            }
+            Self::AbortReservedAppend {
+                keyspace_id,
+                file_id,
+                reservation,
+            } => {
+                16u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                reservation.encode(out)
+            }
             Self::Flush {
                 keyspace_id,
                 file_id,
@@ -11757,6 +12574,31 @@ impl DurableCodec for NativeRequest {
                 bytes: Vec::decode(input)?,
                 durability: WriteDurability::decode(input)?,
             }),
+            13 => Ok(Self::ReserveAppend {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                lease: AppendLease::decode(input)?,
+                exact_bytes: u64::decode(input)?,
+                placement: AppendReservationPlacement::decode(input)?,
+            }),
+            14 => Ok(Self::FillReservedAppend {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                reservation: AppendExtentReservation::decode(input)?,
+                offset: u64::decode(input)?,
+                bytes: Vec::decode(input)?,
+            }),
+            15 => Ok(Self::CommitReservedAppend {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                reservation: AppendExtentReservation::decode(input)?,
+                durability: WriteDurability::decode(input)?,
+            }),
+            16 => Ok(Self::AbortReservedAppend {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                reservation: AppendExtentReservation::decode(input)?,
+            }),
             9 => Ok(Self::Flush {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
@@ -11812,6 +12654,22 @@ impl DurableCodec for NativeResponse {
                 8u8.encode(out)?;
                 lease.encode(out)
             }
+            Self::AppendReserved(reservation) => {
+                13u8.encode(out)?;
+                reservation.encode(out)
+            }
+            Self::AppendReservationFilled(fill) => {
+                14u8.encode(out)?;
+                fill.encode(out)
+            }
+            Self::AppendReservationCommitted(commit) => {
+                15u8.encode(out)?;
+                commit.encode(out)
+            }
+            Self::AppendReservationAborted(abort) => {
+                16u8.encode(out)?;
+                abort.encode(out)
+            }
             Self::Flush(flush) => {
                 9u8.encode(out)?;
                 flush.encode(out)
@@ -11841,6 +12699,18 @@ impl DurableCodec for NativeResponse {
             6 => Ok(Self::Write(FileWriteCommit::decode(input)?)),
             7 => Ok(Self::Append(AppendCommit::decode(input)?)),
             8 => Ok(Self::AppendLease(AppendLease::decode(input)?)),
+            13 => Ok(Self::AppendReserved(AppendExtentReservation::decode(
+                input,
+            )?)),
+            14 => Ok(Self::AppendReservationFilled(
+                AppendReservationFill::decode(input)?,
+            )),
+            15 => Ok(Self::AppendReservationCommitted(AppendCommit::decode(
+                input,
+            )?)),
+            16 => Ok(Self::AppendReservationAborted(
+                AppendReservationAbort::decode(input)?,
+            )),
             9 => Ok(Self::Flush(FlushResult::decode(input)?)),
             10 => Ok(Self::KeyspaceCheckpointed(CheckpointId::decode(input)?)),
             11 => Ok(Self::KeyspaceSnapshotted(KeyspaceId::decode(input)?)),
@@ -12191,6 +13061,7 @@ mod tests {
             metadata_fanout: 2,
             metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(77),
+            max_append_reservation_bytes: 32 * 1024 * 1024,
         }
     }
 
@@ -12201,6 +13072,25 @@ mod tests {
             file_root_blocks: 32,
             ..config()
         }
+    }
+
+    #[test]
+    fn local_store_config_validates_append_reservation_limit() {
+        let mut cfg = config();
+        cfg.max_append_reservation_bytes = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = config();
+        cfg.max_append_reservation_bytes = u64::from(cfg.block_size) - 1;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = config();
+        cfg.max_append_reservation_bytes = u64::from(cfg.block_size) + 1;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = config();
+        cfg.max_append_reservation_bytes = u64::from(cfg.block_size);
+        cfg.validate().unwrap();
     }
 
     fn durable_temp_dir(name: &str) -> PathBuf {
@@ -12261,6 +13151,7 @@ mod tests {
             metadata: image.metadata,
             next_write_intent: image.next_write_intent,
             next_extent_id: image.next_extent_id,
+            next_append_reservation_id: image.next_append_reservation_id,
         };
         let primary = image
             .storage_nodes
@@ -12326,6 +13217,21 @@ mod tests {
             &self,
             lease: AppendLease,
             data: &[u8],
+        ) -> Result<AppendCommit>;
+        fn reserve_append_for_conformance(
+            &self,
+            lease: AppendLease,
+            exact_bytes: u64,
+        ) -> Result<AppendExtentReservation>;
+        fn fill_reserved_append_for_conformance(
+            &self,
+            reservation: AppendExtentReservation,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<AppendReservationFill>;
+        fn commit_reserved_append_for_conformance(
+            &self,
+            reservation: AppendExtentReservation,
         ) -> Result<AppendCommit>;
         fn read_file_for_conformance(
             &self,
@@ -12440,6 +13346,34 @@ mod tests {
             self.append_file(lease, data, WriteDurability::Acknowledged)
         }
 
+        fn reserve_append_for_conformance(
+            &self,
+            lease: AppendLease,
+            exact_bytes: u64,
+        ) -> Result<AppendExtentReservation> {
+            self.reserve_append_extent(
+                lease,
+                exact_bytes,
+                AppendReservationPlacement::SingleSegmentRequired,
+            )
+        }
+
+        fn fill_reserved_append_for_conformance(
+            &self,
+            reservation: AppendExtentReservation,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<AppendReservationFill> {
+            self.fill_reserved_append(reservation, offset, data)
+        }
+
+        fn commit_reserved_append_for_conformance(
+            &self,
+            reservation: AppendExtentReservation,
+        ) -> Result<AppendCommit> {
+            self.commit_reserved_append(reservation, WriteDurability::Acknowledged)
+        }
+
         fn read_file_for_conformance(
             &self,
             keyspace_id: KeyspaceId,
@@ -12534,6 +13468,34 @@ mod tests {
             self.append_file(lease, data, WriteDurability::Flushed)
         }
 
+        fn reserve_append_for_conformance(
+            &self,
+            lease: AppendLease,
+            exact_bytes: u64,
+        ) -> Result<AppendExtentReservation> {
+            self.reserve_append_extent(
+                lease,
+                exact_bytes,
+                AppendReservationPlacement::SingleSegmentRequired,
+            )
+        }
+
+        fn fill_reserved_append_for_conformance(
+            &self,
+            reservation: AppendExtentReservation,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<AppendReservationFill> {
+            self.fill_reserved_append(reservation, offset, data)
+        }
+
+        fn commit_reserved_append_for_conformance(
+            &self,
+            reservation: AppendExtentReservation,
+        ) -> Result<AppendCommit> {
+            self.commit_reserved_append(reservation, WriteDurability::Flushed)
+        }
+
         fn read_file_for_conformance(
             &self,
             keyspace_id: KeyspaceId,
@@ -12616,6 +13578,51 @@ mod tests {
             .acquire_append_for_conformance(keyspace_id, file_id)
             .unwrap();
         store.append_file_for_conformance(lease, b"-beta").unwrap();
+
+        let reserved_file_id = store
+            .create_file_for_conformance(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("reserved-file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let reserved_lease = store
+            .acquire_append_for_conformance(keyspace_id, reserved_file_id)
+            .unwrap();
+        let reservation = store
+            .reserve_append_for_conformance(reserved_lease, 8192)
+            .unwrap();
+        store
+            .fill_reserved_append_for_conformance(reservation.clone(), 4096, &repeated_blocks(1, 9))
+            .unwrap();
+        store
+            .fill_reserved_append_for_conformance(reservation.clone(), 0, &repeated_blocks(1, 8))
+            .unwrap();
+        let reserved_commit = store
+            .commit_reserved_append_for_conformance(reservation)
+            .unwrap();
+        assert_eq!(reserved_commit.range, ByteRange::new(0, 8192));
+
+        let mut reserved_contents = vec![0; 8192];
+        store
+            .read_file_for_conformance(
+                keyspace_id,
+                reserved_file_id,
+                ByteRange::new(0, 8192),
+                &mut reserved_contents,
+            )
+            .unwrap();
+        assert_eq!(
+            &reserved_contents[0..4096],
+            repeated_blocks(1, 8).as_slice()
+        );
+        assert_eq!(
+            &reserved_contents[4096..8192],
+            repeated_blocks(1, 9).as_slice()
+        );
 
         let mut source = vec![0; b"alpha-beta".len()];
         store
@@ -14066,6 +15073,7 @@ mod tests {
                 "0000000000000004",
                 "0000000000000400",
                 "00000000000000000000000000000001",
+                "0000000002000000",
                 "00000000000000000000000000000001",
                 "0000000000000000",
             )
@@ -14190,6 +15198,7 @@ mod tests {
             metadata: MetadataInner::new(),
             next_write_intent: 1,
             next_extent_id: 1,
+            next_append_reservation_id: 1,
         };
         let mut new_metadata = old_metadata.clone();
         new_metadata.next_write_intent = 2;
@@ -14389,6 +15398,138 @@ mod tests {
             )
             .len(),
             3
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_reserved_append_reopens_committed_data_and_drops_uncommitted_staging() {
+        let root = durable_temp_dir("reserved-append-restart");
+        let cfg = LocalStoreConfig {
+            file_root_blocks: 16,
+            ..config()
+        };
+        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest { name: None })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            )
+            .unwrap();
+        let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+        let uncommitted = store
+            .reserve_append_extent(
+                lease,
+                8192,
+                AppendReservationPlacement::SingleSegmentRequired,
+            )
+            .unwrap();
+        let (uncommitted_storage_node, uncommitted_segment_id, uncommitted_write_intent) = {
+            let reservations = lock(&store.local.append_reservations).unwrap();
+            let staged = reservations.get(&uncommitted.reservation_id).unwrap();
+            let write_intent = store
+                .local
+                .storage_nodes
+                .node(staged.storage_node)
+                .unwrap()
+                .segment_catalog
+                .entries()
+                .unwrap()
+                .into_iter()
+                .find(|(segment_id, _, _)| *segment_id == staged.segment_reservation.segment_id)
+                .map(|(_, _, write_intent)| write_intent)
+                .unwrap();
+            (
+                staged.storage_node,
+                staged.segment_reservation.segment_id,
+                write_intent,
+            )
+        };
+        store
+            .fill_reserved_append(uncommitted.clone(), 0, &repeated_blocks(2, 1))
+            .unwrap();
+        drop(store);
+
+        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        assert_eq!(
+            reopened
+                .metadata()
+                .get_file_info(keyspace_id, file_id)
+                .unwrap()
+                .size,
+            0
+        );
+        assert!(
+            reopened
+                .commit_reserved_append(uncommitted, WriteDurability::Flushed)
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .local
+                .storage_nodes
+                .node(uncommitted_storage_node)
+                .unwrap()
+                .segment_catalog
+                .state(uncommitted_segment_id)
+                .unwrap(),
+            SegmentLifecycleState::Reserved
+        );
+        let cleanup = reopened
+            .run_storage_node_custodian(&BTreeSet::from([uncommitted_write_intent]))
+            .unwrap();
+        assert_eq!(cleanup.expired_reservations, vec![uncommitted_segment_id]);
+        assert_eq!(
+            reopened
+                .local
+                .storage_nodes
+                .node(uncommitted_storage_node)
+                .unwrap()
+                .segment_catalog
+                .state(uncommitted_segment_id)
+                .unwrap(),
+            SegmentLifecycleState::Freed
+        );
+
+        let lease = reopened.acquire_append_lease(keyspace_id, file_id).unwrap();
+        let committed = reopened
+            .reserve_append_extent(
+                lease,
+                8192,
+                AppendReservationPlacement::SingleSegmentRequired,
+            )
+            .unwrap();
+        reopened
+            .fill_reserved_append(committed.clone(), 4096, &repeated_blocks(1, 3))
+            .unwrap();
+        reopened
+            .fill_reserved_append(committed.clone(), 0, &repeated_blocks(1, 2))
+            .unwrap();
+        reopened
+            .commit_reserved_append(committed, WriteDurability::Flushed)
+            .unwrap();
+        drop(reopened);
+
+        let reopened_again = DurableObjectStore::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 8192];
+        reopened_again
+            .read_file(keyspace_id, file_id, ByteRange::new(0, 8192), &mut bytes)
+            .unwrap();
+        assert_eq!(
+            bytes,
+            repeated_blocks(1, 2)
+                .into_iter()
+                .chain(repeated_blocks(1, 3))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            file_segment_ids(&reopened_again.metadata(), keyspace_id, file_id).len(),
+            1
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -16674,6 +17815,119 @@ mod tests {
             decode_network_frame(NETWORK_BLOCK_REQUEST, &frame).unwrap();
         assert_eq!(decoded.incarnation, request.incarnation);
         assert_eq!(decoded.envelope, request.envelope);
+
+        let keyspace_id = KeyspaceId::from_raw(10);
+        let file_id = FileId::from_raw(11);
+        let lease = AppendLease {
+            keyspace_id,
+            file_id,
+            lease_id: AppendLeaseId::from_raw(12),
+            writer_epoch: WriterEpoch::from_raw(13),
+            base_version: FileVersion::from_raw(14),
+        };
+        let reservation = AppendExtentReservation {
+            reservation_id: AppendReservationId::from_raw(15),
+            keyspace_id,
+            file_id,
+            lease: lease.clone(),
+            base_size: 4096,
+            exact_bytes: 8192,
+            placement: AppendReservationPlacement::SingleSegmentRequired,
+        };
+        let reservation_requests = vec![
+            NativeRequest::ReserveAppend {
+                keyspace_id,
+                file_id,
+                lease: lease.clone(),
+                exact_bytes: 8192,
+                placement: AppendReservationPlacement::SingleSegmentRequired,
+            },
+            NativeRequest::FillReservedAppend {
+                keyspace_id,
+                file_id,
+                reservation: reservation.clone(),
+                offset: 4096,
+                bytes: vec![7; 4096],
+            },
+            NativeRequest::CommitReservedAppend {
+                keyspace_id,
+                file_id,
+                reservation: reservation.clone(),
+                durability: WriteDurability::Flushed,
+            },
+            NativeRequest::AbortReservedAppend {
+                keyspace_id,
+                file_id,
+                reservation: reservation.clone(),
+            },
+        ];
+        for (index, native_request) in reservation_requests.into_iter().enumerate() {
+            let envelope = NativeRequestEnvelope::new(
+                RequestId::from_raw(20 + index as u128),
+                ClientEpoch::from_raw(21),
+                Some(LogicalDeadline::from_raw(22)),
+                native_request,
+            );
+            let wire = RemoteWireRequest {
+                incarnation: ServerIncarnation::from_raw(23),
+                envelope: envelope.clone(),
+            };
+            let frame = encode_network_frame(NETWORK_NATIVE_REQUEST, &wire).unwrap();
+            let decoded: RemoteWireRequest<NativeRequestEnvelope> =
+                decode_network_frame(NETWORK_NATIVE_REQUEST, &frame).unwrap();
+            assert_eq!(decoded.incarnation, wire.incarnation);
+            assert_eq!(decoded.envelope, envelope);
+        }
+
+        let commit = AppendCommit {
+            keyspace_id,
+            file_id,
+            extent_id: ExtentId::from_raw(16),
+            range: ByteRange::new(4096, 8192),
+            version: FileVersion::from_raw(17),
+            commit_seq: CommitSeq::from_raw(18),
+            durability: WriteDurability::Flushed,
+        };
+        let reservation_responses = vec![
+            NativeResponse::AppendReserved(reservation.clone()),
+            NativeResponse::AppendReservationFilled(AppendReservationFill {
+                reservation_id: reservation.reservation_id,
+                range: ByteRange::new(0, 4096),
+                filled_bytes: 4096,
+                complete: false,
+            }),
+            NativeResponse::AppendReservationCommitted(commit),
+            NativeResponse::AppendReservationAborted(AppendReservationAbort {
+                reservation_id: reservation.reservation_id,
+                keyspace_id,
+                file_id,
+            }),
+        ];
+        for (index, native_response) in reservation_responses.into_iter().enumerate() {
+            let envelope = NativeResponseEnvelope {
+                request_id: RequestId::from_raw(30 + index as u128),
+                response: native_response,
+            };
+            let wire = RemoteWireReply::Ok {
+                incarnation: ServerIncarnation::from_raw(31),
+                envelope: envelope.clone(),
+            };
+            let frame = encode_network_frame(NETWORK_NATIVE_RESPONSE, &wire).unwrap();
+            let decoded: RemoteWireReply<NativeResponseEnvelope> =
+                decode_network_frame(NETWORK_NATIVE_RESPONSE, &frame).unwrap();
+            match decoded {
+                RemoteWireReply::Ok {
+                    incarnation,
+                    envelope: decoded_envelope,
+                } => {
+                    assert_eq!(incarnation, ServerIncarnation::from_raw(31));
+                    assert_eq!(decoded_envelope, envelope);
+                }
+                RemoteWireReply::Err { reason, .. } => {
+                    panic!("reservation response decoded as error: {reason}");
+                }
+            }
+        }
 
         let mut bad_magic = frame.clone();
         bad_magic[0] ^= 0xff;
@@ -19035,6 +20289,171 @@ mod tests {
         let file_segments = file_segment_ids(&store.metadata(), keyspace.keyspace_id, file.file_id);
         assert_eq!(file_segments.len(), 3);
         assert_eq!(segment_storage_nodes(&store, &file_segments).len(), 3);
+    }
+
+    #[test]
+    fn native_reserved_append_commits_32mib_as_one_segment() {
+        let store = LocalObjectStore::with_config(LocalStoreConfig {
+            file_root_blocks: 8192,
+            metadata_leaf_blocks: 8192,
+            ..config()
+        })
+        .unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, file) = create_local_file(&client, keyspace_id);
+        let exact_bytes = 32 * 1024 * 1024;
+        let lease = file.acquire_append().unwrap();
+        let reservation = file.reserve_append_extent(lease, exact_bytes).unwrap();
+
+        for (offset, byte) in [
+            (16 * 1024 * 1024, 3),
+            (0, 1),
+            (24 * 1024 * 1024, 4),
+            (8 * 1024 * 1024, 2),
+        ] {
+            let fill = file
+                .fill_reserved_append(reservation.clone(), offset, &vec![byte; 8 * 1024 * 1024])
+                .unwrap();
+            assert_eq!(fill.reservation_id, reservation.reservation_id);
+        }
+
+        let commit = file
+            .commit_reserved_append(reservation, WriteDurability::Acknowledged)
+            .unwrap();
+        assert_eq!(commit.range, ByteRange::new(0, exact_bytes));
+        assert_eq!(file.info().unwrap().size, exact_bytes);
+
+        let segments = file_segment_ids(&store.metadata(), keyspace_id, file_id);
+        assert_eq!(segments.len(), 1);
+        let segment = store.storage_nodes.commit_for_segment(segments[0]).unwrap();
+        assert_eq!(segment.descriptor.bytes, exact_bytes);
+
+        let mut out = vec![0; exact_bytes as usize];
+        file.read_at(0, &mut out).unwrap();
+        for (chunk, byte) in out.chunks_exact(8 * 1024 * 1024).zip([1, 2, 3, 4]) {
+            assert_eq!(chunk, vec![byte; 8 * 1024 * 1024].as_slice());
+        }
+    }
+
+    #[test]
+    fn native_reserved_append_fill_validation_abort_and_normal_append_fallback() {
+        let store = LocalObjectStore::with_config(LocalStoreConfig {
+            file_root_blocks: 8,
+            max_append_reservation_bytes: 8 * 4096,
+            ..config()
+        })
+        .unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+
+        let lease = file.acquire_append().unwrap();
+        assert!(file.reserve_append_extent(lease.clone(), 0).is_err());
+        assert!(file.reserve_append_extent(lease.clone(), 4097).is_err());
+        assert!(file.reserve_append_extent(lease.clone(), 9 * 4096).is_err());
+
+        let reservation = file.reserve_append_extent(lease, 2 * 4096).unwrap();
+        file.fill_reserved_append(reservation.clone(), 4096, &repeated_blocks(1, 2))
+            .unwrap();
+        file.fill_reserved_append(reservation.clone(), 4096, &repeated_blocks(1, 2))
+            .unwrap();
+        assert!(
+            file.fill_reserved_append(reservation.clone(), 4096, &repeated_blocks(1, 3))
+                .is_err()
+        );
+        assert!(
+            file.commit_reserved_append(reservation.clone(), WriteDurability::Acknowledged)
+                .is_err()
+        );
+        let abort = file.abort_reserved_append(reservation).unwrap();
+        assert_eq!(abort.keyspace_id, keyspace_id);
+
+        let lease = file.acquire_append().unwrap();
+        let commit = file
+            .append_with_lease(lease, &repeated_blocks(1, 9))
+            .unwrap();
+        assert_eq!(commit.range, ByteRange::new(0, 4096));
+        assert_eq!(read_file_bytes(&file, 1), repeated_blocks(1, 9));
+    }
+
+    #[test]
+    fn native_reserved_append_stale_lease_rejects_and_releases_unwritten_reservation() {
+        let store = LocalObjectStore::with_config(LocalStoreConfig {
+            file_root_blocks: 8,
+            ..config()
+        })
+        .unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+        let stale = file.acquire_append().unwrap();
+        let reservation = file.reserve_append_extent(stale, 4096).unwrap();
+        file.fill_reserved_append(reservation.clone(), 0, &repeated_blocks(1, 7))
+            .unwrap();
+        let segment_id = lock(&store.append_reservations)
+            .unwrap()
+            .get(&reservation.reservation_id)
+            .unwrap()
+            .segment_reservation
+            .segment_id;
+
+        let fresh = file.acquire_append().unwrap();
+        assert!(
+            file.commit_reserved_append(reservation, WriteDurability::Acknowledged)
+                .is_err()
+        );
+        assert!(lock(&store.append_reservations).unwrap().is_empty());
+        assert_eq!(
+            store.storage_nodes.state(segment_id).unwrap(),
+            SegmentLifecycleState::Freed
+        );
+        assert_eq!(file.info().unwrap().size, 0);
+
+        file.append_with_lease(fresh, &repeated_blocks(1, 8))
+            .unwrap();
+        assert_eq!(read_file_bytes(&file, 1), repeated_blocks(1, 8));
+    }
+
+    #[test]
+    fn local_multi_node_reserved_appends_spread_segments_without_exposing_node_choice() {
+        let cfg = config();
+        let store = LocalObjectStore::with_storage_nodes(
+            LocalStoreConfig {
+                file_root_blocks: 8,
+                ..cfg
+            },
+            vec![
+                cfg.storage_node,
+                StorageNodeId::from_raw(78),
+                StorageNodeId::from_raw(79),
+            ],
+        )
+        .unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, file) = create_local_file(&client, keyspace_id);
+
+        for byte in [1, 2, 3] {
+            let lease = file.acquire_append().unwrap();
+            let reservation = file.reserve_append_extent(lease, 4096).unwrap();
+            file.fill_reserved_append(reservation.clone(), 0, &repeated_blocks(1, byte))
+                .unwrap();
+            file.commit_reserved_append(reservation, WriteDurability::Acknowledged)
+                .unwrap();
+        }
+
+        assert_eq!(
+            read_file_bytes(&file, 3),
+            repeated_blocks(1, 1)
+                .into_iter()
+                .chain(repeated_blocks(1, 2))
+                .chain(repeated_blocks(1, 3))
+                .collect::<Vec<_>>()
+        );
+        let segments = file_segment_ids(&store.metadata(), keyspace_id, file_id);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segment_storage_nodes(&store, &segments).len(), 3);
     }
 
     #[test]

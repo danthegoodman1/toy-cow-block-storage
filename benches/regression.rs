@@ -21,9 +21,9 @@ use toy_cow_block_storage::provider::{
 };
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
-    AppendLease, AppendLeaseId, BlockClient, BlockDevice, BlockRequest, ByteRange, DeviceId,
-    DeviceSpec, FileId, FileVersion, ForkRequest, KeyspaceId, NativeFile, NativeKeyspaceClient,
-    NativeRequest, RestorePoint, WriteDurability, WriterEpoch,
+    AppendLease, AppendLeaseId, AppendReservationPlacement, BlockClient, BlockDevice, BlockRequest,
+    ByteRange, DeviceId, DeviceSpec, FileId, FileVersion, ForkRequest, KeyspaceId, NativeFile,
+    NativeKeyspaceClient, NativeRequest, RestorePoint, WriteDurability, WriterEpoch,
 };
 
 fn bench_byte_range_validation(c: &mut Criterion) {
@@ -334,6 +334,7 @@ fn bench_local_single_shard_write_by_tree_depth(c: &mut Criterion) {
                             metadata_fanout: 4,
                             metadata_leaf_blocks: leaf_blocks,
                             storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                            max_append_reservation_bytes: 32 * 1024 * 1024,
                         })
                         .unwrap();
                         let head = store
@@ -377,6 +378,7 @@ fn bench_local_multi_shard_atomic_write(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 8,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    max_append_reservation_bytes: 32 * 1024 * 1024,
                 })
                 .unwrap();
                 let server =
@@ -415,6 +417,7 @@ fn bench_local_read_by_mapping_count(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 4,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    max_append_reservation_bytes: 32 * 1024 * 1024,
                 })
                 .unwrap();
                 let server =
@@ -486,6 +489,248 @@ fn bench_local_native_append(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+}
+
+fn bench_local_native_reserved_append(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_native_reserved_append");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(1));
+    const LARGE_BYTES: usize = 32 * 1024 * 1024;
+    const CHUNK_BYTES: usize = 4096;
+    const LARGE_BLOCKS: u64 = (LARGE_BYTES / CHUNK_BYTES) as u64;
+    const REGRESSION_SMALL_APPENDS: u64 = 1024;
+
+    let large_config = LocalStoreConfig {
+        shard_count: 1,
+        block_size: 4096,
+        file_root_blocks: LARGE_BLOCKS,
+        metadata_fanout: 4,
+        metadata_leaf_blocks: LARGE_BLOCKS,
+        storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        max_append_reservation_bytes: LARGE_BYTES as u64,
+    };
+
+    group.bench_function("normal_single_32mib_append", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::with_config(large_config).unwrap();
+                let keyspace = store
+                    .metadata()
+                    .create_keyspace(MetadataCreateKeyspaceRequest {
+                        request: toy_cow_block_storage::CreateKeyspaceRequest { name: None },
+                    })
+                    .unwrap();
+                let file = store
+                    .metadata()
+                    .create_file(MetadataCreateFileRequest {
+                        keyspace_id: keyspace.keyspace_id,
+                        request: toy_cow_block_storage::CreateFileRequest {
+                            spec: toy_cow_block_storage::FileSpec { name: None },
+                        },
+                    })
+                    .unwrap();
+                let lease = store
+                    .acquire_append_lease(keyspace.keyspace_id, file.file_id)
+                    .unwrap();
+                (store, lease, vec![7; LARGE_BYTES])
+            },
+            |(store, lease, payload)| {
+                store
+                    .append_file(lease, black_box(&payload), WriteDurability::Acknowledged)
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("reserved_32mib_append_filled_4k_chunks", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::with_config(large_config).unwrap();
+                let keyspace = store
+                    .metadata()
+                    .create_keyspace(MetadataCreateKeyspaceRequest {
+                        request: toy_cow_block_storage::CreateKeyspaceRequest { name: None },
+                    })
+                    .unwrap();
+                let file = store
+                    .metadata()
+                    .create_file(MetadataCreateFileRequest {
+                        keyspace_id: keyspace.keyspace_id,
+                        request: toy_cow_block_storage::CreateFileRequest {
+                            spec: toy_cow_block_storage::FileSpec { name: None },
+                        },
+                    })
+                    .unwrap();
+                let lease = store
+                    .acquire_append_lease(keyspace.keyspace_id, file.file_id)
+                    .unwrap();
+                let reservation = store
+                    .reserve_append_extent(
+                        lease,
+                        LARGE_BYTES as u64,
+                        AppendReservationPlacement::SingleSegmentRequired,
+                    )
+                    .unwrap();
+                (store, reservation, vec![9; CHUNK_BYTES])
+            },
+            |(store, reservation, chunk)| {
+                for offset in (0..LARGE_BYTES as u64).step_by(CHUNK_BYTES) {
+                    store
+                        .fill_reserved_append(
+                            black_box(reservation.clone()),
+                            black_box(offset),
+                            black_box(&chunk),
+                        )
+                        .unwrap();
+                }
+                store
+                    .commit_reserved_append(black_box(reservation), WriteDurability::Acknowledged)
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("normal_1024x4k_appends", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalObjectStore::with_config(large_config).unwrap();
+                let keyspace = store
+                    .metadata()
+                    .create_keyspace(MetadataCreateKeyspaceRequest {
+                        request: toy_cow_block_storage::CreateKeyspaceRequest { name: None },
+                    })
+                    .unwrap();
+                let file = store
+                    .metadata()
+                    .create_file(MetadataCreateFileRequest {
+                        keyspace_id: keyspace.keyspace_id,
+                        request: toy_cow_block_storage::CreateFileRequest {
+                            spec: toy_cow_block_storage::FileSpec { name: None },
+                        },
+                    })
+                    .unwrap();
+                (
+                    store,
+                    keyspace.keyspace_id,
+                    file.file_id,
+                    vec![5; CHUNK_BYTES],
+                )
+            },
+            |(store, keyspace_id, file_id, chunk)| {
+                for _ in 0..REGRESSION_SMALL_APPENDS {
+                    let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                    store
+                        .append_file(lease, black_box(&chunk), WriteDurability::Acknowledged)
+                        .unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    if std::env::var_os("TOY_COW_LONG_BENCH").is_some() {
+        group.bench_function("normal_8192x4k_appends", |b| {
+            b.iter_batched(
+                || {
+                    let store = LocalObjectStore::with_config(large_config).unwrap();
+                    let keyspace = store
+                        .metadata()
+                        .create_keyspace(MetadataCreateKeyspaceRequest {
+                            request: toy_cow_block_storage::CreateKeyspaceRequest { name: None },
+                        })
+                        .unwrap();
+                    let file = store
+                        .metadata()
+                        .create_file(MetadataCreateFileRequest {
+                            keyspace_id: keyspace.keyspace_id,
+                            request: toy_cow_block_storage::CreateFileRequest {
+                                spec: toy_cow_block_storage::FileSpec { name: None },
+                            },
+                        })
+                        .unwrap();
+                    (
+                        store,
+                        keyspace.keyspace_id,
+                        file.file_id,
+                        vec![5; CHUNK_BYTES],
+                    )
+                },
+                |(store, keyspace_id, file_id, chunk)| {
+                    for _ in 0..LARGE_BLOCKS {
+                        let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                        store
+                            .append_file(lease, black_box(&chunk), WriteDurability::Acknowledged)
+                            .unwrap();
+                    }
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+
+    group.bench_function("three_node_reserved_3x4k_appends", |b| {
+        b.iter_batched(
+            || {
+                let cfg = LocalStoreConfig {
+                    file_root_blocks: 16,
+                    ..LocalStoreConfig::default()
+                };
+                let store = LocalObjectStore::with_storage_nodes(
+                    cfg,
+                    vec![
+                        cfg.storage_node,
+                        toy_cow_block_storage::StorageNodeId::from_raw(2),
+                        toy_cow_block_storage::StorageNodeId::from_raw(3),
+                    ],
+                )
+                .unwrap();
+                let keyspace = store
+                    .metadata()
+                    .create_keyspace(MetadataCreateKeyspaceRequest {
+                        request: toy_cow_block_storage::CreateKeyspaceRequest { name: None },
+                    })
+                    .unwrap();
+                let file = store
+                    .metadata()
+                    .create_file(MetadataCreateFileRequest {
+                        keyspace_id: keyspace.keyspace_id,
+                        request: toy_cow_block_storage::CreateFileRequest {
+                            spec: toy_cow_block_storage::FileSpec { name: None },
+                        },
+                    })
+                    .unwrap();
+                (
+                    store,
+                    keyspace.keyspace_id,
+                    file.file_id,
+                    vec![11; CHUNK_BYTES],
+                )
+            },
+            |(store, keyspace_id, file_id, chunk)| {
+                for _ in 0..3 {
+                    let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                    let reservation = store
+                        .reserve_append_extent(
+                            lease,
+                            CHUNK_BYTES as u64,
+                            AppendReservationPlacement::SingleSegmentRequired,
+                        )
+                        .unwrap();
+                    store
+                        .fill_reserved_append(reservation.clone(), 0, black_box(&chunk))
+                        .unwrap();
+                    store
+                        .commit_reserved_append(reservation, WriteDurability::Acknowledged)
+                        .unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
 }
 
 fn bench_local_native_write_at(c: &mut Criterion) {
@@ -576,6 +821,7 @@ fn bench_local_fork_vs_device_size(c: &mut Criterion) {
                             metadata_fanout: 4,
                             metadata_leaf_blocks: logical_blocks,
                             storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                            max_append_reservation_bytes: 32 * 1024 * 1024,
                         })
                         .unwrap();
                         let server = std::sync::Arc::new(
@@ -622,6 +868,7 @@ fn bench_local_checkpoint_restore(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 16,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    max_append_reservation_bytes: 32 * 1024 * 1024,
                 })
                 .unwrap();
                 let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(
@@ -670,6 +917,7 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 16,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    max_append_reservation_bytes: 32 * 1024 * 1024,
                 })
                 .unwrap();
                 let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(
@@ -731,6 +979,7 @@ fn bench_roots_for_gc_with_deleted_retention(c: &mut Criterion) {
         metadata_fanout: 4,
         metadata_leaf_blocks: 16,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        max_append_reservation_bytes: 32 * 1024 * 1024,
     })
     .unwrap();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store.clone()));
@@ -772,6 +1021,7 @@ fn bench_metadata_gc_mark_traversal(c: &mut Criterion) {
         metadata_fanout: 4,
         metadata_leaf_blocks: 8,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        max_append_reservation_bytes: 32 * 1024 * 1024,
     })
     .unwrap();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store.clone()));
@@ -853,6 +1103,7 @@ fn native_scaling_config() -> LocalStoreConfig {
         metadata_fanout: 2,
         metadata_leaf_blocks: 1_000_000,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        max_append_reservation_bytes: 32 * 1024 * 1024,
     }
 }
 
@@ -1293,6 +1544,7 @@ fn durable_bench_config() -> LocalStoreConfig {
         metadata_fanout: 4,
         metadata_leaf_blocks: 16,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        max_append_reservation_bytes: 32 * 1024 * 1024,
     }
 }
 
@@ -1943,6 +2195,6 @@ fn bench_durable_provider(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_reserved_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
 }
 criterion_main!(regression);

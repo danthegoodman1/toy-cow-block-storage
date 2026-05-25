@@ -745,6 +745,52 @@ by logical segment and placement; storage-node custodians apply only evidence
 for their own node. Storage nodes must not crawl metadata trees or infer
 deletion from current heads.
 
+### Native Large Append Segment Reservations
+
+The native file API supports a hard reservation path for append-heavy callers
+that need a real extent-shape performance contract. A caller may reserve an
+exact append length with `SingleSegmentRequired`, fill the reservation in
+chunks, and commit it as one logical immutable segment. This is native-file
+only; the block API continues to expose normal block-device writes.
+
+The contract is:
+
+1. The caller supplies an append lease and exact byte length.
+2. V1 requires the current file size and exact length to be block aligned.
+3. The provider chooses placement privately and reserves one logical segment on
+   one selected storage placement group.
+4. Chunk fills are staging only. They are not durable and are not visible before
+   commit.
+5. Commit is the only durable publish point: it writes and syncs the full
+   segment, commits the local catalog entry as durable-pending-metadata,
+   publishes one file-version transition, and marks the segment referenced.
+6. The provider either commits the full reservation as one segment or rejects;
+   it must not silently split a `SingleSegmentRequired` reservation.
+
+Durable providers may persist the reservation's consumed IDs and local catalog
+reservation so IDs are not reused after restart. They must not treat staged
+chunk bytes as committed state. If a durable store reopens with a reservation
+that never committed, the native file remains unchanged and the storage-node
+custodian can expire the reserved segment by write-intent evidence.
+
+This feature is not a physical-contiguity promise. "Contiguous" means one
+logical immutable segment with provider-owned placement evidence. Clients still
+do not learn storage node IDs, data-log offsets, replica placement, or physical
+file paths.
+
+The first local provider uses the same deterministic placement policy as normal
+segments at reservation time. Multiple reservations for the same native file may
+land on different storage nodes. Co-locating a file remains a placement-policy
+choice, not a public API invariant.
+
+Reservations are first-class, not a compatibility shim around repeated appends.
+They exist to reduce append metadata amplification for workloads that would
+otherwise issue many small appends. Benchmarks must compare at least one large
+normal append, many small normal appends, and one reserved append filled with
+small chunks. If the hard reservation path does not improve the intended many
+small append workload, the implementation should be optimized or removed rather
+than kept as unused API surface.
+
 ### Future Storage Replication
 
 Replication belongs below the public block/native APIs and above individual

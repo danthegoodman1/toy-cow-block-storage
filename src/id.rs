@@ -59,6 +59,7 @@ id_type!(KeyspaceCatalogShardId, u128);
 id_type!(ShardId, u32);
 id_type!(WriteIntentId, u128);
 id_type!(AppendLeaseId, u128);
+id_type!(AppendReservationId, u128);
 id_type!(ExtentId, u128);
 id_type!(LogicalTime, u64);
 id_type!(LogicalDeadline, u64);
