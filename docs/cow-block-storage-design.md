@@ -239,11 +239,20 @@ BlockClient / BlockDevice API       NativeKeyspaceClient / NativeFile API
      -> BlockServer actor           -> NativeTransport
                                       -> NativeServer actor
         \                              /
-         +------ shared substrate -----+
-                -> MetadataPlane
-                -> SegmentStore
-                -> LocalSegmentCatalog
+         +------ LocalCoordinator -----+
+                  |             |
+                  v             v
+           MetadataPlane   StorageNodeDirectory
+                              -> StorageNodeTransport
 ```
+
+The coordinator is the only local role allowed to talk to both metadata and
+storage nodes. Metadata owns logical visibility: roots, fences, timelines,
+checkpoints, PITR retention, and GC reachability. Storage nodes own physical
+bytes, node-local catalogs, data logs, and segment lifecycle. A normal write is
+ordered as storage-node durable receipt, metadata publish, then storage-node
+referenced marking. If metadata publish fails, the durable receipt remains a
+pending orphan for the storage-node custodian.
 
 Every public trait and provider interface should document the minimum
 guarantees an implementation must preserve. Method documentation should name
@@ -529,6 +538,13 @@ semantics.
 - retained roots for GC
 - cache of hot heads and metadata nodes
 
+`MetadataPlane` must not read or write storage-node catalogs, data logs, or
+segment bytes. When a coordinator persists a metadata leaf that references
+segments, it supplies segment descriptor evidence so the metadata plane can
+validate leaf shape without opening a storage node. Storage nodes later receive
+reference or release evidence from the coordinator; they do not infer logical
+visibility by reading current metadata heads.
+
 ### `SegmentStore` and `LocalSegmentCatalog`
 
 `SegmentStore` reads and writes immutable segment bytes for one storage endpoint
@@ -621,7 +637,7 @@ SQLite layout has row-native root metadata tables plus per-node
 `catalog.sqlite` tables. In each node catalog, `segment_placements` maps
 logical segments to current node-local log records and `data_logs` tracks
 active, sealed, and deleted log files plus live/dead byte estimates. Reopen
-reconstructs the local object store from the root DB plus every node catalog,
+reconstructs the local coordinator from the root DB plus every node catalog,
 and rejects missing heads, missing immutable object payloads, missing node
 catalogs, stale placements, catalog lifecycle gaps, or segment descriptors
 whose data-log bytes are missing or corrupt.
@@ -1399,6 +1415,13 @@ Provider and service boundaries:
   requests.
 - `MetadataPlane`: device catalog, metadata nodes, commit groups, PITR, and GC
   roots for both block and native file metadata.
+- `LocalCoordinator`: embedded trusted coordinator that sequences storage-node
+  receipts, metadata publishes, reference marking, reads, GC releases, and
+  maintenance routing.
+- `StorageNodeTransport`: coordinator-to-storage-node message contract for
+  writing, reading, referencing, releasing, custodians, and maintenance ticks.
+- `StorageNodeDirectory`: provider-private resolver from logical segments or
+  node IDs to storage-node transports.
 - `SegmentStore`: write and read immutable segment bytes.
 - `LocalSegmentCatalog`: per-storage-node replica placement and local segment
   state.

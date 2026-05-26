@@ -43,11 +43,11 @@ use std::sync::Arc;
 
 use toy_cow_block_storage::{
     InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient,
-    LocalBlockServer, LocalNativeClient, LocalNativeServer, LocalObjectStore,
+    LocalBlockServer, LocalNativeClient, LocalNativeServer, LocalCoordinator,
 };
 
 fn local_clients() -> (LocalBlockClient, LocalNativeClient) {
-    let store = LocalObjectStore::new();
+    let store = LocalCoordinator::new();
 
     let block_client = LocalBlockClient::new(InProcessBlockTransport::new(Arc::new(
         LocalBlockServer::new(store.clone()),
@@ -70,12 +70,12 @@ use std::sync::Arc;
 
 use toy_cow_block_storage::{
     BlockClient, BlockDevice, CreateDeviceRequest, DeviceSpec, ForkRequest,
-    InProcessBlockTransport, LocalBlockClient, LocalBlockServer, LocalObjectStore,
+    InProcessBlockTransport, LocalBlockClient, LocalBlockServer, LocalCoordinator,
     RestorePoint,
 };
 
 fn block_device_flow() -> toy_cow_block_storage::Result<()> {
-    let store = LocalObjectStore::new();
+    let store = LocalCoordinator::new();
     let block_client = LocalBlockClient::new(InProcessBlockTransport::new(Arc::new(
         LocalBlockServer::new(store),
     )));
@@ -139,12 +139,12 @@ use std::sync::Arc;
 
 use toy_cow_block_storage::{
     CreateFileRequest, CreateKeyspaceRequest, FileSpec, InProcessNativeTransport,
-    LocalNativeClient, LocalNativeServer, LocalObjectStore, NativeFile,
+    LocalNativeClient, LocalNativeServer, LocalCoordinator, NativeFile,
     NativeKeyspaceClient, RestorePoint, SnapshotKeyspaceRequest,
 };
 
 fn native_keyspace_flow() -> toy_cow_block_storage::Result<()> {
-    let store = LocalObjectStore::new();
+    let store = LocalCoordinator::new();
     let native_client = LocalNativeClient::new(InProcessNativeTransport::new(Arc::new(
         LocalNativeServer::new(store),
     )));
@@ -229,10 +229,10 @@ bytes, ask the deterministic scheduler for a plan, and run one bounded tick.
 
 ```rust
 use toy_cow_block_storage::{
-    DurableObjectStore, MaintenanceMode, MaintenancePolicy, WriteAdmission,
+    DurableCoordinator, MaintenanceMode, MaintenancePolicy, WriteAdmission,
 };
 
-let store = DurableObjectStore::open_with_maintenance_policy(
+let store = DurableCoordinator::open_with_maintenance_policy(
     "/tmp/toy-cow",
     Default::default(),
     MaintenancePolicy::default(), // Manual mode by default.
@@ -257,7 +257,7 @@ policy.dirty_low_watermark_bytes = 64 * 1024 * 1024;
 policy.dirty_high_watermark_bytes = 256 * 1024 * 1024;
 policy.compaction_copy_budget_per_tick = 32 * 1024 * 1024;
 
-let store = DurableObjectStore::open_with_maintenance_policy(
+let store = DurableCoordinator::open_with_maintenance_policy(
     "/tmp/toy-cow",
     Default::default(),
     policy,

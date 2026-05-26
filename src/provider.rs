@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
 use crate::api::{ByteRange, CreateDeviceRequest, DeleteResult, DeviceSpec, RestorePoint};
 use crate::error::Result;
 use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileInfo, KeyspaceInfo};
@@ -9,6 +12,19 @@ use crate::object::{
     Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, KeyspaceHead, MappingOwner,
     MetadataNode, RootUpdate, SegmentDescriptor,
 };
+
+/// Physical storage-node maintenance report.
+///
+/// This is storage-node-local lifecycle evidence. It does not imply metadata
+/// reachability changed; metadata release evidence and coordinator routing own
+/// that boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageNodeCustodianReport {
+    pub expired_reservations: Vec<SegmentId>,
+    pub failed_writes: Vec<SegmentId>,
+    pub orphan_segments: Vec<SegmentId>,
+    pub deleted_released_segments: Vec<SegmentId>,
+}
 
 /// A metadata-root publish request.
 ///
@@ -82,6 +98,27 @@ pub struct MetadataSnapshotKeyspaceRequest {
     pub source: KeyspaceId,
     pub target: Option<KeyspaceId>,
     pub name: Option<String>,
+}
+
+/// Immutable metadata-node persist request with storage-independent evidence.
+///
+/// Leaf nodes carry the segment descriptors needed to validate their logical
+/// ranges without opening a storage-node catalog or reading segment bytes.
+/// Internal nodes usually have no descriptor evidence because they reference
+/// metadata children, not segments.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetadataNodeWrite {
+    pub node: MetadataNode,
+    pub segment_descriptors: Vec<SegmentDescriptor>,
+}
+
+impl MetadataNodeWrite {
+    pub fn new(node: MetadataNode, segment_descriptors: Vec<SegmentDescriptor>) -> Self {
+        Self {
+            node,
+            segment_descriptors,
+        }
+    }
 }
 
 /// Retention settings used when enumerating GC roots.
@@ -170,6 +207,9 @@ impl RetentionPolicy {
 ///   root required by the supplied retention policy.
 /// - The metadata plane never deletes local segment bytes directly; it only
 ///   records metadata reachability and release evidence for custodians.
+/// - The metadata plane must not open storage-node catalogs, data logs, or
+///   segment bytes. Segment descriptor evidence supplied with metadata-node
+///   writes is the full physical evidence it may inspect.
 pub trait MetadataPlane: Send + Sync {
     /// Create a block device and publish its initial empty roots.
     ///
@@ -230,8 +270,10 @@ pub trait MetadataPlane: Send + Sync {
     /// Persist an immutable metadata node.
     ///
     /// Implementors may make identical writes idempotent. A write of different
-    /// content to an existing `node_id` must fail.
-    fn persist_metadata_node(&self, node: MetadataNode) -> Result<()>;
+    /// content to an existing `node_id` must fail. Leaf nodes must be validated
+    /// against the supplied segment descriptors; missing or insufficient
+    /// descriptors must fail instead of consulting storage-node state.
+    fn persist_metadata_node(&self, write: MetadataNodeWrite) -> Result<()>;
 
     /// Fetch an immutable metadata node by ID.
     fn get_metadata_node(&self, node_id: MetadataNodeId) -> Result<MetadataNode>;
@@ -396,6 +438,93 @@ pub struct SegmentReplicaPlacement {
 pub struct SegmentReplicaCommit {
     pub descriptor: SegmentDescriptor,
     pub placement: SegmentReplicaPlacement,
+}
+
+/// Coordinator-to-storage-node request.
+///
+/// These messages are physical segment-node operations. They must not carry
+/// device roots, file versions, keyspace catalogs, PITR timelines, or metadata
+/// commit-group decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageNodeRequest {
+    WriteSegment {
+        segment_id: SegmentId,
+        intent: SegmentReservationIntent,
+        bytes: Vec<u8>,
+    },
+    ReadSegment {
+        segment_id: SegmentId,
+        range: ByteRange,
+    },
+    MarkReferenced {
+        segment_id: SegmentId,
+    },
+    Release {
+        segment_id: SegmentId,
+    },
+    RunCustodian {
+        expired_write_intents: BTreeSet<WriteIntentId>,
+    },
+    ObserveMaintenance,
+    RunMaintenanceTick,
+}
+
+/// Coordinator-to-storage-node response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageNodeResponse {
+    WriteSegment {
+        reservation: SegmentReservation,
+        commit: SegmentReplicaCommit,
+    },
+    ReadSegment {
+        bytes: Vec<u8>,
+    },
+    MarkReferenced,
+    Released,
+    Custodian(StorageNodeCustodianReport),
+    MaintenanceObserved,
+    MaintenanceTicked,
+}
+
+/// Transport boundary from a coordinator to one physical storage node.
+///
+/// Minimal implementor guarantees:
+///
+/// - Storage-node transports own bytes, local segment lifecycle, and physical
+///   placement for exactly one storage node.
+/// - `WriteSegment` reserves the supplied logical segment ID, writes and syncs
+///   bytes, and returns a durable-pending receipt. It must not make metadata
+///   roots visible.
+/// - `MarkReferenced` may only mark a durable-pending segment after the
+///   coordinator has a successful metadata publish.
+/// - Storage nodes never decide logical visibility, writer fencing, PITR
+///   retention, or commit-group ordering.
+pub trait StorageNodeTransport: Send + Sync {
+    fn storage_node_id(&self) -> StorageNodeId;
+    fn send(&self, request: StorageNodeRequest) -> Result<StorageNodeResponse>;
+}
+
+/// Provider-private directory for locating storage nodes.
+///
+/// The coordinator uses this to choose nodes, allocate logical segment IDs, and
+/// resolve reads. Metadata implementations must not depend on this directory.
+pub trait StorageNodeDirectory: Send + Sync {
+    fn storage_node_ids(&self) -> Result<Vec<StorageNodeId>>;
+    fn allocate_segment_id(&self) -> Result<SegmentId>;
+    fn transport_for_node(
+        &self,
+        storage_node: StorageNodeId,
+    ) -> Result<Arc<dyn StorageNodeTransport>>;
+    fn transport_for_segment(&self, segment_id: SegmentId)
+    -> Result<Arc<dyn StorageNodeTransport>>;
+}
+
+/// Deterministic provider-private placement policy.
+///
+/// Clients never choose storage nodes. Embedded or service coordinators call
+/// this policy below the public block/native APIs.
+pub trait PlacementPolicy: Send + Sync {
+    fn choose_storage_node(&self, candidates: &[StorageNodeId]) -> Result<StorageNodeId>;
 }
 
 /// Per-storage-node catalog of local segment replica placement and lifecycle

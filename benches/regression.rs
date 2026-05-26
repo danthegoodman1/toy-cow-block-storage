@@ -10,14 +10,14 @@ use std::{
 use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId, StorageNodeId};
 use toy_cow_block_storage::local::{
-    DurableDataLogPolicy, DurableObjectStore, InMemoryMetadataPlane, InMemorySegmentStore,
-    LocalObjectStore, LocalStoreConfig, MaintenanceMode, MaintenancePolicy,
+    DurableCoordinator, DurableDataLogPolicy, InMemoryMetadataPlane, InMemorySegmentStore,
+    LocalCoordinator, LocalStoreConfig, MaintenanceMode, MaintenancePolicy,
 };
 use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
 use toy_cow_block_storage::provider::{
     MetadataCreateDeviceRequest, MetadataCreateFileRequest, MetadataCreateKeyspaceRequest,
-    MetadataPlane, MetadataSnapshotKeyspaceRequest, RetentionPolicy, SegmentReservation,
-    SegmentStore,
+    MetadataNodeWrite, MetadataPlane, MetadataSnapshotKeyspaceRequest, RetentionPolicy,
+    SegmentReservation, SegmentStore,
 };
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
@@ -134,7 +134,9 @@ fn bench_in_memory_metadata_node_lookup(c: &mut Criterion) {
             entries: Vec::new(),
         },
     };
-    metadata.persist_metadata_node(node.clone()).unwrap();
+    metadata
+        .persist_metadata_node(MetadataNodeWrite::new(node.clone(), Vec::new()))
+        .unwrap();
 
     c.bench_function("in_memory_metadata_node_lookup", |b| {
         b.iter(|| metadata.get_metadata_node(black_box(node.node_id)))
@@ -166,7 +168,7 @@ fn bench_in_memory_segment_read(c: &mut Criterion) {
 }
 
 fn bench_local_empty_device_read(c: &mut Criterion) {
-    let store = LocalObjectStore::new();
+    let store = LocalCoordinator::new();
     let head = store
         .metadata()
         .create_device(MetadataCreateDeviceRequest {
@@ -197,7 +199,7 @@ fn bench_local_single_shard_write(c: &mut Criterion) {
     c.bench_function("local_single_shard_write", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::new();
+                let store = LocalCoordinator::new();
                 let head = store
                     .metadata()
                     .create_device(MetadataCreateDeviceRequest {
@@ -231,7 +233,7 @@ fn bench_local_multi_node_placement(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let config = LocalStoreConfig::default();
-                let store = LocalObjectStore::with_storage_nodes(
+                let store = LocalCoordinator::with_storage_nodes(
                     config,
                     vec![
                         config.storage_node,
@@ -271,7 +273,7 @@ fn bench_local_multi_node_placement(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let config = LocalStoreConfig::default();
-                let store = LocalObjectStore::with_storage_nodes(
+                let store = LocalCoordinator::with_storage_nodes(
                     config,
                     vec![
                         config.storage_node,
@@ -327,7 +329,7 @@ fn bench_local_single_shard_write_by_tree_depth(c: &mut Criterion) {
             |b, &leaf_blocks| {
                 b.iter_batched(
                     || {
-                        let store = LocalObjectStore::with_config(LocalStoreConfig {
+                        let store = LocalCoordinator::with_config(LocalStoreConfig {
                             shard_count: 1,
                             block_size: 4096,
                             file_root_blocks: 1024,
@@ -370,7 +372,7 @@ fn bench_local_multi_shard_atomic_write(c: &mut Criterion) {
     c.bench_function("local_multi_shard_atomic_write", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                let store = LocalCoordinator::with_config(LocalStoreConfig {
                     shard_count: 4,
                     block_size: 4096,
                     file_root_blocks: 128,
@@ -408,7 +410,7 @@ fn bench_local_read_by_mapping_count(c: &mut Criterion) {
             BenchmarkId::from_parameter(mapping_count),
             &mapping_count,
             |b, &mapping_count| {
-                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                let store = LocalCoordinator::with_config(LocalStoreConfig {
                     shard_count: 4,
                     block_size: 4096,
                     file_root_blocks: 128,
@@ -451,7 +453,7 @@ fn bench_local_native_append(c: &mut Criterion) {
     c.bench_function("local_native_append", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::new();
+                let store = LocalCoordinator::new();
                 let keyspace = store
                     .metadata()
                     .create_keyspace(
@@ -509,7 +511,7 @@ fn bench_local_native_large_append(c: &mut Criterion) {
     group.bench_function("normal_single_32mib_append", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::with_config(large_config).unwrap();
+                let store = LocalCoordinator::with_config(large_config).unwrap();
                 let keyspace = store
                     .metadata()
                     .create_keyspace(MetadataCreateKeyspaceRequest {
@@ -542,7 +544,7 @@ fn bench_local_native_large_append(c: &mut Criterion) {
     group.bench_function("normal_1024x4k_appends", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::with_config(large_config).unwrap();
+                let store = LocalCoordinator::with_config(large_config).unwrap();
                 let keyspace = store
                     .metadata()
                     .create_keyspace(MetadataCreateKeyspaceRequest {
@@ -584,7 +586,7 @@ fn bench_local_native_write_at(c: &mut Criterion) {
     c.bench_function("local_native_write_at", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::new();
+                let store = LocalCoordinator::new();
                 let keyspace = store
                     .metadata()
                     .create_keyspace(
@@ -621,7 +623,7 @@ fn bench_local_native_write_at(c: &mut Criterion) {
 }
 
 fn bench_local_native_stale_lease_rejection(c: &mut Criterion) {
-    let store = LocalObjectStore::new();
+    let store = LocalCoordinator::new();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(store));
     let client = toy_cow_block_storage::LocalNativeClient::new(
         toy_cow_block_storage::InProcessNativeTransport::new(server),
@@ -661,7 +663,7 @@ fn bench_local_fork_vs_device_size(c: &mut Criterion) {
             |b, &logical_blocks| {
                 b.iter_batched(
                     || {
-                        let store = LocalObjectStore::with_config(LocalStoreConfig {
+                        let store = LocalCoordinator::with_config(LocalStoreConfig {
                             shard_count: 8,
                             block_size: 4096,
                             file_root_blocks: 1024,
@@ -707,7 +709,7 @@ fn bench_local_checkpoint_restore(c: &mut Criterion) {
     c.bench_function("local_checkpoint_restore", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                let store = LocalCoordinator::with_config(LocalStoreConfig {
                     shard_count: 4,
                     block_size: 4096,
                     file_root_blocks: 1024,
@@ -755,7 +757,7 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
     c.bench_function("local_native_keyspace_checkpoint_restore", |b| {
         b.iter_batched(
             || {
-                let store = LocalObjectStore::with_config(LocalStoreConfig {
+                let store = LocalCoordinator::with_config(LocalStoreConfig {
                     shard_count: 1,
                     block_size: 4096,
                     file_root_blocks: 1024,
@@ -816,7 +818,7 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
 }
 
 fn bench_roots_for_gc_with_deleted_retention(c: &mut Criterion) {
-    let store = LocalObjectStore::with_config(LocalStoreConfig {
+    let store = LocalCoordinator::with_config(LocalStoreConfig {
         shard_count: 8,
         block_size: 4096,
         file_root_blocks: 1024,
@@ -857,7 +859,7 @@ fn bench_roots_for_gc_with_deleted_retention(c: &mut Criterion) {
 }
 
 fn bench_metadata_gc_mark_traversal(c: &mut Criterion) {
-    let store = LocalObjectStore::with_config(LocalStoreConfig {
+    let store = LocalCoordinator::with_config(LocalStoreConfig {
         shard_count: 8,
         block_size: 4096,
         file_root_blocks: 1024,
@@ -948,7 +950,7 @@ fn native_scaling_config() -> LocalStoreConfig {
     }
 }
 
-fn create_native_keyspace(store: &LocalObjectStore) -> KeyspaceId {
+fn create_native_keyspace(store: &LocalCoordinator) -> KeyspaceId {
     store
         .metadata()
         .create_keyspace(MetadataCreateKeyspaceRequest {
@@ -958,7 +960,7 @@ fn create_native_keyspace(store: &LocalObjectStore) -> KeyspaceId {
         .keyspace_id
 }
 
-fn create_native_file(store: &LocalObjectStore, keyspace_id: KeyspaceId) -> FileId {
+fn create_native_file(store: &LocalCoordinator, keyspace_id: KeyspaceId) -> FileId {
     store
         .metadata()
         .create_file(MetadataCreateFileRequest {
@@ -971,8 +973,8 @@ fn create_native_file(store: &LocalObjectStore, keyspace_id: KeyspaceId) -> File
         .file_id
 }
 
-fn seed_native_keyspace(file_count: usize) -> (LocalObjectStore, KeyspaceId, Vec<FileId>) {
-    let store = LocalObjectStore::with_config(native_scaling_config()).unwrap();
+fn seed_native_keyspace(file_count: usize) -> (LocalCoordinator, KeyspaceId, Vec<FileId>) {
+    let store = LocalCoordinator::with_config(native_scaling_config()).unwrap();
     let keyspace_id = create_native_keyspace(&store);
     let mut files = Vec::with_capacity(file_count);
     for _ in 0..file_count {
@@ -1407,7 +1409,7 @@ fn elapsed_durable_iters(iters: u64, mut run_one: impl FnMut() -> Duration) -> D
     elapsed
 }
 
-fn create_durable_block_device(store: &DurableObjectStore, logical_blocks: u64) -> DeviceId {
+fn create_durable_block_device(store: &DurableCoordinator, logical_blocks: u64) -> DeviceId {
     store
         .create_device(toy_cow_block_storage::CreateDeviceRequest {
             spec: DeviceSpec {
@@ -1419,7 +1421,7 @@ fn create_durable_block_device(store: &DurableObjectStore, logical_blocks: u64) 
         .unwrap()
 }
 
-fn create_durable_native_file(store: &DurableObjectStore) -> (KeyspaceId, FileId) {
+fn create_durable_native_file(store: &DurableCoordinator) -> (KeyspaceId, FileId) {
     let keyspace_id = store
         .create_keyspace(toy_cow_block_storage::CreateKeyspaceRequest { name: None })
         .unwrap();
@@ -1434,7 +1436,7 @@ fn create_durable_native_file(store: &DurableObjectStore) -> (KeyspaceId, FileId
     (keyspace_id, file_id)
 }
 
-fn seed_durable_block_history(store: &DurableObjectStore, device_id: DeviceId, writes: u64) {
+fn seed_durable_block_history(store: &DurableCoordinator, device_id: DeviceId, writes: u64) {
     seed_durable_block_history_with_durability(
         store,
         device_id,
@@ -1444,7 +1446,7 @@ fn seed_durable_block_history(store: &DurableObjectStore, device_id: DeviceId, w
 }
 
 fn seed_durable_block_history_with_durability(
-    store: &DurableObjectStore,
+    store: &DurableCoordinator,
     device_id: DeviceId,
     writes: u64,
     durability: WriteDurability,
@@ -1457,7 +1459,7 @@ fn seed_durable_block_history_with_durability(
 }
 
 fn seed_durable_native_history(
-    store: &DurableObjectStore,
+    store: &DurableCoordinator,
     keyspace_id: KeyspaceId,
     file_id: FileId,
     writes: u64,
@@ -1472,7 +1474,7 @@ fn seed_durable_native_history(
 }
 
 fn seed_durable_native_history_with_durability(
-    store: &DurableObjectStore,
+    store: &DurableCoordinator,
     keyspace_id: KeyspaceId,
     file_id: FileId,
     writes: u64,
@@ -1512,7 +1514,7 @@ fn maintenance_bench_policy(mode: MaintenanceMode) -> MaintenancePolicy {
     }
 }
 
-fn seed_durable_compaction_debt(store: &DurableObjectStore, device_id: DeviceId, writes: u64) {
+fn seed_durable_compaction_debt(store: &DurableCoordinator, device_id: DeviceId, writes: u64) {
     for block in 0..writes {
         store
             .write_device(
@@ -1631,7 +1633,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("block-write-ack-fresh");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 let payload = vec![3; 4096];
                 let started = Instant::now();
@@ -1654,7 +1656,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("block-write-flushed-fresh");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 let payload = vec![3; 4096];
                 let started = Instant::now();
@@ -1677,7 +1679,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("block-flush-after-32");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history(&store, device_id, 32);
                 let started = Instant::now();
@@ -1693,7 +1695,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("block-overwrite-flushed-after-32");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1722,13 +1724,13 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("block-read-reopen");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 store
                     .write_device(device_id, 0, &[7; 4096], WriteDurability::Flushed)
                     .unwrap();
                 drop(store);
-                let reopened = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let reopened = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let mut buf = vec![0; 4096];
                 let started = Instant::now();
                 reopened
@@ -1750,7 +1752,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("open-after-32-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1760,7 +1762,7 @@ fn bench_durable_provider(c: &mut Criterion) {
                 );
                 drop(store);
                 let started = Instant::now();
-                let reopened = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let reopened = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let elapsed = started.elapsed();
                 black_box(reopened.device_info(device_id).unwrap());
                 drop(reopened);
@@ -1774,7 +1776,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("block-flush-after-256");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history(&store, device_id, LARGE_DURABLE_HISTORY_WRITES);
                 let started = Instant::now();
@@ -1790,7 +1792,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("open-after-256-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1800,7 +1802,7 @@ fn bench_durable_provider(c: &mut Criterion) {
                 );
                 drop(store);
                 let started = Instant::now();
-                let reopened = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let reopened = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let elapsed = started.elapsed();
                 black_box(reopened.device_info(device_id).unwrap());
                 drop(reopened);
@@ -1814,7 +1816,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("checkpoint-after-256-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1836,7 +1838,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("fork-after-256-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1866,7 +1868,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("restore-after-256-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1897,7 +1899,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("custodian-after-256-deleted-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1926,7 +1928,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("sqlite-rows-wal-after-256-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1950,7 +1952,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("compact-after-32-block-writes");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let device_id = create_durable_block_device(&store, 1024);
                 seed_durable_block_history_with_durability(
                     &store,
@@ -1978,7 +1980,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("maintenance-observe-idle");
-                let store = DurableObjectStore::open_with_maintenance_policy(
+                let store = DurableCoordinator::open_with_maintenance_policy(
                     &root,
                     durable_bench_config(),
                     maintenance_bench_policy(MaintenanceMode::Manual),
@@ -1998,7 +2000,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("maintenance-tick-idle");
-                let store = DurableObjectStore::open_with_maintenance_policy(
+                let store = DurableCoordinator::open_with_maintenance_policy(
                     &root,
                     durable_bench_config(),
                     maintenance_bench_policy(MaintenanceMode::Manual),
@@ -2018,7 +2020,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("maintenance-enabled-idle-write");
-                let store = DurableObjectStore::open_with_maintenance_policy(
+                let store = DurableCoordinator::open_with_maintenance_policy(
                     &root,
                     durable_bench_config(),
                     maintenance_bench_policy(MaintenanceMode::AlwaysOn),
@@ -2048,7 +2050,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("maintenance-tick-active");
-                let store = DurableObjectStore::open_with_maintenance_policy(
+                let store = DurableCoordinator::open_with_maintenance_policy(
                     &root,
                     durable_bench_config(),
                     maintenance_bench_policy(MaintenanceMode::Manual),
@@ -2072,7 +2074,7 @@ fn bench_durable_provider(c: &mut Criterion) {
                 let root = durable_bench_root("maintenance-throttled-write");
                 let mut policy = maintenance_bench_policy(MaintenanceMode::Manual);
                 policy.dirty_high_watermark_bytes = 1;
-                let store = DurableObjectStore::open_with_maintenance_policy(
+                let store = DurableCoordinator::open_with_maintenance_policy(
                     &root,
                     durable_bench_config(),
                     policy,
@@ -2096,7 +2098,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-write-ack-fresh");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
                 let payload = vec![4; 4096];
                 let started = Instant::now();
@@ -2120,7 +2122,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-write-flushed-fresh");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
                 let payload = vec![4; 4096];
                 let started = Instant::now();
@@ -2144,7 +2146,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-flush-after-32");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
                 seed_durable_native_history(&store, keyspace_id, file_id, 32);
                 let started = Instant::now();
@@ -2162,7 +2164,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-write-flushed-after-32");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
                 seed_durable_native_history_with_durability(
                     &store,
@@ -2193,7 +2195,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-append-ack-fresh");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
                 let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
                 let payload = vec![5; 4096];
@@ -2216,7 +2218,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-append-flushed-fresh");
-                let store = DurableObjectStore::open(&root, durable_bench_config()).unwrap();
+                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
                 let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
                 let payload = vec![5; 4096];

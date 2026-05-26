@@ -37,16 +37,20 @@ pub use id::{
     StorageNodeId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
-    ChaosRemoteWireTransport, ChaosTransportMetrics, DurableCompactionReport, DurableDataLogPolicy,
-    DurableDataLogRef, DurableObjectStore, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane,
+    ChaosRemoteWireTransport, ChaosTransportMetrics, DurableCompactionReport, DurableCoordinator,
+    DurableDataLogPolicy, DurableDataLogRef, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane,
     InMemorySegmentStore, InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient,
-    LocalBlockDevice, LocalBlockServer, LocalNativeClient, LocalNativeFile, LocalNativeServer,
-    LocalObjectStore, LocalStoreConfig, MaintenanceCommand, MaintenanceDataLogObservation,
+    LocalBlockDevice, LocalBlockServer, LocalCoordinator, LocalNativeClient, LocalNativeFile,
+    LocalNativeServer, LocalStoreConfig, MaintenanceCommand, MaintenanceDataLogObservation,
     MaintenanceDiagnostics, MaintenanceMode, MaintenanceNodeObservation, MaintenanceObservation,
     MaintenancePolicy, MaintenanceScheduler, MaintenanceSkippedLog, MaintenanceTickPlan,
     MaintenanceTickReport, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
     RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport,
-    RemoteWireTransport, SegmentLifecycleState, StorageNodeCustodianReport, WriteAdmission,
+    RemoteWireTransport, SegmentLifecycleState, WriteAdmission,
+};
+pub use provider::{
+    MetadataNodeWrite, PlacementPolicy, StorageNodeCustodianReport, StorageNodeDirectory,
+    StorageNodeRequest, StorageNodeResponse, StorageNodeTransport,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

@@ -503,7 +503,10 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 24 owns deterministic background compaction scheduling, maintenance
   budgets, and explicit write backpressure policy for the partitioned durable
   layout.
-- Phase 25 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 25 owns the coordinator/metadata/storage-node boundary refactor that
+  makes local in-process roles match the intended distributed architecture
+  before replication adds quorum behavior.
+- Phase 26 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -1211,7 +1214,7 @@ Deliverables:
 - [x] Flushed writes export only rows at or beyond the previous durable
   high-water cursor for immutable ID/commit tables, while mutable head,
   lifecycle, mark, and deletion-sensitive tables remain reconciled explicitly.
-- [x] Reopen rebuilds `LocalObjectStore` from row-native tables plus data-log
+- [x] Reopen rebuilds `LocalCoordinator` from row-native tables plus data-log
   placement rows, then validates heads, checkpoints, metadata object
   reachability, segment descriptors, placements, catalog lifecycle state,
   readable data-log payloads, ID counters, and monotonic timelines.
@@ -1358,7 +1361,75 @@ the 32-write debt fixture about 5.1 ms, and an explicitly throttled write
 decision about 74 us. Treat these as regression smoke baselines; durable write
 latency on this host is dominated by the fsync path.
 
-## Phase 25: Storage Replication
+## Phase 25: Coordinator / Metadata / Storage-Node Boundary Refactor
+
+Status: complete.
+
+Refactor the local implementation so its code shape matches the intended
+distributed architecture. The phase stays local and in-process, but removes the
+conceptual shortcut where one provider object directly owns logical metadata
+and physical storage-node catalogs as a single collapsed role.
+
+Non-goals:
+
+- No TCP storage-node protocol.
+- No storage replication or quorum durability.
+- No Postgres metadata provider.
+- No public block/native API changes.
+- No compatibility aliases for the old collapsed local object-store shape.
+
+Deliverables:
+
+- [x] Provider-public role interfaces for `StorageNodeTransport`,
+  `StorageNodeDirectory`, `PlacementPolicy`, and `LocalCoordinator`.
+- [x] `MetadataPlane` documentation and persist contracts state that metadata
+  owns roots, fences, timelines, checkpoints, PITR, and GC reachability, and
+  must not read storage-node catalogs, data logs, or segment bytes.
+- [x] Metadata-node persistence receives `MetadataNodeWrite` descriptor
+  evidence so leaf shape can be validated without storage-node access.
+- [x] `LocalCoordinator` is the only in-process role that sequences both
+  metadata and storage-node operations.
+- [x] `DurableCoordinator` is the embedded durable coordinator bundle; the old
+  collapsed object-store names are removed rather than aliased.
+- [x] `LocalBlockServer` and `LocalNativeServer` remain thin request and
+  idempotency adapters over the coordinator.
+- [x] In-process storage-node messages cover `WriteSegment`, `ReadSegment`,
+  `MarkReferenced`, `Release`, `RunCustodian`, `ObserveMaintenance`, and
+  `RunMaintenanceTick`.
+- [x] Ordinary writes are ordered as storage-node durable receipt, metadata
+  publish, then storage-node referenced marking.
+- [x] Failed metadata publish after a durable storage-node receipt leaves no
+  visible block/file change and leaves the receipt as a pending orphan.
+- [x] Reads resolve segment ownership through `StorageNodeDirectory`; metadata
+  never opens node-local catalogs or data logs.
+
+Exit gate:
+
+- [x] Role-boundary tests cover metadata-only descriptor validation,
+  storage-node write receipts that stay pending until reference evidence, and
+  coordinator-only crossing of the metadata/storage-node boundary.
+- [x] Block and native writes preserve the same public semantics after the role
+  split.
+- [x] Metadata publish failure leaves old roots visible and storage-node state
+  unreferenced.
+- [x] Multi-node placement and reads still route through provider-private node
+  resolution without exposing storage-node choices to clients.
+- [x] Metadata GC emits release evidence and the coordinator routes releases to
+  owning storage nodes.
+- [x] Manual maintenance and storage-node custodians behave the same after the
+  split.
+- [x] There are no compatibility aliases or wrappers for the old collapsed
+  store type names.
+
+Short-run Phase 25 Criterion smoke numbers on this host: local 4 KiB block
+write 2.4 us, local native append 7.7 us, durable flushed 4 KiB block write
+5.4 ms, durable flushed native write-at 5.6 ms, durable flushed native append
+5.7 ms, reopen after 256 block writes 20.4 ms, custodian publish after 256
+deleted block writes 8.0 ms, and idle maintenance tick 10.9 us. The focused
+Criterion comparisons reported improvements or no statistically significant
+change; reopen/custodian numbers remain host-filesystem sensitive.
+
+## Phase 26: Storage Replication
 
 Status: not started.
 
@@ -1418,7 +1489,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 26: Linux io_uring Storage Node Backend
+## Phase 27: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1459,7 +1530,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 27: Optional ublk Adapter
+## Phase 28: Optional ublk Adapter
 
 Status: not started.
 

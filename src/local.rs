@@ -45,9 +45,11 @@ use crate::object::{
 };
 use crate::provider::{
     CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
-    MetadataCreateKeyspaceRequest, MetadataFence, MetadataForkRequest, MetadataPlane,
-    MetadataSnapshotKeyspaceRequest, RetentionPolicy, SegmentReplicaCommit,
-    SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent, SegmentStore,
+    MetadataCreateKeyspaceRequest, MetadataFence, MetadataForkRequest, MetadataNodeWrite,
+    MetadataPlane, MetadataSnapshotKeyspaceRequest, PlacementPolicy, RetentionPolicy,
+    SegmentReplicaCommit, SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent,
+    SegmentStore, StorageNodeCustodianReport, StorageNodeDirectory, StorageNodeRequest,
+    StorageNodeResponse, StorageNodeTransport,
 };
 
 const KEYSPACE_CATALOG_SHARD_COUNT: usize = 256;
@@ -139,11 +141,113 @@ fn normalize_storage_nodes(
     out
 }
 
-/// Shared local in-process provider bundle.
+/// In-process storage-node role.
 #[derive(Debug, Clone)]
 struct LocalStorageNode {
+    storage_node: StorageNodeId,
     segment_store: Arc<InMemorySegmentStore>,
     segment_catalog: Arc<InMemoryLocalSegmentCatalog>,
+}
+
+impl LocalStorageNode {
+    fn run_custodian(
+        &self,
+        expired_write_intents: &BTreeSet<WriteIntentId>,
+    ) -> Result<StorageNodeCustodianReport> {
+        let mut report = StorageNodeCustodianReport {
+            expired_reservations: Vec::new(),
+            failed_writes: Vec::new(),
+            orphan_segments: Vec::new(),
+            deleted_released_segments: Vec::new(),
+        };
+
+        for (segment_id, state, write_intent) in self.segment_catalog.entries()? {
+            match state {
+                SegmentLifecycleState::Reserved
+                    if expired_write_intents.contains(&write_intent) =>
+                {
+                    self.segment_catalog.expire_reservation(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.expired_reservations.push(segment_id);
+                }
+                SegmentLifecycleState::Writing if expired_write_intents.contains(&write_intent) => {
+                    self.segment_catalog.fail_write(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.failed_writes.push(segment_id);
+                }
+                SegmentLifecycleState::DurablePendingMetadata
+                    if expired_write_intents.contains(&write_intent) =>
+                {
+                    self.segment_catalog.free_orphan_segment(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.orphan_segments.push(segment_id);
+                }
+                SegmentLifecycleState::Released => {
+                    self.segment_catalog.delete_segment(segment_id)?;
+                    self.segment_store.delete_segment(segment_id)?;
+                    report.deleted_released_segments.push(segment_id);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(report)
+    }
+}
+
+impl StorageNodeTransport for LocalStorageNode {
+    fn storage_node_id(&self) -> StorageNodeId {
+        self.storage_node
+    }
+
+    fn send(&self, request: StorageNodeRequest) -> Result<StorageNodeResponse> {
+        match request {
+            StorageNodeRequest::WriteSegment {
+                segment_id,
+                intent,
+                bytes,
+            } => {
+                let reservation = self
+                    .segment_catalog
+                    .reserve_segment_with_id(segment_id, intent)?;
+                self.segment_catalog.begin_write(&reservation)?;
+                let commit = self
+                    .segment_store
+                    .write_segment_owned(&reservation, bytes)?;
+                self.segment_store.sync_segment(reservation.segment_id)?;
+                self.segment_catalog
+                    .commit_segment(reservation.clone(), commit.clone())?;
+                Ok(StorageNodeResponse::WriteSegment {
+                    reservation,
+                    commit,
+                })
+            }
+            StorageNodeRequest::ReadSegment { segment_id, range } => {
+                let len = usize::try_from(range.len).map_err(|_| {
+                    StorageError::invalid_argument("segment read byte length overflows usize")
+                })?;
+                let mut bytes = vec![0; len];
+                self.segment_store
+                    .read_segment(segment_id, range, &mut bytes)?;
+                Ok(StorageNodeResponse::ReadSegment { bytes })
+            }
+            StorageNodeRequest::MarkReferenced { segment_id } => {
+                self.segment_catalog.mark_segment_referenced(segment_id)?;
+                Ok(StorageNodeResponse::MarkReferenced)
+            }
+            StorageNodeRequest::Release { segment_id } => {
+                self.segment_catalog.release_segment(segment_id)?;
+                Ok(StorageNodeResponse::Released)
+            }
+            StorageNodeRequest::RunCustodian {
+                expired_write_intents,
+            } => Ok(StorageNodeResponse::Custodian(
+                self.run_custodian(&expired_write_intents)?,
+            )),
+            StorageNodeRequest::ObserveMaintenance => Ok(StorageNodeResponse::MaintenanceObserved),
+            StorageNodeRequest::RunMaintenanceTick => Ok(StorageNodeResponse::MaintenanceTicked),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +269,7 @@ impl StorageNodeRegistry {
             nodes.insert(
                 *node_id,
                 LocalStorageNode {
+                    storage_node: *node_id,
                     segment_store: Arc::new(InMemorySegmentStore::new(node_config)?),
                     segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::new(node_config)?),
                 },
@@ -215,6 +320,7 @@ impl StorageNodeRegistry {
             nodes.insert(
                 *node_id,
                 LocalStorageNode {
+                    storage_node: *node_id,
                     segment_store: Arc::new(InMemorySegmentStore::from_inner(
                         node_config,
                         image.segment_store.clone(),
@@ -270,44 +376,6 @@ impl StorageNodeRegistry {
         self.node_order.as_ref().clone()
     }
 
-    fn choose_storage_node(&self) -> Result<StorageNodeId> {
-        let mut next = lock(&self.next_placement_index)?;
-        let index = usize::try_from(*next % self.node_order.len() as u64)
-            .map_err(|_| StorageError::invalid_argument("placement index overflows usize"))?;
-        let node_id = self.node_order[index];
-        *next = next
-            .checked_add(1)
-            .ok_or_else(|| StorageError::conflict("placement index overflow"))?;
-        Ok(node_id)
-    }
-
-    fn reserve_segment(
-        &self,
-        storage_node: StorageNodeId,
-        intent: SegmentReservationIntent,
-    ) -> Result<SegmentReservation> {
-        let mut next = lock(&self.next_segment_id)?;
-        let segment_id = loop {
-            let candidate = SegmentId::from_raw(*next);
-            *next = next
-                .checked_add(1)
-                .ok_or_else(|| StorageError::conflict("segment id overflow"))?;
-            let mut exists = false;
-            for node in self.nodes.values() {
-                if node.segment_catalog.contains_segment(candidate)? {
-                    exists = true;
-                    break;
-                }
-            }
-            if !exists {
-                break candidate;
-            }
-        };
-        self.node(storage_node)?
-            .segment_catalog
-            .reserve_segment_with_id(segment_id, intent)
-    }
-
     fn owner_node_for_segment(&self, segment_id: SegmentId) -> Result<&LocalStorageNode> {
         let mut found = None;
         for (node_id, node) in self.nodes.iter() {
@@ -338,34 +406,118 @@ impl StorageNodeRegistry {
     }
 
     fn mark_segment_referenced(&self, segment_id: SegmentId) -> Result<()> {
-        self.owner_node_for_segment(segment_id)?
-            .segment_catalog
-            .mark_segment_referenced(segment_id)
+        let response = self
+            .transport_for_segment(segment_id)?
+            .send(StorageNodeRequest::MarkReferenced { segment_id })?;
+        if response != StorageNodeResponse::MarkReferenced {
+            return Err(StorageError::corrupt(
+                "storage node returned unexpected mark-referenced response",
+            ));
+        }
+        Ok(())
     }
 
     fn release_segment(&self, segment_id: SegmentId) -> Result<()> {
-        self.owner_node_for_segment(segment_id)?
-            .segment_catalog
-            .release_segment(segment_id)
+        let response = self
+            .transport_for_segment(segment_id)?
+            .send(StorageNodeRequest::Release { segment_id })?;
+        if response != StorageNodeResponse::Released {
+            return Err(StorageError::corrupt(
+                "storage node returned unexpected release response",
+            ));
+        }
+        Ok(())
     }
 
     fn read_segment(&self, segment_id: SegmentId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
-        self.owner_node_for_segment(segment_id)?
-            .segment_store
-            .read_segment(segment_id, range, buf)
+        let response = self
+            .transport_for_segment(segment_id)?
+            .send(StorageNodeRequest::ReadSegment { segment_id, range })?;
+        let StorageNodeResponse::ReadSegment { bytes } = response else {
+            return Err(StorageError::corrupt(
+                "storage node returned unexpected read response",
+            ));
+        };
+        if bytes.len() != buf.len() {
+            return Err(StorageError::corrupt(
+                "storage node read response length disagrees with buffer",
+            ));
+        }
+        buf.copy_from_slice(&bytes);
+        Ok(())
     }
 }
 
-/// Shared local in-process provider bundle.
+impl PlacementPolicy for StorageNodeRegistry {
+    fn choose_storage_node(&self, candidates: &[StorageNodeId]) -> Result<StorageNodeId> {
+        if candidates.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "placement policy requires at least one storage node",
+            ));
+        }
+        let mut next = lock(&self.next_placement_index)?;
+        let index = usize::try_from(*next % candidates.len() as u64)
+            .map_err(|_| StorageError::invalid_argument("placement index overflows usize"))?;
+        let node_id = candidates[index];
+        self.node(node_id)?;
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("placement index overflow"))?;
+        Ok(node_id)
+    }
+}
+
+impl StorageNodeDirectory for StorageNodeRegistry {
+    fn storage_node_ids(&self) -> Result<Vec<StorageNodeId>> {
+        Ok(self.node_order.as_ref().clone())
+    }
+
+    fn allocate_segment_id(&self) -> Result<SegmentId> {
+        let mut next = lock(&self.next_segment_id)?;
+        loop {
+            let candidate = SegmentId::from_raw(*next);
+            *next = next
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("segment id overflow"))?;
+            let mut exists = false;
+            for node in self.nodes.values() {
+                if node.segment_catalog.contains_segment(candidate)? {
+                    exists = true;
+                    break;
+                }
+            }
+            if !exists {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    fn transport_for_node(
+        &self,
+        storage_node: StorageNodeId,
+    ) -> Result<Arc<dyn StorageNodeTransport>> {
+        Ok(Arc::new(self.node(storage_node)?.clone()))
+    }
+
+    fn transport_for_segment(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Arc<dyn StorageNodeTransport>> {
+        Ok(Arc::new(self.owner_node_for_segment(segment_id)?.clone()))
+    }
+}
+
+/// In-process coordinator that owns request orchestration across metadata and
+/// storage-node roles.
 #[derive(Debug, Clone)]
-pub struct LocalObjectStore {
+pub struct LocalCoordinator {
     metadata: Arc<InMemoryMetadataPlane>,
     storage_nodes: StorageNodeRegistry,
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
 }
 
-impl LocalObjectStore {
+impl LocalCoordinator {
     pub fn new() -> Self {
         Self::with_config(LocalStoreConfig::default()).expect("default local store config is valid")
     }
@@ -956,38 +1108,25 @@ impl LocalObjectStore {
             deleted_released_segments: Vec::new(),
         };
 
-        for node in self.storage_nodes.nodes.values() {
-            for (segment_id, state, write_intent) in node.segment_catalog.entries()? {
-                match state {
-                    SegmentLifecycleState::Reserved
-                        if expired_write_intents.contains(&write_intent) =>
-                    {
-                        node.segment_catalog.expire_reservation(segment_id)?;
-                        node.segment_store.delete_segment(segment_id)?;
-                        report.expired_reservations.push(segment_id);
-                    }
-                    SegmentLifecycleState::Writing
-                        if expired_write_intents.contains(&write_intent) =>
-                    {
-                        node.segment_catalog.fail_write(segment_id)?;
-                        node.segment_store.delete_segment(segment_id)?;
-                        report.failed_writes.push(segment_id);
-                    }
-                    SegmentLifecycleState::DurablePendingMetadata
-                        if expired_write_intents.contains(&write_intent) =>
-                    {
-                        node.segment_catalog.free_orphan_segment(segment_id)?;
-                        node.segment_store.delete_segment(segment_id)?;
-                        report.orphan_segments.push(segment_id);
-                    }
-                    SegmentLifecycleState::Released => {
-                        node.segment_catalog.delete_segment(segment_id)?;
-                        node.segment_store.delete_segment(segment_id)?;
-                        report.deleted_released_segments.push(segment_id);
-                    }
-                    _ => {}
-                }
-            }
+        for storage_node in self.storage_nodes.storage_node_ids()? {
+            let response = self.storage_nodes.transport_for_node(storage_node)?.send(
+                StorageNodeRequest::RunCustodian {
+                    expired_write_intents: expired_write_intents.clone(),
+                },
+            )?;
+            let StorageNodeResponse::Custodian(node_report) = response else {
+                return Err(StorageError::corrupt(
+                    "storage node returned unexpected custodian response",
+                ));
+            };
+            report
+                .expired_reservations
+                .extend(node_report.expired_reservations);
+            report.failed_writes.extend(node_report.failed_writes);
+            report.orphan_segments.extend(node_report.orphan_segments);
+            report
+                .deleted_released_segments
+                .extend(node_report.deleted_released_segments);
         }
 
         Ok(report)
@@ -1061,14 +1200,30 @@ impl LocalObjectStore {
                 StorageError::invalid_argument("segment reservation byte length overflows u64")
             })?,
         };
-        let storage_node = self.storage_nodes.choose_storage_node()?;
-        let node = self.storage_nodes.node(storage_node)?;
-        let reservation = self.storage_nodes.reserve_segment(storage_node, intent)?;
-        node.segment_catalog.begin_write(&reservation)?;
-        let commit = node.segment_store.write_segment_owned(&reservation, data)?;
-        node.segment_store.sync_segment(reservation.segment_id)?;
-        node.segment_catalog
-            .commit_segment(reservation.clone(), commit)?;
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        let segment_id = self.storage_nodes.allocate_segment_id()?;
+        let response = self.storage_nodes.transport_for_node(storage_node)?.send(
+            StorageNodeRequest::WriteSegment {
+                segment_id,
+                intent,
+                bytes: data,
+            },
+        )?;
+        let StorageNodeResponse::WriteSegment {
+            reservation,
+            commit,
+        } = response
+        else {
+            return Err(StorageError::corrupt(
+                "storage node returned unexpected write response",
+            ));
+        };
+        if reservation.segment_id != segment_id || commit.descriptor.segment_id != segment_id {
+            return Err(StorageError::corrupt(
+                "storage node write receipt disagrees with requested segment ID",
+            ));
+        }
         Ok(reservation)
     }
 
@@ -1166,7 +1321,10 @@ impl LocalObjectStore {
                     },
                 )?;
                 new_node.validate(&segment_descriptors)?;
-                self.metadata.persist_metadata_node(new_node.clone())?;
+                self.metadata.persist_metadata_node(MetadataNodeWrite::new(
+                    new_node.clone(),
+                    segment_descriptors,
+                ))?;
                 Ok(TreeEditResult {
                     root: new_node.node_id,
                     changed: true,
@@ -1203,7 +1361,8 @@ impl LocalObjectStore {
                     },
                 )?;
                 new_node.validate(&[])?;
-                self.metadata.persist_metadata_node(new_node.clone())?;
+                self.metadata
+                    .persist_metadata_node(MetadataNodeWrite::new(new_node.clone(), Vec::new()))?;
                 Ok(TreeEditResult {
                     root: new_node.node_id,
                     changed: true,
@@ -1552,7 +1711,7 @@ impl LocalObjectStore {
     }
 }
 
-impl Default for LocalObjectStore {
+impl Default for LocalCoordinator {
     fn default() -> Self {
         Self::new()
     }
@@ -2437,7 +2596,7 @@ impl DurableSqliteStore {
         .map_err(sqlite_error)
     }
 
-    fn load(&self, expected_config: LocalStoreConfig) -> Result<Option<LocalObjectStore>> {
+    fn load(&self, expected_config: LocalStoreConfig) -> Result<Option<LocalCoordinator>> {
         let conn = lock(&self.conn)?;
         let Some(cursor) = load_export_cursor(&conn)? else {
             reject_legacy_current_state_if_present(&conn)?;
@@ -2460,7 +2619,7 @@ impl DurableSqliteStore {
             };
             validate_row_native_image(&self.node_catalogs, &image)?;
             self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
-            return Ok(Some(LocalObjectStore::from_state_image(image)?));
+            return Ok(Some(LocalCoordinator::from_state_image(image)?));
         };
         if cursor.config != expected_config {
             return Err(StorageError::corrupt(
@@ -2502,7 +2661,7 @@ impl DurableSqliteStore {
         };
         validate_row_native_image(&self.node_catalogs, &image)?;
         self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
-        Ok(Some(LocalObjectStore::from_state_image(image)?))
+        Ok(Some(LocalCoordinator::from_state_image(image)?))
     }
 
     fn persist_catalog_reference_repairs(
@@ -5550,7 +5709,7 @@ fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
 
 #[derive(Clone)]
 struct DurableMaintenanceParts {
-    local: LocalObjectStore,
+    local: LocalCoordinator,
     durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     persist_lock: Arc<Mutex<()>>,
@@ -5730,10 +5889,11 @@ fn run_maintenance_tick_parts(
     Ok(MaintenanceTickReport { plan, compaction })
 }
 
-/// Local durable provider bundle using SQLite metadata and rolled data logs.
+/// Durable in-process coordinator using SQLite metadata and node-scoped rolled
+/// data logs.
 #[derive(Debug, Clone)]
-pub struct DurableObjectStore {
-    local: LocalObjectStore,
+pub struct DurableCoordinator {
+    local: LocalCoordinator,
     durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     persist_lock: Arc<Mutex<()>>,
@@ -5742,7 +5902,7 @@ pub struct DurableObjectStore {
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
 }
 
-impl DurableObjectStore {
+impl DurableCoordinator {
     pub fn open(root: impl AsRef<Path>, config: LocalStoreConfig) -> Result<Self> {
         Self::open_with_data_log_policy(root, config, DurableDataLogPolicy::default())
     }
@@ -5815,7 +5975,7 @@ impl DurableObjectStore {
 
         let local = durable
             .load(config)?
-            .unwrap_or(LocalObjectStore::with_storage_nodes(config, storage_nodes)?);
+            .unwrap_or(LocalCoordinator::with_storage_nodes(config, storage_nodes)?);
         let persisted_segments = local.state_image()?.storage_nodes.segment_ids();
         let maintenance_cursor = Arc::new(Mutex::new(durable.load_maintenance_cursor()?));
 
@@ -6236,14 +6396,14 @@ impl DurableObjectStore {
         }
     }
 
-    fn run_and_persist<T>(&self, op: impl FnOnce(&LocalObjectStore) -> Result<T>) -> Result<T> {
+    fn run_and_persist<T>(&self, op: impl FnOnce(&LocalCoordinator) -> Result<T>) -> Result<T> {
         self.run_and_maybe_persist(true, op)
     }
 
     fn run_and_maybe_persist<T>(
         &self,
         persist: bool,
-        op: impl FnOnce(&LocalObjectStore) -> Result<T>,
+        op: impl FnOnce(&LocalCoordinator) -> Result<T>,
     ) -> Result<T> {
         let result = op(&self.local);
         if !persist {
@@ -6328,14 +6488,6 @@ pub struct MetadataCustodianReport {
     pub mark: MetadataMarkReport,
     pub sweep: MetadataSweepReport,
     pub catalog_released_segments: Vec<SegmentId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StorageNodeCustodianReport {
-    pub expired_reservations: Vec<SegmentId>,
-    pub failed_writes: Vec<SegmentId>,
-    pub orphan_segments: Vec<SegmentId>,
-    pub deleted_released_segments: Vec<SegmentId>,
 }
 
 #[derive(Debug, Clone)]
@@ -8290,15 +8442,16 @@ impl MetadataPlane for InMemoryMetadataPlane {
         })
     }
 
-    fn persist_metadata_node(&self, node: MetadataNode) -> Result<()> {
+    fn persist_metadata_node(&self, write: MetadataNodeWrite) -> Result<()> {
+        write.node.validate(&write.segment_descriptors)?;
         let mut inner = lock(&self.inner)?;
-        match inner.metadata_nodes.get(&node.node_id) {
-            Some(existing) if existing == &node => Ok(()),
+        match inner.metadata_nodes.get(&write.node.node_id) {
+            Some(existing) if existing == &write.node => Ok(()),
             Some(_) => Err(StorageError::conflict(
                 "metadata node ID already exists with different content",
             )),
             None => {
-                inner.metadata_nodes.insert(node.node_id, node);
+                inner.metadata_nodes.insert(write.node.node_id, write.node);
                 Ok(())
             }
         }
@@ -9327,14 +9480,14 @@ struct CachedNativeRequest {
 
 #[derive(Debug, Clone)]
 pub struct LocalBlockServer {
-    store: LocalObjectStore,
+    store: LocalCoordinator,
     request_log: Arc<Mutex<Vec<RequestId>>>,
     responses: Arc<Mutex<BTreeMap<RequestKey, CachedBlockRequest>>>,
     stripes: Arc<Vec<Mutex<()>>>,
 }
 
 impl LocalBlockServer {
-    pub fn new(store: LocalObjectStore) -> Self {
+    pub fn new(store: LocalCoordinator) -> Self {
         Self {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
@@ -9454,14 +9607,14 @@ impl BlockServer for LocalBlockServer {
 /// Local native keyspace/file request coordinator.
 #[derive(Debug, Clone)]
 pub struct LocalNativeServer {
-    store: LocalObjectStore,
+    store: LocalCoordinator,
     request_log: Arc<Mutex<Vec<RequestId>>>,
     responses: Arc<Mutex<BTreeMap<RequestKey, CachedNativeRequest>>>,
     stripes: Arc<Vec<Mutex<()>>>,
 }
 
 impl LocalNativeServer {
-    pub fn new(store: LocalObjectStore) -> Self {
+    pub fn new(store: LocalCoordinator) -> Self {
         Self {
             store,
             request_log: Arc::new(Mutex::new(Vec::new())),
@@ -13929,7 +14082,7 @@ mod tests {
     }
 
     fn durable_images_from_store(
-        store: &LocalObjectStore,
+        store: &LocalCoordinator,
     ) -> (
         DurableMetadataImage,
         DurableCatalogImage,
@@ -14016,7 +14169,7 @@ mod tests {
         ) -> Result<()>;
     }
 
-    impl ProviderConformanceStore for LocalObjectStore {
+    impl ProviderConformanceStore for LocalCoordinator {
         fn create_device_for_conformance(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
             self.metadata()
                 .create_device(MetadataCreateDeviceRequest::from(request))
@@ -14131,7 +14284,7 @@ mod tests {
         }
     }
 
-    impl ProviderConformanceStore for DurableObjectStore {
+    impl ProviderConformanceStore for DurableCoordinator {
         fn create_device_for_conformance(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
             self.create_device(request)
         }
@@ -14337,9 +14490,13 @@ mod tests {
         let metadata = InMemoryMetadataPlane::new(config()).unwrap();
         let node = metadata_leaf(999, 0, 4);
 
-        metadata.persist_metadata_node(node.clone()).unwrap();
+        metadata
+            .persist_metadata_node(MetadataNodeWrite::new(node.clone(), Vec::new()))
+            .unwrap();
         assert_eq!(metadata.get_metadata_node(node.node_id).unwrap(), node);
-        metadata.persist_metadata_node(node.clone()).unwrap();
+        metadata
+            .persist_metadata_node(MetadataNodeWrite::new(node.clone(), Vec::new()))
+            .unwrap();
 
         let changed = MetadataNode {
             covered_range: crate::api::BlockRange::new(
@@ -14348,7 +14505,11 @@ mod tests {
             ),
             ..node.clone()
         };
-        assert!(metadata.persist_metadata_node(changed).is_err());
+        assert!(
+            metadata
+                .persist_metadata_node(MetadataNodeWrite::new(changed, Vec::new()))
+                .is_err()
+        );
         assert!(
             metadata
                 .get_metadata_node(MetadataNodeId::from_raw(1000))
@@ -14361,7 +14522,9 @@ mod tests {
         let metadata = InMemoryMetadataPlane::new(config()).unwrap();
         let head = metadata.create_device(device_request()).unwrap();
         let new_node = metadata_leaf(999, 0, 8);
-        metadata.persist_metadata_node(new_node.clone()).unwrap();
+        metadata
+            .persist_metadata_node(MetadataNodeWrite::new(new_node.clone(), Vec::new()))
+            .unwrap();
 
         let stale_missing = CommitGroupIntent {
             owner: MappingOwner::BlockDevice(head.device_id),
@@ -14406,6 +14569,42 @@ mod tests {
     }
 
     #[test]
+    fn metadata_node_persist_requires_segment_descriptor_evidence() {
+        let metadata = InMemoryMetadataPlane::new(config()).unwrap();
+        let descriptor = SegmentDescriptor {
+            segment_id: SegmentId::from_raw(700),
+            blocks: BlockCount::from_raw(1),
+            bytes: 4096,
+            checksum: None,
+        };
+        let node = MetadataNode {
+            node_id: MetadataNodeId::from_raw(700),
+            covered_range: crate::api::BlockRange::new(
+                BlockIndex::from_raw(0),
+                BlockCount::from_raw(1),
+            ),
+            kind: MetadataNodeKind::Leaf {
+                entries: vec![LeafEntry {
+                    logical_start: BlockIndex::from_raw(0),
+                    blocks: BlockCount::from_raw(1),
+                    segment_id: descriptor.segment_id,
+                    segment_offset: BlockIndex::from_raw(0),
+                }],
+            },
+        };
+
+        assert!(
+            metadata
+                .persist_metadata_node(MetadataNodeWrite::new(node.clone(), Vec::new()))
+                .is_err()
+        );
+        metadata
+            .persist_metadata_node(MetadataNodeWrite::new(node.clone(), vec![descriptor]))
+            .unwrap();
+        assert_eq!(metadata.get_metadata_node(node.node_id).unwrap(), node);
+    }
+
+    #[test]
     fn file_commit_uses_version_fence_and_roots_for_gc_include_live_owners() {
         let metadata = InMemoryMetadataPlane::new(config()).unwrap();
         let keyspace = metadata
@@ -14424,7 +14623,9 @@ mod tests {
             })
             .unwrap();
         let new_root = metadata_leaf(1001, 0, 8);
-        metadata.persist_metadata_node(new_root.clone()).unwrap();
+        metadata
+            .persist_metadata_node(MetadataNodeWrite::new(new_root.clone(), Vec::new()))
+            .unwrap();
 
         metadata
             .publish_commit_group(CommitGroupIntent {
@@ -14453,7 +14654,7 @@ mod tests {
 
     #[test]
     fn delete_moves_device_out_of_live_catalog_without_deleting_objects() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 16);
         let device_id = device.device_id();
         device.write_at(0, &[7; 4096]).unwrap();
@@ -14516,7 +14717,7 @@ mod tests {
 
     #[test]
     fn roots_for_gc_respects_deleted_device_retention_policy() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 16);
         let device_id = device.device_id();
         device.write_at(0, &[7; 4096]).unwrap();
@@ -14590,7 +14791,7 @@ mod tests {
 
         for seed in 0..10 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
-            let store = LocalObjectStore::with_config(config()).unwrap();
+            let store = LocalCoordinator::with_config(config()).unwrap();
             let server = Arc::new(LocalBlockServer::new(store.clone()));
             let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
             let mut live_roots: BTreeMap<DeviceId, Vec<MetadataNodeId>> = BTreeMap::new();
@@ -14729,7 +14930,7 @@ mod tests {
 
     #[test]
     fn deleted_device_can_restore_from_retained_checkpoint_but_not_after_delete_time() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let device_id = client
@@ -14768,7 +14969,7 @@ mod tests {
 
     #[test]
     fn metadata_gc_releases_deleted_device_segments_after_retention_expires() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 16);
         let device_id = device.device_id();
         device.write_at(0, &[7; 4096]).unwrap();
@@ -14817,7 +15018,7 @@ mod tests {
 
     #[test]
     fn deleted_device_retention_can_expire_by_commit_age() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 16);
         let device_id = device.device_id();
         device.write_at(0, &[7; 4096]).unwrap();
@@ -14859,7 +15060,7 @@ mod tests {
 
     #[test]
     fn retention_expiring_gc_prunes_deleted_pitr_catalog() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 16);
         let device_id = device.device_id();
         device.write_at(0, &[7; 4096]).unwrap();
@@ -14887,7 +15088,7 @@ mod tests {
 
     #[test]
     fn metadata_gc_retains_deleted_pitr_roots_when_policy_requires_it() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let device_id = client
@@ -14927,7 +15128,7 @@ mod tests {
 
     #[test]
     fn paused_gc_sweep_preserves_nodes_marked_in_epoch() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 16);
         device.write_at(0, &[5; 4096]).unwrap();
         let mark = store
@@ -14970,7 +15171,7 @@ mod tests {
     #[test]
     fn generated_gc_interleavings_preserve_live_device_models() {
         fn assert_live_models(
-            store: &LocalObjectStore,
+            store: &LocalCoordinator,
             client: &LocalBlockClient,
             models: &BTreeMap<DeviceId, Vec<u8>>,
             seed: u64,
@@ -14993,7 +15194,7 @@ mod tests {
 
         for seed in 0..8 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
-            let store = LocalObjectStore::with_config(LocalStoreConfig {
+            let store = LocalCoordinator::with_config(LocalStoreConfig {
                 shard_count: 2,
                 ..tree_config()
             })
@@ -15121,7 +15322,7 @@ mod tests {
     #[test]
     fn generated_end_to_end_simulator_is_replayable_across_operations_and_faults() {
         fn graph_summary(
-            store: &LocalObjectStore,
+            store: &LocalCoordinator,
             native_file_count: usize,
         ) -> crate::sim::ObjectGraphSummary {
             let entries = store.segment_catalog().entries().unwrap();
@@ -15151,7 +15352,7 @@ mod tests {
         }
 
         fn validate_live_devices(
-            store: &LocalObjectStore,
+            store: &LocalCoordinator,
             client: &LocalBlockClient,
             seed: u64,
             trace: &[String],
@@ -15174,7 +15375,7 @@ mod tests {
         fn run(seed: u64) -> crate::sim::FailureArtifact {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
             let faults = crate::sim::FaultInjector::new(seed ^ 0x0051_ab1e);
-            let store = LocalObjectStore::with_config(LocalStoreConfig {
+            let store = LocalCoordinator::with_config(LocalStoreConfig {
                 shard_count: 2,
                 ..tree_config()
             })
@@ -15489,7 +15690,7 @@ mod tests {
 
     #[test]
     fn storage_node_custodian_reclaims_expired_failed_orphan_and_released_segments() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let reserved = store
             .segment_catalog()
             .reserve_segment(SegmentReservationIntent {
@@ -15619,16 +15820,16 @@ mod tests {
 
     #[test]
     fn provider_conformance_harness_runs_against_memory_and_durable_stores() {
-        let memory = LocalObjectStore::with_config(tree_config()).unwrap();
+        let memory = LocalCoordinator::with_config(tree_config()).unwrap();
         run_provider_conformance(&memory);
 
         let root = durable_temp_dir("provider-conformance");
         let cfg = tree_config();
-        let durable = DurableObjectStore::open(&root, cfg).unwrap();
+        let durable = DurableCoordinator::open(&root, cfg).unwrap();
         let durable_outcome = run_provider_conformance(&durable);
         drop(durable);
 
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         let mut device_bytes = vec![0; 3 * 4096];
         reopened
             .read_device(
@@ -15666,7 +15867,7 @@ mod tests {
 
     #[test]
     fn durable_state_image_codec_round_trips_real_block_and_native_state() {
-        let store = LocalObjectStore::with_config(tree_config()).unwrap();
+        let store = LocalCoordinator::with_config(tree_config()).unwrap();
         let device = create_local_device(&store, 32);
         device.write_at(7 * 4096, &repeated_blocks(3, 8)).unwrap();
         store.metadata().checkpoint(device.device_id()).unwrap();
@@ -15896,7 +16097,7 @@ mod tests {
     fn durable_provider_reopens_committed_block_contents_and_restore_points() {
         let root = durable_temp_dir("block-restart");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -15927,7 +16128,7 @@ mod tests {
         assert!(data_log_path(&root.join("data"), cfg.storage_node, 1).exists());
 
         drop(store);
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         let mut current = vec![0; 2 * 4096];
         reopened
             .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut current)
@@ -15944,7 +16145,7 @@ mod tests {
         assert_eq!(restored_bytes, repeated_blocks(2, 3));
 
         drop(reopened);
-        let reopened_again = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened_again = DurableCoordinator::open(&root, cfg).unwrap();
         let mut restored_after_restart = vec![0; 2 * 4096];
         reopened_again
             .read_device(
@@ -15966,7 +16167,7 @@ mod tests {
             StorageNodeId::from_raw(78),
             StorageNodeId::from_raw(79),
         ];
-        let store = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+        let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
             &root,
             cfg,
             node_ids.clone(),
@@ -16033,7 +16234,7 @@ mod tests {
         );
 
         drop(store);
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         assert_eq!(reopened.storage_node_ids_for_test(), node_ids);
         let mut device_bytes = vec![0; 3 * 4096];
         reopened
@@ -16077,7 +16278,7 @@ mod tests {
     fn durable_acknowledged_write_requires_flush_for_restart_visibility() {
         let root = durable_temp_dir("ack-flush-restart");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16097,7 +16298,7 @@ mod tests {
             .unwrap();
 
         drop(store);
-        let reopened_before_flush = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened_before_flush = DurableCoordinator::open(&root, cfg).unwrap();
         let mut before_flush = vec![99; 4096];
         reopened_before_flush
             .read_device(device_id, ByteRange::new(0, 4096), &mut before_flush)
@@ -16116,7 +16317,7 @@ mod tests {
         assert!(flush.durable_through.raw() > 0);
 
         drop(reopened_before_flush);
-        let reopened_after_flush = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened_after_flush = DurableCoordinator::open(&root, cfg).unwrap();
         let mut after_flush = vec![0; 4096];
         reopened_after_flush
             .read_device(device_id, ByteRange::new(0, 4096), &mut after_flush)
@@ -16129,7 +16330,7 @@ mod tests {
     fn durable_sqlite_uses_row_native_metadata_without_current_state_blob() {
         let root = durable_temp_dir("row-native-no-current-state");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16218,7 +16419,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, config()).is_err());
+        assert!(DurableCoordinator::open(&root, config()).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16231,7 +16432,7 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, config()).is_err());
+        assert!(DurableCoordinator::open(&root, config()).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16239,7 +16440,7 @@ mod tests {
     fn durable_sqlite_rejects_row_native_rows_without_cursor() {
         let root = durable_temp_dir("row-native-without-cursor");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         drop(store);
 
         let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
@@ -16250,7 +16451,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16258,7 +16459,7 @@ mod tests {
     fn durable_sqlite_recovers_node_catalog_rows_without_cursor_as_storage_orphans() {
         let root = durable_temp_dir("node-catalog-without-cursor");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         drop(store);
 
         let conn = node_catalog_conn(&root, cfg.storage_node);
@@ -16271,7 +16472,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16300,7 +16501,7 @@ mod tests {
     fn durable_sqlite_repairs_root_referenced_pending_catalog_rows_on_reopen() {
         let root = durable_temp_dir("pending-catalog-reference-repair");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16326,7 +16527,7 @@ mod tests {
             SegmentLifecycleState::DurablePendingMetadata
         );
 
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         let mut bytes = vec![0; 4096];
         reopened
             .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
@@ -16349,7 +16550,7 @@ mod tests {
     fn durable_sqlite_repairs_native_referenced_pending_catalog_rows_on_reopen() {
         let root = durable_temp_dir("pending-native-catalog-reference-repair");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let keyspace_id = store
             .create_keyspace(CreateKeyspaceRequest { name: None })
             .unwrap();
@@ -16376,7 +16577,7 @@ mod tests {
             SegmentLifecycleState::DurablePendingMetadata
         );
 
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         let mut bytes = vec![0; 4096];
         reopened
             .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
@@ -16399,7 +16600,7 @@ mod tests {
     fn durable_sqlite_failed_root_publish_leaves_pending_orphan_and_does_not_reuse_id() {
         let root = durable_temp_dir("failed-root-publish-pending-orphan");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16420,7 +16621,7 @@ mod tests {
         drop(store);
 
         let root_after_first_publish = metadata_file_snapshot(&root);
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         store
             .write_device(
                 device_id,
@@ -16442,7 +16643,7 @@ mod tests {
         drop(store);
 
         restore_metadata_file_snapshot(&root, &root_after_first_publish);
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         assert_eq!(
             device_segment_ids(&reopened.metadata(), device_id),
             vec![SegmentId::from_raw(1)]
@@ -16490,7 +16691,7 @@ mod tests {
     fn durable_sqlite_rejects_missing_row_native_head_root() {
         let root = durable_temp_dir("row-native-missing-root");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16519,7 +16720,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16527,7 +16728,7 @@ mod tests {
     fn durable_sqlite_rejects_missing_row_native_catalog_entry() {
         let root = durable_temp_dir("row-native-missing-catalog-entry");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16557,7 +16758,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16565,7 +16766,7 @@ mod tests {
     fn durable_sqlite_rejects_corrupt_row_native_payload() {
         let root = durable_temp_dir("row-native-corrupt-payload");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16594,7 +16795,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16602,7 +16803,7 @@ mod tests {
     fn durable_sqlite_rejects_missing_row_native_timeline_root() {
         let root = durable_temp_dir("row-native-missing-timeline-root");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16648,7 +16849,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16656,7 +16857,7 @@ mod tests {
     fn durable_sqlite_rejects_row_native_cursor_behind_rows() {
         let root = durable_temp_dir("row-native-stale-cursor");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16676,7 +16877,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16684,7 +16885,7 @@ mod tests {
     fn durable_sqlite_advances_write_intent_cursor_from_node_catalog_rows() {
         let root = durable_temp_dir("row-native-stale-write-intent-cursor");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16714,7 +16915,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         store
             .write_device(
                 device_id,
@@ -16736,7 +16937,7 @@ mod tests {
         let root = durable_temp_dir("row-native-stale-placement-cursor");
         let cfg = config();
         let second_node = StorageNodeId::from_raw(2);
-        let store = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+        let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
             &root,
             cfg,
             vec![cfg.storage_node, second_node],
@@ -16772,7 +16973,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let store = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+        let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
             &root,
             cfg,
             vec![cfg.storage_node, second_node],
@@ -16804,7 +17005,7 @@ mod tests {
     fn durable_batched_flush_persists_many_segments_in_one_data_log() {
         let root = durable_temp_dir("batched-flush-one-log");
         let cfg = config();
-        let store = DurableObjectStore::open_with_data_log_policy(
+        let store = DurableCoordinator::open_with_data_log_policy(
             &root,
             cfg,
             DurableDataLogPolicy {
@@ -16844,7 +17045,7 @@ mod tests {
         );
 
         drop(store);
-        let reopened = DurableObjectStore::open_with_data_log_policy(
+        let reopened = DurableCoordinator::open_with_data_log_policy(
             &root,
             cfg,
             DurableDataLogPolicy {
@@ -16878,7 +17079,7 @@ mod tests {
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
         };
-        let store = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_data_log_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16918,7 +17119,7 @@ mod tests {
         );
 
         drop(store);
-        let reopened = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let reopened = DurableCoordinator::open_with_data_log_policy(&root, cfg, policy).unwrap();
         let mut bytes = vec![0; 4 * 4096];
         reopened
             .read_device(device_id, ByteRange::new(0, 4 * 4096), &mut bytes)
@@ -16936,7 +17137,7 @@ mod tests {
     fn durable_sqlite_data_log_ignores_unplaced_tail_records() {
         let root = durable_temp_dir("data-log-unplaced-tail");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -16974,7 +17175,7 @@ mod tests {
             .write_all(&torn[..torn.len() / 2])
             .unwrap();
 
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         let mut bytes = vec![0; 4096];
         reopened
             .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
@@ -16987,7 +17188,7 @@ mod tests {
     fn durable_sqlite_data_log_rejects_current_payload_corruption() {
         let root = durable_temp_dir("data-log-corruption");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17022,7 +17223,7 @@ mod tests {
         file.seek(SeekFrom::Start(placement.payload_offset))
             .unwrap();
         file.write_all(&[0xff]).unwrap();
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -17030,7 +17231,7 @@ mod tests {
     fn durable_sqlite_data_log_rejects_current_checksum_corruption() {
         let root = durable_temp_dir("data-log-checksum-corruption");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17071,7 +17272,7 @@ mod tests {
         file.write_all(&[!byte[0]]).unwrap();
         file.sync_data().unwrap();
 
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -17079,7 +17280,7 @@ mod tests {
     fn durable_sqlite_rejects_missing_data_log_for_current_placement() {
         let root = durable_temp_dir("missing-data-log");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17099,7 +17300,7 @@ mod tests {
             .unwrap();
         drop(store);
         fs::remove_file(data_log_path(&root.join("data"), cfg.storage_node, 1)).unwrap();
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -17107,7 +17308,7 @@ mod tests {
     fn durable_sqlite_rejects_missing_node_catalog_for_current_metadata() {
         let root = durable_temp_dir("missing-node-catalog");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17127,7 +17328,7 @@ mod tests {
             .unwrap();
         drop(store);
         fs::remove_file(node_catalog_path(&root.join("data"), cfg.storage_node)).unwrap();
-        assert!(DurableObjectStore::open(&root, cfg).is_err());
+        assert!(DurableCoordinator::open(&root, cfg).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -17141,7 +17342,7 @@ mod tests {
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
         };
-        let store = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_data_log_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17205,7 +17406,7 @@ mod tests {
         assert!(!data_log_path(&root.join("data"), cfg.storage_node, first_log.log_id).exists());
 
         drop(store);
-        let reopened = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let reopened = DurableCoordinator::open_with_data_log_policy(&root, cfg, policy).unwrap();
         let mut bytes = vec![0; 3 * 4096];
         reopened
             .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut bytes)
@@ -17226,7 +17427,7 @@ mod tests {
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
         };
-        let store = DurableObjectStore::open_with_data_log_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_data_log_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17354,7 +17555,7 @@ mod tests {
             StorageNodeId::from_raw(2),
             StorageNodeId::from_raw(3),
         ];
-        let store = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+        let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
             &root,
             cfg,
             nodes.clone(),
@@ -17395,7 +17596,7 @@ mod tests {
         }
 
         drop(store);
-        let reopened = DurableObjectStore::open_with_storage_nodes_and_data_log_policy(
+        let reopened = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
             &root,
             cfg,
             nodes,
@@ -17434,7 +17635,7 @@ mod tests {
             max_logs_scanned_per_tick: 64,
             max_concurrent_compaction_jobs: 1,
         };
-        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17494,9 +17695,9 @@ mod tests {
 
     #[test]
     fn scheduled_compaction_matches_manual_compaction() {
-        fn prepare(root: &Path) -> (DurableObjectStore, DeviceId) {
+        fn prepare(root: &Path) -> (DurableCoordinator, DeviceId) {
             let cfg = config();
-            let store = DurableObjectStore::open_with_maintenance_policy(
+            let store = DurableCoordinator::open_with_maintenance_policy(
                 root,
                 cfg,
                 MaintenancePolicy {
@@ -17623,7 +17824,7 @@ mod tests {
             max_logs_scanned_per_tick: 64,
             max_concurrent_compaction_jobs: 1,
         };
-        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17662,7 +17863,7 @@ mod tests {
         drop(store);
 
         let reopened =
-            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+            DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         let mut bytes = vec![0; 4096];
         reopened
             .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
@@ -17694,7 +17895,7 @@ mod tests {
             max_logs_scanned_per_tick: 1,
             max_concurrent_compaction_jobs: 1,
         };
-        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17733,7 +17934,7 @@ mod tests {
         drop(store);
 
         let reopened =
-            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+            DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         assert_eq!(
             reopened.observe_maintenance().unwrap().compaction_cursor,
             Some(cursor)
@@ -17766,7 +17967,7 @@ mod tests {
             max_logs_scanned_per_tick: 64,
             max_concurrent_compaction_jobs: 1,
         };
-        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17838,7 +18039,7 @@ mod tests {
             max_logs_scanned_per_tick: 64,
             max_concurrent_compaction_jobs: 1,
         };
-        let store = DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let store = DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -17860,7 +18061,7 @@ mod tests {
         drop(store);
 
         let reopened =
-            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+            DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
         let mut bytes = vec![0; 4096];
         reopened
             .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
@@ -17895,7 +18096,7 @@ mod tests {
             };
             let mut rng = crate::sim::SeededRng::new(seed);
             let mut store =
-                DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+                DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
             let device_id = store
                 .create_device(CreateDeviceRequest {
                     spec: DeviceSpec {
@@ -17935,7 +18136,7 @@ mod tests {
                     _ => {
                         drop(store);
                         store =
-                            DurableObjectStore::open_with_maintenance_policy(&root, cfg, policy)
+                            DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy)
                                 .unwrap();
                     }
                 }
@@ -17965,7 +18166,7 @@ mod tests {
         }
 
         fn assert_models(
-            store: &DurableObjectStore,
+            store: &DurableCoordinator,
             ids: ModelIds,
             blocks: &[u8],
             file_blocks: &[u8],
@@ -18005,7 +18206,7 @@ mod tests {
             let cfg = tree_config();
             let mut rng = crate::sim::SeededRng::new(seed);
             let mut trace = Vec::new();
-            let mut store = DurableObjectStore::open(&root, cfg).unwrap();
+            let mut store = DurableCoordinator::open(&root, cfg).unwrap();
             let device_id = store
                 .create_device(CreateDeviceRequest {
                     spec: DeviceSpec {
@@ -18105,7 +18306,7 @@ mod tests {
                     }
                     _ => {
                         drop(store);
-                        store = DurableObjectStore::open(&root, cfg).unwrap();
+                        store = DurableCoordinator::open(&root, cfg).unwrap();
                         live_blocks = durable_blocks.clone();
                         live_file = durable_file.clone();
                         trace.push(format!("step={step} crash_reopen"));
@@ -18119,7 +18320,7 @@ mod tests {
             durable_blocks = live_blocks;
             durable_file = live_file;
             drop(store);
-            let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+            let reopened = DurableCoordinator::open(&root, cfg).unwrap();
             trace.push("final_reopen".to_string());
             assert_models(&reopened, ids, &durable_blocks, &durable_file, seed, &trace);
             let _ = fs::remove_dir_all(root);
@@ -18130,7 +18331,7 @@ mod tests {
     fn durable_provider_reopens_native_keyspace_and_writer_epochs() {
         let root = durable_temp_dir("native-restart");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let keyspace_id = store
             .create_keyspace(CreateKeyspaceRequest {
                 name: Some("ks".to_string()),
@@ -18150,7 +18351,7 @@ mod tests {
         let fresh = store.acquire_append_lease(keyspace_id, file_id).unwrap();
 
         drop(store);
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         assert!(
             reopened
                 .append_file(stale, b"stale", WriteDurability::Acknowledged)
@@ -18171,7 +18372,7 @@ mod tests {
         assert_eq!(bytes, b"durable");
 
         drop(reopened);
-        let reopened_again = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened_again = DurableCoordinator::open(&root, cfg).unwrap();
         let mut bytes_after_restart = vec![0; b"durable".len()];
         reopened_again
             .read_file(
@@ -18189,7 +18390,7 @@ mod tests {
     fn durable_provider_reopen_matrix_covers_block_and_native_commit_shapes() {
         let root = durable_temp_dir("durable-matrix");
         let cfg = tree_config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
 
         let device_id = store
             .create_device(CreateDeviceRequest {
@@ -18281,7 +18482,7 @@ mod tests {
             .unwrap();
 
         drop(store);
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         assert!(reopened.device_info(device_id).is_err());
 
         let mut forked_bytes = vec![0; 3 * 4096];
@@ -18369,7 +18570,7 @@ mod tests {
     fn durable_provider_persists_storage_node_custodian_deletions() {
         let root = durable_temp_dir("custodian-restart");
         let cfg = config();
-        let store = DurableObjectStore::open(&root, cfg).unwrap();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
         let device_id = store
             .create_device(CreateDeviceRequest {
                 spec: DeviceSpec {
@@ -18407,7 +18608,7 @@ mod tests {
         );
 
         drop(store);
-        let reopened = DurableObjectStore::open(&root, cfg).unwrap();
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
         assert!(
             !reopened
                 .segment_store()
@@ -18505,7 +18706,7 @@ mod tests {
 
     #[test]
     fn local_transports_preserve_request_identity_and_order() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store.clone()));
         let block_transport = InProcessBlockTransport::new(block_server.clone());
         let create = BlockRequestEnvelope::new(
@@ -18638,7 +18839,7 @@ mod tests {
 
     #[test]
     fn remote_block_transport_serializes_dedupes_and_rejects_stale_faults() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store));
         let endpoint = Arc::new(RemoteBlockEndpoint::new(
             block_server.clone(),
@@ -18751,7 +18952,7 @@ mod tests {
 
     #[test]
     fn remote_block_endpoint_enforces_backpressure() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store));
         let endpoint = Arc::new(RemoteBlockEndpoint::new(
             block_server,
@@ -18782,7 +18983,7 @@ mod tests {
 
     #[test]
     fn chaos_block_wire_transport_covers_drop_delay_duplicate_and_reorder() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store));
         let endpoint = Arc::new(RemoteBlockEndpoint::new(
             block_server.clone(),
@@ -18974,7 +19175,7 @@ mod tests {
 
     #[test]
     fn chaos_native_wire_transport_covers_drop_delay_duplicate_and_reorder() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let native_server = Arc::new(LocalNativeServer::new(store));
         let endpoint = Arc::new(RemoteNativeEndpoint::new(
             native_server.clone(),
@@ -19163,7 +19364,7 @@ mod tests {
 
     #[test]
     fn remote_native_transport_serializes_retries_and_preserves_file_semantics() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let native_server = Arc::new(LocalNativeServer::new(store));
         let endpoint = Arc::new(RemoteNativeEndpoint::new(
             native_server.clone(),
@@ -19398,7 +19599,7 @@ mod tests {
         .unwrap();
         let transport = NetworkBlockTransport::new(
             Arc::new(NetworkBlockEndpoint::new(
-                Arc::new(LocalBlockServer::new(LocalObjectStore::new())),
+                Arc::new(LocalBlockServer::new(LocalCoordinator::new())),
                 ServerIncarnation::from_raw(3),
                 8,
                 4,
@@ -19414,7 +19615,7 @@ mod tests {
 
     #[test]
     fn network_block_transport_loopback_retries_and_rejects_corrupt_frames() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store));
         let endpoint = Arc::new(NetworkBlockEndpoint::new(
             block_server.clone(),
@@ -19526,7 +19727,7 @@ mod tests {
 
     #[test]
     fn tcp_wire_server_accepts_split_client_frames() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store));
         let endpoint = Arc::new(NetworkBlockEndpoint::new(
             block_server,
@@ -19577,7 +19778,7 @@ mod tests {
 
     #[test]
     fn network_native_transport_loopback_preserves_file_semantics() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let native_server = Arc::new(LocalNativeServer::new(store));
         let endpoint = Arc::new(NetworkNativeEndpoint::new(
             native_server,
@@ -19616,7 +19817,7 @@ mod tests {
 
     #[test]
     fn network_endpoints_enforce_backpressure_and_deadlines() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store));
         let endpoint = Arc::new(NetworkBlockEndpoint::new(
             block_server,
@@ -19647,7 +19848,7 @@ mod tests {
         );
         tcp_server.shutdown().unwrap();
 
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = Arc::new(LocalBlockServer::new(store));
         let endpoint = Arc::new(NetworkBlockEndpoint::new(
             block_server,
@@ -19707,7 +19908,7 @@ mod tests {
             shard_count: 4,
             ..config()
         };
-        let store = LocalObjectStore::with_config(cfg).unwrap();
+        let store = LocalCoordinator::with_config(cfg).unwrap();
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let device_id = client
@@ -19745,7 +19946,7 @@ mod tests {
             shard_count: 1,
             ..config()
         };
-        let store = LocalObjectStore::with_config(cfg).unwrap();
+        let store = LocalCoordinator::with_config(cfg).unwrap();
         let head = store.metadata().create_device(device_request()).unwrap();
         let reservation = store
             .segment_catalog()
@@ -19762,7 +19963,7 @@ mod tests {
             .unwrap();
         store
             .segment_catalog()
-            .commit_segment(reservation.clone(), commit)
+            .commit_segment(reservation.clone(), commit.clone())
             .unwrap();
         store
             .segment_catalog()
@@ -19786,7 +19987,10 @@ mod tests {
         };
         store
             .metadata()
-            .persist_metadata_node(node.clone())
+            .persist_metadata_node(MetadataNodeWrite::new(
+                node.clone(),
+                vec![commit.descriptor],
+            ))
             .unwrap();
         store
             .metadata()
@@ -19814,7 +20018,7 @@ mod tests {
 
     #[test]
     fn local_native_file_client_creates_opens_and_reads_empty_file() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let file_id = client
@@ -19889,7 +20093,7 @@ mod tests {
         ];
 
         for case in cases {
-            let store = LocalObjectStore::with_config(LocalStoreConfig {
+            let store = LocalCoordinator::with_config(LocalStoreConfig {
                 shard_count: 2,
                 ..config()
             })
@@ -19917,7 +20121,7 @@ mod tests {
 
     #[test]
     fn cross_shard_write_publishes_one_commit_group_and_references_segments_after_sync() {
-        let store = LocalObjectStore::with_config(LocalStoreConfig {
+        let store = LocalCoordinator::with_config(LocalStoreConfig {
             shard_count: 2,
             ..config()
         })
@@ -19969,7 +20173,7 @@ mod tests {
     #[test]
     fn metadata_tree_shape_is_deterministic_for_a_write_trace() {
         fn run_trace() -> String {
-            let store = LocalObjectStore::with_config(LocalStoreConfig {
+            let store = LocalCoordinator::with_config(LocalStoreConfig {
                 shard_count: 1,
                 ..tree_config()
             })
@@ -19995,7 +20199,7 @@ mod tests {
 
     #[test]
     fn root_to_leaf_path_copy_changes_only_touched_nodes() {
-        let store = LocalObjectStore::with_config(LocalStoreConfig {
+        let store = LocalCoordinator::with_config(LocalStoreConfig {
             shard_count: 1,
             ..tree_config()
         })
@@ -20039,7 +20243,7 @@ mod tests {
     fn generated_block_tree_reads_match_reference_model() {
         for seed in 0..16 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
-            let store = LocalObjectStore::with_config(LocalStoreConfig {
+            let store = LocalCoordinator::with_config(LocalStoreConfig {
                 shard_count: 2,
                 ..tree_config()
             })
@@ -20080,7 +20284,7 @@ mod tests {
     fn generated_native_tree_reads_match_reference_model() {
         for seed in 0..16 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
-            let store = LocalObjectStore::with_config(tree_config()).unwrap();
+            let store = LocalCoordinator::with_config(tree_config()).unwrap();
             let client = create_native_client(&store);
             let keyspace_id = create_local_keyspace(&client);
             let (file_id, file) = create_local_file(&client, keyspace_id);
@@ -20140,7 +20344,7 @@ mod tests {
 
     #[test]
     fn fork_copies_roots_without_allocating_metadata_and_records_catalog() {
-        let store = LocalObjectStore::with_config(LocalStoreConfig {
+        let store = LocalCoordinator::with_config(LocalStoreConfig {
             shard_count: 2,
             ..tree_config()
         })
@@ -20188,7 +20392,7 @@ mod tests {
 
     #[test]
     fn forked_devices_initially_match_and_then_diverge() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let parent_id = client
@@ -20232,7 +20436,7 @@ mod tests {
     fn generated_repeated_forks_and_divergent_writes_match_reference_model() {
         for seed in 0..12 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
-            let store = LocalObjectStore::with_config(LocalStoreConfig {
+            let store = LocalCoordinator::with_config(LocalStoreConfig {
                 shard_count: 2,
                 ..tree_config()
             })
@@ -20307,7 +20511,7 @@ mod tests {
 
     #[test]
     fn pitr_replays_roots_and_restores_to_commit_checkpoint_and_time() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let device_id = client
@@ -20399,7 +20603,7 @@ mod tests {
 
     #[test]
     fn pitr_gc_releases_history_older_than_commit_window() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let device_id = client
@@ -20492,7 +20696,7 @@ mod tests {
 
     #[test]
     fn checkpoint_validation_detects_mismatched_roots() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 8);
         let initial_roots = store
             .metadata()
@@ -20515,7 +20719,7 @@ mod tests {
 
     #[test]
     fn pitr_restore_interacts_with_forks_without_mutating_sources() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let parent_id = client
@@ -20563,7 +20767,7 @@ mod tests {
     fn generated_pitr_restores_match_historical_model() {
         for seed in 0..12 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
-            let store = LocalObjectStore::with_config(LocalStoreConfig {
+            let store = LocalCoordinator::with_config(LocalStoreConfig {
                 shard_count: 2,
                 ..tree_config()
             })
@@ -20623,7 +20827,7 @@ mod tests {
 
     #[test]
     fn discard_removes_mapping_and_write_zeroes_reads_as_zeroes() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let device = create_local_device(&store, 8);
         device.write_at(0, &repeated_blocks(8, 8)).unwrap();
         device.discard(2 * 4096, 2 * 4096).unwrap();
@@ -20643,7 +20847,7 @@ mod tests {
 
     #[test]
     fn failed_publish_after_durable_segment_write_leaves_old_roots_and_orphan() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let head = store.metadata().create_device(device_request()).unwrap();
         let reservation = store
             .write_segment_for_owner(
@@ -20671,7 +20875,16 @@ mod tests {
             .unwrap();
         store
             .metadata()
-            .persist_metadata_node(node.clone())
+            .persist_metadata_node(MetadataNodeWrite::new(
+                node.clone(),
+                vec![
+                    store
+                        .storage_nodes
+                        .commit_for_segment(reservation.segment_id)
+                        .unwrap()
+                        .descriptor,
+                ],
+            ))
             .unwrap();
 
         let failed = store.metadata().publish_commit_group(CommitGroupIntent {
@@ -20701,8 +20914,41 @@ mod tests {
     }
 
     #[test]
+    fn block_write_publish_failure_does_not_mark_storage_receipt_referenced() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let head = store.metadata().create_device(device_request()).unwrap();
+        let original = store.metadata().get_head(head.device_id).unwrap();
+        store
+            .metadata()
+            .set_next_commit_seq_for_test(u64::MAX)
+            .unwrap();
+
+        let failed = store.write_device(
+            head.device_id,
+            0,
+            &repeated_blocks(1, 11),
+            WriteDurability::Acknowledged,
+        );
+
+        assert!(failed.is_err());
+        assert_eq!(store.metadata().get_head(head.device_id).unwrap(), original);
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+        let mut buf = vec![1; 4096];
+        store
+            .read_device(head.device_id, ByteRange::new(0, 4096), &mut buf)
+            .unwrap();
+        assert_eq!(buf, vec![0; 4096]);
+    }
+
+    #[test]
     fn native_append_valid_stale_and_stolen_leases_are_deterministic() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (file_id, file) = create_local_file(&client, keyspace_id);
@@ -20750,7 +20996,7 @@ mod tests {
 
     #[test]
     fn native_append_publish_failure_leaves_file_version_and_orphan_unchanged() {
-        let store = LocalObjectStore::with_config(LocalStoreConfig {
+        let store = LocalCoordinator::with_config(LocalStoreConfig {
             file_root_blocks: 1,
             ..config()
         })
@@ -20774,8 +21020,40 @@ mod tests {
     }
 
     #[test]
+    fn native_write_publish_failure_does_not_mark_storage_receipt_referenced() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, file) = create_local_file(&client, keyspace_id);
+        let original = file.info().unwrap();
+        store
+            .metadata()
+            .set_next_commit_seq_for_test(u64::MAX)
+            .unwrap();
+
+        let failed = file.write_at(0, &repeated_blocks(1, 13));
+
+        assert!(failed.is_err());
+        assert_eq!(file.info().unwrap(), original);
+        assert_eq!(
+            store
+                .segment_catalog()
+                .state(SegmentId::from_raw(1))
+                .unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+        let mut buf = vec![1; 4096];
+        assert!(
+            store
+                .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut buf)
+                .is_err()
+        );
+        assert_eq!(buf, vec![1; 4096]);
+    }
+
+    #[test]
     fn native_file_accepts_unaligned_appends_and_reads() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (_file_id, file) = create_local_file(&client, keyspace_id);
@@ -20819,7 +21097,7 @@ mod tests {
 
     #[test]
     fn native_file_write_at_is_first_class_and_snapshot_isolated() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (file_id, file) = create_local_file(&client, keyspace_id);
@@ -20860,7 +21138,7 @@ mod tests {
 
     #[test]
     fn native_file_write_at_preserves_unmodified_bytes_and_rejects_sparse_gaps() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (_file_id, file) = create_local_file(&client, keyspace_id);
@@ -20915,7 +21193,7 @@ mod tests {
 
     #[test]
     fn native_keyspace_catalog_publish_copies_only_one_catalog_shard() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let mut file_ids = Vec::new();
@@ -21016,7 +21294,7 @@ mod tests {
 
     #[test]
     fn native_keyspace_snapshot_and_restore_are_filesystem_level() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let file_a_id = client
@@ -21242,7 +21520,7 @@ mod tests {
 
     #[test]
     fn native_keyspace_checkpoint_validation_rejects_mismatched_root() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (_file_id, file) = create_local_file(&client, keyspace_id);
@@ -21261,7 +21539,7 @@ mod tests {
 
     #[test]
     fn native_keyspace_checkpoint_restore_uses_checkpoint_root_without_timeline_replay() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (file_id, file) = create_local_file(&client, keyspace_id);
@@ -21304,7 +21582,7 @@ mod tests {
 
     #[test]
     fn native_keyspace_pitr_gc_respects_commit_window() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (file_id, file) = create_local_file(&client, keyspace_id);
@@ -21392,7 +21670,7 @@ mod tests {
     fn generated_native_keyspace_restores_match_historical_model() {
         for seed in 0..8 {
             let mut harness = crate::sim::DeterministicHarness::new(seed);
-            let store = LocalObjectStore::with_config(tree_config()).unwrap();
+            let store = LocalCoordinator::with_config(tree_config()).unwrap();
             let client = create_native_client(&store);
             let keyspace_id = create_local_keyspace(&client);
             let (file_a, handle_a) = create_local_file(&client, keyspace_id);
@@ -21495,7 +21773,7 @@ mod tests {
                 shard_count: 4,
                 ..config()
             };
-            let store = LocalObjectStore::with_config(cfg).unwrap();
+            let store = LocalCoordinator::with_config(cfg).unwrap();
             let server = Arc::new(LocalBlockServer::new(store.clone()));
             let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
             let device_id = client
@@ -21529,7 +21807,7 @@ mod tests {
 
     #[test]
     fn block_and_native_services_share_segment_lifecycle_machinery() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let block_server = LocalBlockServer::new(store.clone());
         let native_server = LocalNativeServer::new(store.clone());
         let reservation = store
@@ -21567,12 +21845,12 @@ mod tests {
         SegmentLifecycleState,
         Vec<MetadataNodeId>,
     ) {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let head = store.metadata().create_device(device_request()).unwrap();
         let new_node = metadata_leaf(2000, 0, 8);
         store
             .metadata()
-            .persist_metadata_node(new_node.clone())
+            .persist_metadata_node(MetadataNodeWrite::new(new_node.clone(), Vec::new()))
             .unwrap();
         let commit_group = store
             .metadata()
@@ -21628,7 +21906,7 @@ mod tests {
 
     #[test]
     fn unsupported_local_service_operations_preserve_no_partial_state() {
-        let store = LocalObjectStore::with_config(config()).unwrap();
+        let store = LocalCoordinator::with_config(config()).unwrap();
         let server = LocalBlockServer::new(store.clone());
         let response = server.handle(BlockRequestEnvelope::new(
             RequestId::from_raw(10),
@@ -21675,7 +21953,7 @@ mod tests {
             StorageNodeId::from_raw(78),
             StorageNodeId::from_raw(79),
         ];
-        let store = LocalObjectStore::with_storage_nodes(cfg, node_ids.clone()).unwrap();
+        let store = LocalCoordinator::with_storage_nodes(cfg, node_ids.clone()).unwrap();
         assert_eq!(store.storage_node_ids_for_test(), node_ids);
 
         let device = store.metadata().create_device(device_request()).unwrap();
@@ -21749,9 +22027,56 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_transport_write_receipt_stays_pending_until_reference_message() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let intent = SegmentReservationIntent {
+            write_intent: WriteIntentId::from_raw(88),
+            owner: MappingOwner::BlockDevice(DeviceId::from_raw(99)),
+            bytes: 4096,
+        };
+
+        let response = registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::WriteSegment {
+                segment_id,
+                intent,
+                bytes: repeated_blocks(1, 12),
+            })
+            .unwrap();
+        let StorageNodeResponse::WriteSegment {
+            reservation,
+            commit,
+        } = response
+        else {
+            panic!("expected write-segment receipt");
+        };
+
+        assert_eq!(reservation.segment_id, segment_id);
+        assert_eq!(commit.placement.storage_node, cfg.storage_node);
+        assert_eq!(
+            registry.state(segment_id).unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+
+        let response = registry
+            .transport_for_segment(segment_id)
+            .unwrap()
+            .send(StorageNodeRequest::MarkReferenced { segment_id })
+            .unwrap();
+        assert_eq!(response, StorageNodeResponse::MarkReferenced);
+        assert_eq!(
+            registry.state(segment_id).unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+    }
+
+    #[test]
     fn local_multi_node_custodian_reclaims_released_segments_on_owning_node_only() {
         let cfg = config();
-        let store = LocalObjectStore::with_storage_nodes(
+        let store = LocalCoordinator::with_storage_nodes(
             cfg,
             vec![
                 cfg.storage_node,
@@ -21820,7 +22145,7 @@ mod tests {
     #[test]
     fn local_multi_node_registry_rejects_duplicate_segment_ownership() {
         let cfg = config();
-        let store = LocalObjectStore::with_storage_nodes(
+        let store = LocalCoordinator::with_storage_nodes(
             cfg,
             vec![cfg.storage_node, StorageNodeId::from_raw(78)],
         )
@@ -21868,7 +22193,7 @@ mod tests {
         assert!(node.validate(&[commit.descriptor]).is_ok());
     }
 
-    fn create_local_device(store: &LocalObjectStore, logical_blocks: u64) -> LocalBlockDevice {
+    fn create_local_device(store: &LocalCoordinator, logical_blocks: u64) -> LocalBlockDevice {
         let server = Arc::new(LocalBlockServer::new(store.clone()));
         let client = LocalBlockClient::new(InProcessBlockTransport::new(server));
         let device_id = client
@@ -21883,7 +22208,7 @@ mod tests {
         client.open_device(device_id).unwrap()
     }
 
-    fn create_native_client(store: &LocalObjectStore) -> LocalNativeClient {
+    fn create_native_client(store: &LocalCoordinator) -> LocalNativeClient {
         let server = Arc::new(LocalNativeServer::new(store.clone()));
         LocalNativeClient::new(InProcessNativeTransport::new(server))
     }
@@ -21914,7 +22239,7 @@ mod tests {
         vec![byte; blocks as usize * 4096]
     }
 
-    fn first_device_segment(store: &DurableObjectStore, device_id: DeviceId) -> SegmentId {
+    fn first_device_segment(store: &DurableCoordinator, device_id: DeviceId) -> SegmentId {
         device_segment_ids(&store.metadata(), device_id)
             .into_iter()
             .next()
@@ -22011,7 +22336,7 @@ mod tests {
     }
 
     fn segment_storage_nodes(
-        store: &LocalObjectStore,
+        store: &LocalCoordinator,
         segment_ids: &[SegmentId],
     ) -> BTreeSet<StorageNodeId> {
         segment_ids
@@ -22072,14 +22397,14 @@ mod tests {
         model[offset..end].copy_from_slice(payload);
     }
 
-    fn validate_device_roots(store: &LocalObjectStore, device_id: DeviceId) {
+    fn validate_device_roots(store: &LocalCoordinator, device_id: DeviceId) {
         let head = store.metadata().get_head(device_id).unwrap();
         for root in head.shard_roots {
             store.validate_metadata_tree(root).unwrap();
         }
     }
 
-    fn render_device_roots(store: &LocalObjectStore, device_id: DeviceId) -> String {
+    fn render_device_roots(store: &LocalCoordinator, device_id: DeviceId) -> String {
         let head = store.metadata().get_head(device_id).unwrap();
         let mut out = String::new();
         for (shard, root) in head.shard_roots.iter().enumerate() {
