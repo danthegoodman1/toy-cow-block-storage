@@ -33,9 +33,10 @@ use crate::extent::{
 };
 use crate::id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitGroupId, CommitSeq,
-    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId,
-    KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, MetadataNodeId,
-    RequestId, SegmentId, ServerIncarnation, StorageNodeId, WriteIntentId, WriterEpoch,
+    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, GrantEpoch, GrantId, GrantNonce,
+    KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline,
+    LogicalTime, MetadataNodeId, PrincipalId, RequestId, SegmentId, ServerIncarnation, ShardId,
+    StorageNodeId, StorageNodeKeyId, TenantId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
@@ -44,15 +45,25 @@ use crate::object::{
     SegmentDescriptor, ShardCommit, ShardRootUpdate,
 };
 use crate::provider::{
-    CommitGroupIntent, LocalSegmentCatalog, MetadataCreateDeviceRequest, MetadataCreateFileRequest,
-    MetadataCreateKeyspaceRequest, MetadataFence, MetadataForkRequest, MetadataNodeWrite,
-    MetadataPlane, MetadataSnapshotKeyspaceRequest, PlacementPolicy, RetentionPolicy,
-    SegmentReplicaCommit, SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent,
-    SegmentStore, StorageNodeCustodianReport, StorageNodeDirectory, StorageNodeRequest,
-    StorageNodeResponse, StorageNodeTransport,
+    CommitGroupIntent, GrantReceiptAuthority, LocalSegmentCatalog, MetadataCreateDeviceRequest,
+    MetadataCreateFileRequest, MetadataCreateKeyspaceRequest, MetadataFence, MetadataForkRequest,
+    MetadataNodeWrite, MetadataPlane, MetadataSnapshotKeyspaceRequest, PlacementPolicy,
+    ProofScheme, ReferenceEvidence, RetentionPolicy, SegmentReceiptLifecycle, SegmentReplicaCommit,
+    SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent, SegmentStore,
+    SegmentWriteReceipt, StorageNodeCustodianReport, StorageNodeDirectory,
+    StorageNodeMaintenanceObservation, StorageNodeMaintenanceReport, StorageNodeRequest,
+    StorageNodeResponse, StorageNodeTransport, VerifiedSegmentReceipt, WriteGrant,
+    WriteGrantIntent, WriteGrantRequest, deterministic_test_grant_hash_and_proof,
+    deterministic_test_proof_for_grant, deterministic_test_proof_for_receipt,
+    deterministic_test_proof_for_reference,
 };
 
 const KEYSPACE_CATALOG_SHARD_COUNT: usize = 256;
+const LOCAL_TENANT_ID: TenantId = TenantId::from_raw(1);
+const LOCAL_PRINCIPAL_ID: PrincipalId = PrincipalId::from_raw(1);
+const LOCAL_GRANT_EPOCH: GrantEpoch = GrantEpoch::from_raw(1);
+const LOCAL_GRANT_EXPIRATION: LogicalDeadline = LogicalDeadline::from_raw(u64::MAX);
+const LOCAL_STORAGE_NODE_INCARNATION: ServerIncarnation = ServerIncarnation::from_raw(1);
 
 /// Local provider configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -141,15 +152,419 @@ fn normalize_storage_nodes(
     out
 }
 
+#[derive(Debug, Clone, Default)]
+struct LocalGrantReceiptAuthority;
+
+impl LocalGrantReceiptAuthority {
+    fn node_key_id(storage_node: StorageNodeId) -> StorageNodeKeyId {
+        StorageNodeKeyId::from_raw(storage_node.raw())
+    }
+
+    fn grant_id(segment_id: SegmentId) -> GrantId {
+        GrantId::from_raw(segment_id.raw())
+    }
+
+    fn nonce(segment_id: SegmentId, write_intent: WriteIntentId) -> GrantNonce {
+        GrantNonce::from_raw(segment_id.raw() ^ write_intent.raw().rotate_left(17))
+    }
+
+    fn verify_expected_proof(
+        expected: crate::provider::ProofTag,
+        proof: crate::provider::ProofTag,
+    ) -> Result<()> {
+        if proof != expected {
+            return Err(StorageError::conflict("proof verification failed"));
+        }
+        Ok(())
+    }
+
+    fn verify_grant_proof_and_hash(grant: &WriteGrant) -> Result<crate::provider::GrantHash> {
+        let (hash, expected_proof) = deterministic_test_grant_hash_and_proof(grant.key_id, grant);
+        Self::verify_expected_proof(expected_proof, grant.proof)?;
+        Ok(hash)
+    }
+
+    fn verify_receipt_proof(receipt: &SegmentWriteReceipt) -> Result<()> {
+        Self::verify_expected_proof(
+            deterministic_test_proof_for_receipt(receipt.node_key_id, receipt),
+            receipt.proof,
+        )
+    }
+
+    fn verify_reference_proof(evidence: &ReferenceEvidence) -> Result<()> {
+        Self::verify_expected_proof(
+            deterministic_test_proof_for_reference(evidence.node_key_id, evidence),
+            evidence.proof,
+        )
+    }
+
+    fn verify_not_expired(expires_at: LogicalDeadline) -> Result<()> {
+        if expires_at.raw() < LOCAL_GRANT_EPOCH.raw() {
+            return Err(StorageError::unavailable("write grant expired"));
+        }
+        Ok(())
+    }
+
+    fn verify_receipt_matches_grant(
+        &self,
+        grant: &WriteGrant,
+        receipt: &SegmentWriteReceipt,
+    ) -> Result<VerifiedSegmentReceipt> {
+        let grant_hash = self.verify_write_grant_and_hash(
+            grant,
+            receipt.storage_node,
+            receipt.segment_id,
+            receipt.bytes,
+        )?;
+        let verified = self.verify_segment_receipt(receipt)?;
+        if receipt.grant_id != grant.grant_id
+            || receipt.grant_hash != grant_hash
+            || receipt.tenant != grant.tenant
+            || receipt.principal != grant.principal
+            || receipt.owner != grant.owner
+            || receipt.intent != grant.intent
+            || receipt.write_intent != grant.write_intent
+            || receipt.segment_id != grant.segment_id
+            || receipt.storage_node != grant.storage_node
+            || receipt.bytes != grant.max_bytes
+            || receipt.durability != grant.durability
+            || receipt.receipt_epoch != grant.grant_epoch
+            || receipt.expires_at != grant.expires_at
+            || receipt.node_key_id != grant.key_id
+        {
+            return Err(StorageError::conflict(
+                "segment receipt does not match write grant",
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn create_segment_receipt_after_verified_write(
+        &self,
+        grant: &WriteGrant,
+        grant_hash: crate::provider::GrantHash,
+        commit: SegmentReplicaCommit,
+        storage_node_incarnation: ServerIncarnation,
+    ) -> Result<SegmentWriteReceipt> {
+        if commit.descriptor.segment_id != grant.segment_id
+            || commit.placement.segment_id != grant.segment_id
+        {
+            return Err(StorageError::conflict(
+                "receipt commit does not match granted segment",
+            ));
+        }
+        if commit.descriptor.bytes != grant.max_bytes || commit.placement.bytes != grant.max_bytes {
+            return Err(StorageError::conflict(
+                "receipt byte count does not match granted byte count",
+            ));
+        }
+        let mut receipt = SegmentWriteReceipt {
+            tenant: grant.tenant,
+            grant_id: grant.grant_id,
+            grant_hash,
+            principal: grant.principal,
+            owner: grant.owner,
+            storage_node: grant.storage_node,
+            storage_node_incarnation,
+            segment_id: grant.segment_id,
+            write_intent: grant.write_intent,
+            intent: grant.intent,
+            bytes: grant.max_bytes,
+            checksum: commit.descriptor.checksum,
+            durability: grant.durability,
+            lifecycle: SegmentReceiptLifecycle::DurablePendingMetadata,
+            receipt_epoch: grant.grant_epoch,
+            expires_at: grant.expires_at,
+            node_key_id: Self::node_key_id(grant.storage_node),
+            proof_scheme: ProofScheme::DeterministicTestMacV1,
+            proof: crate::provider::ProofTag::ZERO,
+            descriptor: commit.descriptor,
+            placement: commit.placement,
+        };
+        receipt.proof = deterministic_test_proof_for_receipt(receipt.node_key_id, &receipt);
+        Ok(receipt)
+    }
+
+    fn verify_write_grant_and_hash(
+        &self,
+        grant: &WriteGrant,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        bytes: u64,
+    ) -> Result<crate::provider::GrantHash> {
+        Self::verify_not_expired(grant.expires_at)?;
+        if grant.grant_epoch != LOCAL_GRANT_EPOCH {
+            return Err(StorageError::conflict(
+                "write grant epoch does not match verifier epoch",
+            ));
+        }
+        if grant.owner != grant.intent.owner() {
+            return Err(StorageError::conflict(
+                "write grant owner does not match intent",
+            ));
+        }
+        if grant.max_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "write grant must authorize at least one byte",
+            ));
+        }
+        if grant.proof_scheme != ProofScheme::DeterministicTestMacV1 {
+            return Err(StorageError::unsupported(
+                "local grant verifier supports only deterministic test proofs",
+            ));
+        }
+        if grant.key_id != Self::node_key_id(grant.storage_node) {
+            return Err(StorageError::conflict(
+                "grant key does not match storage node",
+            ));
+        }
+        let grant_hash = Self::verify_grant_proof_and_hash(grant)?;
+        if grant.storage_node != storage_node {
+            return Err(StorageError::conflict(
+                "write grant storage node does not match request",
+            ));
+        }
+        if grant.segment_id != segment_id {
+            return Err(StorageError::conflict(
+                "write grant segment ID does not match request",
+            ));
+        }
+        if bytes != grant.max_bytes {
+            return Err(StorageError::invalid_argument(
+                "write grant byte count does not match granted segment length",
+            ));
+        }
+        Ok(grant_hash)
+    }
+}
+
+impl GrantReceiptAuthority for LocalGrantReceiptAuthority {
+    fn issue_write_grant(&self, request: WriteGrantRequest) -> Result<WriteGrant> {
+        if request.max_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "write grant must authorize at least one byte",
+            ));
+        }
+        Self::verify_not_expired(request.expires_at)?;
+        let owner = request.intent.owner();
+        let key_id = Self::node_key_id(request.storage_node);
+        let mut grant = WriteGrant {
+            tenant: request.tenant,
+            principal: request.principal,
+            grant_id: Self::grant_id(request.segment_id),
+            nonce: Self::nonce(request.segment_id, request.write_intent),
+            grant_epoch: LOCAL_GRANT_EPOCH,
+            expires_at: request.expires_at,
+            owner,
+            intent: request.intent,
+            write_intent: request.write_intent,
+            segment_id: request.segment_id,
+            storage_node: request.storage_node,
+            max_bytes: request.max_bytes,
+            durability: request.durability,
+            key_id,
+            proof_scheme: ProofScheme::DeterministicTestMacV1,
+            proof: crate::provider::ProofTag::ZERO,
+        };
+        grant.proof = deterministic_test_proof_for_grant(key_id, &grant);
+        Ok(grant)
+    }
+
+    fn verify_write_grant(
+        &self,
+        grant: &WriteGrant,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        bytes: u64,
+    ) -> Result<()> {
+        self.verify_write_grant_and_hash(grant, storage_node, segment_id, bytes)
+            .map(|_| ())
+    }
+
+    fn create_segment_receipt(
+        &self,
+        grant: &WriteGrant,
+        commit: SegmentReplicaCommit,
+        storage_node_incarnation: ServerIncarnation,
+    ) -> Result<SegmentWriteReceipt> {
+        let grant_hash = self.verify_write_grant_and_hash(
+            grant,
+            commit.placement.storage_node,
+            commit.descriptor.segment_id,
+            commit.descriptor.bytes,
+        )?;
+        self.create_segment_receipt_after_verified_write(
+            grant,
+            grant_hash,
+            commit,
+            storage_node_incarnation,
+        )
+    }
+
+    fn verify_segment_receipt(
+        &self,
+        receipt: &SegmentWriteReceipt,
+    ) -> Result<VerifiedSegmentReceipt> {
+        Self::verify_not_expired(receipt.expires_at)?;
+        if receipt.receipt_epoch != LOCAL_GRANT_EPOCH {
+            return Err(StorageError::conflict(
+                "receipt epoch does not match verifier epoch",
+            ));
+        }
+        if receipt.owner != receipt.intent.owner() {
+            return Err(StorageError::conflict(
+                "receipt owner does not match intent",
+            ));
+        }
+        if receipt.bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "receipt must describe at least one byte",
+            ));
+        }
+        if receipt.proof_scheme != ProofScheme::DeterministicTestMacV1 {
+            return Err(StorageError::unsupported(
+                "local receipt verifier supports only deterministic test proofs",
+            ));
+        }
+        if receipt.node_key_id != Self::node_key_id(receipt.storage_node) {
+            return Err(StorageError::conflict(
+                "receipt key does not match storage node",
+            ));
+        }
+        Self::verify_receipt_proof(receipt)?;
+        if receipt.lifecycle != SegmentReceiptLifecycle::DurablePendingMetadata {
+            return Err(StorageError::conflict(
+                "receipt is not durable-pending-metadata",
+            ));
+        }
+        if receipt.segment_id != receipt.descriptor.segment_id
+            || receipt.segment_id != receipt.placement.segment_id
+        {
+            return Err(StorageError::conflict(
+                "receipt segment IDs do not match descriptor and placement",
+            ));
+        }
+        if receipt.storage_node != receipt.placement.storage_node {
+            return Err(StorageError::conflict(
+                "receipt storage node does not match placement",
+            ));
+        }
+        if receipt.bytes != receipt.descriptor.bytes || receipt.bytes != receipt.placement.bytes {
+            return Err(StorageError::conflict(
+                "receipt byte count does not match descriptor and placement",
+            ));
+        }
+        if receipt.checksum != receipt.descriptor.checksum {
+            return Err(StorageError::conflict(
+                "receipt checksum does not match descriptor",
+            ));
+        }
+        Ok(VerifiedSegmentReceipt {
+            receipt: receipt.clone(),
+            descriptor: receipt.descriptor.clone(),
+        })
+    }
+
+    fn create_reference_evidence(
+        &self,
+        receipt: &SegmentWriteReceipt,
+        metadata_commit: CommitSeq,
+    ) -> Result<ReferenceEvidence> {
+        self.verify_segment_receipt(receipt)?;
+        let mut evidence = ReferenceEvidence {
+            tenant: receipt.tenant,
+            principal: receipt.principal,
+            owner: receipt.owner,
+            grant_id: receipt.grant_id,
+            segment_id: receipt.segment_id,
+            storage_node: receipt.storage_node,
+            metadata_commit,
+            receipt_epoch: receipt.receipt_epoch,
+            node_key_id: receipt.node_key_id,
+            proof_scheme: ProofScheme::DeterministicTestMacV1,
+            proof: crate::provider::ProofTag::ZERO,
+        };
+        evidence.proof = deterministic_test_proof_for_reference(evidence.node_key_id, &evidence);
+        Ok(evidence)
+    }
+
+    fn verify_reference_evidence(
+        &self,
+        evidence: &ReferenceEvidence,
+        segment_id: SegmentId,
+        storage_node: StorageNodeId,
+    ) -> Result<()> {
+        if evidence.proof_scheme != ProofScheme::DeterministicTestMacV1 {
+            return Err(StorageError::unsupported(
+                "local reference verifier supports only deterministic test proofs",
+            ));
+        }
+        if evidence.segment_id != segment_id {
+            return Err(StorageError::conflict(
+                "reference evidence segment ID does not match request",
+            ));
+        }
+        if evidence.storage_node != storage_node {
+            return Err(StorageError::conflict(
+                "reference evidence storage node does not match request",
+            ));
+        }
+        if evidence.node_key_id != Self::node_key_id(storage_node) {
+            return Err(StorageError::conflict(
+                "reference evidence key does not match storage node",
+            ));
+        }
+        Self::verify_reference_proof(evidence)
+    }
+}
+
 /// In-process storage-node role.
 #[derive(Debug, Clone)]
 struct LocalStorageNode {
     storage_node: StorageNodeId,
     segment_store: Arc<InMemorySegmentStore>,
     segment_catalog: Arc<InMemoryLocalSegmentCatalog>,
+    authority: Arc<LocalGrantReceiptAuthority>,
 }
 
 impl LocalStorageNode {
+    fn observe_maintenance(&self) -> Result<StorageNodeMaintenanceObservation> {
+        let counts = self.segment_catalog.lifecycle_counts()?;
+        Ok(StorageNodeMaintenanceObservation {
+            storage_node: self.storage_node,
+            reserved_segments: counts.reserved,
+            writing_segments: counts.writing,
+            durable_pending_segments: counts.durable_pending,
+            referenced_segments: counts.referenced,
+            released_segments: counts.released,
+            freed_segments: counts.freed,
+        })
+    }
+
+    fn run_maintenance_tick(&self) -> Result<StorageNodeMaintenanceReport> {
+        let mut deleted_released_segments = Vec::new();
+        let mut skipped_segments = Vec::new();
+        for (segment_id, state, _) in self.segment_catalog.entries()? {
+            if state == SegmentLifecycleState::Released {
+                self.segment_catalog.delete_segment(segment_id)?;
+                self.segment_store.delete_segment(segment_id)?;
+                deleted_released_segments.push(segment_id);
+            } else if matches!(
+                state,
+                SegmentLifecycleState::Reserved
+                    | SegmentLifecycleState::Writing
+                    | SegmentLifecycleState::DurablePendingMetadata
+            ) {
+                skipped_segments.push(segment_id);
+            }
+        }
+        Ok(StorageNodeMaintenanceReport {
+            storage_node: self.storage_node,
+            deleted_released_segments,
+            skipped_segments,
+        })
+    }
+
     fn run_custodian(
         &self,
         expired_write_intents: &BTreeSet<WriteIntentId>,
@@ -202,24 +617,68 @@ impl StorageNodeTransport for LocalStorageNode {
 
     fn send(&self, request: StorageNodeRequest) -> Result<StorageNodeResponse> {
         match request {
-            StorageNodeRequest::WriteSegment {
-                segment_id,
-                intent,
-                bytes,
-            } => {
+            StorageNodeRequest::WriteSegment { grant, bytes } => {
+                let bytes_len = u64::try_from(bytes.len()).map_err(|_| {
+                    StorageError::invalid_argument("segment write length overflows u64")
+                })?;
+                let grant_hash = self.authority.verify_write_grant_and_hash(
+                    &grant,
+                    self.storage_node,
+                    grant.segment_id,
+                    bytes_len,
+                )?;
+                if self.segment_catalog.contains_segment(grant.segment_id)? {
+                    let receipt = self.segment_catalog.receipt_for_segment(grant.segment_id)?;
+                    self.authority.verify_segment_receipt(&receipt)?;
+                    if receipt.grant_id == grant.grant_id
+                        && receipt.grant_hash == grant_hash
+                        && receipt.bytes == bytes_len
+                        && receipt.checksum == Some(checksum64(&bytes))
+                    {
+                        let existing_len = usize::try_from(bytes_len).map_err(|_| {
+                            StorageError::invalid_argument(
+                                "duplicate segment length overflows usize",
+                            )
+                        })?;
+                        let mut existing = vec![0; existing_len];
+                        self.segment_store.read_segment(
+                            grant.segment_id,
+                            ByteRange::new(0, bytes_len),
+                            &mut existing,
+                        )?;
+                        if existing == bytes {
+                            return Ok(StorageNodeResponse::WriteSegment {
+                                receipt: Box::new(receipt),
+                            });
+                        }
+                    }
+                    return Err(StorageError::conflict(
+                        "duplicate segment write conflicts with existing receipt",
+                    ));
+                }
+                let intent = SegmentReservationIntent {
+                    write_intent: grant.write_intent,
+                    owner: grant.owner,
+                    bytes: grant.max_bytes,
+                };
                 let reservation = self
                     .segment_catalog
-                    .reserve_segment_with_id(segment_id, intent)?;
+                    .reserve_segment_with_id(grant.segment_id, intent)?;
                 self.segment_catalog.begin_write(&reservation)?;
                 let commit = self
                     .segment_store
                     .write_segment_owned(&reservation, bytes)?;
                 self.segment_store.sync_segment(reservation.segment_id)?;
-                self.segment_catalog
-                    .commit_segment(reservation.clone(), commit.clone())?;
-                Ok(StorageNodeResponse::WriteSegment {
-                    reservation,
+                let receipt = self.authority.create_segment_receipt_after_verified_write(
+                    &grant,
+                    grant_hash,
                     commit,
+                    LOCAL_STORAGE_NODE_INCARNATION,
+                )?;
+                self.segment_catalog
+                    .commit_segment(reservation, receipt.clone())?;
+                Ok(StorageNodeResponse::WriteSegment {
+                    receipt: Box::new(receipt),
                 })
             }
             StorageNodeRequest::ReadSegment { segment_id, range } => {
@@ -231,7 +690,13 @@ impl StorageNodeTransport for LocalStorageNode {
                     .read_segment(segment_id, range, &mut bytes)?;
                 Ok(StorageNodeResponse::ReadSegment { bytes })
             }
-            StorageNodeRequest::MarkReferenced { segment_id } => {
+            StorageNodeRequest::MarkReferenced { evidence } => {
+                let segment_id = evidence.segment_id;
+                self.authority.verify_reference_evidence(
+                    &evidence,
+                    segment_id,
+                    self.storage_node,
+                )?;
                 self.segment_catalog.mark_segment_referenced(segment_id)?;
                 Ok(StorageNodeResponse::MarkReferenced)
             }
@@ -244,8 +709,12 @@ impl StorageNodeTransport for LocalStorageNode {
             } => Ok(StorageNodeResponse::Custodian(
                 self.run_custodian(&expired_write_intents)?,
             )),
-            StorageNodeRequest::ObserveMaintenance => Ok(StorageNodeResponse::MaintenanceObserved),
-            StorageNodeRequest::RunMaintenanceTick => Ok(StorageNodeResponse::MaintenanceTicked),
+            StorageNodeRequest::ObserveMaintenance => Ok(StorageNodeResponse::MaintenanceObserved(
+                self.observe_maintenance()?,
+            )),
+            StorageNodeRequest::RunMaintenanceTick => Ok(StorageNodeResponse::MaintenanceTicked(
+                self.run_maintenance_tick()?,
+            )),
         }
     }
 }
@@ -264,6 +733,7 @@ impl StorageNodeRegistry {
         config.validate()?;
         let node_order = normalize_storage_nodes(config.storage_node, storage_nodes);
         let mut nodes = BTreeMap::new();
+        let authority = Arc::new(LocalGrantReceiptAuthority);
         for node_id in &node_order {
             let node_config = config.for_storage_node(*node_id);
             nodes.insert(
@@ -272,6 +742,7 @@ impl StorageNodeRegistry {
                     storage_node: *node_id,
                     segment_store: Arc::new(InMemorySegmentStore::new(node_config)?),
                     segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::new(node_config)?),
+                    authority: Arc::clone(&authority),
                 },
             );
         }
@@ -311,6 +782,7 @@ impl StorageNodeRegistry {
         }
 
         let mut nodes = BTreeMap::new();
+        let authority = Arc::new(LocalGrantReceiptAuthority);
         for node_id in &inner.node_order {
             let image = inner
                 .nodes
@@ -329,6 +801,7 @@ impl StorageNodeRegistry {
                         node_config,
                         image.segment_catalog.clone(),
                     )?),
+                    authority: Arc::clone(&authority),
                 },
             );
         }
@@ -393,10 +866,17 @@ impl StorageNodeRegistry {
         self.node(node_id)
     }
 
+    #[cfg(test)]
     fn commit_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaCommit> {
         self.owner_node_for_segment(segment_id)?
             .segment_catalog
             .commit_for_segment(segment_id)
+    }
+
+    fn receipt_for_segment(&self, segment_id: SegmentId) -> Result<SegmentWriteReceipt> {
+        self.owner_node_for_segment(segment_id)?
+            .segment_catalog
+            .receipt_for_segment(segment_id)
     }
 
     fn state(&self, segment_id: SegmentId) -> Result<SegmentLifecycleState> {
@@ -405,10 +885,16 @@ impl StorageNodeRegistry {
             .state(segment_id)
     }
 
-    fn mark_segment_referenced(&self, segment_id: SegmentId) -> Result<()> {
+    fn mark_segment_referenced(
+        &self,
+        receipt: &SegmentWriteReceipt,
+        commit_seq: CommitSeq,
+        authority: &dyn GrantReceiptAuthority,
+    ) -> Result<()> {
+        let evidence = authority.create_reference_evidence(receipt, commit_seq)?;
         let response = self
-            .transport_for_segment(segment_id)?
-            .send(StorageNodeRequest::MarkReferenced { segment_id })?;
+            .transport_for_segment(receipt.segment_id)?
+            .send(StorageNodeRequest::MarkReferenced { evidence })?;
         if response != StorageNodeResponse::MarkReferenced {
             return Err(StorageError::corrupt(
                 "storage node returned unexpected mark-referenced response",
@@ -513,6 +999,7 @@ impl StorageNodeDirectory for StorageNodeRegistry {
 pub struct LocalCoordinator {
     metadata: Arc<InMemoryMetadataPlane>,
     storage_nodes: StorageNodeRegistry,
+    authority: Arc<LocalGrantReceiptAuthority>,
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
 }
@@ -534,6 +1021,7 @@ impl LocalCoordinator {
         Ok(Self {
             metadata: Arc::new(InMemoryMetadataPlane::new(config)?),
             storage_nodes: StorageNodeRegistry::new(config, storage_nodes)?,
+            authority: Arc::new(LocalGrantReceiptAuthority),
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
         })
@@ -547,6 +1035,7 @@ impl LocalCoordinator {
                 image.metadata,
             )?),
             storage_nodes: StorageNodeRegistry::from_inner(image.config, image.storage_nodes)?,
+            authority: Arc::new(LocalGrantReceiptAuthority),
             next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
         })
@@ -638,7 +1127,8 @@ impl LocalCoordinator {
         let owner = MappingOwner::BlockDevice(device_id);
         let write_intent = self.next_write_intent()?;
         let mut updates = Vec::with_capacity(chunks.len());
-        let mut segment_ids = Vec::with_capacity(chunks.len());
+        let mut segment_receipts = Vec::with_capacity(chunks.len());
+        let current = self.metadata.get_head(device_id)?;
 
         for chunk in chunks {
             let chunk_offset = chunk
@@ -666,18 +1156,33 @@ impl LocalCoordinator {
             let chunk_bytes = data
                 .get(byte_start..byte_end)
                 .ok_or_else(|| StorageError::corrupt("write chunk is outside request bytes"))?;
-            let reservation =
-                self.write_segment_for_owner_with_intent(owner, write_intent, chunk_bytes)?;
-            segment_ids.push(reservation.segment_id);
+            let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
+                WriteGrantIntent::BlockWrite {
+                    device_id,
+                    range: chunk.range,
+                    fence: current.generation,
+                },
+                write_intent,
+                chunk_bytes.to_vec(),
+                durability,
+            )?;
+            let segment_id = verified_receipt.descriptor.segment_id;
 
             let edit = TreeRangeEdit {
                 range: chunk.range,
                 replacement: Some(SegmentReplacement {
-                    segment_id: reservation.segment_id,
+                    segment_id,
                     segment_base: chunk.range.start,
                 }),
             };
-            let new_root = self.replace_tree_range(chunk.old_root, edit)?.root;
+            let new_root = self
+                .replace_tree_range_with_receipts(
+                    chunk.old_root,
+                    edit,
+                    std::slice::from_ref(&verified_receipt),
+                )?
+                .root;
+            segment_receipts.push(verified_receipt);
             updates.push(RootUpdate::BlockShard(ShardRootUpdate {
                 shard_id: chunk.shard_id,
                 old_root: chunk.old_root,
@@ -685,15 +1190,18 @@ impl LocalCoordinator {
             }));
         }
 
-        let current = self.metadata.get_head(device_id)?;
         let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
             owner,
             fence: MetadataFence::DeviceGeneration(current.generation),
             updates,
         })?;
 
-        for segment_id in segment_ids {
-            self.storage_nodes.mark_segment_referenced(segment_id)?;
+        for receipt in &segment_receipts {
+            self.storage_nodes.mark_segment_referenced(
+                receipt.receipt(),
+                commit_group.commit_seq,
+                self.authority.as_ref(),
+            )?;
         }
 
         Ok(WriteCommit {
@@ -856,10 +1364,18 @@ impl LocalCoordinator {
             segment_bytes
         };
 
-        let reservation = self.write_segment_for_owner_with_intent_owned(
-            owner,
+        let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
+            WriteGrantIntent::NativeAppend {
+                keyspace_id: lease.keyspace_id,
+                file_id: lease.file_id,
+                append_offset: head.size,
+                bytes: data_len,
+                base_version: lease.base_version,
+                writer_epoch: lease.writer_epoch,
+            },
             self.next_write_intent()?,
             segment_bytes,
+            durability,
         )?;
         let append_range = crate::api::BlockRange::new(
             BlockIndex::from_raw(segment_start_block),
@@ -872,7 +1388,7 @@ impl LocalCoordinator {
         let edit = TreeRangeEdit {
             range: append_range,
             replacement: Some(SegmentReplacement {
-                segment_id: reservation.segment_id,
+                segment_id: verified_receipt.descriptor.segment_id,
                 segment_base: append_range.start,
             }),
         };
@@ -895,9 +1411,15 @@ impl LocalCoordinator {
                 ));
             }
         }
-        let new_root = self.replace_tree_range(head.root, edit)?.root;
+        let new_root = self
+            .replace_tree_range_with_receipts(
+                head.root,
+                edit,
+                std::slice::from_ref(&verified_receipt),
+            )?
+            .root;
 
-        self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
             owner,
             fence: MetadataFence::WriterEpoch {
                 base_version: lease.base_version,
@@ -910,8 +1432,11 @@ impl LocalCoordinator {
                 new_size,
             }],
         })?;
-        self.storage_nodes
-            .mark_segment_referenced(reservation.segment_id)?;
+        self.storage_nodes.mark_segment_referenced(
+            verified_receipt.receipt(),
+            commit_group.commit_seq,
+            self.authority.as_ref(),
+        )?;
         let committed = self
             .metadata
             .get_file_head(lease.keyspace_id, lease.file_id)?;
@@ -1003,22 +1528,34 @@ impl LocalCoordinator {
             bytes
         };
 
-        let reservation = self.write_segment_for_owner_with_intent(
-            owner,
+        let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
+            WriteGrantIntent::NativeWrite {
+                keyspace_id,
+                file_id,
+                range,
+                base_version: head.version,
+            },
             self.next_write_intent()?,
-            &segment_bytes,
+            segment_bytes,
+            durability,
         )?;
         let edit = TreeRangeEdit {
             range: write_range,
             replacement: Some(SegmentReplacement {
-                segment_id: reservation.segment_id,
+                segment_id: verified_receipt.descriptor.segment_id,
                 segment_base: write_range.start,
             }),
         };
-        let new_root = self.replace_tree_range(head.root, edit)?.root;
+        let new_root = self
+            .replace_tree_range_with_receipts(
+                head.root,
+                edit,
+                std::slice::from_ref(&verified_receipt),
+            )?
+            .root;
         let new_size = head.size.max(end);
 
-        self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
             owner,
             fence: MetadataFence::FileVersion(head.version),
             updates: vec![RootUpdate::FileRoot {
@@ -1028,8 +1565,11 @@ impl LocalCoordinator {
                 new_size,
             }],
         })?;
-        self.storage_nodes
-            .mark_segment_referenced(reservation.segment_id)?;
+        self.storage_nodes.mark_segment_referenced(
+            verified_receipt.receipt(),
+            commit_group.commit_seq,
+            self.authority.as_ref(),
+        )?;
         let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
 
         Ok(FileWriteCommit {
@@ -1173,74 +1713,590 @@ impl LocalCoordinator {
         &self,
         owner: MappingOwner,
         data: &[u8],
-    ) -> Result<SegmentReservation> {
+    ) -> Result<SegmentWriteReceipt> {
         let write_intent = self.next_write_intent()?;
-        self.write_segment_for_owner_with_intent(owner, write_intent, data)
+        self.write_segment_for_intent_with_id(
+            WriteGrantIntent::Internal { owner },
+            write_intent,
+            data,
+            WriteDurability::Acknowledged,
+        )
     }
 
-    fn write_segment_for_owner_with_intent(
+    #[cfg(test)]
+    fn write_segment_for_intent_with_id(
         &self,
-        owner: MappingOwner,
+        intent: WriteGrantIntent,
         write_intent: WriteIntentId,
         data: &[u8],
-    ) -> Result<SegmentReservation> {
-        self.write_segment_for_owner_with_intent_owned(owner, write_intent, data.to_vec())
+        durability: WriteDurability,
+    ) -> Result<SegmentWriteReceipt> {
+        self.write_segment_for_intent_with_id_owned(intent, write_intent, data.to_vec(), durability)
     }
 
-    fn write_segment_for_owner_with_intent_owned(
+    #[cfg(test)]
+    fn write_segment_for_intent_with_id_owned(
         &self,
-        owner: MappingOwner,
+        intent: WriteGrantIntent,
         write_intent: WriteIntentId,
         data: Vec<u8>,
-    ) -> Result<SegmentReservation> {
-        let intent = SegmentReservationIntent {
-            write_intent,
-            owner,
-            bytes: u64::try_from(data.len()).map_err(|_| {
-                StorageError::invalid_argument("segment reservation byte length overflows u64")
-            })?,
-        };
+        durability: WriteDurability,
+    ) -> Result<SegmentWriteReceipt> {
+        Ok(self
+            .write_segment_for_intent_with_id_owned_verified(
+                intent,
+                write_intent,
+                data,
+                durability,
+            )?
+            .receipt)
+    }
+
+    fn write_segment_for_intent_with_id_owned_verified(
+        &self,
+        intent: WriteGrantIntent,
+        write_intent: WriteIntentId,
+        data: Vec<u8>,
+        durability: WriteDurability,
+    ) -> Result<VerifiedSegmentReceipt> {
+        let max_bytes = u64::try_from(data.len()).map_err(|_| {
+            StorageError::invalid_argument("segment reservation byte length overflows u64")
+        })?;
         let candidates = self.storage_nodes.storage_node_ids()?;
         let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
         let segment_id = self.storage_nodes.allocate_segment_id()?;
+        let grant = self.issue_write_grant(WriteGrantRequest {
+            tenant: LOCAL_TENANT_ID,
+            principal: LOCAL_PRINCIPAL_ID,
+            intent,
+            write_intent,
+            segment_id,
+            storage_node,
+            max_bytes,
+            durability,
+            expires_at: LOCAL_GRANT_EXPIRATION,
+        })?;
+        self.write_granted_segment_verified(&grant, data)
+    }
+
+    pub fn issue_write_grant(&self, request: WriteGrantRequest) -> Result<WriteGrant> {
+        self.authority.issue_write_grant(request)
+    }
+
+    pub fn issue_block_write_grant(
+        &self,
+        device_id: DeviceId,
+        range: crate::api::BlockRange,
+        durability: WriteDurability,
+    ) -> Result<WriteGrant> {
+        range.validate_non_empty()?;
+        let head = self.metadata.get_head(device_id)?;
+        let block_size = u64::from(self.metadata.config.block_size);
+        let max_bytes = range
+            .blocks
+            .raw()
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("grant byte length overflows"))?;
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        let segment_id = self.storage_nodes.allocate_segment_id()?;
+        let write_intent = self.next_write_intent()?;
+        self.issue_write_grant(WriteGrantRequest {
+            tenant: LOCAL_TENANT_ID,
+            principal: LOCAL_PRINCIPAL_ID,
+            intent: WriteGrantIntent::BlockWrite {
+                device_id,
+                range,
+                fence: head.generation,
+            },
+            write_intent,
+            segment_id,
+            storage_node,
+            max_bytes,
+            durability,
+            expires_at: LOCAL_GRANT_EXPIRATION,
+        })
+    }
+
+    pub fn issue_native_write_grant(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+        segment_bytes: u64,
+        durability: WriteDurability,
+    ) -> Result<WriteGrant> {
+        if range.len == 0 || segment_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "native write grant must contain bytes",
+            ));
+        }
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        let segment_id = self.storage_nodes.allocate_segment_id()?;
+        let write_intent = self.next_write_intent()?;
+        self.issue_write_grant(WriteGrantRequest {
+            tenant: LOCAL_TENANT_ID,
+            principal: LOCAL_PRINCIPAL_ID,
+            intent: WriteGrantIntent::NativeWrite {
+                keyspace_id,
+                file_id,
+                range,
+                base_version: head.version,
+            },
+            write_intent,
+            segment_id,
+            storage_node,
+            max_bytes: segment_bytes,
+            durability,
+            expires_at: LOCAL_GRANT_EXPIRATION,
+        })
+    }
+
+    pub fn issue_native_append_grant(
+        &self,
+        lease: AppendLease,
+        logical_bytes: u64,
+        segment_bytes: u64,
+        durability: WriteDurability,
+    ) -> Result<WriteGrant> {
+        if logical_bytes == 0 || segment_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "native append grant must contain bytes",
+            ));
+        }
+        let head = self
+            .metadata
+            .get_file_head(lease.keyspace_id, lease.file_id)?;
+        if head.version != lease.base_version {
+            return Err(StorageError::conflict("stale append lease"));
+        }
+        self.metadata.validate_writer_epoch(
+            lease.keyspace_id,
+            lease.file_id,
+            lease.writer_epoch,
+        )?;
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        let segment_id = self.storage_nodes.allocate_segment_id()?;
+        let write_intent = self.next_write_intent()?;
+        self.issue_write_grant(WriteGrantRequest {
+            tenant: LOCAL_TENANT_ID,
+            principal: LOCAL_PRINCIPAL_ID,
+            intent: WriteGrantIntent::NativeAppend {
+                keyspace_id: lease.keyspace_id,
+                file_id: lease.file_id,
+                append_offset: head.size,
+                bytes: logical_bytes,
+                base_version: lease.base_version,
+                writer_epoch: lease.writer_epoch,
+            },
+            write_intent,
+            segment_id,
+            storage_node,
+            max_bytes: segment_bytes,
+            durability,
+            expires_at: LOCAL_GRANT_EXPIRATION,
+        })
+    }
+
+    pub fn write_granted_segment(
+        &self,
+        grant: &WriteGrant,
+        data: Vec<u8>,
+    ) -> Result<SegmentWriteReceipt> {
+        Ok(self.write_granted_segment_verified(grant, data)?.receipt)
+    }
+
+    fn write_granted_segment_verified(
+        &self,
+        grant: &WriteGrant,
+        data: Vec<u8>,
+    ) -> Result<VerifiedSegmentReceipt> {
+        let expected_segment = grant.segment_id;
+        let storage_node = grant.storage_node;
         let response = self.storage_nodes.transport_for_node(storage_node)?.send(
             StorageNodeRequest::WriteSegment {
-                segment_id,
-                intent,
+                grant: grant.clone(),
                 bytes: data,
             },
         )?;
-        let StorageNodeResponse::WriteSegment {
-            reservation,
-            commit,
-        } = response
-        else {
+        let StorageNodeResponse::WriteSegment { receipt } = response else {
             return Err(StorageError::corrupt(
                 "storage node returned unexpected write response",
             ));
         };
-        if reservation.segment_id != segment_id || commit.descriptor.segment_id != segment_id {
+        let receipt = *receipt;
+        if receipt.segment_id != expected_segment {
             return Err(StorageError::corrupt(
                 "storage node write receipt disagrees with requested segment ID",
             ));
         }
-        Ok(reservation)
+        self.authority.verify_receipt_matches_grant(grant, &receipt)
     }
 
-    fn descriptors_for_entries(&self, entries: &[LeafEntry]) -> Result<Vec<SegmentDescriptor>> {
-        let mut descriptors: BTreeMap<SegmentId, SegmentDescriptor> = BTreeMap::new();
-        for entry in entries {
-            if let std::collections::btree_map::Entry::Vacant(vacant) =
-                descriptors.entry(entry.segment_id)
-            {
-                vacant.insert(
-                    self.storage_nodes
-                        .commit_for_segment(entry.segment_id)?
-                        .descriptor,
-                );
+    pub fn storage_node_transport_for_grant(
+        &self,
+        grant: &WriteGrant,
+    ) -> Result<Arc<dyn StorageNodeTransport>> {
+        self.authority.verify_write_grant(
+            grant,
+            grant.storage_node,
+            grant.segment_id,
+            grant.max_bytes,
+        )?;
+        self.storage_nodes.transport_for_node(grant.storage_node)
+    }
+
+    pub fn verify_segment_receipt(
+        &self,
+        receipt: &SegmentWriteReceipt,
+    ) -> Result<VerifiedSegmentReceipt> {
+        self.authority.verify_segment_receipt(receipt)
+    }
+
+    pub fn submit_block_write_receipt(
+        &self,
+        grant: &WriteGrant,
+        receipt: SegmentWriteReceipt,
+    ) -> Result<WriteCommit> {
+        let verified = self
+            .authority
+            .verify_receipt_matches_grant(grant, &receipt)?;
+        let WriteGrantIntent::BlockWrite {
+            device_id,
+            range,
+            fence,
+        } = receipt.intent
+        else {
+            return Err(StorageError::invalid_argument(
+                "trusted block publish requires a block write receipt",
+            ));
+        };
+        if receipt.owner != MappingOwner::BlockDevice(device_id) {
+            return Err(StorageError::conflict(
+                "receipt owner does not match block device intent",
+            ));
+        }
+        let current = self.metadata.get_head(device_id)?;
+        let mut selected = None;
+        for (shard_index, root_id) in current.shard_roots.iter().copied().enumerate() {
+            let node = self.metadata.get_metadata_node(root_id)?;
+            if node.covered_range.contains_range(range)? {
+                let shard_id = u32::try_from(shard_index)
+                    .map_err(|_| StorageError::invalid_argument("shard index overflows u32"))?;
+                selected = Some((ShardId::from_raw(shard_id), root_id));
+                break;
             }
         }
-        Ok(descriptors.into_values().collect())
+        let (shard_id, old_root) = selected.ok_or_else(|| {
+            StorageError::invalid_argument("receipt block range is not contained by one shard")
+        })?;
+        let new_root = self
+            .replace_tree_range_with_receipts(
+                old_root,
+                TreeRangeEdit {
+                    range,
+                    replacement: Some(SegmentReplacement {
+                        segment_id: verified.descriptor.segment_id,
+                        segment_base: range.start,
+                    }),
+                },
+                std::slice::from_ref(&verified),
+            )?
+            .root;
+        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+            owner: MappingOwner::BlockDevice(device_id),
+            fence: MetadataFence::DeviceGeneration(fence),
+            updates: vec![RootUpdate::BlockShard(ShardRootUpdate {
+                shard_id,
+                old_root,
+                new_root,
+            })],
+        })?;
+        self.storage_nodes.mark_segment_referenced(
+            &receipt,
+            commit_group.commit_seq,
+            self.authority.as_ref(),
+        )?;
+        let block_size = u64::from(self.metadata.config.block_size);
+        let byte_offset = range
+            .start
+            .raw()
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("receipt byte offset overflows"))?;
+        let byte_len = range
+            .blocks
+            .raw()
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("receipt byte length overflows"))?;
+        Ok(WriteCommit {
+            device_id,
+            commit_seq: commit_group.commit_seq,
+            range: ByteRange::new(byte_offset, byte_len),
+            durability: receipt.durability,
+        })
+    }
+
+    pub fn submit_native_write_receipt(
+        &self,
+        grant: &WriteGrant,
+        receipt: SegmentWriteReceipt,
+    ) -> Result<FileWriteCommit> {
+        let verified = self
+            .authority
+            .verify_receipt_matches_grant(grant, &receipt)?;
+        let WriteGrantIntent::NativeWrite {
+            keyspace_id,
+            file_id,
+            range,
+            base_version,
+        } = receipt.intent
+        else {
+            return Err(StorageError::invalid_argument(
+                "trusted native write publish requires a native write receipt",
+            ));
+        };
+        if receipt.owner != MappingOwner::NativeKeyspace(keyspace_id) {
+            return Err(StorageError::conflict(
+                "receipt owner does not match native keyspace intent",
+            ));
+        }
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        if head.version != base_version {
+            return Err(StorageError::conflict("stale native file version"));
+        }
+        let end = range.end_exclusive()?;
+        let block_size = u64::from(self.metadata.config.block_size);
+        let first_block = range.offset / block_size;
+        let requested_start = first_block
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("native write range overflows"))?;
+        let segment_blocks = blocks_for_bytes(end - requested_start, block_size)?;
+        let write_range = crate::api::BlockRange::new(
+            BlockIndex::from_raw(first_block),
+            BlockCount::from_raw(segment_blocks),
+        );
+        let root = self.metadata.get_metadata_node(head.root)?;
+        if !root.covered_range.contains_range(write_range)? {
+            return Err(StorageError::invalid_argument(
+                "native file write exceeds file root coverage",
+            ));
+        }
+        let expected_segment_bytes = segment_blocks.checked_mul(block_size).ok_or_else(|| {
+            StorageError::invalid_argument("native write segment length overflows")
+        })?;
+        if verified.descriptor.bytes != expected_segment_bytes {
+            return Err(StorageError::conflict(
+                "native write receipt byte count does not match metadata intent",
+            ));
+        }
+        let new_root = self
+            .replace_tree_range_with_receipts(
+                head.root,
+                TreeRangeEdit {
+                    range: write_range,
+                    replacement: Some(SegmentReplacement {
+                        segment_id: verified.descriptor.segment_id,
+                        segment_base: write_range.start,
+                    }),
+                },
+                std::slice::from_ref(&verified),
+            )?
+            .root;
+        let new_size = head.size.max(end);
+        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+            owner: MappingOwner::NativeKeyspace(keyspace_id),
+            fence: MetadataFence::FileVersion(base_version),
+            updates: vec![RootUpdate::FileRoot {
+                file_id,
+                old_root: head.root,
+                new_root,
+                new_size,
+            }],
+        })?;
+        self.storage_nodes.mark_segment_referenced(
+            &receipt,
+            commit_group.commit_seq,
+            self.authority.as_ref(),
+        )?;
+        let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
+        Ok(FileWriteCommit {
+            keyspace_id,
+            file_id,
+            range,
+            version: committed.version,
+            commit_seq: committed.latest_commit,
+            durability: receipt.durability,
+        })
+    }
+
+    pub fn submit_native_append_receipt(
+        &self,
+        grant: &WriteGrant,
+        receipt: SegmentWriteReceipt,
+    ) -> Result<AppendCommit> {
+        let verified = self
+            .authority
+            .verify_receipt_matches_grant(grant, &receipt)?;
+        let (keyspace_id, file_id, append_offset, logical_bytes, base_version, writer_epoch) =
+            match receipt.intent {
+                WriteGrantIntent::NativeAppend {
+                    keyspace_id,
+                    file_id,
+                    append_offset,
+                    bytes,
+                    base_version,
+                    writer_epoch,
+                }
+                | WriteGrantIntent::NativeReservedAppend {
+                    keyspace_id,
+                    file_id,
+                    append_offset,
+                    bytes,
+                    base_version,
+                    writer_epoch,
+                } => (
+                    keyspace_id,
+                    file_id,
+                    append_offset,
+                    bytes,
+                    base_version,
+                    writer_epoch,
+                ),
+                _ => {
+                    return Err(StorageError::invalid_argument(
+                        "trusted native append publish requires a native append receipt",
+                    ));
+                }
+            };
+        if receipt.owner != MappingOwner::NativeKeyspace(keyspace_id) {
+            return Err(StorageError::conflict(
+                "receipt owner does not match native keyspace intent",
+            ));
+        }
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        if head.size != append_offset || head.version != base_version {
+            return Err(StorageError::conflict("stale native append receipt"));
+        }
+        self.metadata
+            .validate_writer_epoch(keyspace_id, file_id, writer_epoch)?;
+        let block_size = u64::from(self.metadata.config.block_size);
+        let tail_bytes = head.size % block_size;
+        let segment_start_block = head.size / block_size;
+        let segment_payload_len = tail_bytes
+            .checked_add(logical_bytes)
+            .ok_or_else(|| StorageError::invalid_argument("append segment length overflows"))?;
+        let segment_blocks = blocks_for_bytes(segment_payload_len, block_size)?;
+        let expected_segment_bytes = segment_blocks.checked_mul(block_size).ok_or_else(|| {
+            StorageError::invalid_argument("append segment byte length overflows")
+        })?;
+        if verified.descriptor.bytes != expected_segment_bytes {
+            return Err(StorageError::conflict(
+                "native append receipt byte count does not match metadata intent",
+            ));
+        }
+        let append_range = crate::api::BlockRange::new(
+            BlockIndex::from_raw(segment_start_block),
+            BlockCount::from_raw(segment_blocks),
+        );
+        if tail_bytes == 0 && self.tree_has_mappings(head.root, append_range)? {
+            return Err(StorageError::conflict(
+                "append range overlaps existing file metadata",
+            ));
+        }
+        if tail_bytes != 0 && segment_blocks > 1 {
+            let next_block = segment_start_block
+                .checked_add(1)
+                .ok_or_else(|| StorageError::invalid_argument("append range overflows"))?;
+            let new_blocks = crate::api::BlockRange::new(
+                BlockIndex::from_raw(next_block),
+                BlockCount::from_raw(segment_blocks - 1),
+            );
+            if self.tree_has_mappings(head.root, new_blocks)? {
+                return Err(StorageError::conflict(
+                    "append range overlaps existing file metadata after tail block",
+                ));
+            }
+        }
+        let new_root = self
+            .replace_tree_range_with_receipts(
+                head.root,
+                TreeRangeEdit {
+                    range: append_range,
+                    replacement: Some(SegmentReplacement {
+                        segment_id: verified.descriptor.segment_id,
+                        segment_base: append_range.start,
+                    }),
+                },
+                std::slice::from_ref(&verified),
+            )?
+            .root;
+        let new_size = head
+            .size
+            .checked_add(logical_bytes)
+            .ok_or_else(|| StorageError::invalid_argument("file size overflows u64"))?;
+        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+            owner: MappingOwner::NativeKeyspace(keyspace_id),
+            fence: MetadataFence::WriterEpoch {
+                base_version,
+                writer_epoch,
+            },
+            updates: vec![RootUpdate::FileRoot {
+                file_id,
+                old_root: head.root,
+                new_root,
+                new_size,
+            }],
+        })?;
+        self.storage_nodes.mark_segment_referenced(
+            &receipt,
+            commit_group.commit_seq,
+            self.authority.as_ref(),
+        )?;
+        let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
+        Ok(AppendCommit {
+            keyspace_id,
+            file_id,
+            extent_id: self.next_extent_id()?,
+            range: ByteRange::new(head.size, logical_bytes),
+            version: committed.version,
+            commit_seq: committed.latest_commit,
+            durability: receipt.durability,
+        })
+    }
+
+    fn verified_receipts_for_entries(
+        &self,
+        entries: &[LeafEntry],
+    ) -> Result<Vec<VerifiedSegmentReceipt>> {
+        self.verified_receipts_for_entries_with_cache(entries, &[])
+    }
+
+    fn verified_receipts_for_entries_with_cache(
+        &self,
+        entries: &[LeafEntry],
+        additional_receipts: &[VerifiedSegmentReceipt],
+    ) -> Result<Vec<VerifiedSegmentReceipt>> {
+        let mut cache: BTreeMap<SegmentId, VerifiedSegmentReceipt> = additional_receipts
+            .iter()
+            .map(|receipt| (receipt.descriptor.segment_id, receipt.clone()))
+            .collect();
+        let mut receipts: BTreeMap<SegmentId, VerifiedSegmentReceipt> = BTreeMap::new();
+        for entry in entries {
+            if let std::collections::btree_map::Entry::Vacant(vacant) =
+                receipts.entry(entry.segment_id)
+            {
+                if let Some(receipt) = cache.remove(&entry.segment_id) {
+                    vacant.insert(receipt);
+                } else {
+                    let receipt = self.storage_nodes.receipt_for_segment(entry.segment_id)?;
+                    vacant.insert(self.authority.verify_segment_receipt(&receipt)?);
+                }
+            }
+        }
+        Ok(receipts.into_values().collect())
     }
 
     fn next_write_intent(&self) -> Result<WriteIntentId> {
@@ -1266,6 +2322,15 @@ impl LocalCoordinator {
         root_id: MetadataNodeId,
         edit: TreeRangeEdit,
     ) -> Result<TreeEditResult> {
+        self.replace_tree_range_with_receipts(root_id, edit, &[])
+    }
+
+    fn replace_tree_range_with_receipts(
+        &self,
+        root_id: MetadataNodeId,
+        edit: TreeRangeEdit,
+        additional_receipts: &[VerifiedSegmentReceipt],
+    ) -> Result<TreeEditResult> {
         edit.range.validate_non_empty()?;
         let root = self.metadata.get_metadata_node(root_id)?;
         if !root.covered_range.contains_range(edit.range)? {
@@ -1273,13 +2338,14 @@ impl LocalCoordinator {
                 "edit range is outside metadata tree coverage",
             ));
         }
-        self.replace_tree_range_at(&root, edit)
+        self.replace_tree_range_at(&root, edit, additional_receipts)
     }
 
     fn replace_tree_range_at(
         &self,
         node: &MetadataNode,
         edit: TreeRangeEdit,
+        additional_receipts: &[VerifiedSegmentReceipt],
     ) -> Result<TreeEditResult> {
         if !node.covered_range.overlaps(edit.range)? {
             return Ok(TreeEditResult {
@@ -1313,17 +2379,22 @@ impl LocalCoordinator {
                         changed: false,
                     });
                 }
-                let segment_descriptors = self.descriptors_for_entries(&new_entries)?;
+                let segment_receipts = self
+                    .verified_receipts_for_entries_with_cache(&new_entries, additional_receipts)?;
                 let new_node = self.metadata.allocate_metadata_node(
                     node.covered_range,
                     MetadataNodeKind::Leaf {
                         entries: new_entries,
                     },
                 )?;
+                let segment_descriptors: Vec<_> = segment_receipts
+                    .iter()
+                    .map(|receipt| receipt.descriptor.clone())
+                    .collect();
                 new_node.validate(&segment_descriptors)?;
                 self.metadata.persist_metadata_node(MetadataNodeWrite::new(
                     new_node.clone(),
-                    segment_descriptors,
+                    segment_receipts,
                 ))?;
                 Ok(TreeEditResult {
                     root: new_node.node_id,
@@ -1336,7 +2407,8 @@ impl LocalCoordinator {
                 for child in children {
                     if child.range.overlaps(edit.range)? {
                         let child_node = self.metadata.get_metadata_node(child.node_id)?;
-                        let child_result = self.replace_tree_range_at(&child_node, edit)?;
+                        let child_result =
+                            self.replace_tree_range_at(&child_node, edit, additional_receipts)?;
                         changed |= child_result.changed;
                         new_children.push(MetadataChild {
                             range: child.range,
@@ -1438,7 +2510,11 @@ impl LocalCoordinator {
                         "metadata leaf exceeds configured leaf block span",
                     ));
                 }
-                let descriptors = self.descriptors_for_entries(entries)?;
+                let receipts = self.verified_receipts_for_entries(entries)?;
+                let descriptors: Vec<_> = receipts
+                    .iter()
+                    .map(|receipt| receipt.descriptor.clone())
+                    .collect();
                 node.validate(&descriptors)?;
                 Ok(MetadataTreeStats {
                     nodes: 1,
@@ -2717,15 +3793,16 @@ impl DurableSqliteStore {
                 next_segment_id = next_segment_id.max(segment_id.raw().saturating_add(1));
                 next_write_intent =
                     next_write_intent.max(entry.intent.write_intent.raw().saturating_add(1));
-                let Some(commit) = &entry.commit else {
+                let Some(receipt) = &entry.receipt else {
                     continue;
                 };
                 if matches!(entry.state, SegmentLifecycleState::Freed) {
                     continue;
                 }
+                let commit = receipt.replica_commit();
                 let record = DurableSegmentRecord {
                     synced: true,
-                    commit: commit.clone(),
+                    commit,
                 };
                 let placement =
                     Self::placement_for_segment_on_node(&node_conn, row.storage_node, *segment_id)?;
@@ -4837,13 +5914,13 @@ fn load_catalog_inner(
             ));
         }
         if entry
-            .commit
+            .receipt
             .as_ref()
-            .map(|commit| commit.placement.storage_node)
-            != entry.commit.as_ref().map(|_| storage_node)
+            .map(|receipt| receipt.placement.storage_node)
+            != entry.receipt.as_ref().map(|_| storage_node)
         {
             return Err(StorageError::corrupt(
-                "segment catalog commit storage node disagrees with row",
+                "segment catalog receipt storage node disagrees with row",
             ));
         }
         if entries.insert(segment_id, entry).is_some() {
@@ -5011,12 +6088,13 @@ fn validate_row_native_image(
             if entry.reservation.segment_id != *segment_id {
                 return Err(StorageError::corrupt("catalog segment key mismatch"));
             }
-            if let Some(commit) = &entry.commit {
-                if commit.placement.storage_node != *node_id {
+            if let Some(receipt) = &entry.receipt {
+                if receipt.placement.storage_node != *node_id || receipt.storage_node != *node_id {
                     return Err(StorageError::corrupt(
-                        "catalog commit storage node mismatch",
+                        "catalog receipt storage node mismatch",
                     ));
                 }
+                let commit = receipt.replica_commit();
                 let record = node.segment_store.segments.get(segment_id);
                 if matches!(
                     entry.state,
@@ -5029,9 +6107,9 @@ fn validate_row_native_image(
                     ));
                 }
                 if let Some(record) = record {
-                    if record.commit != *commit {
+                    if record.commit != commit {
                         return Err(StorageError::corrupt(
-                            "catalog commit disagrees with segment record",
+                            "catalog receipt disagrees with segment record",
                         ));
                     }
                     let node_conn = node_catalogs.lock(*node_id)?;
@@ -5046,7 +6124,7 @@ fn validate_row_native_image(
                     SegmentLifecycleState::Reserved | SegmentLifecycleState::Writing
                 ) {
                     return Err(StorageError::corrupt(
-                        "uncommitted catalog state has a segment commit",
+                        "uncommitted catalog state has a segment receipt",
                     ));
                 }
             }
@@ -5057,7 +6135,12 @@ fn validate_row_native_image(
                 .entries
                 .get(segment_id)
                 .ok_or_else(|| StorageError::corrupt("segment record missing catalog entry"))?;
-            if entry.commit.as_ref() != Some(&record.commit) {
+            if entry
+                .receipt
+                .as_ref()
+                .map(SegmentWriteReceipt::replica_commit)
+                != Some(record.commit.clone())
+            {
                 return Err(StorageError::corrupt(
                     "segment record disagrees with catalog entry",
                 ));
@@ -8443,7 +9526,8 @@ impl MetadataPlane for InMemoryMetadataPlane {
     }
 
     fn persist_metadata_node(&self, write: MetadataNodeWrite) -> Result<()> {
-        write.node.validate(&write.segment_descriptors)?;
+        let segment_descriptors = write.segment_descriptors();
+        write.node.validate(&segment_descriptors)?;
         let mut inner = lock(&self.inner)?;
         match inner.metadata_nodes.get(&write.node.node_id) {
             Some(existing) if existing == &write.node => Ok(()),
@@ -9136,13 +10220,23 @@ struct CatalogEntry {
     intent: SegmentReservationIntent,
     reservation: SegmentReservation,
     state: SegmentLifecycleState,
-    commit: Option<SegmentReplicaCommit>,
+    receipt: Option<SegmentWriteReceipt>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CatalogInner {
     next_segment_id: u128,
     entries: BTreeMap<SegmentId, CatalogEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CatalogLifecycleCounts {
+    reserved: usize,
+    writing: usize,
+    durable_pending: usize,
+    referenced: usize,
+    released: usize,
+    freed: usize,
 }
 
 /// In-memory implementation of `LocalSegmentCatalog`.
@@ -9207,7 +10301,7 @@ impl InMemoryLocalSegmentCatalog {
                 intent,
                 reservation: reservation.clone(),
                 state: SegmentLifecycleState::Reserved,
-                commit: None,
+                receipt: None,
             },
         );
         Ok(reservation)
@@ -9233,9 +10327,22 @@ impl InMemoryLocalSegmentCatalog {
             .get(&segment_id)
             .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
         entry
-            .commit
+            .receipt
+            .as_ref()
+            .map(SegmentWriteReceipt::replica_commit)
+            .ok_or_else(|| StorageError::unavailable("segment has no durable receipt"))
+    }
+
+    pub fn receipt_for_segment(&self, segment_id: SegmentId) -> Result<SegmentWriteReceipt> {
+        let inner = lock(&self.inner)?;
+        let entry = inner
+            .entries
+            .get(&segment_id)
+            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+        entry
+            .receipt
             .clone()
-            .ok_or_else(|| StorageError::unavailable("segment has no durable commit"))
+            .ok_or_else(|| StorageError::unavailable("segment has no durable receipt"))
     }
 
     pub fn intent_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReservationIntent> {
@@ -9254,6 +10361,22 @@ impl InMemoryLocalSegmentCatalog {
             .iter()
             .map(|(segment_id, entry)| (*segment_id, entry.state, entry.intent.write_intent))
             .collect())
+    }
+
+    fn lifecycle_counts(&self) -> Result<CatalogLifecycleCounts> {
+        let inner = lock(&self.inner)?;
+        let mut counts = CatalogLifecycleCounts::default();
+        for entry in inner.entries.values() {
+            match entry.state {
+                SegmentLifecycleState::Reserved => counts.reserved += 1,
+                SegmentLifecycleState::Writing => counts.writing += 1,
+                SegmentLifecycleState::DurablePendingMetadata => counts.durable_pending += 1,
+                SegmentLifecycleState::Referenced => counts.referenced += 1,
+                SegmentLifecycleState::Released => counts.released += 1,
+                SegmentLifecycleState::Freed => counts.freed += 1,
+            }
+        }
+        Ok(counts)
     }
 
     fn get_entry_mut(inner: &mut CatalogInner, segment_id: SegmentId) -> Result<&mut CatalogEntry> {
@@ -9302,7 +10425,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     fn commit_segment(
         &self,
         reservation: SegmentReservation,
-        commit: SegmentReplicaCommit,
+        receipt: SegmentWriteReceipt,
     ) -> Result<()> {
         let mut inner = lock(&self.inner)?;
         let entry = Self::get_entry_mut(&mut inner, reservation.segment_id)?;
@@ -9311,39 +10434,43 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
                 "reservation does not match catalog entry",
             ));
         }
-        if commit.descriptor.segment_id != reservation.segment_id
-            || commit.placement.segment_id != reservation.segment_id
+        if receipt.segment_id != reservation.segment_id
+            || receipt.descriptor.segment_id != reservation.segment_id
+            || receipt.placement.segment_id != reservation.segment_id
         {
             return Err(StorageError::invalid_argument(
-                "segment commit IDs must match reservation",
+                "segment receipt IDs must match reservation",
             ));
         }
-        if commit.placement.storage_node != self.config.storage_node {
-            return Err(StorageError::invalid_argument(
-                "segment commit storage node does not match local catalog",
-            ));
-        }
-        if commit.descriptor.bytes != reservation.bytes
-            || commit.placement.bytes != reservation.bytes
+        if receipt.storage_node != self.config.storage_node
+            || receipt.placement.storage_node != self.config.storage_node
         {
             return Err(StorageError::invalid_argument(
-                "segment commit bytes must match reservation",
+                "segment receipt storage node does not match local catalog",
+            ));
+        }
+        if receipt.bytes != reservation.bytes
+            || receipt.descriptor.bytes != reservation.bytes
+            || receipt.placement.bytes != reservation.bytes
+        {
+            return Err(StorageError::invalid_argument(
+                "segment receipt bytes must match reservation",
             ));
         }
 
         match entry.state {
             SegmentLifecycleState::Writing => {
-                entry.commit = Some(commit);
+                entry.receipt = Some(receipt);
                 entry.state = SegmentLifecycleState::DurablePendingMetadata;
                 Ok(())
             }
             SegmentLifecycleState::DurablePendingMetadata
-                if entry.commit.as_ref() == Some(&commit) =>
+                if entry.receipt.as_ref() == Some(&receipt) =>
             {
                 Ok(())
             }
             _ => Err(StorageError::conflict(
-                "segment commit requires Writing state",
+                "segment receipt requires Writing state",
             )),
         }
     }
@@ -9433,9 +10560,9 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
             SegmentLifecycleState::DurablePendingMetadata
             | SegmentLifecycleState::Referenced
             | SegmentLifecycleState::Released => entry
-                .commit
+                .receipt
                 .as_ref()
-                .map(|commit| commit.placement.clone())
+                .map(|receipt| receipt.placement.clone())
                 .ok_or_else(|| StorageError::corrupt("committed segment missing placement")),
             SegmentLifecycleState::Freed => {
                 Err(StorageError::not_found("segment", segment_id.to_string()))
@@ -10088,6 +11215,218 @@ impl RemoteWireTransport for ChaosRemoteWireTransport {
                 delayed
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct ChaosStorageNodeState {
+    delayed: VecDeque<Result<StorageNodeResponse>>,
+    trace: Vec<String>,
+    metrics: ChaosTransportMetrics,
+    fail_next_call: bool,
+    drop_next_request: bool,
+    drop_next_response: bool,
+    corrupt_next_grant: bool,
+    corrupt_next_receipt: bool,
+    duplicate_next_request: bool,
+    delay_next_response: bool,
+    return_delayed_next: bool,
+}
+
+impl ChaosStorageNodeState {
+    fn new() -> Self {
+        Self {
+            delayed: VecDeque::new(),
+            trace: Vec::new(),
+            metrics: ChaosTransportMetrics::default(),
+            fail_next_call: false,
+            drop_next_request: false,
+            drop_next_response: false,
+            corrupt_next_grant: false,
+            corrupt_next_receipt: false,
+            duplicate_next_request: false,
+            delay_next_response: false,
+            return_delayed_next: false,
+        }
+    }
+}
+
+/// Deterministic chaos wrapper for coordinator-to-storage-node messages.
+///
+/// Tests can inject drops, duplicates, delays, and proof corruption without
+/// spawning background work or relying on wall-clock timing.
+#[derive(Clone)]
+pub struct ChaosStorageNodeTransport {
+    inner: Arc<dyn StorageNodeTransport>,
+    state: Arc<Mutex<ChaosStorageNodeState>>,
+}
+
+impl ChaosStorageNodeTransport {
+    pub fn new(inner: Arc<dyn StorageNodeTransport>) -> Self {
+        Self {
+            inner,
+            state: Arc::new(Mutex::new(ChaosStorageNodeState::new())),
+        }
+    }
+
+    pub fn trace(&self) -> Result<Vec<String>> {
+        Ok(lock(&self.state)?.trace.clone())
+    }
+
+    pub fn metrics(&self) -> Result<ChaosTransportMetrics> {
+        Ok(lock(&self.state)?.metrics)
+    }
+
+    pub fn delayed_len(&self) -> Result<usize> {
+        Ok(lock(&self.state)?.delayed.len())
+    }
+
+    pub fn fail_next_call(&self) -> Result<()> {
+        lock(&self.state)?.fail_next_call = true;
+        Ok(())
+    }
+
+    pub fn drop_next_request(&self) -> Result<()> {
+        lock(&self.state)?.drop_next_request = true;
+        Ok(())
+    }
+
+    pub fn drop_next_response(&self) -> Result<()> {
+        lock(&self.state)?.drop_next_response = true;
+        Ok(())
+    }
+
+    pub fn corrupt_next_grant(&self) -> Result<()> {
+        lock(&self.state)?.corrupt_next_grant = true;
+        Ok(())
+    }
+
+    pub fn corrupt_next_receipt(&self) -> Result<()> {
+        lock(&self.state)?.corrupt_next_receipt = true;
+        Ok(())
+    }
+
+    pub fn duplicate_next_request(&self) -> Result<()> {
+        lock(&self.state)?.duplicate_next_request = true;
+        Ok(())
+    }
+
+    pub fn delay_next_response(&self) -> Result<()> {
+        lock(&self.state)?.delay_next_response = true;
+        Ok(())
+    }
+
+    pub fn return_delayed_response_next_call(&self) -> Result<()> {
+        lock(&self.state)?.return_delayed_next = true;
+        Ok(())
+    }
+
+    fn mutate_request(request: &mut StorageNodeRequest) {
+        if let StorageNodeRequest::WriteSegment { grant, .. } = request {
+            grant.proof.0[0] ^= 0xff;
+        }
+    }
+
+    fn mutate_response(response: &mut StorageNodeResponse) {
+        if let StorageNodeResponse::WriteSegment { receipt } = response {
+            receipt.proof.0[0] ^= 0xff;
+        }
+    }
+
+    fn pop_delayed(&self) -> Result<Result<StorageNodeResponse>> {
+        let mut state = lock(&self.state)?;
+        state
+            .delayed
+            .pop_front()
+            .ok_or_else(|| StorageError::unavailable("chaos storage node has no delayed response"))
+    }
+}
+
+impl StorageNodeTransport for ChaosStorageNodeTransport {
+    fn storage_node_id(&self) -> StorageNodeId {
+        self.inner.storage_node_id()
+    }
+
+    fn send(&self, mut request: StorageNodeRequest) -> Result<StorageNodeResponse> {
+        {
+            let mut state = lock(&self.state)?;
+            if state.fail_next_call {
+                state.fail_next_call = false;
+                state.metrics.injected_failures = state.metrics.injected_failures.saturating_add(1);
+                state.trace.push("fail storage-node call".to_string());
+                return Err(StorageError::unavailable("chaos storage node failed call"));
+            }
+            if state.drop_next_request {
+                state.drop_next_request = false;
+                state.metrics.request_drops = state.metrics.request_drops.saturating_add(1);
+                state.trace.push("drop storage-node request".to_string());
+                return Err(StorageError::unavailable(
+                    "chaos storage node dropped request before send",
+                ));
+            }
+            if state.return_delayed_next {
+                state.return_delayed_next = false;
+                state
+                    .trace
+                    .push("return delayed storage-node response".to_string());
+                drop(state);
+                return self.pop_delayed()?;
+            }
+            if state.corrupt_next_grant {
+                state.corrupt_next_grant = false;
+                state.metrics.corrupted_responses =
+                    state.metrics.corrupted_responses.saturating_add(1);
+                state.trace.push("corrupt storage-node grant".to_string());
+                Self::mutate_request(&mut request);
+            }
+        }
+
+        let mut response = if lock(&self.state)?.duplicate_next_request {
+            {
+                let mut state = lock(&self.state)?;
+                state.duplicate_next_request = false;
+                state.metrics.duplicated_requests =
+                    state.metrics.duplicated_requests.saturating_add(1);
+                state
+                    .trace
+                    .push("duplicate storage-node request".to_string());
+            }
+            let first = self.inner.send(request.clone());
+            let second = self.inner.send(request);
+            match (first, second) {
+                (Ok(response), Ok(_)) => Ok(response),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+            }?
+        } else {
+            self.inner.send(request)?
+        };
+
+        let mut state = lock(&self.state)?;
+        if state.drop_next_response {
+            state.drop_next_response = false;
+            state.metrics.response_drops = state.metrics.response_drops.saturating_add(1);
+            state.trace.push("drop storage-node response".to_string());
+            return Err(StorageError::unavailable(
+                "chaos storage node dropped response after send",
+            ));
+        }
+        if state.corrupt_next_receipt {
+            state.corrupt_next_receipt = false;
+            state.metrics.corrupted_responses = state.metrics.corrupted_responses.saturating_add(1);
+            state.trace.push("corrupt storage-node receipt".to_string());
+            Self::mutate_response(&mut response);
+        }
+        if state.delay_next_response {
+            state.delay_next_response = false;
+            state.metrics.delayed_responses = state.metrics.delayed_responses.saturating_add(1);
+            state.trace.push("delay storage-node response".to_string());
+            state.delayed.push_back(Ok(response));
+            return Err(StorageError::unavailable(
+                "chaos storage node delayed response after send",
+            ));
+        }
+        Ok(response)
     }
 }
 
@@ -12110,13 +13449,18 @@ durable_id_codec_u128!(
     DeviceId,
     ExtentId,
     FileId,
+    GrantId,
+    GrantNonce,
     KeyspaceCatalogShardId,
     KeyspaceId,
     KeyspaceRootId,
     MetadataNodeId,
+    PrincipalId,
     RequestId,
     SegmentId,
     StorageNodeId,
+    StorageNodeKeyId,
+    TenantId,
     WriteIntentId,
 );
 
@@ -12127,6 +13471,7 @@ durable_id_codec_u64!(
     CommitSeq,
     DeviceGeneration,
     FileVersion,
+    GrantEpoch,
     KeyspaceGeneration,
     LogicalDeadline,
     LogicalTime,
@@ -12720,6 +14065,218 @@ impl DurableCodec for SegmentReplicaCommit {
     }
 }
 
+impl DurableCodec for ProofScheme {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        let tag = match self {
+            Self::DeterministicTestMacV1 => 1u8,
+            Self::NodeSignatureV1 => 2,
+        };
+        tag.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::DeterministicTestMacV1),
+            2 => Ok(Self::NodeSignatureV1),
+            _ => Err(durable_codec_error("invalid proof scheme tag")),
+        }
+    }
+}
+
+impl DurableCodec for crate::provider::ProofTag {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        out.bytes.extend_from_slice(&self.0);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(input.take(32)?);
+        Ok(Self(bytes))
+    }
+}
+
+impl DurableCodec for crate::provider::GrantHash {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        out.bytes.extend_from_slice(&self.0);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(input.take(32)?);
+        Ok(Self(bytes))
+    }
+}
+
+impl DurableCodec for WriteGrantIntent {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::BlockWrite {
+                device_id,
+                range,
+                fence,
+            } => {
+                1u8.encode(out)?;
+                device_id.encode(out)?;
+                range.encode(out)?;
+                fence.encode(out)
+            }
+            Self::NativeWrite {
+                keyspace_id,
+                file_id,
+                range,
+                base_version,
+            } => {
+                2u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                range.encode(out)?;
+                base_version.encode(out)
+            }
+            Self::NativeAppend {
+                keyspace_id,
+                file_id,
+                append_offset,
+                bytes,
+                base_version,
+                writer_epoch,
+            } => {
+                3u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                append_offset.encode(out)?;
+                bytes.encode(out)?;
+                base_version.encode(out)?;
+                writer_epoch.encode(out)
+            }
+            Self::NativeReservedAppend {
+                keyspace_id,
+                file_id,
+                append_offset,
+                bytes,
+                base_version,
+                writer_epoch,
+            } => {
+                4u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                append_offset.encode(out)?;
+                bytes.encode(out)?;
+                base_version.encode(out)?;
+                writer_epoch.encode(out)
+            }
+            Self::Internal { owner } => {
+                5u8.encode(out)?;
+                owner.encode(out)
+            }
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::BlockWrite {
+                device_id: DeviceId::decode(input)?,
+                range: crate::api::BlockRange::decode(input)?,
+                fence: DeviceGeneration::decode(input)?,
+            }),
+            2 => Ok(Self::NativeWrite {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                range: ByteRange::decode(input)?,
+                base_version: FileVersion::decode(input)?,
+            }),
+            3 => Ok(Self::NativeAppend {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                append_offset: u64::decode(input)?,
+                bytes: u64::decode(input)?,
+                base_version: FileVersion::decode(input)?,
+                writer_epoch: WriterEpoch::decode(input)?,
+            }),
+            4 => Ok(Self::NativeReservedAppend {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                append_offset: u64::decode(input)?,
+                bytes: u64::decode(input)?,
+                base_version: FileVersion::decode(input)?,
+                writer_epoch: WriterEpoch::decode(input)?,
+            }),
+            5 => Ok(Self::Internal {
+                owner: MappingOwner::decode(input)?,
+            }),
+            _ => Err(durable_codec_error("invalid write grant intent tag")),
+        }
+    }
+}
+
+impl DurableCodec for SegmentReceiptLifecycle {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::DurablePendingMetadata => 1u8.encode(out),
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::DurablePendingMetadata),
+            _ => Err(durable_codec_error("invalid segment receipt lifecycle tag")),
+        }
+    }
+}
+
+impl DurableCodec for SegmentWriteReceipt {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.tenant.encode(out)?;
+        self.grant_id.encode(out)?;
+        self.grant_hash.encode(out)?;
+        self.principal.encode(out)?;
+        self.owner.encode(out)?;
+        self.storage_node.encode(out)?;
+        self.storage_node_incarnation.encode(out)?;
+        self.segment_id.encode(out)?;
+        self.write_intent.encode(out)?;
+        self.intent.encode(out)?;
+        self.bytes.encode(out)?;
+        self.checksum.encode(out)?;
+        self.durability.encode(out)?;
+        self.lifecycle.encode(out)?;
+        self.receipt_epoch.encode(out)?;
+        self.expires_at.encode(out)?;
+        self.node_key_id.encode(out)?;
+        self.proof_scheme.encode(out)?;
+        self.proof.encode(out)?;
+        self.descriptor.encode(out)?;
+        self.placement.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            tenant: TenantId::decode(input)?,
+            grant_id: GrantId::decode(input)?,
+            grant_hash: crate::provider::GrantHash::decode(input)?,
+            principal: PrincipalId::decode(input)?,
+            owner: MappingOwner::decode(input)?,
+            storage_node: StorageNodeId::decode(input)?,
+            storage_node_incarnation: ServerIncarnation::decode(input)?,
+            segment_id: SegmentId::decode(input)?,
+            write_intent: WriteIntentId::decode(input)?,
+            intent: WriteGrantIntent::decode(input)?,
+            bytes: u64::decode(input)?,
+            checksum: Option::decode(input)?,
+            durability: WriteDurability::decode(input)?,
+            lifecycle: SegmentReceiptLifecycle::decode(input)?,
+            receipt_epoch: GrantEpoch::decode(input)?,
+            expires_at: LogicalDeadline::decode(input)?,
+            node_key_id: StorageNodeKeyId::decode(input)?,
+            proof_scheme: ProofScheme::decode(input)?,
+            proof: crate::provider::ProofTag::decode(input)?,
+            descriptor: SegmentDescriptor::decode(input)?,
+            placement: SegmentReplicaPlacement::decode(input)?,
+        })
+    }
+}
+
 impl DurableCodec for SegmentLifecycleState {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         let tag: u8 = match self {
@@ -12751,7 +14308,7 @@ impl DurableCodec for CatalogEntry {
         self.intent.encode(out)?;
         self.reservation.encode(out)?;
         self.state.encode(out)?;
-        self.commit.encode(out)
+        self.receipt.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -12759,7 +14316,7 @@ impl DurableCodec for CatalogEntry {
             intent: SegmentReservationIntent::decode(input)?,
             reservation: SegmentReservation::decode(input)?,
             state: SegmentLifecycleState::decode(input)?,
-            commit: Option::decode(input)?,
+            receipt: Option::decode(input)?,
         })
     }
 }
@@ -14077,6 +15634,70 @@ mod tests {
         }
     }
 
+    fn receipt_for_commit(
+        intent: SegmentReservationIntent,
+        commit: SegmentReplicaCommit,
+    ) -> SegmentWriteReceipt {
+        let authority = LocalGrantReceiptAuthority;
+        let grant = authority
+            .issue_write_grant(WriteGrantRequest {
+                tenant: LOCAL_TENANT_ID,
+                principal: LOCAL_PRINCIPAL_ID,
+                intent: WriteGrantIntent::Internal {
+                    owner: intent.owner,
+                },
+                write_intent: intent.write_intent,
+                segment_id: commit.descriptor.segment_id,
+                storage_node: commit.placement.storage_node,
+                max_bytes: commit.descriptor.bytes,
+                durability: WriteDurability::Acknowledged,
+                expires_at: LOCAL_GRANT_EXPIRATION,
+            })
+            .unwrap();
+        authority
+            .create_segment_receipt(&grant, commit, LOCAL_STORAGE_NODE_INCARNATION)
+            .unwrap()
+    }
+
+    fn verified_receipt_for_commit(
+        intent: SegmentReservationIntent,
+        commit: SegmentReplicaCommit,
+    ) -> VerifiedSegmentReceipt {
+        let authority = LocalGrantReceiptAuthority;
+        let receipt = receipt_for_commit(intent, commit);
+        authority.verify_segment_receipt(&receipt).unwrap()
+    }
+
+    fn grant_for_segment(
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        write_intent: WriteIntentId,
+        owner: MappingOwner,
+        bytes: u64,
+    ) -> WriteGrant {
+        LocalGrantReceiptAuthority
+            .issue_write_grant(WriteGrantRequest {
+                tenant: LOCAL_TENANT_ID,
+                principal: LOCAL_PRINCIPAL_ID,
+                intent: WriteGrantIntent::Internal { owner },
+                write_intent,
+                segment_id,
+                storage_node,
+                max_bytes: bytes,
+                durability: WriteDurability::Acknowledged,
+                expires_at: LOCAL_GRANT_EXPIRATION,
+            })
+            .unwrap()
+    }
+
+    fn resign_grant(grant: &mut WriteGrant) {
+        grant.proof = deterministic_test_proof_for_grant(grant.key_id, grant);
+    }
+
+    fn resign_receipt(receipt: &mut SegmentWriteReceipt) {
+        receipt.proof = deterministic_test_proof_for_receipt(receipt.node_key_id, receipt);
+    }
+
     fn bytes_to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -14569,7 +16190,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_node_persist_requires_segment_descriptor_evidence() {
+    fn metadata_node_persist_requires_verified_receipt_evidence() {
         let metadata = InMemoryMetadataPlane::new(config()).unwrap();
         let descriptor = SegmentDescriptor {
             segment_id: SegmentId::from_raw(700),
@@ -14598,8 +16219,20 @@ mod tests {
                 .persist_metadata_node(MetadataNodeWrite::new(node.clone(), Vec::new()))
                 .is_err()
         );
+        let receipt = verified_receipt_for_commit(
+            reservation_intent(),
+            SegmentReplicaCommit {
+                descriptor,
+                placement: SegmentReplicaPlacement {
+                    segment_id: SegmentId::from_raw(700),
+                    storage_node: config().storage_node,
+                    offset: 0,
+                    bytes: 4096,
+                },
+            },
+        );
         metadata
-            .persist_metadata_node(MetadataNodeWrite::new(node.clone(), vec![descriptor]))
+            .persist_metadata_node(MetadataNodeWrite::new(node.clone(), vec![receipt]))
             .unwrap();
         assert_eq!(metadata.get_metadata_node(node.node_id).unwrap(), node);
     }
@@ -15725,9 +17358,17 @@ mod tests {
             .segment_store()
             .sync_segment(orphan.segment_id)
             .unwrap();
+        let orphan_receipt = receipt_for_commit(
+            SegmentReservationIntent {
+                write_intent: WriteIntentId::from_raw(12),
+                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                bytes: 4096,
+            },
+            orphan_commit,
+        );
         store
             .segment_catalog()
-            .commit_segment(orphan.clone(), orphan_commit)
+            .commit_segment(orphan.clone(), orphan_receipt)
             .unwrap();
         let referenced = store
             .write_segment_for_owner(MappingOwner::BlockDevice(DeviceId::from_raw(1)), &[4; 4096])
@@ -18632,20 +20273,23 @@ mod tests {
             catalog
                 .commit_segment(
                     reservation.clone(),
-                    SegmentReplicaCommit {
-                        descriptor: SegmentDescriptor {
-                            segment_id: reservation.segment_id,
-                            blocks: BlockCount::from_raw(1),
-                            bytes: 4096,
-                            checksum: None,
+                    receipt_for_commit(
+                        reservation_intent(),
+                        SegmentReplicaCommit {
+                            descriptor: SegmentDescriptor {
+                                segment_id: reservation.segment_id,
+                                blocks: BlockCount::from_raw(1),
+                                bytes: 4096,
+                                checksum: None,
+                            },
+                            placement: SegmentReplicaPlacement {
+                                segment_id: reservation.segment_id,
+                                storage_node: config().storage_node,
+                                offset: 0,
+                                bytes: 4096,
+                            },
                         },
-                        placement: SegmentReplicaPlacement {
-                            segment_id: reservation.segment_id,
-                            storage_node: config().storage_node,
-                            offset: 0,
-                            bytes: 4096,
-                        },
-                    },
+                    ),
                 )
                 .is_err()
         );
@@ -18653,11 +20297,12 @@ mod tests {
         catalog.begin_write(&reservation).unwrap();
         let commit = store.write_segment(&reservation, &[1; 4096]).unwrap();
         store.sync_segment(reservation.segment_id).unwrap();
+        let receipt = receipt_for_commit(reservation_intent(), commit.clone());
         catalog
-            .commit_segment(reservation.clone(), commit.clone())
+            .commit_segment(reservation.clone(), receipt.clone())
             .unwrap();
         catalog
-            .commit_segment(reservation.clone(), commit.clone())
+            .commit_segment(reservation.clone(), receipt.clone())
             .unwrap();
         assert_eq!(
             catalog.state(reservation.segment_id).unwrap(),
@@ -19961,9 +21606,10 @@ mod tests {
             .segment_store()
             .sync_segment(reservation.segment_id)
             .unwrap();
+        let receipt = receipt_for_commit(reservation_intent(), commit.clone());
         store
             .segment_catalog()
-            .commit_segment(reservation.clone(), commit.clone())
+            .commit_segment(reservation.clone(), receipt.clone())
             .unwrap();
         store
             .segment_catalog()
@@ -19989,7 +21635,11 @@ mod tests {
             .metadata()
             .persist_metadata_node(MetadataNodeWrite::new(
                 node.clone(),
-                vec![commit.descriptor],
+                vec![
+                    LocalGrantReceiptAuthority
+                        .verify_segment_receipt(&receipt)
+                        .unwrap(),
+                ],
             ))
             .unwrap();
         store
@@ -20879,10 +22529,13 @@ mod tests {
                 node.clone(),
                 vec![
                     store
-                        .storage_nodes
-                        .commit_for_segment(reservation.segment_id)
-                        .unwrap()
-                        .descriptor,
+                        .verify_segment_receipt(
+                            &store
+                                .storage_nodes
+                                .receipt_for_segment(reservation.segment_id)
+                                .unwrap(),
+                        )
+                        .unwrap(),
                 ],
             ))
             .unwrap();
@@ -21878,9 +23531,10 @@ mod tests {
             .segment_store()
             .sync_segment(reservation.segment_id)
             .unwrap();
+        let receipt = receipt_for_commit(reservation_intent(), replica_commit.clone());
         store
             .segment_catalog()
-            .commit_segment(reservation.clone(), replica_commit.clone())
+            .commit_segment(reservation.clone(), receipt.clone())
             .unwrap();
         store
             .segment_catalog()
@@ -22036,40 +23690,667 @@ mod tests {
             owner: MappingOwner::BlockDevice(DeviceId::from_raw(99)),
             bytes: 4096,
         };
+        let authority = LocalGrantReceiptAuthority;
+        let grant = authority
+            .issue_write_grant(WriteGrantRequest {
+                tenant: LOCAL_TENANT_ID,
+                principal: LOCAL_PRINCIPAL_ID,
+                intent: WriteGrantIntent::Internal {
+                    owner: intent.owner,
+                },
+                write_intent: intent.write_intent,
+                segment_id,
+                storage_node: cfg.storage_node,
+                max_bytes: intent.bytes,
+                durability: WriteDurability::Acknowledged,
+                expires_at: LOCAL_GRANT_EXPIRATION,
+            })
+            .unwrap();
 
         let response = registry
             .transport_for_node(cfg.storage_node)
             .unwrap()
             .send(StorageNodeRequest::WriteSegment {
-                segment_id,
-                intent,
+                grant,
                 bytes: repeated_blocks(1, 12),
             })
             .unwrap();
-        let StorageNodeResponse::WriteSegment {
-            reservation,
-            commit,
-        } = response
-        else {
+        let StorageNodeResponse::WriteSegment { receipt } = response else {
             panic!("expected write-segment receipt");
         };
 
-        assert_eq!(reservation.segment_id, segment_id);
-        assert_eq!(commit.placement.storage_node, cfg.storage_node);
+        assert_eq!(receipt.segment_id, segment_id);
+        assert_eq!(receipt.placement.storage_node, cfg.storage_node);
         assert_eq!(
             registry.state(segment_id).unwrap(),
             SegmentLifecycleState::DurablePendingMetadata
         );
 
+        let evidence = authority
+            .create_reference_evidence(&receipt, CommitSeq::from_raw(1))
+            .unwrap();
         let response = registry
             .transport_for_segment(segment_id)
             .unwrap()
-            .send(StorageNodeRequest::MarkReferenced { segment_id })
+            .send(StorageNodeRequest::MarkReferenced { evidence })
             .unwrap();
         assert_eq!(response, StorageNodeResponse::MarkReferenced);
         assert_eq!(
             registry.state(segment_id).unwrap(),
             SegmentLifecycleState::Referenced
+        );
+    }
+
+    #[test]
+    fn grants_and_receipts_reject_scope_and_proof_corruption() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let owner = MappingOwner::BlockDevice(DeviceId::from_raw(99));
+        let mut grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(99),
+            owner,
+            4096,
+        );
+        grant.tenant = TenantId::from_raw(404);
+        assert!(
+            registry
+                .transport_for_node(cfg.storage_node)
+                .unwrap()
+                .send(StorageNodeRequest::WriteSegment {
+                    grant,
+                    bytes: repeated_blocks(1, 1),
+                })
+                .is_err()
+        );
+
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(99),
+            owner,
+            4096,
+        );
+        let response = registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::WriteSegment {
+                grant,
+                bytes: repeated_blocks(1, 2),
+            })
+            .unwrap();
+        let StorageNodeResponse::WriteSegment { mut receipt } = response else {
+            panic!("expected receipt");
+        };
+        LocalGrantReceiptAuthority
+            .verify_segment_receipt(&receipt)
+            .unwrap();
+        receipt.proof.0[0] ^= 0xff;
+        assert!(
+            LocalGrantReceiptAuthority
+                .verify_segment_receipt(&receipt)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn grants_and_receipts_reject_signed_semantic_mismatches() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let owner = MappingOwner::BlockDevice(DeviceId::from_raw(99));
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(991),
+            owner,
+            4096,
+        );
+
+        let mut wrong_owner_grant = grant.clone();
+        wrong_owner_grant.owner = MappingOwner::BlockDevice(DeviceId::from_raw(100));
+        resign_grant(&mut wrong_owner_grant);
+        assert!(
+            registry
+                .transport_for_node(cfg.storage_node)
+                .unwrap()
+                .send(StorageNodeRequest::WriteSegment {
+                    grant: wrong_owner_grant,
+                    bytes: repeated_blocks(1, 3),
+                })
+                .is_err()
+        );
+
+        let mut stale_epoch_grant = grant.clone();
+        stale_epoch_grant.grant_epoch = GrantEpoch::from_raw(0);
+        resign_grant(&mut stale_epoch_grant);
+        assert!(
+            registry
+                .transport_for_node(cfg.storage_node)
+                .unwrap()
+                .send(StorageNodeRequest::WriteSegment {
+                    grant: stale_epoch_grant,
+                    bytes: repeated_blocks(1, 3),
+                })
+                .is_err()
+        );
+
+        assert!(
+            registry
+                .transport_for_node(cfg.storage_node)
+                .unwrap()
+                .send(StorageNodeRequest::WriteSegment {
+                    grant: grant.clone(),
+                    bytes: repeated_blocks(1, 3)[..2048].to_vec(),
+                })
+                .is_err()
+        );
+        assert!(registry.state(segment_id).is_err());
+
+        let response = registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::WriteSegment {
+                grant: grant.clone(),
+                bytes: repeated_blocks(1, 3),
+            })
+            .unwrap();
+        let StorageNodeResponse::WriteSegment { receipt } = response else {
+            panic!("expected receipt");
+        };
+
+        let mut wrong_owner_receipt = (*receipt).clone();
+        wrong_owner_receipt.owner = MappingOwner::BlockDevice(DeviceId::from_raw(100));
+        resign_receipt(&mut wrong_owner_receipt);
+        assert!(
+            LocalGrantReceiptAuthority
+                .verify_segment_receipt(&wrong_owner_receipt)
+                .is_err()
+        );
+
+        let mut stale_epoch_receipt = (*receipt).clone();
+        stale_epoch_receipt.receipt_epoch = GrantEpoch::from_raw(0);
+        resign_receipt(&mut stale_epoch_receipt);
+        assert!(
+            LocalGrantReceiptAuthority
+                .verify_segment_receipt(&stale_epoch_receipt)
+                .is_err()
+        );
+
+        let mut mismatched_grant_hash = (*receipt).clone();
+        mismatched_grant_hash.grant_hash.0[0] ^= 0xff;
+        resign_receipt(&mut mismatched_grant_hash);
+        assert!(
+            LocalGrantReceiptAuthority
+                .verify_segment_receipt(&mismatched_grant_hash)
+                .is_ok()
+        );
+        assert!(
+            LocalGrantReceiptAuthority
+                .verify_receipt_matches_grant(&grant, &mismatched_grant_hash)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn storage_node_retries_same_grant_idempotently_but_rejects_conflicting_bytes() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(992),
+            MappingOwner::BlockDevice(DeviceId::from_raw(99)),
+            4096,
+        );
+        let transport = registry.transport_for_node(cfg.storage_node).unwrap();
+        let first = transport
+            .send(StorageNodeRequest::WriteSegment {
+                grant: grant.clone(),
+                bytes: repeated_blocks(1, 8),
+            })
+            .unwrap();
+        let retry = transport
+            .send(StorageNodeRequest::WriteSegment {
+                grant: grant.clone(),
+                bytes: repeated_blocks(1, 8),
+            })
+            .unwrap();
+        assert_eq!(retry, first);
+        assert!(
+            transport
+                .send(StorageNodeRequest::WriteSegment {
+                    grant,
+                    bytes: repeated_blocks(1, 9),
+                })
+                .is_err()
+        );
+        assert_eq!(
+            registry.state(segment_id).unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+    }
+
+    #[test]
+    fn storage_node_duplicate_retry_compares_stored_bytes_not_only_receipt_checksum() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(993),
+            MappingOwner::BlockDevice(DeviceId::from_raw(99)),
+            4096,
+        );
+        let transport = registry.transport_for_node(cfg.storage_node).unwrap();
+        let original = repeated_blocks(1, 7);
+        transport
+            .send(StorageNodeRequest::WriteSegment {
+                grant: grant.clone(),
+                bytes: original.clone(),
+            })
+            .unwrap();
+
+        let node = registry.node(cfg.storage_node).unwrap();
+        {
+            let mut inner = lock(&node.segment_store.inner).unwrap();
+            let record = inner.segments.get_mut(&segment_id).unwrap();
+            record.bytes = repeated_blocks(1, 8);
+        }
+
+        assert!(
+            transport
+                .send(StorageNodeRequest::WriteSegment {
+                    grant,
+                    bytes: original,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            registry.state(segment_id).unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+    }
+
+    #[test]
+    fn trusted_block_grant_receipt_flow_publishes_and_marks_reference() {
+        let store = LocalCoordinator::with_config(LocalStoreConfig {
+            shard_count: 1,
+            ..config()
+        })
+        .unwrap();
+        let head = store.metadata().create_device(device_request()).unwrap();
+        let grant = store
+            .issue_block_write_grant(
+                head.device_id,
+                crate::api::BlockRange::new(BlockIndex::from_raw(2), BlockCount::from_raw(1)),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let receipt = store
+            .write_granted_segment(&grant, repeated_blocks(1, 55))
+            .unwrap();
+        let commit = store
+            .submit_block_write_receipt(&grant, receipt.clone())
+            .unwrap();
+        assert_eq!(commit.range, ByteRange::new(2 * 4096, 4096));
+        assert_eq!(
+            store.storage_nodes.state(receipt.segment_id).unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+
+        let mut bytes = vec![0; 4096];
+        store
+            .read_device(head.device_id, ByteRange::new(2 * 4096, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 55));
+
+        assert!(store.submit_block_write_receipt(&grant, receipt).is_err());
+        let mut bytes_after_duplicate = vec![0; 4096];
+        store
+            .read_device(
+                head.device_id,
+                ByteRange::new(2 * 4096, 4096),
+                &mut bytes_after_duplicate,
+            )
+            .unwrap();
+        assert_eq!(bytes_after_duplicate, repeated_blocks(1, 55));
+    }
+
+    #[test]
+    fn trusted_native_grant_receipt_flow_publishes_append_and_write() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let keyspace = store
+            .metadata()
+            .create_keyspace(MetadataCreateKeyspaceRequest {
+                request: CreateKeyspaceRequest { name: None },
+            })
+            .unwrap();
+        let file = store
+            .metadata()
+            .create_file(MetadataCreateFileRequest {
+                keyspace_id: keyspace.keyspace_id,
+                request: CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            })
+            .unwrap();
+        let lease = store
+            .acquire_append_lease(keyspace.keyspace_id, file.file_id)
+            .unwrap();
+        let append_grant = store
+            .issue_native_append_grant(lease, 4096, 4096, WriteDurability::Acknowledged)
+            .unwrap();
+        let append_receipt = store
+            .write_granted_segment(&append_grant, repeated_blocks(1, 21))
+            .unwrap();
+        let append = store
+            .submit_native_append_receipt(&append_grant, append_receipt.clone())
+            .unwrap();
+        assert_eq!(append.range, ByteRange::new(0, 4096));
+        assert_eq!(
+            store
+                .storage_nodes
+                .state(append_receipt.segment_id)
+                .unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+        assert!(
+            store
+                .submit_native_append_receipt(&append_grant, append_receipt.clone())
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .metadata()
+                .get_file_head(keyspace.keyspace_id, file.file_id)
+                .unwrap()
+                .size,
+            4096
+        );
+
+        let write_grant = store
+            .issue_native_write_grant(
+                keyspace.keyspace_id,
+                file.file_id,
+                ByteRange::new(0, 4096),
+                4096,
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let write_receipt = store
+            .write_granted_segment(&write_grant, repeated_blocks(1, 66))
+            .unwrap();
+        let write = store
+            .submit_native_write_receipt(&write_grant, write_receipt.clone())
+            .unwrap();
+        assert_eq!(write.range, ByteRange::new(0, 4096));
+        assert_eq!(
+            store.storage_nodes.state(write_receipt.segment_id).unwrap(),
+            SegmentLifecycleState::Referenced
+        );
+        assert!(
+            store
+                .submit_native_write_receipt(&write_grant, write_receipt.clone())
+                .is_err()
+        );
+
+        let mut bytes = vec![0; 4096];
+        store
+            .read_file(
+                keyspace.keyspace_id,
+                file.file_id,
+                ByteRange::new(0, 4096),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 66));
+    }
+
+    #[test]
+    fn generated_trusted_block_receipt_flow_matches_normal_writes() {
+        for seed in 0..8 {
+            let mut harness = crate::sim::DeterministicHarness::new(seed);
+            let cfg = LocalStoreConfig {
+                shard_count: 1,
+                ..config()
+            };
+            let normal = LocalCoordinator::with_config(cfg).unwrap();
+            let trusted = LocalCoordinator::with_config(cfg).unwrap();
+            let normal_head = normal.metadata().create_device(device_request()).unwrap();
+            let trusted_head = trusted.metadata().create_device(device_request()).unwrap();
+            for step in 0..24 {
+                let block = harness.rng.next_u64() % 16;
+                let byte = (step as u8).wrapping_add((seed as u8) << 1);
+                let payload = repeated_blocks(1, byte);
+                normal
+                    .write_device(
+                        normal_head.device_id,
+                        block * 4096,
+                        &payload,
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                let grant = trusted
+                    .issue_block_write_grant(
+                        trusted_head.device_id,
+                        crate::api::BlockRange::new(
+                            BlockIndex::from_raw(block),
+                            BlockCount::from_raw(1),
+                        ),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                let receipt = trusted
+                    .write_granted_segment(&grant, payload.clone())
+                    .unwrap();
+                trusted.submit_block_write_receipt(&grant, receipt).unwrap();
+                harness
+                    .trace
+                    .record(format!("write block {block} byte {byte}"));
+            }
+
+            let mut normal_bytes = vec![0; 16 * 4096];
+            let mut trusted_bytes = vec![0; 16 * 4096];
+            normal
+                .read_device(
+                    normal_head.device_id,
+                    ByteRange::new(0, 16 * 4096),
+                    &mut normal_bytes,
+                )
+                .unwrap();
+            trusted
+                .read_device(
+                    trusted_head.device_id,
+                    ByteRange::new(0, 16 * 4096),
+                    &mut trusted_bytes,
+                )
+                .unwrap();
+            assert_eq!(
+                trusted_bytes,
+                normal_bytes,
+                "seed {seed} trace {:?}",
+                harness.trace.events()
+            );
+        }
+    }
+
+    #[test]
+    fn storage_node_rejects_reference_without_metadata_evidence() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(123),
+            MappingOwner::BlockDevice(DeviceId::from_raw(8)),
+            4096,
+        );
+        let response = registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::WriteSegment {
+                grant,
+                bytes: repeated_blocks(1, 9),
+            })
+            .unwrap();
+        let StorageNodeResponse::WriteSegment { receipt } = response else {
+            panic!("expected receipt");
+        };
+        let mut evidence = LocalGrantReceiptAuthority
+            .create_reference_evidence(&receipt, CommitSeq::from_raw(1))
+            .unwrap();
+        evidence.proof.0[0] ^= 0xff;
+        assert!(
+            registry
+                .transport_for_segment(segment_id)
+                .unwrap()
+                .send(StorageNodeRequest::MarkReferenced { evidence })
+                .is_err()
+        );
+        assert_eq!(
+            registry.state(segment_id).unwrap(),
+            SegmentLifecycleState::DurablePendingMetadata
+        );
+    }
+
+    #[test]
+    fn chaos_storage_node_transport_exercises_duplicate_delay_and_corruption() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let inner = registry.transport_for_node(cfg.storage_node).unwrap();
+        let chaos = ChaosStorageNodeTransport::new(inner);
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(321),
+            MappingOwner::BlockDevice(DeviceId::from_raw(8)),
+            4096,
+        );
+
+        chaos.duplicate_next_request().unwrap();
+        let response = chaos
+            .send(StorageNodeRequest::WriteSegment {
+                grant: grant.clone(),
+                bytes: repeated_blocks(1, 10),
+            })
+            .unwrap();
+        let StorageNodeResponse::WriteSegment { receipt } = response else {
+            panic!("expected receipt");
+        };
+        LocalGrantReceiptAuthority
+            .verify_segment_receipt(&receipt)
+            .unwrap();
+        assert_eq!(chaos.metrics().unwrap().duplicated_requests, 1);
+
+        let delayed_segment = registry.allocate_segment_id().unwrap();
+        let delayed_grant = grant_for_segment(
+            cfg.storage_node,
+            delayed_segment,
+            WriteIntentId::from_raw(322),
+            MappingOwner::BlockDevice(DeviceId::from_raw(8)),
+            4096,
+        );
+        chaos.delay_next_response().unwrap();
+        assert!(
+            chaos
+                .send(StorageNodeRequest::WriteSegment {
+                    grant: delayed_grant.clone(),
+                    bytes: repeated_blocks(1, 11),
+                })
+                .is_err()
+        );
+        assert_eq!(chaos.delayed_len().unwrap(), 1);
+        chaos.return_delayed_response_next_call().unwrap();
+        let delayed = chaos.send(StorageNodeRequest::ObserveMaintenance).unwrap();
+        assert!(matches!(delayed, StorageNodeResponse::WriteSegment { .. }));
+
+        let corrupt_segment = registry.allocate_segment_id().unwrap();
+        let corrupt_grant = grant_for_segment(
+            cfg.storage_node,
+            corrupt_segment,
+            WriteIntentId::from_raw(323),
+            MappingOwner::BlockDevice(DeviceId::from_raw(8)),
+            4096,
+        );
+        chaos.corrupt_next_receipt().unwrap();
+        let response = chaos
+            .send(StorageNodeRequest::WriteSegment {
+                grant: corrupt_grant,
+                bytes: repeated_blocks(1, 12),
+            })
+            .unwrap();
+        let StorageNodeResponse::WriteSegment { receipt } = response else {
+            panic!("expected corrupted receipt");
+        };
+        assert!(
+            LocalGrantReceiptAuthority
+                .verify_segment_receipt(&receipt)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn storage_node_maintenance_messages_return_typed_reports() {
+        let cfg = config();
+        let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(444),
+            MappingOwner::BlockDevice(DeviceId::from_raw(8)),
+            4096,
+        );
+        let response = registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::WriteSegment {
+                grant,
+                bytes: repeated_blocks(1, 13),
+            })
+            .unwrap();
+        let StorageNodeResponse::WriteSegment { receipt } = response else {
+            panic!("expected receipt");
+        };
+        let evidence = LocalGrantReceiptAuthority
+            .create_reference_evidence(&receipt, CommitSeq::from_raw(1))
+            .unwrap();
+        registry
+            .transport_for_segment(segment_id)
+            .unwrap()
+            .send(StorageNodeRequest::MarkReferenced { evidence })
+            .unwrap();
+        registry.release_segment(segment_id).unwrap();
+
+        let observed = registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::ObserveMaintenance)
+            .unwrap();
+        let StorageNodeResponse::MaintenanceObserved(observed) = observed else {
+            panic!("expected maintenance observation");
+        };
+        assert_eq!(observed.released_segments, 1);
+
+        let tick = registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::RunMaintenanceTick)
+            .unwrap();
+        let StorageNodeResponse::MaintenanceTicked(report) = tick else {
+            panic!("expected maintenance report");
+        };
+        assert_eq!(report.deleted_released_segments, vec![segment_id]);
+        assert_eq!(
+            registry.state(segment_id).unwrap(),
+            SegmentLifecycleState::Freed
         );
     }
 

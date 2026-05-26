@@ -540,10 +540,11 @@ semantics.
 
 `MetadataPlane` must not read or write storage-node catalogs, data logs, or
 segment bytes. When a coordinator persists a metadata leaf that references
-segments, it supplies segment descriptor evidence so the metadata plane can
-validate leaf shape without opening a storage node. Storage nodes later receive
-reference or release evidence from the coordinator; they do not infer logical
-visibility by reading current metadata heads.
+segments, it supplies verified storage-node receipt evidence. The metadata
+plane extracts segment descriptors from those verified receipts to validate
+leaf shape without opening a storage node. Storage nodes later receive
+metadata-produced reference or release evidence from the coordinator; they do
+not infer logical visibility by reading current metadata heads.
 
 ### `SegmentStore` and `LocalSegmentCatalog`
 
@@ -799,24 +800,33 @@ The intended flow is:
 client/coordinator asks metadata for a write grant
 client/coordinator writes bytes to the granted storage node
 storage node returns a verifiable durable-pending segment receipt
-client/coordinator submits receipt plus metadata update intent
-metadata verifies receipt and fencing, then publishes roots
+client/coordinator submits grant, receipt, and metadata update intent
+metadata verifies the grant, receipt, grant/receipt binding, and fencing, then publishes roots
 coordinator/metadata-produced evidence marks the storage node referenced
 ```
 
-A write grant should bind the mapping owner, write intent, segment identity or
-reservation class, byte length, placement node or placement-policy result,
-durability requirement, caller identity, expiration, and metadata epoch. A
-segment receipt should bind storage node, segment ID, write intent, owner,
+A write grant should bind the tenant, principal, mapping owner, operation
+intent, write intent, segment identity or reservation class, byte length,
+placement node or placement-policy result, durability requirement, caller
+identity, expiration, and metadata epoch. A segment receipt should bind storage
+node, storage-node incarnation, segment ID, grant ID/hash, write intent, owner,
 bytes, checksum, durability reached, durable-pending lifecycle state, receipt
-epoch/expiration, and an implementation-private authentication proof such as a
-signature or MAC.
+epoch/expiration, node key ID, proof scheme, and proof bytes.
 
-Metadata may verify grant/receipt evidence, but must still not open
-storage-node catalogs or read segment bytes. Storage nodes may authenticate a
-grant and issue a receipt, but must still not publish metadata, assign file
-versions, or mark a segment referenced from a client's word alone. Reference
-state follows metadata-produced evidence after publish.
+Receipt proofs use a canonical crate-owned binary receipt body with a domain
+separator such as `TCOW_SEGMENT_RECEIPT_V1`. The proof covers the payload
+checksum and all logical/placement fields, not the full payload bytes.
+Production adapters should prefer asymmetric storage-node signatures
+(`NodeSignatureV1`) verified through a storage-node key registry. The local
+provider may use deterministic test MACs so simulations remain replayable, but
+the verifier boundary and receipt body must stay production-shaped.
+
+Metadata verifies grant/receipt evidence and their binding before it accepts a
+new segment reference, but must still not open storage-node catalogs or read
+segment bytes. Storage nodes may authenticate a grant and issue a receipt, but
+must still not publish metadata, assign file versions, or mark a segment
+referenced from a client's word alone. Reference state follows
+metadata-produced evidence after publish.
 
 ### Future Storage Replication
 
@@ -888,10 +898,10 @@ not become permanent shortcuts:
   storage should first use SQLite outbox/apply-cursor tables for release and
   reference evidence; custom durable logs or external queues need specific
   remote-deployment or benchmark evidence.
-- Storage-node write receipts are currently in-process structs. Remote or
-  trusted-client data paths need authenticated write grants, verifiable
-  storage-node receipts, metadata-side receipt verification, and deterministic
-  storage-node chaos tests before replication multiplies the protocol.
+- Storage-node write receipts now use authenticated grant and receipt bodies in
+  the local provider. Remote adapters still need a network encoding, a
+  storage-node key registry, and a production `NodeSignatureV1` verifier before
+  those receipts can cross trust boundaries.
 - Durable compaction is one local append log in Phase 20. The SQLite metadata
   plus partitioned-data-log phase needs placement tables, relocation
   transactions, data-log manifests, and incremental compaction tests before

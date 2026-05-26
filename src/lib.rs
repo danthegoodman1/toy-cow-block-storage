@@ -32,25 +32,30 @@ pub use extent::{
 };
 pub use id::{
     AppendLeaseId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration,
-    DeviceId, ExtentId, FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration,
-    KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, RequestId, ServerIncarnation,
-    StorageNodeId, WriteIntentId, WriterEpoch,
+    DeviceId, ExtentId, FileId, FileVersion, GrantEpoch, GrantId, GrantNonce,
+    KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline,
+    LogicalTime, PrincipalId, RequestId, ServerIncarnation, StorageNodeId, StorageNodeKeyId,
+    TenantId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
-    ChaosRemoteWireTransport, ChaosTransportMetrics, DurableCompactionReport, DurableCoordinator,
-    DurableDataLogPolicy, DurableDataLogRef, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane,
-    InMemorySegmentStore, InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient,
-    LocalBlockDevice, LocalBlockServer, LocalCoordinator, LocalNativeClient, LocalNativeFile,
-    LocalNativeServer, LocalStoreConfig, MaintenanceCommand, MaintenanceDataLogObservation,
-    MaintenanceDiagnostics, MaintenanceMode, MaintenanceNodeObservation, MaintenanceObservation,
-    MaintenancePolicy, MaintenanceScheduler, MaintenanceSkippedLog, MaintenanceTickPlan,
-    MaintenanceTickReport, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
-    RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport,
-    RemoteWireTransport, SegmentLifecycleState, WriteAdmission,
+    ChaosRemoteWireTransport, ChaosStorageNodeTransport, ChaosTransportMetrics,
+    DurableCompactionReport, DurableCoordinator, DurableDataLogPolicy, DurableDataLogRef,
+    InMemoryLocalSegmentCatalog, InMemoryMetadataPlane, InMemorySegmentStore,
+    InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient, LocalBlockDevice,
+    LocalBlockServer, LocalCoordinator, LocalNativeClient, LocalNativeFile, LocalNativeServer,
+    LocalStoreConfig, MaintenanceCommand, MaintenanceDataLogObservation, MaintenanceDiagnostics,
+    MaintenanceMode, MaintenanceNodeObservation, MaintenanceObservation, MaintenancePolicy,
+    MaintenanceScheduler, MaintenanceSkippedLog, MaintenanceTickPlan, MaintenanceTickReport,
+    MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport, RemoteBlockEndpoint,
+    RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport, RemoteWireTransport,
+    SegmentLifecycleState, WriteAdmission,
 };
 pub use provider::{
-    MetadataNodeWrite, PlacementPolicy, StorageNodeCustodianReport, StorageNodeDirectory,
-    StorageNodeRequest, StorageNodeResponse, StorageNodeTransport,
+    GrantHash, GrantReceiptAuthority, MetadataNodeWrite, PlacementPolicy, ProofScheme, ProofTag,
+    ReferenceEvidence, SegmentReceiptLifecycle, SegmentWriteReceipt, StorageNodeCustodianReport,
+    StorageNodeDirectory, StorageNodeMaintenanceObservation, StorageNodeMaintenanceReport,
+    StorageNodeRequest, StorageNodeResponse, StorageNodeTransport, VerifiedSegmentReceipt,
+    WriteGrant, WriteGrantIntent, WriteGrantRequest,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

@@ -10,14 +10,14 @@ use std::{
 use toy_cow_block_storage::api::BlockRange;
 use toy_cow_block_storage::id::{BlockCount, BlockIndex, MetadataNodeId, SegmentId, StorageNodeId};
 use toy_cow_block_storage::local::{
-    DurableCoordinator, DurableDataLogPolicy, InMemoryMetadataPlane, InMemorySegmentStore,
-    LocalCoordinator, LocalStoreConfig, MaintenanceMode, MaintenancePolicy,
+    ChaosStorageNodeTransport, DurableCoordinator, DurableDataLogPolicy, InMemoryMetadataPlane,
+    InMemorySegmentStore, LocalCoordinator, LocalStoreConfig, MaintenanceMode, MaintenancePolicy,
 };
 use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
 use toy_cow_block_storage::provider::{
     MetadataCreateDeviceRequest, MetadataCreateFileRequest, MetadataCreateKeyspaceRequest,
     MetadataNodeWrite, MetadataPlane, MetadataSnapshotKeyspaceRequest, RetentionPolicy,
-    SegmentReservation, SegmentStore,
+    SegmentReservation, SegmentStore, StorageNodeRequest, StorageNodeTransport,
 };
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
@@ -225,6 +225,167 @@ fn bench_local_single_shard_write(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+}
+
+fn bench_local_grant_receipt_flow(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_grant_receipt_flow");
+    group.bench_function("trusted_block_grant_receipt_publish_4k", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalCoordinator::new();
+                let head = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                let grant = store
+                    .issue_block_write_grant(
+                        head.device_id,
+                        BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(1)),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                (store, grant, vec![3; 4096])
+            },
+            |(store, grant, bytes)| {
+                let receipt = store
+                    .write_granted_segment(black_box(&grant), black_box(bytes))
+                    .unwrap();
+                store
+                    .submit_block_write_receipt(black_box(&grant), black_box(receipt))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("duplicate_storage_write_receipt_retry_4k", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalCoordinator::new();
+                let head = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                let grant = store
+                    .issue_block_write_grant(
+                        head.device_id,
+                        BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(1)),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                store.write_granted_segment(&grant, vec![4; 4096]).unwrap();
+                (store, grant, vec![4; 4096])
+            },
+            |(store, grant, bytes)| {
+                store
+                    .write_granted_segment(black_box(&grant), black_box(bytes))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("trusted_native_append_receipt_publish_4k", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalCoordinator::new();
+                let (keyspace_id, file_id) = create_native_file_for_bench(&store);
+                let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                let grant = store
+                    .issue_native_append_grant(lease, 4096, 4096, WriteDurability::Acknowledged)
+                    .unwrap();
+                (store, grant, vec![6; 4096])
+            },
+            |(store, grant, bytes)| {
+                let receipt = store
+                    .write_granted_segment(black_box(&grant), black_box(bytes))
+                    .unwrap();
+                store
+                    .submit_native_append_receipt(black_box(&grant), black_box(receipt))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("trusted_native_write_receipt_publish_4k", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalCoordinator::new();
+                let (keyspace_id, file_id) = create_native_file_for_bench(&store);
+                let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+                store
+                    .append_file(lease, &vec![1; 4096], WriteDurability::Acknowledged)
+                    .unwrap();
+                let grant = store
+                    .issue_native_write_grant(
+                        keyspace_id,
+                        file_id,
+                        ByteRange::new(0, 4096),
+                        4096,
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                (store, grant, vec![7; 4096])
+            },
+            |(store, grant, bytes)| {
+                let receipt = store
+                    .write_granted_segment(black_box(&grant), black_box(bytes))
+                    .unwrap();
+                store
+                    .submit_native_write_receipt(black_box(&grant), black_box(receipt))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("chaos_storage_node_dispatch_pass_4k", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalCoordinator::new();
+                let head = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                let grant = store
+                    .issue_block_write_grant(
+                        head.device_id,
+                        BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(1)),
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                let transport = ChaosStorageNodeTransport::new(
+                    store.storage_node_transport_for_grant(&grant).unwrap(),
+                );
+                (transport, grant, vec![5; 4096])
+            },
+            |(transport, grant, bytes)| {
+                transport
+                    .send(StorageNodeRequest::WriteSegment {
+                        grant: black_box(grant),
+                        bytes: black_box(bytes),
+                    })
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
 }
 
 fn bench_local_multi_node_placement(c: &mut Criterion) {
@@ -971,6 +1132,12 @@ fn create_native_file(store: &LocalCoordinator, keyspace_id: KeyspaceId) -> File
         })
         .unwrap()
         .file_id
+}
+
+fn create_native_file_for_bench(store: &LocalCoordinator) -> (KeyspaceId, FileId) {
+    let keyspace_id = create_native_keyspace(store);
+    let file_id = create_native_file(store, keyspace_id);
+    (keyspace_id, file_id)
 }
 
 fn seed_native_keyspace(file_count: usize) -> (LocalCoordinator, KeyspaceId, Vec<FileId>) {
@@ -2243,6 +2410,6 @@ fn bench_durable_provider(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_large_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_grant_receipt_flow, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_large_append, bench_local_native_write_at, bench_local_native_stale_lease_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
 }
 criterion_main!(regression);

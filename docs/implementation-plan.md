@@ -1388,8 +1388,9 @@ Deliverables:
 - [x] `MetadataPlane` documentation and persist contracts state that metadata
   owns roots, fences, timelines, checkpoints, PITR, and GC reachability, and
   must not read storage-node catalogs, data logs, or segment bytes.
-- [x] Metadata-node persistence receives `MetadataNodeWrite` descriptor
-  evidence so leaf shape can be validated without storage-node access.
+- [x] Metadata-node persistence receives `MetadataNodeWrite` evidence so leaf
+  shape can be validated without storage-node access. After Phase 26, that
+  evidence is verified storage-node receipts, not raw descriptors.
 - [x] `LocalCoordinator` is the only in-process role that sequences both
   metadata and storage-node operations.
 - [x] `DurableCoordinator` is the embedded durable coordinator bundle; the old
@@ -1408,7 +1409,8 @@ Deliverables:
 
 Exit gate:
 
-- [x] Role-boundary tests cover metadata-only descriptor validation,
+- [x] Role-boundary tests cover metadata-only receipt-derived descriptor
+  validation,
   storage-node write receipts that stay pending until reference evidence, and
   coordinator-only crossing of the metadata/storage-node boundary.
 - [x] Block and native writes preserve the same public semantics after the role
@@ -1434,14 +1436,14 @@ change; reopen/custodian numbers remain host-filesystem sensitive.
 
 ## Phase 26: Authenticated Write Grants, Segment Receipts, and Storage-Node Chaos
 
-Status: not started.
+Status: complete.
 
 Make proof-carrying storage writes first-class before replicated writes multiply
 the protocol. This phase allows a future trusted client or embedded coordinator
 to write bytes directly to storage nodes, receive a verifiable durable-pending
-receipt, and submit that receipt to metadata for logical publish. Clients may
-carry proof between services, but they still do not create logical truth:
-metadata owns visibility and storage nodes own byte durability.
+receipt, and submit the grant plus receipt to metadata for logical publish.
+Clients may carry proof between services, but they still do not create logical
+truth: metadata owns visibility and storage nodes own byte durability.
 
 Non-goals:
 
@@ -1455,62 +1457,77 @@ Non-goals:
 
 Deliverables:
 
-- [ ] Metadata-issued `WriteGrant` shape that binds owner, write intent,
+- [x] Metadata-issued `WriteGrant` shape that binds owner, write intent,
   segment ID or reservation class, byte length, placement node or placement
   policy result, expiration/epoch, durability requirement, and allowed caller
   identity.
-- [ ] Storage-node `SegmentWriteReceipt` shape that binds storage node,
+- [x] Storage-node `SegmentWriteReceipt` shape that binds storage node,
   segment ID, write intent, owner, byte length, checksum, durability reached,
   durable-pending lifecycle state, receipt epoch/expiration, and authentication
   proof.
-- [ ] Metadata-side receipt verifier that accepts receipts as evidence for
+- [x] Production-shaped proof envelope with `ProofScheme`, node key ID, grant
+  hash, canonical crate-owned receipt bodies, deterministic local MACs, and a
+  `NodeSignatureV1` path reserved for production storage-node signatures.
+- [x] Metadata-side receipt verifier that accepts receipts as evidence for
   `MetadataNodeWrite`/publish without opening storage-node catalogs or reading
   segment bytes.
-- [ ] Coordinator path that uses the same grant/receipt verifier internally so
+- [x] Coordinator path that uses the same grant/receipt verifier internally so
   local coordinator writes and trusted direct-client writes share one proof
   model.
-- [ ] Direct trusted-client flow in local tests: obtain grant, write to storage
-  node, receive receipt, submit receipt to metadata/coordinator, publish roots,
-  then apply reference evidence to the storage node.
-- [ ] Explicit failure semantics: expired grants, wrong caller identity, wrong
+- [x] Direct trusted-client flow in local tests: obtain grant, write to storage
+  node, receive receipt, submit grant plus receipt to metadata/coordinator,
+  publish roots, then apply reference evidence to the storage node.
+- [x] Explicit failure semantics: expired grants, wrong caller identity, wrong
   segment ID, wrong owner, wrong write intent, wrong length, wrong checksum,
   wrong storage node, stale receipt epoch, insufficient durability, and
   duplicate/conflicting receipts all fail without logical visibility.
-- [ ] Durable idempotency keys for grant issue, storage-node write receipt, and
+- [x] Durable idempotency keys for grant issue, storage-node write receipt, and
   metadata publish submission so retries after timeout do not double-publish or
   double-reference a segment.
-- [ ] Storage-node chaos transport for coordinator-to-storage-node messages,
+- [x] Storage-node chaos transport for coordinator-to-storage-node messages,
   covering dropped, duplicated, delayed, reordered, and stale write receipts;
   duplicated/delayed `MarkReferenced`; reordered release/reference evidence;
   stale write intents; and interrupted custodian/maintenance ticks.
-- [ ] Real payload/report semantics for storage-node `ObserveMaintenance` and
+- [x] Real payload/report semantics for storage-node `ObserveMaintenance` and
   `RunMaintenanceTick`, or an explicit split that keeps maintenance below a
   separate storage-node maintenance service boundary.
-- [ ] Deterministic generated traces comparing normal coordinator writes and
+- [x] Deterministic generated traces comparing normal coordinator writes and
   trusted proof-carrying writes against the same block/native reference models.
-- [ ] Criterion smoke benchmarks for coordinator write overhead with receipts,
+- [x] Criterion smoke benchmarks for coordinator write overhead with receipts,
   trusted-client grant/receipt/publish overhead, duplicate-retry overhead, and
   chaos-transport dispatch overhead.
 
 Exit gate:
 
-- [ ] Metadata can publish from verifiable storage-node receipts without
+- [x] Metadata can publish from verifiable storage-node receipts without
   reading storage-node catalogs or bytes.
-- [ ] A trusted client can carry grants and receipts, but cannot choose
+- [x] A trusted client can carry grants and receipts, but cannot choose
   unauthorized placement, invent a segment, weaken durability, or bypass
   metadata fencing.
-- [ ] Storage nodes never mark a durable-pending segment referenced from the
+- [x] Storage nodes never mark a durable-pending segment referenced from the
   client's word alone; reference state still requires metadata-produced
   evidence or coordinator-verified publish success.
-- [ ] Failed metadata publish after a valid storage receipt leaves only a
+- [x] Failed metadata publish after a valid storage receipt leaves only a
   reclaimable pending orphan.
-- [ ] Retries, duplicate receipts, delayed references, and reordered
+- [x] Retries, duplicate receipts, delayed references, and reordered
   release/reference evidence are idempotent and deterministic under chaos
   tests.
-- [ ] Existing public block/native APIs remain unchanged, and ordinary clients
+- [x] Existing public block/native APIs remain unchanged, and ordinary clients
   still do not choose storage nodes or fan out writes.
-- [ ] The no-tombstones rule is upheld: local in-process receipt shortcuts are
+- [x] The no-tombstones rule is upheld: local in-process receipt shortcuts are
   replaced by the grant/receipt proof model rather than kept beside it.
+
+Implementation note: Phase 26 changed `StorageNodeRequest::WriteSegment` to
+carry a `WriteGrant` and changed write responses to carry boxed
+`SegmentWriteReceipt` values. Trusted publish submission carries both the grant
+and receipt so metadata verifies the grant proof, receipt proof, and
+grant/receipt binding before publishing. Metadata-node writes now carry
+`VerifiedSegmentReceipt` evidence, whose fields are crate-private so external
+callers cannot manufacture "verified" evidence without passing the verifier.
+`MarkReferenced` now requires metadata-produced `ReferenceEvidence`. The local
+proof implementation remains deterministic test MACs, but the canonical receipt
+body, proof scheme, key ID, and verifier boundary are shaped for future
+asymmetric storage-node signatures.
 
 ## Phase 27: Storage Replication
 
