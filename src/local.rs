@@ -3693,7 +3693,7 @@ impl DurableSqliteStore {
                 next_write_intent,
                 next_extent_id: 1,
             };
-            validate_row_native_image(&self.node_catalogs, &image)?;
+            validate_row_native_image(&image)?;
             self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
             return Ok(Some(LocalCoordinator::from_state_image(image)?));
         };
@@ -3735,7 +3735,7 @@ impl DurableSqliteStore {
             next_write_intent,
             next_extent_id: cursor.next_extent_id,
         };
-        validate_row_native_image(&self.node_catalogs, &image)?;
+        validate_row_native_image(&image)?;
         self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
         Ok(Some(LocalCoordinator::from_state_image(image)?))
     }
@@ -4196,6 +4196,7 @@ impl DurableSqliteStore {
         compaction_cursor: Option<DurableDataLogRef>,
         recent_write_bytes: u64,
         recent_flushed_write_bytes: u64,
+        include_sqlite_wal_bytes: bool,
     ) -> Result<MaintenanceObservation> {
         let mut node_logs: BTreeMap<StorageNodeId, Vec<(DataLogRow, String)>> = BTreeMap::new();
         for storage_node in self.node_catalogs.storage_nodes() {
@@ -4274,7 +4275,11 @@ impl DurableSqliteStore {
 
         Ok(MaintenanceObservation {
             nodes,
-            sqlite_wal_bytes: self.sqlite_wal_bytes()?,
+            sqlite_wal_bytes: if include_sqlite_wal_bytes {
+                self.sqlite_wal_bytes()?
+            } else {
+                0
+            },
             pending_custodian_releases: 0,
             pitr_retention_floor: None,
             recent_write_bytes,
@@ -5933,10 +5938,7 @@ fn load_catalog_inner(
     })
 }
 
-fn validate_row_native_image(
-    node_catalogs: &NodeCatalogs,
-    image: &DurableStoreImage,
-) -> Result<()> {
+fn validate_row_native_image(image: &DurableStoreImage) -> Result<()> {
     validate_row_native_cursors(image)?;
     let descriptors = row_native_segment_descriptors(image);
     for (device_id, head) in &image.metadata.device_heads {
@@ -6106,18 +6108,12 @@ fn validate_row_native_image(
                         "referenced or durable-pending segment missing segment record",
                     ));
                 }
-                if let Some(record) = record {
-                    if record.commit != commit {
-                        return Err(StorageError::corrupt(
-                            "catalog receipt disagrees with segment record",
-                        ));
-                    }
-                    let node_conn = node_catalogs.lock(*node_id)?;
-                    DurableSqliteStore::placement_for_segment_on_node(
-                        &node_conn,
-                        *node_id,
-                        *segment_id,
-                    )?;
+                if let Some(record) = record
+                    && record.commit != commit
+                {
+                    return Err(StorageError::corrupt(
+                        "catalog receipt disagrees with segment record",
+                    ));
                 }
                 if matches!(
                     entry.state,
@@ -6930,6 +6926,7 @@ fn run_maintenance_tick_parts(
         cursor,
         recent_write_bytes,
         recent_flushed_write_bytes,
+        policy_uses_sqlite_wal_pressure(parts.maintenance_policy),
     )?;
     let plan = scheduler.step(&observation);
     let mut compaction = empty_compaction_report();
@@ -6970,6 +6967,10 @@ fn run_maintenance_tick_parts(
         *lock(&parts.maintenance_cursor)? = plan.next_cursor;
     }
     Ok(MaintenanceTickReport { plan, compaction })
+}
+
+fn policy_uses_sqlite_wal_pressure(policy: MaintenancePolicy) -> bool {
+    policy.max_sqlite_wal_bytes != u64::MAX
 }
 
 /// Durable in-process coordinator using SQLite metadata and node-scoped rolled
@@ -7085,10 +7086,28 @@ impl DurableCoordinator {
                 maintenance_cursor: Arc::clone(&self.maintenance_cursor),
                 maintenance_policy: self.maintenance_policy,
             })?;
-            worker.notify();
+            if self.startup_maintenance_has_work()? {
+                worker.notify();
+            }
             self.maintenance_worker = Some(worker);
         }
         Ok(())
+    }
+
+    fn startup_maintenance_has_work(&self) -> Result<bool> {
+        self.maintenance_plan_has_commands(self.maintenance_policy)
+    }
+
+    fn maintenance_plan_has_commands(&self, policy: MaintenancePolicy) -> Result<bool> {
+        let scheduler = MaintenanceScheduler::new(policy)?;
+        let cursor = *lock(&self.maintenance_cursor)?;
+        let observation = self.durable.maintenance_observation(
+            cursor,
+            0,
+            0,
+            policy_uses_sqlite_wal_pressure(policy),
+        )?;
+        Ok(!scheduler.step(&observation).commands.is_empty())
     }
 
     fn maintenance_parts(&self) -> DurableMaintenanceParts {
@@ -7114,7 +7133,7 @@ impl DurableCoordinator {
     /// before a plan is run.
     pub fn observe_maintenance(&self) -> Result<MaintenanceObservation> {
         let cursor = *lock(&self.maintenance_cursor)?;
-        self.durable.maintenance_observation(cursor, 0, 0)
+        self.durable.maintenance_observation(cursor, 0, 0, true)
     }
 
     /// Plan one maintenance tick from the current observation.
@@ -7123,7 +7142,13 @@ impl DurableCoordinator {
     /// fairness cursor, throttle a write, or start background work.
     pub fn plan_maintenance(&self) -> Result<MaintenanceTickPlan> {
         let scheduler = MaintenanceScheduler::new(self.maintenance_policy)?;
-        let observation = self.observe_maintenance()?;
+        let cursor = *lock(&self.maintenance_cursor)?;
+        let observation = self.durable.maintenance_observation(
+            cursor,
+            0,
+            0,
+            policy_uses_sqlite_wal_pressure(self.maintenance_policy),
+        )?;
         Ok(scheduler.step(&observation))
     }
 
@@ -7154,9 +7179,12 @@ impl DurableCoordinator {
             return Ok(WriteAdmission::Accept);
         }
         let cursor = *lock(&self.maintenance_cursor)?;
-        let observation =
-            self.durable
-                .maintenance_observation(cursor, bytes, if flushed { bytes } else { 0 })?;
+        let observation = self.durable.maintenance_observation(
+            cursor,
+            bytes,
+            if flushed { bytes } else { 0 },
+            policy_uses_sqlite_wal_pressure(self.maintenance_policy),
+        )?;
         let plan = MaintenanceScheduler::new(self.maintenance_policy)?.step(&observation);
         if self.maintenance_policy.write_backpressure_enabled
             && let Some(reason) = plan.admission.unavailable_reason()
@@ -19187,6 +19215,73 @@ mod tests {
     }
 
     #[test]
+    fn idle_maintenance_tick_does_not_persist_cursor_or_compact() {
+        let root = durable_temp_dir("idle-maintenance-no-persist");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::Manual,
+            data_log_policy: DurableDataLogPolicy::compact_everything_for_test(),
+            write_backpressure_enabled: true,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: u64::MAX,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: u64::MAX,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 64,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let store = DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        assert_eq!(store.observe_maintenance().unwrap().compaction_cursor, None);
+
+        let report = store.run_maintenance_tick().unwrap();
+        assert!(report.plan.commands.is_empty());
+        assert_eq!(report.plan.next_cursor, None);
+        assert!(report.compaction.deleted_logs.is_empty());
+        assert!(report.compaction.relocated_logs.is_empty());
+        assert_eq!(report.compaction.bytes_copied, 0);
+        assert_eq!(report.compaction.bytes_deleted, 0);
+        assert_eq!(store.observe_maintenance().unwrap().compaction_cursor, None);
+        drop(store);
+
+        let reopened =
+            DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        assert_eq!(
+            reopened.observe_maintenance().unwrap().compaction_cursor,
+            None
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintenance_planning_skips_wal_stats_only_when_policy_cannot_use_them() {
+        let root = durable_temp_dir("maintenance-wal-skip");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::Manual,
+            data_log_policy: DurableDataLogPolicy::compact_everything_for_test(),
+            write_backpressure_enabled: true,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: u64::MAX,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: u64::MAX,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 64,
+            max_concurrent_compaction_jobs: 1,
+        };
+        let store = DurableCoordinator::open_with_maintenance_policy(&root, cfg, policy).unwrap();
+        let exact_wal_bytes = store.durable.sqlite_wal_bytes().unwrap();
+        let observation = store.observe_maintenance().unwrap();
+        assert_eq!(observation.sqlite_wal_bytes, exact_wal_bytes);
+        let plan = store.plan_maintenance().unwrap();
+        assert_eq!(plan.diagnostics.sqlite_wal_bytes, 0);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn durable_data_logs_are_scoped_to_storage_nodes_and_reopen() {
         let root = durable_temp_dir("node-scoped-data-logs");
         let mut cfg = config();
@@ -19710,6 +19805,76 @@ mod tests {
         assert_eq!(bytes, repeated_blocks(1, 7));
         reopened.shutdown_maintenance();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn always_on_startup_plan_detects_clean_and_dirty_state_without_hidden_work() {
+        let clean_root = durable_temp_dir("always-on-startup-clean");
+        let dirty_root = durable_temp_dir("always-on-startup-dirty");
+        let cfg = config();
+        let policy = MaintenancePolicy {
+            mode: MaintenanceMode::AlwaysOn,
+            data_log_policy: DurableDataLogPolicy {
+                target_data_log_bytes: 4096,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+            write_backpressure_enabled: false,
+            dirty_low_watermark_bytes: 1,
+            dirty_high_watermark_bytes: u64::MAX,
+            max_sealed_logs: 64,
+            max_reclaimable_debt_bytes: u64::MAX,
+            compaction_copy_budget_per_tick: u64::MAX,
+            max_sqlite_wal_bytes: u64::MAX,
+            max_logs_scanned_per_tick: 64,
+            max_concurrent_compaction_jobs: 1,
+        };
+
+        let clean =
+            DurableCoordinator::open_with_maintenance_policy(&clean_root, cfg, policy).unwrap();
+        assert!(!clean.startup_maintenance_has_work().unwrap());
+        clean.shutdown_maintenance();
+
+        let mut manual_policy = policy;
+        manual_policy.mode = MaintenanceMode::Manual;
+        let dirty =
+            DurableCoordinator::open_with_maintenance_policy(&dirty_root, cfg, manual_policy)
+                .unwrap();
+        let device_id = dirty
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 4,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        dirty
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 1),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        dirty
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 2),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        dirty
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        dirty.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+        assert!(dirty.maintenance_plan_has_commands(policy).unwrap());
+        drop(clean);
+        drop(dirty);
+        let _ = fs::remove_dir_all(clean_root);
+        let _ = fs::remove_dir_all(dirty_root);
     }
 
     #[test]

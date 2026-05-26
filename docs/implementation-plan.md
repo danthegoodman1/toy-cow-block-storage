@@ -509,7 +509,15 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 26 owns authenticated write grants, storage-node commit receipts,
   metadata receipt verification, and storage-node chaos testing so direct
   trusted-client write paths carry proof without creating logical truth.
-- Phase 27 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 27 owns operational observability: stable counters, gauges, structured
+  events, diagnostics snapshots, and regression gates for metadata,
+  coordinator, storage-node, maintenance, GC, and proof paths.
+- Phase 28 owns recovery and admin tooling: offline verification, inspection,
+  corruption explanation, state export, and explicit safe repair commands.
+- Phase 29 owns production proof and key lifecycle: real signature-backed
+  proof verification, durable key registries, key rotation, revocation, and
+  deterministic tests for trust-boundary failures.
+- Phase 30 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -1529,17 +1537,207 @@ proof implementation remains deterministic test MACs, but the canonical receipt
 body, proof scheme, key ID, and verifier boundary are shaped for future
 asymmetric storage-node signatures.
 
-## Phase 27: Storage Replication
+## Phase 27: Operational Observability
+
+Status: not started.
+
+Make the local durable provider observable before replication and production
+security work add more moving parts. Observability is a correctness and
+operations surface, not a tracing backend choice. The core requirement is that
+operators and tests can see durable debt, custody state, proof failures,
+maintenance pressure, and recovery risk without changing storage behavior.
+
+Non-goals:
+
+- No dependency on Prometheus, OpenTelemetry, StatsD, or any hosted telemetry
+  product.
+- No wall-clock reads in deterministic code.
+- No hidden hot-path scans merely because metrics are enabled.
+- No public exposure of storage-node placement choices through ordinary
+  block/native APIs.
+
+Deliverables:
+
+- [ ] Provider-public observation types for stable counters, gauges,
+  structured events, and point-in-time diagnostics snapshots.
+- [ ] Coordinator metrics for write attempts, publish successes/failures,
+  stale fences, failed metadata publishes, write admission decisions,
+  throttles/rejects, and request idempotency hits.
+- [ ] Metadata metrics for live/deleted heads, commit sequence, checkpoint
+  counts, PITR retention floors, GC epochs, reachable/unreachable metadata
+  counts, and pending release evidence.
+- [ ] Storage-node metrics for segment lifecycle counts, durable-pending
+  orphans, referenced/released/freed counts, active and sealed data-log bytes,
+  dirty/reclaimable bytes, data-log checksum failures, and custodian lag.
+- [ ] Maintenance metrics for scheduler decisions, compaction debt, copied and
+  deleted bytes, cursor position, skipped/stale commands, SQLite WAL size, and
+  backpressure reasons.
+- [ ] Grant/receipt metrics for issued grants, verified receipts, rejected
+  grants/receipts by reason, duplicate/replay attempts, stale epochs, and
+  proof-scheme/key-ID mismatches.
+- [ ] Deterministic structured event stream for state transitions that tests
+  can assert without relying on wall-clock timestamps.
+- [ ] Optional adapter boundary for exporting observations; adapters must sit
+  outside the deterministic core and cannot own storage decisions.
+- [ ] Human-readable README/design copy describing which signals matter during
+  normal operation, write pressure, compaction pressure, failed publish cleanup,
+  and recovery triage.
+
+Exit gate:
+
+- [ ] Observing metrics or diagnostics never changes logical state, durable
+  state, write admission, compaction selection, GC, or custodian behavior.
+- [ ] Deterministic tests assert exact event sequences and metric deltas for
+  writes, flushes, failed publishes, forks, restores, GC, custodian runs,
+  compaction ticks, receipt verification failures, and reopen.
+- [ ] Diagnostics snapshots match authoritative provider state and reject
+  impossible accounting such as negative dirty bytes, orphan counts larger than
+  durable-pending segment counts, or WAL pressure without a metadata store.
+- [ ] Hot write/read/fork/restore paths do not regress by more than the
+  documented threshold when observations are enabled but not exported.
+- [ ] Observation names and reason strings are stable enough for tests and
+  admin tooling; changes require updating golden tests and docs in the same
+  change.
+
+## Phase 28: Recovery and Admin Tooling
+
+Status: not started.
+
+Build explicit tooling for inspecting, verifying, explaining, exporting, and
+repairing a local durable store. Reopen failures should not be a black box, and
+maintenance should not require ad hoc SQLite or filesystem poking.
+
+Non-goals:
+
+- No online schema compatibility layer or migration framework.
+- No best-effort data salvage that can make uncommitted bytes visible.
+- No GUI or daemon.
+- No repair command that silently mutates state without an explicit dry-run and
+  apply boundary.
+
+Deliverables:
+
+- [ ] CLI or provider-admin entry points for `inspect`, `verify`, `explain`,
+  `export`, `run-custodian`, `run-maintenance-tick`, and `checkpoint` style
+  operations.
+- [ ] Offline verifier for metadata SQLite rows, storage-node catalogs,
+  node-scoped data logs, placement rows, receipt proofs, segment checksums,
+  commit timelines, PITR roots, GC marks, release/reference evidence, and
+  maintenance cursors.
+- [ ] Corruption explanations that classify failures as missing metadata row,
+  missing node catalog, missing placement, missing data-log payload, checksum
+  mismatch, stale timeline/head, bad receipt proof, cursor regression, or
+  ambiguous/unsafe state.
+- [ ] Machine-readable JSON output and concise human summaries for every admin
+  command.
+- [ ] Read-only inspection by default, including root/head summaries, segment
+  owner lookup, lifecycle counts, data-log inventory, orphan inventory,
+  compaction debt, PITR retention windows, and key/proof registry summaries
+  after Phase 29.
+- [ ] Explicit safe repairs for classes already proven by reopen logic, such as
+  reference-state repair from committed metadata, orphan cleanup through
+  custodian evidence, cursor reconstruction when all IDs are provably above
+  persisted rows, and SQLite WAL/data-log maintenance that does not change
+  logical contents.
+- [ ] Golden fixtures for healthy stores and every known corruption class.
+- [ ] Documentation that tells operators when to run read-only verify, when to
+  run custodians, when to run maintenance, when repair is safe, and when the
+  store must be treated as corrupt instead of repaired.
+
+Exit gate:
+
+- [ ] `verify` detects every corruption currently covered by durable reopen
+  tests and reports a stable, specific diagnostic instead of a generic open
+  failure.
+- [ ] `inspect` and `export` are read-only and can run on a store that fails
+  normal reopen because of recoverable local damage.
+- [ ] Every repair has a dry-run mode, an explicit apply mode, deterministic
+  before/after diagnostics, and idempotency tests.
+- [ ] Repair refuses ambiguous states, proof failures, checksum mismatches, and
+  any case where making data visible would depend on guessing.
+- [ ] Admin commands are covered by golden output tests and generated fixtures
+  for writes, forks, native snapshots/restores, PITR expiry, GC, maintenance,
+  and failed-publish orphan cleanup.
+- [ ] Verifier and inspect benchmarks cover small stores and large stores with
+  many segments, histories, and data logs.
+
+## Phase 29: Production Proof and Key Lifecycle
+
+Status: not started.
+
+Turn the Phase 26 production-shaped proof envelope into a real trust-boundary
+implementation. Deterministic test MACs can remain for simulation, but any
+provider mode that claims remote/trusted-client security must use durable key
+registries, real signatures or MACs appropriate to the deployment, explicit key
+status, rotation, revocation, and replay protection.
+
+Non-goals:
+
+- No storage replication or quorum durability.
+- No dependency on one cloud IAM product.
+- No change to ordinary public block/native APIs.
+- No acceptance of deterministic test proofs across a production trust
+  boundary.
+
+Deliverables:
+
+- [ ] Durable grant-authority and storage-node key registries with key IDs,
+  algorithms, public verification material or local secret references,
+  storage-node incarnation binding, owner/tenant scope, validity epochs, and
+  key status (`active`, `retiring`, `retired`, `revoked`).
+- [ ] `NodeSignatureV1` implementation over the canonical receipt body using a
+  documented production signature scheme, such as Ed25519, with domain
+  separation and golden vectors.
+- [ ] Production grant proof implementation or pluggable authority boundary for
+  metadata-issued grants; local tests may keep deterministic proofs behind an
+  explicit test-only configuration.
+- [ ] Metadata verifier rules for key status, validity epoch, expiration,
+  tenant/principal/device/keyspace scope, storage-node incarnation, durability
+  requirement, grant/receipt binding, checksum, and replay/idempotency keys.
+- [ ] Key rotation flow that overlaps old and new keys for deterministic
+  logical epochs, rejects new proofs from retired keys, keeps old proofs
+  verifiable only while their grants/receipts remain valid, and treats revoked
+  keys as hard failures.
+- [ ] Reopen and admin-tool integration so key registries, key status, and
+  pending grants/receipts survive restart and can be inspected.
+- [ ] Chaos tests for forged proofs, wrong key ID, wrong node identity, wrong
+  tenant, stale incarnation, expired grant, retired key, revoked key, replayed
+  receipt, and key rotation during pending writes.
+- [ ] Benchmarks for grant issue, storage-node signing, metadata verification,
+  duplicate receipt verification, large append grant windows, and batched
+  receipt verification if implemented.
+
+Exit gate:
+
+- [ ] Production-mode storage nodes reject writes without valid grants signed or
+  MACed by an accepted grant authority.
+- [ ] Metadata rejects receipts unless the receipt proof verifies against the
+  registered storage-node key and the verified body matches the grant and
+  logical metadata intent.
+- [ ] Deterministic test proofs cannot be enabled accidentally in production
+  provider configuration.
+- [ ] Key rotation and revocation are deterministic, persisted, replay-safe, and
+  covered by generated traces with delayed, duplicated, and reordered grants and
+  receipts.
+- [ ] Real proof verification does not regress local hot-path write benchmarks
+  beyond the documented threshold without a specific optimization follow-up.
+- [ ] No second proof path remains beside the current grant/receipt verifier;
+  test and production schemes share the same canonical bodies and verifier
+  boundary.
+
+## Phase 30: Storage Replication
 
 Status: not started.
 
 Add replicated segment storage only after Phase 21 proves incremental
 compaction and Phase 22 proves segment placement across multiple local storage
-nodes, and after Phase 26 proves authenticated storage-node receipts and chaos
-delivery for the one-replica path. The local and durable providers must pass
-the same conformance suite, remote transport behavior must be deterministic,
-and the real network transport must have proven the wire contract across a
-process boundary.
+nodes, after Phase 26 proves authenticated storage-node receipts and chaos
+delivery for the one-replica path, after Phase 27 makes operational debt
+observable, after Phase 28 provides verification/admin tooling, and after Phase
+29 proves production key lifecycle for proof-carrying writes. The local and
+durable providers must pass the same conformance suite, remote transport
+behavior must be deterministic, and the real network transport must have proven
+the wire contract across a process boundary.
 
 Deliverables:
 
@@ -1591,7 +1789,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 28: Linux io_uring Storage Node Backend
+## Phase 31: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1632,7 +1830,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 29: Optional ublk Adapter
+## Phase 32: Optional ublk Adapter
 
 Status: not started.
 
