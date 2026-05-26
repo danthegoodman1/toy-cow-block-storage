@@ -506,7 +506,10 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 25 owns the coordinator/metadata/storage-node boundary refactor that
   makes local in-process roles match the intended distributed architecture
   before replication adds quorum behavior.
-- Phase 26 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 26 owns authenticated write grants, storage-node commit receipts,
+  metadata receipt verification, and storage-node chaos testing so direct
+  trusted-client write paths carry proof without creating logical truth.
+- Phase 27 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -1429,15 +1432,97 @@ deleted block writes 8.0 ms, and idle maintenance tick 10.9 us. The focused
 Criterion comparisons reported improvements or no statistically significant
 change; reopen/custodian numbers remain host-filesystem sensitive.
 
-## Phase 26: Storage Replication
+## Phase 26: Authenticated Write Grants, Segment Receipts, and Storage-Node Chaos
+
+Status: not started.
+
+Make proof-carrying storage writes first-class before replicated writes multiply
+the protocol. This phase allows a future trusted client or embedded coordinator
+to write bytes directly to storage nodes, receive a verifiable durable-pending
+receipt, and submit that receipt to metadata for logical publish. Clients may
+carry proof between services, but they still do not create logical truth:
+metadata owns visibility and storage nodes own byte durability.
+
+Non-goals:
+
+- No storage replication or quorum writes.
+- No public client choice of storage nodes.
+- No permanent local-only receipt shortcut.
+- No dependency on a specific cloud IAM provider or cryptographic library.
+- No remote storage-node TCP protocol unless needed to test the contract; the
+  in-process transport and deterministic chaos transport are enough for this
+  phase.
+
+Deliverables:
+
+- [ ] Metadata-issued `WriteGrant` shape that binds owner, write intent,
+  segment ID or reservation class, byte length, placement node or placement
+  policy result, expiration/epoch, durability requirement, and allowed caller
+  identity.
+- [ ] Storage-node `SegmentWriteReceipt` shape that binds storage node,
+  segment ID, write intent, owner, byte length, checksum, durability reached,
+  durable-pending lifecycle state, receipt epoch/expiration, and authentication
+  proof.
+- [ ] Metadata-side receipt verifier that accepts receipts as evidence for
+  `MetadataNodeWrite`/publish without opening storage-node catalogs or reading
+  segment bytes.
+- [ ] Coordinator path that uses the same grant/receipt verifier internally so
+  local coordinator writes and trusted direct-client writes share one proof
+  model.
+- [ ] Direct trusted-client flow in local tests: obtain grant, write to storage
+  node, receive receipt, submit receipt to metadata/coordinator, publish roots,
+  then apply reference evidence to the storage node.
+- [ ] Explicit failure semantics: expired grants, wrong caller identity, wrong
+  segment ID, wrong owner, wrong write intent, wrong length, wrong checksum,
+  wrong storage node, stale receipt epoch, insufficient durability, and
+  duplicate/conflicting receipts all fail without logical visibility.
+- [ ] Durable idempotency keys for grant issue, storage-node write receipt, and
+  metadata publish submission so retries after timeout do not double-publish or
+  double-reference a segment.
+- [ ] Storage-node chaos transport for coordinator-to-storage-node messages,
+  covering dropped, duplicated, delayed, reordered, and stale write receipts;
+  duplicated/delayed `MarkReferenced`; reordered release/reference evidence;
+  stale write intents; and interrupted custodian/maintenance ticks.
+- [ ] Real payload/report semantics for storage-node `ObserveMaintenance` and
+  `RunMaintenanceTick`, or an explicit split that keeps maintenance below a
+  separate storage-node maintenance service boundary.
+- [ ] Deterministic generated traces comparing normal coordinator writes and
+  trusted proof-carrying writes against the same block/native reference models.
+- [ ] Criterion smoke benchmarks for coordinator write overhead with receipts,
+  trusted-client grant/receipt/publish overhead, duplicate-retry overhead, and
+  chaos-transport dispatch overhead.
+
+Exit gate:
+
+- [ ] Metadata can publish from verifiable storage-node receipts without
+  reading storage-node catalogs or bytes.
+- [ ] A trusted client can carry grants and receipts, but cannot choose
+  unauthorized placement, invent a segment, weaken durability, or bypass
+  metadata fencing.
+- [ ] Storage nodes never mark a durable-pending segment referenced from the
+  client's word alone; reference state still requires metadata-produced
+  evidence or coordinator-verified publish success.
+- [ ] Failed metadata publish after a valid storage receipt leaves only a
+  reclaimable pending orphan.
+- [ ] Retries, duplicate receipts, delayed references, and reordered
+  release/reference evidence are idempotent and deterministic under chaos
+  tests.
+- [ ] Existing public block/native APIs remain unchanged, and ordinary clients
+  still do not choose storage nodes or fan out writes.
+- [ ] The no-tombstones rule is upheld: local in-process receipt shortcuts are
+  replaced by the grant/receipt proof model rather than kept beside it.
+
+## Phase 27: Storage Replication
 
 Status: not started.
 
 Add replicated segment storage only after Phase 21 proves incremental
 compaction and Phase 22 proves segment placement across multiple local storage
-nodes. The local and durable providers must pass the same conformance suite,
-remote transport behavior must be deterministic, and the real network transport
-must have proven the wire contract across a process boundary.
+nodes, and after Phase 26 proves authenticated storage-node receipts and chaos
+delivery for the one-replica path. The local and durable providers must pass
+the same conformance suite, remote transport behavior must be deterministic,
+and the real network transport must have proven the wire contract across a
+process boundary.
 
 Deliverables:
 
@@ -1447,8 +1532,8 @@ Deliverables:
   inputs for replica-set decisions.
 - [ ] Replica write path that reserves, writes, syncs, and records one local
   replica commit per selected storage endpoint.
-- [ ] Metadata publish waits for the requested replica durability before making
-  the logical segment visible.
+- [ ] Metadata publish waits for verifiable replica receipts satisfying the
+  requested durability before making the logical segment visible.
 - [ ] SQLite-backed metadata outbox tables for reference and release evidence
   keyed by safe commit/reachability epoch. Do not introduce custom evidence logs
   or queues unless local SQLite tables fail a documented remote or performance
@@ -1489,7 +1574,7 @@ Exit gate:
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers.
 
-## Phase 27: Linux io_uring Storage Node Backend
+## Phase 28: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1530,7 +1615,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 28: Optional ublk Adapter
+## Phase 29: Optional ublk Adapter
 
 Status: not started.
 

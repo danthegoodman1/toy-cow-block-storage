@@ -786,12 +786,48 @@ by logical segment and placement; storage-node custodians apply only evidence
 for their own node. Storage nodes must not crawl metadata trees or infer
 deletion from current heads.
 
+### Authenticated Write Grants and Segment Receipts
+
+The coordinator split also allows a future trusted-client fast path where a
+client writes directly to storage nodes, similar in shape to cloud systems that
+authorize data-plane access separately from metadata-plane commits. The client
+may carry proof between services, but it must not create truth.
+
+The intended flow is:
+
+```text
+client/coordinator asks metadata for a write grant
+client/coordinator writes bytes to the granted storage node
+storage node returns a verifiable durable-pending segment receipt
+client/coordinator submits receipt plus metadata update intent
+metadata verifies receipt and fencing, then publishes roots
+coordinator/metadata-produced evidence marks the storage node referenced
+```
+
+A write grant should bind the mapping owner, write intent, segment identity or
+reservation class, byte length, placement node or placement-policy result,
+durability requirement, caller identity, expiration, and metadata epoch. A
+segment receipt should bind storage node, segment ID, write intent, owner,
+bytes, checksum, durability reached, durable-pending lifecycle state, receipt
+epoch/expiration, and an implementation-private authentication proof such as a
+signature or MAC.
+
+Metadata may verify grant/receipt evidence, but must still not open
+storage-node catalogs or read segment bytes. Storage nodes may authenticate a
+grant and issue a receipt, but must still not publish metadata, assign file
+versions, or mark a segment referenced from a client's word alone. Reference
+state follows metadata-produced evidence after publish.
+
 ### Future Storage Replication
 
 Replication belongs below the public block/native APIs and above individual
 `SegmentStore` implementations. Public clients may eventually request a
 durability or replication class, but they should not fan out writes to replicas
 or choose storage nodes.
+
+Replication should build on authenticated write grants and segment receipts,
+not invent a separate proof path. A replicated publish waits for a set of
+verifiable receipts that satisfies the requested durability class.
 
 The block and native servers remain request coordinators. A later placement
 coordinator can choose a replica set for a segment, issue one reservation and
@@ -852,6 +888,10 @@ not become permanent shortcuts:
   storage should first use SQLite outbox/apply-cursor tables for release and
   reference evidence; custom durable logs or external queues need specific
   remote-deployment or benchmark evidence.
+- Storage-node write receipts are currently in-process structs. Remote or
+  trusted-client data paths need authenticated write grants, verifiable
+  storage-node receipts, metadata-side receipt verification, and deterministic
+  storage-node chaos tests before replication multiplies the protocol.
 - Durable compaction is one local append log in Phase 20. The SQLite metadata
   plus partitioned-data-log phase needs placement tables, relocation
   transactions, data-log manifests, and incremental compaction tests before
