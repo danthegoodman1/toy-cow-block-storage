@@ -219,10 +219,13 @@ Native API guarantees to care about:
 
 ## Durable Maintenance
 
-The durable local provider stores segment bytes in node-scoped rolled data logs
-and keeps metadata in SQLite. Maintenance is explicit by default: callers can
-observe dirty/reclaimable bytes, ask the deterministic scheduler for a plan,
-and run one bounded tick.
+The durable local provider stores logical metadata in root SQLite and gives
+each storage node its own SQLite catalog plus rolled data logs. Those catalogs
+are independent durability boundaries: segment bytes and the node's catalog
+receipt commit before root metadata references them, so a failed metadata
+publish leaves an invisible orphan for cleanup instead of a half-visible write.
+Maintenance is explicit by default: callers can observe dirty/reclaimable
+bytes, ask the deterministic scheduler for a plan, and run one bounded tick.
 
 ```rust
 use toy_cow_block_storage::{

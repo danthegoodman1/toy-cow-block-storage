@@ -1536,46 +1536,90 @@ fn seed_durable_compaction_debt(store: &DurableObjectStore, device_id: DeviceId,
 
 fn durable_sqlite_operational_row_count(root: &Path) -> i64 {
     let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
-    let mut rows = 0;
-    for table in [
-        "store_meta",
-        "maintenance_state",
-        "data_logs",
-        "segment_placements",
-        "storage_nodes",
-        "device_specs",
-        "device_heads",
-        "deleted_device_heads",
-        "keyspace_heads",
-        "keyspace_roots",
-        "keyspace_catalog_shards",
-        "file_writer_epochs",
-        "metadata_nodes",
-        "commit_groups",
-        "shard_commits",
-        "keyspace_commits",
-        "file_commits",
-        "fork_records",
-        "delete_records",
-        "checkpoints",
-        "metadata_gc_marks",
-        "segment_gc_marks",
-        "segment_records",
-        "segment_catalog_entries",
-    ] {
-        rows += conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap();
+    let mut rows = sqlite_count_rows(
+        &conn,
+        &[
+            "store_meta",
+            "maintenance_state",
+            "device_specs",
+            "device_heads",
+            "deleted_device_heads",
+            "keyspace_heads",
+            "keyspace_roots",
+            "keyspace_catalog_shards",
+            "file_writer_epochs",
+            "metadata_nodes",
+            "commit_groups",
+            "shard_commits",
+            "keyspace_commits",
+            "file_commits",
+            "fork_records",
+            "delete_records",
+            "checkpoints",
+            "metadata_gc_marks",
+            "segment_gc_marks",
+        ],
+    );
+    for catalog_path in durable_node_catalog_paths(root) {
+        let conn = Connection::open(catalog_path).unwrap();
+        rows += sqlite_count_rows(
+            &conn,
+            &[
+                "node_meta",
+                "data_logs",
+                "segment_placements",
+                "segment_catalog_entries",
+            ],
+        );
     }
     rows
 }
 
+fn sqlite_count_rows(conn: &Connection, tables: &[&str]) -> i64 {
+    let query = tables
+        .iter()
+        .map(|table| format!("(SELECT COUNT(*) FROM {table})"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    conn.query_row(&format!("SELECT {query}"), [], |row| row.get::<_, i64>(0))
+        .unwrap()
+}
+
 fn durable_sqlite_wal_bytes(root: &Path) -> u64 {
-    fs::metadata(root.join("metadata.sqlite-wal"))
+    let mut bytes = fs::metadata(root.join("metadata.sqlite-wal"))
         .map(|metadata| metadata.len())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    for catalog_path in durable_node_catalog_paths(root) {
+        let Some(file_name) = catalog_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        bytes += fs::metadata(catalog_path.with_file_name(format!("{file_name}-wal")))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+    }
+    bytes
+}
+
+fn durable_node_catalog_paths(root: &Path) -> Vec<std::path::PathBuf> {
+    let data_dir = root.join("data");
+    let mut paths = Vec::new();
+    let Ok(entries) = fs::read_dir(data_dir) else {
+        return paths;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("catalog.sqlite");
+        if path.exists() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
 }
 
 fn bench_durable_provider(c: &mut Criterion) {

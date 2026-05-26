@@ -937,9 +937,11 @@ store/
   metadata.sqlite-shm
   data/
     node-1/
+      catalog.sqlite
       data-000001.log
       data-000002.log
     node-2/
+      catalog.sqlite
       data-000001.log
   tmp/
 ```
@@ -952,19 +954,26 @@ segment_id -> data_log_id, offset, length, crc64_ecma, storage_node_id
 
 Deliverables:
 
-- [x] SQLite metadata store for device heads, native keyspace/file heads,
-  commit groups, PITR/checkpoints, write-intent state, append leases, segment
-  lifecycle state, placement index, data-log manifests, relocation state, and
-  custodian evidence. Phase 21 initially used a whole-state SQLite blob for the
-  logical metadata image while indexing physical placement and data-log
-  manifests in separate tables. Phase 23 replaced that blob with row-native
-  operational metadata tables under the no-tombstones rule.
+- [x] SQLite metadata store split by ownership: root `metadata.sqlite` for
+  device heads, native keyspace/file heads, commit groups, PITR/checkpoints,
+  write-intent state, append leases, and logical metadata; per-storage-node
+  `catalog.sqlite` files for segment lifecycle state, placement index, data-log
+  manifests, relocation state, and local segment descriptors. Phase 21
+  initially used a whole-state SQLite blob for the logical metadata image while
+  indexing physical placement and data-log manifests in separate tables. Phase
+  23 replaced that blob with row-native operational metadata tables under the
+  no-tombstones rule. The later node-catalog split removed storage-node catalog
+  tables from the root DB instead of leaving a dual representation.
 - [x] SQLite schema with explicit tables, indexes, uniqueness constraints, and
   foreign-key or equivalent integrity checks for `segment_id`, `data_log_id`,
   placement state, owner/reachability state, and data-log accounting.
 - [x] SQLite transaction boundaries documenting exactly which rows become
   durable/visible together for create, write, append, flush, checkpoint,
-  restore, delete, GC, custodian release, and compaction relocation.
+  restore, delete, GC, custodian release, and compaction relocation. Root
+  metadata and per-node catalogs are independent durability domains; ordinary
+  writes commit node segment receipts before root metadata, and failed root
+  publish leaves node-local orphan segments instead of relying on SQLite
+  `ATTACH` atomicity.
 - [x] SQLite durability settings documented and tested. Use conservative
   defaults first, such as WAL mode plus `synchronous=FULL` or equivalent,
   before optimizing.
@@ -988,8 +997,8 @@ Deliverables:
 - [x] Compaction path that deletes fully dead data-log files without copying
   payload bytes.
 - [x] Relocation path that copies only live payload records from selected dirty
-  data logs into new data logs, fsyncs the new data log, commits SQLite
-  placement updates in one transaction, and deletes old logs only after the
+  data logs into new data logs, fsyncs the new data log, commits the owning
+  node catalog placement transaction, and deletes old logs only after the
   relocation transaction is durable.
 - [x] SQLite maintenance path for checkpoints, WAL size control, integrity
   checks, and optional `VACUUM`/incremental vacuum. This must not rewrite data
@@ -1021,8 +1030,12 @@ Deliverables:
 Exit gate:
 
 - [x] The durable write ordering is explicit: segment payload reaches the data
-  log and is fsynced before the SQLite transaction publishes metadata that can
-  reference it.
+  log and is fsynced before the storage-node catalog commits a segment receipt,
+  and root metadata is committed only after those receipts are durable.
+- [x] New segment receipts are written as `DurablePendingMetadata` before the
+  root metadata transaction. Reopen promotes only pending rows that are
+  referenced by committed metadata, so a failed root publish leaves an invisible
+  reclaimable orphan rather than a false referenced catalog row.
 - [x] Flushed writes and group commit use the minimum syncs required by the
   documented SQLite/data-log durability policy; extra syncs require a benchmark
   or correctness justification.
@@ -1326,11 +1339,17 @@ Exit gate:
   clients to choose storage nodes, compact logs, or fan out writes.
 
 Implementation note: Phase 24 also made durable data logs node-scoped as
-`(storage_node, log_id)`. The previous non-node-scoped shape is gone; there is
-no compatibility reader or migration layer for old internal stores. The
-maintenance cursor is persisted in SQLite maintenance state, and opportunistic
-maintenance runs before the admitted write so a failed maintenance tick cannot
-retroactively report a successful write as failed.
+`(storage_node, log_id)` and the durable provider now stores node-local catalog
+metadata in each storage node's `catalog.sqlite` through independent
+connections. The previous non-node-scoped and root-bundled storage catalog
+shapes are gone; there is no compatibility reader or migration layer for old
+internal stores. The provider intentionally does not use SQLite `ATTACH` or a
+cross-catalog transaction. Storage-node catalog commits are the durable segment
+receipt; root metadata commits after those receipts and failed root publishes
+leave reclaimable node-local orphans. The maintenance cursor is persisted in
+root SQLite maintenance state, and opportunistic maintenance runs before the
+admitted write so a failed maintenance tick cannot retroactively report a
+successful write as failed.
 
 Short-run Phase 24 Criterion smoke numbers on this host: idle maintenance
 observation measured about 37 us, an idle manual maintenance tick about 40 us,

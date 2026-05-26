@@ -568,21 +568,27 @@ store/
   metadata.sqlite-shm
   data/
     node-1/
+      catalog.sqlite
       data-000001.log
       data-000002.log
     node-2/
+      catalog.sqlite
       data-000001.log
   tmp/
 ```
 
-SQLite is the metadata publish boundary. Data-log files own large immutable
-segment payloads. The current local provider stores operational metadata in
-row-native SQLite tables: counters/config, live and deleted heads, immutable
-metadata object payloads keyed by stable IDs, commit timelines, checkpoints, GC
-mark epochs, storage-node catalogs, segment descriptors, placement rows, and
-data-log manifests. Complex immutable objects may remain crate-owned binary
-payloads inside rows where decomposing every field would add cost without a hot
-predicate. The old whole-state blob is not a production compatibility path.
+The root metadata database and storage-node catalogs have separate durability
+boundaries. The root `metadata.sqlite` stores logical metadata-plane rows:
+counters/config, live and deleted heads, immutable metadata object payloads
+keyed by stable IDs, commit timelines, checkpoints, GC mark epochs, and
+scheduler state. Each storage node owns its own
+`data/node-*/catalog.sqlite`, which stores that node's data-log manifests,
+segment placement rows, segment descriptors, lifecycle catalog entries, and
+local offsets. Data-log files own large immutable segment payloads. Complex
+immutable objects may remain crate-owned binary payloads inside rows where
+decomposing every field would add cost without a hot predicate. The old
+whole-state blob and the old bundled root-storage catalog shape are not
+production compatibility paths.
 
 ### Phase 18 Durable Format Decision
 
@@ -601,21 +607,24 @@ runtime provider.
 ### Partitioned Durable Data Logs
 
 The active durable layout stores transactional metadata in SQLite row tables
-and segment payloads in partitioned data logs. SQLite owns committed logical
-metadata rows, placement state, data-log manifests, and the publish
-transaction. Plain data-log files own large immutable segment bytes. This keeps
-compaction focused on selected data files instead of rewriting every live byte
-on a storage node.
+and segment payloads in partitioned data logs. The root metadata DB owns
+committed logical metadata rows. Each node catalog DB owns node-local placement
+state and data-log manifests through an independent connection. The local
+provider deliberately does not depend on SQLite multi-database transactions:
+that would be a local-only shortcut and would not map to remote storage nodes.
+Plain data-log files own large immutable segment bytes. This keeps compaction
+focused on selected data files instead of rewriting every live byte on a
+storage node.
 
 Data records live in rolled data-log files scoped by storage node. The v1
-SQLite schema has row-native metadata tables plus `segment_placements` and
-node-scoped `data_logs` keyed by `(storage_node, log_id)`.
-`segment_placements` maps logical segments to current node/log records;
-`data_logs` tracks active, sealed, and deleted log files plus live/dead byte
-estimates. Reopen reconstructs the local object store from these rows and
-rejects missing heads, missing immutable object payloads, stale placements,
-catalog lifecycle gaps, or segment descriptors whose data-log bytes are missing
-or corrupt.
+SQLite layout has row-native root metadata tables plus per-node
+`catalog.sqlite` tables. In each node catalog, `segment_placements` maps
+logical segments to current node-local log records and `data_logs` tracks
+active, sealed, and deleted log files plus live/dead byte estimates. Reopen
+reconstructs the local object store from the root DB plus every node catalog,
+and rejects missing heads, missing immutable object payloads, missing node
+catalogs, stale placements, catalog lifecycle gaps, or segment descriptors
+whose data-log bytes are missing or corrupt.
 
 Each data-log record carries a fixed magic, version, segment ID, payload length,
 CRC64-ECMA payload checksum, and payload bytes. Reopen rejects a current
@@ -636,25 +645,30 @@ metadata roots.
 Durable write ordering:
 
 ```text
-append segment bytes to data log(s)
+append segment bytes to node data log(s)
 fsync each touched data log once for the publish batch
-SQLite transaction inserts placements and row-native metadata
-commit SQLite transaction
+commit each touched storage-node catalog with durable segment receipts
+commit root metadata rows that reference those already-durable segments
 ```
 
-The SQLite transaction is the metadata publish boundary. It must not commit a
-metadata root that references data-log bytes that failed to reach the requested
-durability.
+The root SQLite transaction is the logical metadata publish boundary. It must
+not commit a metadata root that references data-log bytes and node catalog
+receipts that failed to reach the requested durability. If a storage node
+commits segment bytes and catalog rows but the root metadata publish fails, the
+segment remains invisible through the block/native APIs and is treated as a
+storage-node orphan for later custodian cleanup. Reopen advances local
+allocation cursors from node catalogs so those orphaned IDs are not reused.
 
 The durable provider honors the public `WriteDurability` boundary. A successful
 `Acknowledged` block or native file write is committed to the live in-process
 mapping and visible to later reads, but may be lost across process crash until a
 later `flush`, a `Flushed` write, or another synchronous metadata operation
 persists the current state. A successful `Flushed` write has appended all newly
-referenced segment data records, synced their data logs, and committed the
-SQLite transaction before the call returns. `flush` persists the current live
-state with the same data-before-metadata ordering and reports the latest commit
-sequence visible to the relevant device or native file as `durable_through`.
+referenced segment data records, synced their data logs, committed the touched
+node catalogs, and committed the root metadata transaction before the call
+returns. `flush` persists the current live state with the same
+data-before-metadata ordering and reports the latest commit sequence visible to
+the relevant device or native file as `durable_through`.
 
 Synchronous metadata operations that do not carry a `WriteDurability` argument
 -- create, checkpoint, fork, restore, delete, keyspace snapshot, and custodian
@@ -872,13 +886,18 @@ server:
 8. Publishes the block metadata update or native keyspace catalog update through
    a metadata commit group.
 9. Marks durable local replica catalog entries as referenced by the successful
-   commit.
+   commit. This referenced transition is repairable: if the root metadata
+   commit survives a crash but the final catalog state update does not, reopen
+   promotes only catalog entries that are actually referenced by committed
+   metadata rows before exposing the store.
 10. Acknowledges the public write only after the metadata commit group succeeds.
 
 If steps 1-6 succeed but metadata publish fails, the segment is an orphan. It is
 durable local replica data but not reachable from any committed device or file
 root. Orphans are not user-visible and must be reclaimed by custodian work after
-their write intent can no longer commit.
+their write intent can no longer commit. The pre-root catalog state must remain
+`DurablePendingMetadata`; writing `Referenced` before the root commit would make
+failed publishes indistinguishable from committed data during recovery.
 
 The v1 local server does not hide publish conflicts behind implicit retries. It
 serializes local requests before commit assembly, and stale direct metadata
