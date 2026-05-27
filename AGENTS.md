@@ -41,6 +41,10 @@ before adding code.
 - Start the container with `docker compose up -d dev`, then run work through
   `docker compose exec dev ...` or one-shot commands through
   `docker compose run --rm dev ...`.
+- The development container runs privileged as root so future Linux-only mount
+  and block device integration work, such as FUSE or ublk adapters, can be
+  exercised inside Docker. Kernel features still depend on the Docker host
+  exposing the relevant device, such as `/dev/fuse` or `/dev/ublk-control`.
 - Run the full Rust gate from inside the container:
   `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test`, `cargo doc --no-deps`, and

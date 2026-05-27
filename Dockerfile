@@ -5,6 +5,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \
+        fuse3 \
+        kmod \
+        libfuse3-dev \
         libsqlite3-dev \
         pkg-config \
         sqlite3 \

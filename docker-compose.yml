@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     image: toy-cow-block-storage-dev
     working_dir: /workspace
-    user: "${UID:-1000}:${GID:-1000}"
+    privileged: true
     environment:
       CARGO_HOME: /cargo
       CARGO_TARGET_DIR: /workspace/target
