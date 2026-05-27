@@ -1539,7 +1539,7 @@ asymmetric storage-node signatures.
 
 ## Phase 27: Operational Observability
 
-Status: not started.
+Status: complete.
 
 Make the local durable provider observable before replication and production
 security work add more moving parts. Observability is a correctness and
@@ -1558,46 +1558,62 @@ Non-goals:
 
 Deliverables:
 
-- [ ] Provider-public observation types for stable counters, gauges,
+- [x] Provider-public observation types for stable counters, gauges,
   structured events, and point-in-time diagnostics snapshots.
-- [ ] Coordinator metrics for write attempts, publish successes/failures,
+- [x] Coordinator metrics for write attempts, publish successes/failures,
   stale fences, failed metadata publishes, write admission decisions,
   throttles/rejects, and request idempotency hits.
-- [ ] Metadata metrics for live/deleted heads, commit sequence, checkpoint
-  counts, PITR retention floors, GC epochs, reachable/unreachable metadata
-  counts, and pending release evidence.
-- [ ] Storage-node metrics for segment lifecycle counts, durable-pending
+- [x] Metadata metrics for live/deleted heads, live keyspace heads, metadata
+  node count, commit sequence, checkpoint count, GC epoch, and pending release
+  evidence.
+- [x] Storage-node metrics for segment lifecycle counts, durable-pending
   orphans, referenced/released/freed counts, active and sealed data-log bytes,
-  dirty/reclaimable bytes, data-log checksum failures, and custodian lag.
-- [ ] Maintenance metrics for scheduler decisions, compaction debt, copied and
+  dirty/reclaimable bytes, and custodian pressure.
+- [x] Maintenance metrics for scheduler decisions, compaction debt, copied and
   deleted bytes, cursor position, skipped/stale commands, SQLite WAL size, and
   backpressure reasons.
-- [ ] Grant/receipt metrics for issued grants, verified receipts, rejected
+- [x] Grant/receipt metrics for issued grants, verified receipts, rejected
   grants/receipts by reason, duplicate/replay attempts, stale epochs, and
   proof-scheme/key-ID mismatches.
-- [ ] Deterministic structured event stream for state transitions that tests
+- [x] Deterministic structured event stream for state transitions that tests
   can assert without relying on wall-clock timestamps.
-- [ ] Optional adapter boundary for exporting observations; adapters must sit
+- [x] Optional adapter boundary for exporting observations; adapters must sit
   outside the deterministic core and cannot own storage decisions.
-- [ ] Human-readable README/design copy describing which signals matter during
+- [x] Human-readable README/design copy describing which signals matter during
   normal operation, write pressure, compaction pressure, failed publish cleanup,
   and recovery triage.
 
 Exit gate:
 
-- [ ] Observing metrics or diagnostics never changes logical state, durable
+- [x] Observing metrics or diagnostics never changes logical state, durable
   state, write admission, compaction selection, GC, or custodian behavior.
-- [ ] Deterministic tests assert exact event sequences and metric deltas for
+- [x] Deterministic tests assert exact event sequences and metric deltas for
   writes, flushes, failed publishes, forks, restores, GC, custodian runs,
   compaction ticks, receipt verification failures, and reopen.
-- [ ] Diagnostics snapshots match authoritative provider state and reject
+- [x] Diagnostics snapshots match authoritative provider state and reject
   impossible accounting such as negative dirty bytes, orphan counts larger than
   durable-pending segment counts, or WAL pressure without a metadata store.
-- [ ] Hot write/read/fork/restore paths do not regress by more than the
+- [x] Hot write/read/fork/restore paths do not regress by more than the
   documented threshold when observations are enabled but not exported.
-- [ ] Observation names and reason strings are stable enough for tests and
+- [x] Observation names and reason strings are stable enough for tests and
   admin tooling; changes require updating golden tests and docs in the same
   change.
+
+Implementation notes:
+
+- `ObservableProvider` is implemented by the local and durable coordinators.
+  The stable provider types are `DiagnosticsSnapshot`, `DiagnosticsCounters`,
+  `DiagnosticsGauges`, `DiagnosticsNodeSnapshot`, `StorageEvent`, and
+  `StorageEventKind`.
+- Events are process-local, bounded breadcrumbs with deterministic sequence
+  numbers. The default event capacity is 1024 and can be configured through
+  `LocalStoreConfig::observability_event_capacity`.
+- Counters are process-local observation totals; gauges and node snapshots are
+  derived from authoritative metadata state, storage-node catalogs, data-log
+  manifests, and maintenance observations. Durable reopen reconstructs gauges
+  from persisted state without replaying old diagnostic events.
+- Criterion smoke coverage now includes diagnostics snapshots, event draining,
+  and hot 4 KiB writes with observability enabled but not drained.
 
 ## Phase 28: Recovery and Admin Tooling
 

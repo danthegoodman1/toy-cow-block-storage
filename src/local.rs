@@ -45,15 +45,16 @@ use crate::object::{
     SegmentDescriptor, ShardCommit, ShardRootUpdate,
 };
 use crate::provider::{
-    CommitGroupIntent, GrantReceiptAuthority, LocalSegmentCatalog, MetadataCreateDeviceRequest,
+    CommitGroupIntent, DiagnosticsCounters, DiagnosticsGauges, DiagnosticsNodeSnapshot,
+    DiagnosticsSnapshot, GrantReceiptAuthority, LocalSegmentCatalog, MetadataCreateDeviceRequest,
     MetadataCreateFileRequest, MetadataCreateKeyspaceRequest, MetadataFence, MetadataForkRequest,
-    MetadataNodeWrite, MetadataPlane, MetadataSnapshotKeyspaceRequest, PlacementPolicy,
-    ProofScheme, ReferenceEvidence, RetentionPolicy, SegmentReceiptLifecycle, SegmentReplicaCommit,
-    SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent, SegmentStore,
-    SegmentWriteReceipt, StorageNodeCustodianReport, StorageNodeDirectory,
-    StorageNodeMaintenanceObservation, StorageNodeMaintenanceReport, StorageNodeRequest,
-    StorageNodeResponse, StorageNodeTransport, VerifiedSegmentReceipt, WriteGrant,
-    WriteGrantIntent, WriteGrantRequest, deterministic_test_grant_hash_and_proof,
+    MetadataNodeWrite, MetadataPlane, MetadataSnapshotKeyspaceRequest, ObservableProvider,
+    PlacementPolicy, ProofScheme, ReferenceEvidence, RetentionPolicy, SegmentReceiptLifecycle,
+    SegmentReplicaCommit, SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent,
+    SegmentStore, SegmentWriteReceipt, StorageEvent, StorageEventKind, StorageNodeCustodianReport,
+    StorageNodeDirectory, StorageNodeMaintenanceObservation, StorageNodeMaintenanceReport,
+    StorageNodeRequest, StorageNodeResponse, StorageNodeTransport, VerifiedSegmentReceipt,
+    WriteGrant, WriteGrantIntent, WriteGrantRequest, deterministic_test_grant_hash_and_proof,
     deterministic_test_proof_for_grant, deterministic_test_proof_for_receipt,
     deterministic_test_proof_for_reference,
 };
@@ -64,6 +65,7 @@ const LOCAL_PRINCIPAL_ID: PrincipalId = PrincipalId::from_raw(1);
 const LOCAL_GRANT_EPOCH: GrantEpoch = GrantEpoch::from_raw(1);
 const LOCAL_GRANT_EXPIRATION: LogicalDeadline = LogicalDeadline::from_raw(u64::MAX);
 const LOCAL_STORAGE_NODE_INCARNATION: ServerIncarnation = ServerIncarnation::from_raw(1);
+const DEFAULT_OBSERVABILITY_EVENT_CAPACITY: usize = 1024;
 
 /// Local provider configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -74,6 +76,7 @@ pub struct LocalStoreConfig {
     pub metadata_fanout: usize,
     pub metadata_leaf_blocks: u64,
     pub storage_node: StorageNodeId,
+    pub observability_event_capacity: usize,
 }
 
 impl Default for LocalStoreConfig {
@@ -85,11 +88,28 @@ impl Default for LocalStoreConfig {
             metadata_fanout: 4,
             metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(1),
+            observability_event_capacity: DEFAULT_OBSERVABILITY_EVENT_CAPACITY,
         }
     }
 }
 
 impl LocalStoreConfig {
+    fn storage_shape_matches(self, other: Self) -> bool {
+        self.shard_count == other.shard_count
+            && self.block_size == other.block_size
+            && self.file_root_blocks == other.file_root_blocks
+            && self.metadata_fanout == other.metadata_fanout
+            && self.metadata_leaf_blocks == other.metadata_leaf_blocks
+            && self.storage_node == other.storage_node
+    }
+
+    fn with_observability_event_capacity(self, observability_event_capacity: usize) -> Self {
+        Self {
+            observability_event_capacity,
+            ..self
+        }
+    }
+
     pub fn validate(self) -> Result<()> {
         if self.shard_count == 0 {
             return Err(StorageError::invalid_argument(
@@ -127,6 +147,12 @@ impl LocalStoreConfig {
             ));
         }
 
+        if self.observability_event_capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "observability_event_capacity must be greater than zero",
+            ));
+        }
+
         Ok(())
     }
 
@@ -150,6 +176,146 @@ fn normalize_storage_nodes(
         }
     }
     out
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug)]
+struct ObservabilityInner {
+    counters: DiagnosticsCounters,
+    events: VecDeque<StorageEvent>,
+    next_event_sequence: u64,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct Observability {
+    inner: Mutex<ObservabilityInner>,
+}
+
+impl Observability {
+    fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "observability_event_capacity must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            inner: Mutex::new(ObservabilityInner {
+                counters: DiagnosticsCounters::default(),
+                events: VecDeque::with_capacity(capacity),
+                next_event_sequence: 1,
+                capacity,
+            }),
+        })
+    }
+
+    fn increment(&self, update: impl FnOnce(&mut DiagnosticsCounters)) {
+        if let Ok(mut inner) = self.inner.lock() {
+            update(&mut inner.counters);
+        }
+    }
+
+    fn record(&self, kind: StorageEventKind) {
+        self.record_with(kind, None, None, None, None);
+    }
+
+    fn record_with(
+        &self,
+        kind: StorageEventKind,
+        storage_node: Option<StorageNodeId>,
+        segment_id: Option<SegmentId>,
+        commit_seq: Option<CommitSeq>,
+        reason: Option<&'static str>,
+    ) {
+        self.record_with_update(kind, storage_node, segment_id, commit_seq, reason, |_| {});
+    }
+
+    fn record_with_update(
+        &self,
+        kind: StorageEventKind,
+        storage_node: Option<StorageNodeId>,
+        segment_id: Option<SegmentId>,
+        commit_seq: Option<CommitSeq>,
+        reason: Option<&'static str>,
+        update: impl FnOnce(&mut DiagnosticsCounters),
+    ) {
+        if let Ok(mut inner) = self.inner.lock() {
+            update(&mut inner.counters);
+            let sequence = inner.next_event_sequence;
+            inner.next_event_sequence = inner.next_event_sequence.saturating_add(1);
+            if inner.events.len() == inner.capacity {
+                inner.events.pop_front();
+                inner.counters.observability_events_dropped = inner
+                    .counters
+                    .observability_events_dropped
+                    .saturating_add(1);
+            }
+            inner.counters.observability_events_recorded = inner
+                .counters
+                .observability_events_recorded
+                .saturating_add(1);
+            inner.events.push_back(StorageEvent {
+                sequence,
+                kind,
+                storage_node,
+                segment_id,
+                commit_seq,
+                reason,
+            });
+        }
+    }
+
+    fn snapshot_parts(&self) -> Result<(DiagnosticsCounters, Vec<StorageEvent>, u64, u64, u64)> {
+        let inner = lock(&self.inner)?;
+        let last_sequence = inner.next_event_sequence.saturating_sub(1);
+        Ok((
+            inner.counters,
+            inner.events.iter().cloned().collect(),
+            usize_to_u64(inner.events.len()),
+            usize_to_u64(inner.capacity),
+            last_sequence,
+        ))
+    }
+
+    fn drain_events(&self, max: usize) -> Result<Vec<StorageEvent>> {
+        let mut inner = lock(&self.inner)?;
+        let count = max.min(inner.events.len());
+        Ok(inner.events.drain(..count).collect())
+    }
+}
+
+fn receipt_rejection_reason(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::Corrupt { .. } => "bad_proof",
+        StorageError::Conflict { reason } if reason.contains("proof") => "bad_proof",
+        StorageError::Conflict { reason } if reason.contains("stale") => "stale_epoch",
+        StorageError::Conflict { reason } if reason.contains("duplicate") => "replay",
+        StorageError::Conflict { .. } | StorageError::InvalidArgument { .. } => "scope",
+        StorageError::NotFound { .. } | StorageError::Unavailable { .. } => "scope",
+        StorageError::Unsupported { .. } => "unsupported",
+    }
+}
+
+fn count_receipt_rejection(counters: &mut DiagnosticsCounters, reason: &'static str) {
+    counters.receipt_rejections = counters.receipt_rejections.saturating_add(1);
+    match reason {
+        "bad_proof" => {
+            counters.receipt_rejected_bad_proof =
+                counters.receipt_rejected_bad_proof.saturating_add(1);
+        }
+        "stale_epoch" => {
+            counters.receipt_rejected_epoch = counters.receipt_rejected_epoch.saturating_add(1);
+        }
+        "replay" => {
+            counters.receipt_rejected_replay = counters.receipt_rejected_replay.saturating_add(1);
+        }
+        _ => {
+            counters.receipt_rejected_scope = counters.receipt_rejected_scope.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -525,6 +691,7 @@ struct LocalStorageNode {
     segment_store: Arc<InMemorySegmentStore>,
     segment_catalog: Arc<InMemoryLocalSegmentCatalog>,
     authority: Arc<LocalGrantReceiptAuthority>,
+    observability: Arc<Observability>,
 }
 
 impl LocalStorageNode {
@@ -621,12 +788,28 @@ impl StorageNodeTransport for LocalStorageNode {
                 let bytes_len = u64::try_from(bytes.len()).map_err(|_| {
                     StorageError::invalid_argument("segment write length overflows u64")
                 })?;
-                let grant_hash = self.authority.verify_write_grant_and_hash(
+                let grant_hash = match self.authority.verify_write_grant_and_hash(
                     &grant,
                     self.storage_node,
                     grant.segment_id,
                     bytes_len,
-                )?;
+                ) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        self.observability.record_with_update(
+                            StorageEventKind::GrantRejected,
+                            Some(self.storage_node),
+                            Some(grant.segment_id),
+                            None,
+                            Some("scope"),
+                            |counters| {
+                                counters.grant_rejections =
+                                    counters.grant_rejections.saturating_add(1);
+                            },
+                        );
+                        return Err(error);
+                    }
+                };
                 if self.segment_catalog.contains_segment(grant.segment_id)? {
                     let receipt = self.segment_catalog.receipt_for_segment(grant.segment_id)?;
                     self.authority.verify_segment_receipt(&receipt)?;
@@ -647,6 +830,20 @@ impl StorageNodeTransport for LocalStorageNode {
                             &mut existing,
                         )?;
                         if existing == bytes {
+                            self.observability.record_with_update(
+                                StorageEventKind::StorageSegmentWriteRetried,
+                                Some(self.storage_node),
+                                Some(grant.segment_id),
+                                None,
+                                None,
+                                |counters| {
+                                    counters.storage_segment_duplicate_writes =
+                                        counters.storage_segment_duplicate_writes.saturating_add(1);
+                                    counters.coordinator_write_idempotency_hits = counters
+                                        .coordinator_write_idempotency_hits
+                                        .saturating_add(1);
+                                },
+                            );
                             return Ok(StorageNodeResponse::WriteSegment {
                                 receipt: Box::new(receipt),
                             });
@@ -677,6 +874,17 @@ impl StorageNodeTransport for LocalStorageNode {
                 )?;
                 self.segment_catalog
                     .commit_segment(reservation, receipt.clone())?;
+                self.observability.record_with_update(
+                    StorageEventKind::StorageSegmentWritten,
+                    Some(self.storage_node),
+                    Some(receipt.segment_id),
+                    None,
+                    None,
+                    |counters| {
+                        counters.storage_segment_writes =
+                            counters.storage_segment_writes.saturating_add(1);
+                    },
+                );
                 Ok(StorageNodeResponse::WriteSegment {
                     receipt: Box::new(receipt),
                 })
@@ -698,10 +906,32 @@ impl StorageNodeTransport for LocalStorageNode {
                     self.storage_node,
                 )?;
                 self.segment_catalog.mark_segment_referenced(segment_id)?;
+                self.observability.record_with_update(
+                    StorageEventKind::StorageSegmentReferenced,
+                    Some(self.storage_node),
+                    Some(segment_id),
+                    Some(evidence.metadata_commit),
+                    None,
+                    |counters| {
+                        counters.storage_segment_references =
+                            counters.storage_segment_references.saturating_add(1);
+                    },
+                );
                 Ok(StorageNodeResponse::MarkReferenced)
             }
             StorageNodeRequest::Release { segment_id } => {
                 self.segment_catalog.release_segment(segment_id)?;
+                self.observability.record_with_update(
+                    StorageEventKind::StorageSegmentReleased,
+                    Some(self.storage_node),
+                    Some(segment_id),
+                    None,
+                    None,
+                    |counters| {
+                        counters.storage_segment_releases =
+                            counters.storage_segment_releases.saturating_add(1);
+                    },
+                );
                 Ok(StorageNodeResponse::Released)
             }
             StorageNodeRequest::RunCustodian {
@@ -729,7 +959,17 @@ struct StorageNodeRegistry {
 }
 
 impl StorageNodeRegistry {
+    #[cfg(test)]
     fn new(config: LocalStoreConfig, storage_nodes: Vec<StorageNodeId>) -> Result<Self> {
+        let observability = Arc::new(Observability::new(config.observability_event_capacity)?);
+        Self::new_with_observability(config, storage_nodes, observability)
+    }
+
+    fn new_with_observability(
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        observability: Arc<Observability>,
+    ) -> Result<Self> {
         config.validate()?;
         let node_order = normalize_storage_nodes(config.storage_node, storage_nodes);
         let mut nodes = BTreeMap::new();
@@ -743,6 +983,7 @@ impl StorageNodeRegistry {
                     segment_store: Arc::new(InMemorySegmentStore::new(node_config)?),
                     segment_catalog: Arc::new(InMemoryLocalSegmentCatalog::new(node_config)?),
                     authority: Arc::clone(&authority),
+                    observability: Arc::clone(&observability),
                 },
             );
         }
@@ -755,7 +996,11 @@ impl StorageNodeRegistry {
         })
     }
 
-    fn from_inner(config: LocalStoreConfig, inner: StorageNodeRegistryInner) -> Result<Self> {
+    fn from_inner_with_observability(
+        config: LocalStoreConfig,
+        inner: StorageNodeRegistryInner,
+        observability: Arc<Observability>,
+    ) -> Result<Self> {
         config.validate()?;
         if inner.node_order.is_empty() {
             return Err(StorageError::corrupt("storage node registry has no nodes"));
@@ -802,6 +1047,7 @@ impl StorageNodeRegistry {
                         image.segment_catalog.clone(),
                     )?),
                     authority: Arc::clone(&authority),
+                    observability: Arc::clone(&observability),
                 },
             );
         }
@@ -932,6 +1178,50 @@ impl StorageNodeRegistry {
         buf.copy_from_slice(&bytes);
         Ok(())
     }
+
+    fn diagnostics_nodes(
+        &self,
+        maintenance: Option<&MaintenanceObservation>,
+    ) -> Result<Vec<DiagnosticsNodeSnapshot>> {
+        let mut nodes = BTreeMap::new();
+        for node_id in self.node_order.iter() {
+            let counts = self.node(*node_id)?.segment_catalog.lifecycle_counts()?;
+            nodes.insert(
+                *node_id,
+                DiagnosticsNodeSnapshot {
+                    storage_node: *node_id,
+                    reserved_segments: usize_to_u64(counts.reserved),
+                    writing_segments: usize_to_u64(counts.writing),
+                    durable_pending_segments: usize_to_u64(counts.durable_pending),
+                    pending_orphan_segments: usize_to_u64(counts.durable_pending),
+                    referenced_segments: usize_to_u64(counts.referenced),
+                    released_segments: usize_to_u64(counts.released),
+                    freed_segments: usize_to_u64(counts.freed),
+                    active_log_bytes: 0,
+                    sealed_log_count: 0,
+                    sealed_log_bytes: 0,
+                    dirty_bytes: 0,
+                    reclaimable_bytes: 0,
+                },
+            );
+        }
+        if let Some(maintenance) = maintenance {
+            for observed in &maintenance.nodes {
+                if let Some(node) = nodes.get_mut(&observed.storage_node) {
+                    node.active_log_bytes = observed.active_log_bytes;
+                    node.sealed_log_count = usize_to_u64(observed.sealed_log_count);
+                    node.sealed_log_bytes = observed
+                        .logs
+                        .iter()
+                        .map(|log| log.total_bytes)
+                        .fold(0_u64, u64::saturating_add);
+                    node.dirty_bytes = observed.dirty_bytes;
+                    node.reclaimable_bytes = observed.reclaimable_bytes;
+                }
+            }
+        }
+        Ok(nodes.into_values().collect())
+    }
 }
 
 impl PlacementPolicy for StorageNodeRegistry {
@@ -1002,6 +1292,7 @@ pub struct LocalCoordinator {
     authority: Arc<LocalGrantReceiptAuthority>,
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
+    observability: Arc<Observability>,
 }
 
 impl LocalCoordinator {
@@ -1018,26 +1309,40 @@ impl LocalCoordinator {
         storage_nodes: Vec<StorageNodeId>,
     ) -> Result<Self> {
         config.validate()?;
+        let observability = Arc::new(Observability::new(config.observability_event_capacity)?);
         Ok(Self {
             metadata: Arc::new(InMemoryMetadataPlane::new(config)?),
-            storage_nodes: StorageNodeRegistry::new(config, storage_nodes)?,
+            storage_nodes: StorageNodeRegistry::new_with_observability(
+                config,
+                storage_nodes,
+                Arc::clone(&observability),
+            )?,
             authority: Arc::new(LocalGrantReceiptAuthority),
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
+            observability,
         })
     }
 
     fn from_state_image(image: DurableStoreImage) -> Result<Self> {
         image.config.validate()?;
+        let observability = Arc::new(Observability::new(
+            image.config.observability_event_capacity,
+        )?);
         Ok(Self {
             metadata: Arc::new(InMemoryMetadataPlane::from_inner(
                 image.config,
                 image.metadata,
             )?),
-            storage_nodes: StorageNodeRegistry::from_inner(image.config, image.storage_nodes)?,
+            storage_nodes: StorageNodeRegistry::from_inner_with_observability(
+                image.config,
+                image.storage_nodes,
+                Arc::clone(&observability),
+            )?,
             authority: Arc::new(LocalGrantReceiptAuthority),
             next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
+            observability,
         })
     }
 
@@ -1075,6 +1380,65 @@ impl LocalCoordinator {
         )
     }
 
+    fn diagnostics_snapshot_with_maintenance(
+        &self,
+        maintenance: Option<&MaintenanceObservation>,
+    ) -> Result<DiagnosticsSnapshot> {
+        let (counters, events, event_buffer_len, event_buffer_capacity, last_event_sequence) =
+            self.observability.snapshot_parts()?;
+        let metadata = self.metadata.state_inner()?;
+        let nodes = self.storage_nodes.diagnostics_nodes(maintenance)?;
+        let mut gauges = DiagnosticsGauges {
+            live_device_heads: usize_to_u64(metadata.device_heads.len()),
+            deleted_device_heads: usize_to_u64(metadata.deleted_device_heads.len()),
+            live_keyspace_heads: usize_to_u64(metadata.keyspace_heads.len()),
+            metadata_nodes: usize_to_u64(metadata.metadata_nodes.len()),
+            commit_seq: metadata.next_commit_seq.saturating_sub(1),
+            checkpoint_count: usize_to_u64(metadata.checkpoints.len()),
+            gc_epoch: metadata.next_gc_epoch.saturating_sub(1),
+            pending_release_evidence: nodes
+                .iter()
+                .map(|node| node.released_segments)
+                .fold(0_u64, u64::saturating_add),
+            event_buffer_len,
+            event_buffer_capacity,
+            last_event_sequence,
+            ..DiagnosticsGauges::default()
+        };
+        if let Some(maintenance) = maintenance {
+            gauges.sqlite_wal_bytes = maintenance.sqlite_wal_bytes;
+            gauges.maintenance_dirty_bytes = maintenance
+                .nodes
+                .iter()
+                .map(|node| node.dirty_bytes)
+                .fold(0_u64, u64::saturating_add);
+            gauges.maintenance_reclaimable_bytes = maintenance
+                .nodes
+                .iter()
+                .map(|node| node.reclaimable_bytes)
+                .fold(0_u64, u64::saturating_add);
+            gauges.maintenance_sealed_logs = maintenance
+                .nodes
+                .iter()
+                .map(|node| usize_to_u64(node.sealed_log_count))
+                .fold(0_u64, u64::saturating_add);
+        }
+        Ok(DiagnosticsSnapshot {
+            counters,
+            gauges,
+            nodes,
+            recent_events: events,
+        })
+    }
+
+    pub fn diagnostics_snapshot(&self) -> Result<DiagnosticsSnapshot> {
+        self.diagnostics_snapshot_with_maintenance(None)
+    }
+
+    pub fn drain_events(&self, max: usize) -> Result<Vec<StorageEvent>> {
+        self.observability.drain_events(max)
+    }
+
     #[cfg(test)]
     fn storage_node_ids_for_test(&self) -> Vec<StorageNodeId> {
         self.storage_nodes.node_ids()
@@ -1100,6 +1464,45 @@ impl LocalCoordinator {
         ))
     }
 
+    fn publish_commit_group_observed(&self, intent: CommitGroupIntent) -> Result<CommitGroup> {
+        match self.metadata.publish_commit_group(intent) {
+            Ok(commit_group) => {
+                self.observability.record_with_update(
+                    StorageEventKind::MetadataPublishSucceeded,
+                    None,
+                    None,
+                    Some(commit_group.commit_seq),
+                    None,
+                    |counters| {
+                        counters.coordinator_write_publish_successes = counters
+                            .coordinator_write_publish_successes
+                            .saturating_add(1);
+                    },
+                );
+                Ok(commit_group)
+            }
+            Err(error) => {
+                self.observability.record_with_update(
+                    StorageEventKind::MetadataPublishFailed,
+                    None,
+                    None,
+                    None,
+                    Some("publish_failed"),
+                    |counters| {
+                        counters.coordinator_write_publish_failures = counters
+                            .coordinator_write_publish_failures
+                            .saturating_add(1);
+                        if matches!(error, StorageError::Conflict { .. }) {
+                            counters.metadata_stale_fences =
+                                counters.metadata_stale_fences.saturating_add(1);
+                        }
+                    },
+                );
+                Err(error)
+            }
+        }
+    }
+
     pub fn write_device(
         &self,
         device_id: DeviceId,
@@ -1121,6 +1524,17 @@ impl LocalCoordinator {
                 durability,
             });
         }
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
 
         let block_size = u64::from(info.spec.block_size);
         let chunks = self.split_device_range(&info, range)?;
@@ -1190,7 +1604,7 @@ impl LocalCoordinator {
             }));
         }
 
-        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner,
             fence: MetadataFence::DeviceGeneration(current.generation),
             updates,
@@ -1269,9 +1683,20 @@ impl LocalCoordinator {
                 durability: crate::api::WriteDurability::Acknowledged,
             });
         }
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
 
         let current = self.metadata.get_head(device_id)?;
-        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner,
             fence: MetadataFence::DeviceGeneration(current.generation),
             updates,
@@ -1304,6 +1729,17 @@ impl LocalCoordinator {
                 "append payload must not be empty",
             ));
         }
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
         let data_len = u64::try_from(data.len())
             .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
 
@@ -1419,7 +1855,7 @@ impl LocalCoordinator {
             )?
             .root;
 
-        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner,
             fence: MetadataFence::WriterEpoch {
                 base_version: lease.base_version,
@@ -1482,6 +1918,17 @@ impl LocalCoordinator {
                 durability,
             });
         }
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
 
         let owner = MappingOwner::NativeKeyspace(keyspace_id);
         let block_size = u64::from(self.metadata.config.block_size);
@@ -1555,7 +2002,7 @@ impl LocalCoordinator {
             .root;
         let new_size = head.size.max(end);
 
-        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner,
             fence: MetadataFence::FileVersion(head.version),
             updates: vec![RootUpdate::FileRoot {
@@ -1588,12 +2035,38 @@ impl LocalCoordinator {
             target: request.target,
             name: request.name,
         })?;
+        self.observability.record_with(
+            StorageEventKind::DeviceForked,
+            None,
+            None,
+            Some(head.latest_commit),
+            None,
+        );
         Ok(head.device_id)
     }
 
     pub fn restore_device(&self, source: DeviceId, point: RestorePoint) -> Result<DeviceId> {
         let head = self.metadata.restore_device(source, point)?;
+        self.observability.record_with(
+            StorageEventKind::DeviceRestored,
+            None,
+            None,
+            Some(head.latest_commit),
+            None,
+        );
         Ok(head.device_id)
+    }
+
+    pub fn restore_keyspace(&self, source: KeyspaceId, point: RestorePoint) -> Result<KeyspaceId> {
+        let head = self.metadata.restore_keyspace(source, point)?;
+        self.observability.record_with(
+            StorageEventKind::KeyspaceRestored,
+            None,
+            None,
+            Some(head.latest_commit),
+            None,
+        );
+        Ok(head.keyspace_id)
     }
 
     pub fn delete_device(&self, device_id: DeviceId) -> Result<DeleteResult> {
@@ -1630,6 +2103,11 @@ impl LocalCoordinator {
                 catalog_released_segments.push(*segment_id);
             }
         }
+        self.observability.increment(|counters| {
+            counters.metadata_custodian_runs = counters.metadata_custodian_runs.saturating_add(1);
+        });
+        self.observability
+            .record(StorageEventKind::MetadataCustodianRan);
         Ok(MetadataCustodianReport {
             mark,
             sweep,
@@ -1669,6 +2147,12 @@ impl LocalCoordinator {
                 .extend(node_report.deleted_released_segments);
         }
 
+        self.observability.increment(|counters| {
+            counters.storage_node_custodian_runs =
+                counters.storage_node_custodian_runs.saturating_add(1);
+        });
+        self.observability
+            .record(StorageEventKind::StorageNodeCustodianRan);
         Ok(report)
     }
 
@@ -1780,7 +2264,34 @@ impl LocalCoordinator {
     }
 
     pub fn issue_write_grant(&self, request: WriteGrantRequest) -> Result<WriteGrant> {
-        self.authority.issue_write_grant(request)
+        match self.authority.issue_write_grant(request) {
+            Ok(grant) => {
+                self.observability.record_with_update(
+                    StorageEventKind::GrantIssued,
+                    Some(grant.storage_node),
+                    Some(grant.segment_id),
+                    None,
+                    None,
+                    |counters| {
+                        counters.grants_issued = counters.grants_issued.saturating_add(1);
+                    },
+                );
+                Ok(grant)
+            }
+            Err(error) => {
+                self.observability.record_with_update(
+                    StorageEventKind::GrantRejected,
+                    None,
+                    None,
+                    None,
+                    Some("scope"),
+                    |counters| {
+                        counters.grant_rejections = counters.grant_rejections.saturating_add(1);
+                    },
+                );
+                Err(error)
+            }
+        }
     }
 
     pub fn issue_block_write_grant(
@@ -1933,7 +2444,7 @@ impl LocalCoordinator {
                 "storage node write receipt disagrees with requested segment ID",
             ));
         }
-        self.authority.verify_receipt_matches_grant(grant, &receipt)
+        self.verify_receipt_matches_grant_observed(grant, &receipt)
     }
 
     pub fn storage_node_transport_for_grant(
@@ -1953,7 +2464,67 @@ impl LocalCoordinator {
         &self,
         receipt: &SegmentWriteReceipt,
     ) -> Result<VerifiedSegmentReceipt> {
-        self.authority.verify_segment_receipt(receipt)
+        match self.authority.verify_segment_receipt(receipt) {
+            Ok(verified) => {
+                self.observability.record_with_update(
+                    StorageEventKind::ReceiptVerified,
+                    Some(receipt.storage_node),
+                    Some(receipt.segment_id),
+                    None,
+                    None,
+                    |counters| {
+                        counters.receipts_verified = counters.receipts_verified.saturating_add(1);
+                    },
+                );
+                Ok(verified)
+            }
+            Err(error) => {
+                let reason = receipt_rejection_reason(&error);
+                self.observability.record_with_update(
+                    StorageEventKind::ReceiptRejected,
+                    Some(receipt.storage_node),
+                    Some(receipt.segment_id),
+                    None,
+                    Some(reason),
+                    |counters| count_receipt_rejection(counters, reason),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn verify_receipt_matches_grant_observed(
+        &self,
+        grant: &WriteGrant,
+        receipt: &SegmentWriteReceipt,
+    ) -> Result<VerifiedSegmentReceipt> {
+        match self.authority.verify_receipt_matches_grant(grant, receipt) {
+            Ok(verified) => {
+                self.observability.record_with_update(
+                    StorageEventKind::ReceiptVerified,
+                    Some(receipt.storage_node),
+                    Some(receipt.segment_id),
+                    None,
+                    None,
+                    |counters| {
+                        counters.receipts_verified = counters.receipts_verified.saturating_add(1);
+                    },
+                );
+                Ok(verified)
+            }
+            Err(error) => {
+                let reason = receipt_rejection_reason(&error);
+                self.observability.record_with_update(
+                    StorageEventKind::ReceiptRejected,
+                    Some(receipt.storage_node),
+                    Some(receipt.segment_id),
+                    None,
+                    Some(reason),
+                    |counters| count_receipt_rejection(counters, reason),
+                );
+                Err(error)
+            }
+        }
     }
 
     pub fn submit_block_write_receipt(
@@ -1961,9 +2532,18 @@ impl LocalCoordinator {
         grant: &WriteGrant,
         receipt: SegmentWriteReceipt,
     ) -> Result<WriteCommit> {
-        let verified = self
-            .authority
-            .verify_receipt_matches_grant(grant, &receipt)?;
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
+        let verified = self.verify_receipt_matches_grant_observed(grant, &receipt)?;
         let WriteGrantIntent::BlockWrite {
             device_id,
             range,
@@ -2006,7 +2586,7 @@ impl LocalCoordinator {
                 std::slice::from_ref(&verified),
             )?
             .root;
-        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner: MappingOwner::BlockDevice(device_id),
             fence: MetadataFence::DeviceGeneration(fence),
             updates: vec![RootUpdate::BlockShard(ShardRootUpdate {
@@ -2044,9 +2624,18 @@ impl LocalCoordinator {
         grant: &WriteGrant,
         receipt: SegmentWriteReceipt,
     ) -> Result<FileWriteCommit> {
-        let verified = self
-            .authority
-            .verify_receipt_matches_grant(grant, &receipt)?;
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
+        let verified = self.verify_receipt_matches_grant_observed(grant, &receipt)?;
         let WriteGrantIntent::NativeWrite {
             keyspace_id,
             file_id,
@@ -2106,7 +2695,7 @@ impl LocalCoordinator {
             )?
             .root;
         let new_size = head.size.max(end);
-        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner: MappingOwner::NativeKeyspace(keyspace_id),
             fence: MetadataFence::FileVersion(base_version),
             updates: vec![RootUpdate::FileRoot {
@@ -2137,9 +2726,18 @@ impl LocalCoordinator {
         grant: &WriteGrant,
         receipt: SegmentWriteReceipt,
     ) -> Result<AppendCommit> {
-        let verified = self
-            .authority
-            .verify_receipt_matches_grant(grant, &receipt)?;
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
+        let verified = self.verify_receipt_matches_grant_observed(grant, &receipt)?;
         let (keyspace_id, file_id, append_offset, logical_bytes, base_version, writer_epoch) =
             match receipt.intent {
                 WriteGrantIntent::NativeAppend {
@@ -2237,7 +2835,7 @@ impl LocalCoordinator {
             .size
             .checked_add(logical_bytes)
             .ok_or_else(|| StorageError::invalid_argument("file size overflows u64"))?;
-        let commit_group = self.metadata.publish_commit_group(CommitGroupIntent {
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner: MappingOwner::NativeKeyspace(keyspace_id),
             fence: MetadataFence::WriterEpoch {
                 base_version,
@@ -3697,11 +4295,14 @@ impl DurableSqliteStore {
             self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
             return Ok(Some(LocalCoordinator::from_state_image(image)?));
         };
-        if cursor.config != expected_config {
+        if !cursor.config.storage_shape_matches(expected_config) {
             return Err(StorageError::corrupt(
                 "durable SQLite state disagrees with open config",
             ));
         }
+        let runtime_config = cursor
+            .config
+            .with_observability_event_capacity(expected_config.observability_event_capacity);
 
         let mut metadata = load_metadata_inner(&conn, &cursor)?;
         let (mut storage_nodes, next_write_intent) = self
@@ -3729,7 +4330,7 @@ impl DurableSqliteStore {
         let repairs = reconcile_catalog_references_from_metadata(&metadata, &mut storage_nodes);
 
         let image = DurableStoreImage {
-            config: cursor.config,
+            config: runtime_config,
             metadata,
             storage_nodes,
             next_write_intent,
@@ -6929,6 +7530,19 @@ fn run_maintenance_tick_parts(
         policy_uses_sqlite_wal_pressure(parts.maintenance_policy),
     )?;
     let plan = scheduler.step(&observation);
+    parts.local.observability.increment(|counters| {
+        counters.maintenance_plans = counters.maintenance_plans.saturating_add(1);
+        counters.maintenance_logs_selected = counters
+            .maintenance_logs_selected
+            .saturating_add(usize_to_u64(plan.diagnostics.selected_logs.len()));
+        counters.maintenance_logs_skipped = counters
+            .maintenance_logs_skipped
+            .saturating_add(usize_to_u64(plan.diagnostics.skipped_logs.len()));
+    });
+    parts
+        .local
+        .observability
+        .record(StorageEventKind::MaintenancePlanned);
     let mut compaction = empty_compaction_report();
     if !plan.commands.is_empty() {
         let _persist_guard = lock(&parts.persist_lock)?;
@@ -6966,6 +7580,19 @@ fn run_maintenance_tick_parts(
         parts.durable.persist_maintenance_cursor(plan.next_cursor)?;
         *lock(&parts.maintenance_cursor)? = plan.next_cursor;
     }
+    parts.local.observability.increment(|counters| {
+        counters.maintenance_ticks = counters.maintenance_ticks.saturating_add(1);
+        counters.maintenance_bytes_copied = counters
+            .maintenance_bytes_copied
+            .saturating_add(compaction.bytes_copied);
+        counters.maintenance_bytes_deleted = counters
+            .maintenance_bytes_deleted
+            .saturating_add(compaction.bytes_deleted);
+    });
+    parts
+        .local
+        .observability
+        .record(StorageEventKind::MaintenanceTicked);
     Ok(MaintenanceTickReport { plan, compaction })
 }
 
@@ -7136,6 +7763,16 @@ impl DurableCoordinator {
         self.durable.maintenance_observation(cursor, 0, 0, true)
     }
 
+    pub fn diagnostics_snapshot(&self) -> Result<DiagnosticsSnapshot> {
+        let observation = self.observe_maintenance()?;
+        self.local
+            .diagnostics_snapshot_with_maintenance(Some(&observation))
+    }
+
+    pub fn drain_events(&self, max: usize) -> Result<Vec<StorageEvent>> {
+        self.local.drain_events(max)
+    }
+
     /// Plan one maintenance tick from the current observation.
     ///
     /// This performs SQLite reads only. It does not compact logs, update the
@@ -7149,7 +7786,20 @@ impl DurableCoordinator {
             0,
             policy_uses_sqlite_wal_pressure(self.maintenance_policy),
         )?;
-        Ok(scheduler.step(&observation))
+        let plan = scheduler.step(&observation);
+        self.local.observability.increment(|counters| {
+            counters.maintenance_plans = counters.maintenance_plans.saturating_add(1);
+            counters.maintenance_logs_selected = counters
+                .maintenance_logs_selected
+                .saturating_add(usize_to_u64(plan.diagnostics.selected_logs.len()));
+            counters.maintenance_logs_skipped = counters
+                .maintenance_logs_skipped
+                .saturating_add(usize_to_u64(plan.diagnostics.skipped_logs.len()));
+        });
+        self.local
+            .observability
+            .record(StorageEventKind::MaintenancePlanned);
+        Ok(plan)
     }
 
     /// Run one bounded maintenance tick synchronously.
@@ -7189,6 +7839,19 @@ impl DurableCoordinator {
         if self.maintenance_policy.write_backpressure_enabled
             && let Some(reason) = plan.admission.unavailable_reason()
         {
+            self.local.observability.record_with_update(
+                StorageEventKind::CoordinatorWriteUnavailable,
+                None,
+                None,
+                None,
+                Some(reason),
+                |counters| {
+                    counters.coordinator_write_attempts =
+                        counters.coordinator_write_attempts.saturating_add(1);
+                    counters.coordinator_write_unavailable =
+                        counters.coordinator_write_unavailable.saturating_add(1);
+                },
+            );
             return Err(StorageError::unavailable(reason));
         }
         if matches!(self.maintenance_policy.mode, MaintenanceMode::Opportunistic)
@@ -7300,12 +7963,7 @@ impl DurableCoordinator {
     }
 
     pub fn restore_keyspace(&self, source: KeyspaceId, point: RestorePoint) -> Result<KeyspaceId> {
-        self.run_and_persist(|local| {
-            local
-                .metadata
-                .restore_keyspace(source, point)
-                .map(|head| head.keyspace_id)
-        })
+        self.run_and_persist(|local| local.restore_keyspace(source, point))
     }
 
     pub fn write_device(
@@ -7544,6 +8202,26 @@ impl DurableCoordinator {
                 .persist(&image, &previous_segments, changed_catalog_segments)?;
         *lock(&self.persisted_segments)? = kept_segments;
         Ok(())
+    }
+}
+
+impl ObservableProvider for LocalCoordinator {
+    fn diagnostics_snapshot(&self) -> Result<DiagnosticsSnapshot> {
+        LocalCoordinator::diagnostics_snapshot(self)
+    }
+
+    fn drain_events(&self, max: usize) -> Result<Vec<StorageEvent>> {
+        LocalCoordinator::drain_events(self, max)
+    }
+}
+
+impl ObservableProvider for DurableCoordinator {
+    fn diagnostics_snapshot(&self) -> Result<DiagnosticsSnapshot> {
+        DurableCoordinator::diagnostics_snapshot(self)
+    }
+
+    fn drain_events(&self, max: usize) -> Result<Vec<StorageEvent>> {
+        DurableCoordinator::drain_events(self, max)
     }
 }
 
@@ -10930,10 +11608,9 @@ impl NativeServer for LocalNativeServer {
                             })?;
                     Ok(NativeResponse::KeyspaceSnapshotted(head.keyspace_id))
                 }
-                NativeRequest::RestoreKeyspace { source, point } => {
-                    let head = self.store.metadata.restore_keyspace(source, point)?;
-                    Ok(NativeResponse::KeyspaceRestored(head.keyspace_id))
-                }
+                NativeRequest::RestoreKeyspace { source, point } => Ok(
+                    NativeResponse::KeyspaceRestored(self.store.restore_keyspace(source, point)?),
+                ),
             }
         })();
         let result = response.map(|response| NativeResponseEnvelope {
@@ -13516,7 +14193,8 @@ impl DurableCodec for LocalStoreConfig {
         self.file_root_blocks.encode(out)?;
         self.metadata_fanout.encode(out)?;
         self.metadata_leaf_blocks.encode(out)?;
-        self.storage_node.encode(out)
+        self.storage_node.encode(out)?;
+        self.observability_event_capacity.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -13527,6 +14205,7 @@ impl DurableCodec for LocalStoreConfig {
             metadata_fanout: usize::decode(input)?,
             metadata_leaf_blocks: u64::decode(input)?,
             storage_node: StorageNodeId::decode(input)?,
+            observability_event_capacity: usize::decode(input)?,
         })
     }
 }
@@ -15609,6 +16288,7 @@ mod tests {
             metadata_fanout: 2,
             metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(77),
+            observability_event_capacity: DEFAULT_OBSERVABILITY_EVENT_CAPACITY,
         }
     }
 
@@ -15639,6 +16319,373 @@ mod tests {
             },
             name: Some("root".to_string()),
         }
+    }
+
+    #[test]
+    fn observability_ring_buffer_is_bounded_ordered_and_drainable() {
+        let observability = Observability::new(2).unwrap();
+        observability.record(StorageEventKind::GrantIssued);
+        observability.record(StorageEventKind::MaintenancePlanned);
+        observability.record(StorageEventKind::MaintenanceTicked);
+
+        let (counters, events, len, capacity, last_sequence) =
+            observability.snapshot_parts().unwrap();
+        assert_eq!(counters.observability_events_recorded, 3);
+        assert_eq!(counters.observability_events_dropped, 1);
+        assert_eq!(len, 2);
+        assert_eq!(capacity, 2);
+        assert_eq!(last_sequence, 3);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[1].sequence, 3);
+
+        let drained = observability.drain_events(1).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].sequence, 2);
+        let (_, events, len, _, _) = observability.snapshot_parts().unwrap();
+        assert_eq!(len, 1);
+        assert_eq!(events[0].sequence, 3);
+    }
+
+    #[test]
+    fn observability_names_and_event_kinds_are_stable() {
+        assert_eq!(
+            crate::provider::DIAGNOSTICS_COUNTER_NAMES,
+            &[
+                "observability_events_recorded",
+                "observability_events_dropped",
+                "coordinator_write_attempts",
+                "coordinator_write_publish_successes",
+                "coordinator_write_publish_failures",
+                "coordinator_write_unavailable",
+                "coordinator_write_idempotency_hits",
+                "metadata_stale_fences",
+                "metadata_custodian_runs",
+                "storage_node_custodian_runs",
+                "storage_segment_writes",
+                "storage_segment_duplicate_writes",
+                "storage_segment_references",
+                "storage_segment_releases",
+                "maintenance_plans",
+                "maintenance_ticks",
+                "maintenance_logs_selected",
+                "maintenance_logs_skipped",
+                "maintenance_bytes_copied",
+                "maintenance_bytes_deleted",
+                "grants_issued",
+                "grant_rejections",
+                "receipts_verified",
+                "receipt_rejections",
+                "receipt_rejected_bad_proof",
+                "receipt_rejected_scope",
+                "receipt_rejected_epoch",
+                "receipt_rejected_replay",
+            ]
+        );
+        assert_eq!(
+            crate::provider::DIAGNOSTICS_GAUGE_NAMES,
+            &[
+                "live_device_heads",
+                "deleted_device_heads",
+                "live_keyspace_heads",
+                "metadata_nodes",
+                "commit_seq",
+                "checkpoint_count",
+                "gc_epoch",
+                "pending_release_evidence",
+                "sqlite_wal_bytes",
+                "maintenance_dirty_bytes",
+                "maintenance_reclaimable_bytes",
+                "maintenance_sealed_logs",
+                "event_buffer_len",
+                "event_buffer_capacity",
+                "last_event_sequence",
+            ]
+        );
+        assert_eq!(
+            crate::provider::STORAGE_EVENT_KIND_NAMES,
+            &[
+                "CoordinatorWriteStarted",
+                "CoordinatorWriteUnavailable",
+                "StorageSegmentWritten",
+                "StorageSegmentWriteRetried",
+                "StorageSegmentReferenced",
+                "StorageSegmentReleased",
+                "MetadataPublishSucceeded",
+                "MetadataPublishFailed",
+                "DeviceForked",
+                "DeviceRestored",
+                "KeyspaceRestored",
+                "MetadataCustodianRan",
+                "StorageNodeCustodianRan",
+                "MaintenancePlanned",
+                "MaintenanceTicked",
+                "GrantIssued",
+                "GrantRejected",
+                "ReceiptVerified",
+                "ReceiptRejected",
+            ]
+        );
+    }
+
+    #[test]
+    fn observability_tracks_local_write_restore_gc_and_custodians() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let device_id = store
+            .metadata()
+            .create_device(device_request())
+            .unwrap()
+            .device_id;
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 7),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let checkpoint = store.metadata().checkpoint(device_id).unwrap();
+        store
+            .fork_device(
+                device_id,
+                ForkRequest {
+                    target: None,
+                    name: None,
+                },
+            )
+            .unwrap();
+        store
+            .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+            .unwrap();
+        store.delete_device(device_id).unwrap();
+        store
+            .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
+
+        let snapshot = store.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.counters.coordinator_write_attempts, 1);
+        assert_eq!(snapshot.counters.coordinator_write_publish_successes, 1);
+        assert_eq!(snapshot.counters.storage_segment_writes, 1);
+        assert_eq!(snapshot.counters.storage_segment_references, 1);
+        assert_eq!(snapshot.counters.metadata_custodian_runs, 1);
+        assert_eq!(snapshot.counters.storage_node_custodian_runs, 1);
+        assert_eq!(snapshot.gauges.live_device_heads, 2);
+        assert_eq!(snapshot.gauges.deleted_device_heads, 0);
+        assert_eq!(snapshot.nodes[0].referenced_segments, 1);
+
+        let kinds: Vec<_> = snapshot
+            .recent_events
+            .iter()
+            .map(|event| event.kind)
+            .collect();
+        assert!(kinds.contains(&StorageEventKind::CoordinatorWriteStarted));
+        assert!(kinds.contains(&StorageEventKind::StorageSegmentWritten));
+        assert!(kinds.contains(&StorageEventKind::MetadataPublishSucceeded));
+        assert!(kinds.contains(&StorageEventKind::StorageSegmentReferenced));
+        assert!(kinds.contains(&StorageEventKind::DeviceForked));
+        assert!(kinds.contains(&StorageEventKind::DeviceRestored));
+        assert!(kinds.contains(&StorageEventKind::MetadataCustodianRan));
+        assert!(kinds.contains(&StorageEventKind::StorageNodeCustodianRan));
+
+        let second = store.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot, second);
+        let drained = store.drain_events(usize::MAX).unwrap();
+        assert_eq!(drained.len(), snapshot.recent_events.len());
+        assert!(
+            store
+                .diagnostics_snapshot()
+                .unwrap()
+                .recent_events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn observability_tracks_native_keyspace_restore_through_public_server() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+        file.write_at(0, b"before").unwrap();
+        let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
+        file.write_at(0, b"after!").unwrap();
+
+        let restored = client
+            .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(checkpoint))
+            .unwrap();
+        assert_ne!(restored, keyspace_id);
+        let snapshot = store.diagnostics_snapshot().unwrap();
+        assert!(
+            snapshot
+                .recent_events
+                .iter()
+                .any(|event| event.kind == StorageEventKind::KeyspaceRestored
+                    && event.commit_seq.is_some())
+        );
+    }
+
+    #[test]
+    fn observability_event_overflow_is_deterministic() {
+        let cfg = LocalStoreConfig {
+            observability_event_capacity: 2,
+            ..config()
+        };
+        let store = LocalCoordinator::with_config(cfg).unwrap();
+        let device_id = store
+            .metadata()
+            .create_device(device_request())
+            .unwrap()
+            .device_id;
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 3),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        let snapshot = store.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.recent_events.len(), 2);
+        assert!(snapshot.counters.observability_events_dropped > 0);
+        assert_eq!(
+            snapshot.gauges.last_event_sequence,
+            snapshot.counters.observability_events_recorded
+        );
+        assert!(
+            snapshot.recent_events[0].sequence < snapshot.recent_events[1].sequence,
+            "bounded event buffer must preserve oldest-to-newest order"
+        );
+    }
+
+    #[test]
+    fn observability_tracks_receipt_rejection_reasons() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let device_id = store
+            .metadata()
+            .create_device(device_request())
+            .unwrap()
+            .device_id;
+        let range = crate::api::BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(1));
+        let grant = store
+            .issue_block_write_grant(device_id, range, WriteDurability::Acknowledged)
+            .unwrap();
+        let mut receipt = store
+            .write_granted_segment(&grant, repeated_blocks(1, 9))
+            .unwrap();
+        receipt.proof = crate::provider::ProofTag([0xff; 32]);
+
+        assert!(store.submit_block_write_receipt(&grant, receipt).is_err());
+        let snapshot = store.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.counters.receipt_rejections, 1);
+        assert_eq!(snapshot.counters.receipt_rejected_bad_proof, 1);
+        assert!(
+            snapshot
+                .recent_events
+                .iter()
+                .any(|event| event.kind == StorageEventKind::ReceiptRejected
+                    && event.reason == Some("bad_proof"))
+        );
+    }
+
+    #[test]
+    fn durable_reopen_diagnostics_match_persisted_state_without_replaying_events() {
+        let root = durable_temp_dir("observability-reopen");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 4),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let before = store.diagnostics_snapshot().unwrap();
+        assert_eq!(before.counters.coordinator_write_attempts, 1);
+        assert_eq!(before.nodes[0].referenced_segments, 1);
+        assert!(before.nodes[0].active_log_bytes > 0);
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let after = reopened.diagnostics_snapshot().unwrap();
+        assert_eq!(after.counters.coordinator_write_attempts, 0);
+        assert_eq!(after.gauges.live_device_heads, 1);
+        assert_eq!(after.nodes[0].referenced_segments, 1);
+        assert!(after.nodes[0].active_log_bytes > 0);
+        assert!(after.recent_events.is_empty());
+        assert_eq!(after, reopened.diagnostics_snapshot().unwrap());
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_reopen_allows_observability_capacity_change_without_state_migration() {
+        let root = durable_temp_dir("observability-capacity-reopen");
+        let initial_cfg = LocalStoreConfig {
+            observability_event_capacity: 2,
+            ..config()
+        };
+        let store = DurableCoordinator::open(&root, initial_cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 6),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let larger_buffer_cfg = LocalStoreConfig {
+            observability_event_capacity: 8,
+            ..config()
+        };
+        let reopened = DurableCoordinator::open(&root, larger_buffer_cfg).unwrap();
+        assert_eq!(
+            reopened
+                .diagnostics_snapshot()
+                .unwrap()
+                .gauges
+                .event_buffer_capacity,
+            8
+        );
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 6));
+        drop(reopened);
+
+        let bad_shape = LocalStoreConfig {
+            block_size: 8192,
+            observability_event_capacity: 8,
+            ..config()
+        };
+        let error = DurableCoordinator::open(&root, bad_shape).unwrap_err();
+        assert_eq!(
+            error,
+            StorageError::corrupt("durable SQLite state disagrees with open config")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     fn metadata_leaf(node_id: u128, start: u64, blocks: u64) -> MetadataNode {
@@ -17616,6 +18663,7 @@ mod tests {
                 "0000000000000004",
                 "0000000000000400",
                 "00000000000000000000000000000001",
+                "0000000000000400",
                 "00000000000000000000000000000001",
                 "0000000000000000",
             )
@@ -19414,6 +20462,13 @@ mod tests {
             throttled,
             StorageError::unavailable("maintenance dirty bytes above high watermark")
         );
+        let snapshot = store.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.counters.coordinator_write_attempts, 3);
+        assert_eq!(snapshot.counters.coordinator_write_unavailable, 1);
+        assert!(snapshot.recent_events.iter().any(|event| {
+            event.kind == StorageEventKind::CoordinatorWriteUnavailable
+                && event.reason == Some("maintenance dirty bytes above high watermark")
+        }));
 
         let report = store.run_maintenance_tick().unwrap();
         assert!(!report.plan.commands.is_empty());
@@ -22757,6 +23812,16 @@ mod tests {
                 .unwrap(),
             SegmentLifecycleState::DurablePendingMetadata
         );
+        let snapshot = store.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.counters.coordinator_write_attempts, 1);
+        assert_eq!(snapshot.counters.coordinator_write_publish_successes, 0);
+        assert_eq!(snapshot.counters.coordinator_write_publish_failures, 1);
+        assert_eq!(snapshot.counters.storage_segment_writes, 1);
+        assert_eq!(snapshot.counters.storage_segment_references, 0);
+        assert!(snapshot.recent_events.iter().any(|event| {
+            event.kind == StorageEventKind::MetadataPublishFailed
+                && event.reason == Some("publish_failed")
+        }));
         let mut buf = vec![1; 4096];
         store
             .read_device(head.device_id, ByteRange::new(0, 4096), &mut buf)

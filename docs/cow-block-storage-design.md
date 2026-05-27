@@ -729,6 +729,26 @@ SQLite maintenance is separate from data compaction. WAL checkpointing,
 integrity checks, and optional vacuum/incremental vacuum manage metadata file
 growth. Metadata maintenance must not rewrite data payload logs.
 
+Operational observability is a provider-native typed surface, not a telemetry
+backend. Local and durable coordinators expose read-only diagnostics snapshots
+with stable counters, gauges, per-node storage summaries, and bounded recent
+events. Exporters such as Prometheus or OpenTelemetry adapters sit above this
+surface and must not own storage decisions.
+
+Counters record process-local totals such as write attempts, publish failures,
+maintenance ticks, grant issuance, and receipt rejection reasons. Gauges are
+derived from authoritative state: live heads, commit sequence, GC epoch,
+checkpoint count, pending release evidence, SQLite WAL bytes, dirty and
+reclaimable data-log bytes, and event-buffer accounting. Storage-node snapshots
+report lifecycle counts, pending orphans, active/sealed log bytes, dirty bytes,
+and reclaimable bytes from node-local catalogs and logs.
+
+Events are deterministic breadcrumbs with monotonically increasing local
+sequence numbers. They are bounded by a configured ring-buffer capacity, oldest
+events are dropped first, and the dropped-event counter records overflow. Events
+are not durable history; durable truth remains in metadata timelines,
+storage-node catalogs, data-log records, checkpoints, and release evidence.
+
 PITR and GC are part of the live-byte decision. A segment no longer reachable
 from the current head may still be live because a retained checkpoint, restore
 point, fork, or keyspace snapshot can reach it. Physical payload deletion is

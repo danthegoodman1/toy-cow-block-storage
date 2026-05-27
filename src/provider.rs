@@ -321,6 +321,220 @@ pub struct StorageNodeMaintenanceReport {
     pub skipped_segments: Vec<SegmentId>,
 }
 
+/// Stable counter names exposed by `DiagnosticsCounters`.
+pub const DIAGNOSTICS_COUNTER_NAMES: &[&str] = &[
+    "observability_events_recorded",
+    "observability_events_dropped",
+    "coordinator_write_attempts",
+    "coordinator_write_publish_successes",
+    "coordinator_write_publish_failures",
+    "coordinator_write_unavailable",
+    "coordinator_write_idempotency_hits",
+    "metadata_stale_fences",
+    "metadata_custodian_runs",
+    "storage_node_custodian_runs",
+    "storage_segment_writes",
+    "storage_segment_duplicate_writes",
+    "storage_segment_references",
+    "storage_segment_releases",
+    "maintenance_plans",
+    "maintenance_ticks",
+    "maintenance_logs_selected",
+    "maintenance_logs_skipped",
+    "maintenance_bytes_copied",
+    "maintenance_bytes_deleted",
+    "grants_issued",
+    "grant_rejections",
+    "receipts_verified",
+    "receipt_rejections",
+    "receipt_rejected_bad_proof",
+    "receipt_rejected_scope",
+    "receipt_rejected_epoch",
+    "receipt_rejected_replay",
+];
+
+/// Stable gauge names exposed by `DiagnosticsGauges`.
+pub const DIAGNOSTICS_GAUGE_NAMES: &[&str] = &[
+    "live_device_heads",
+    "deleted_device_heads",
+    "live_keyspace_heads",
+    "metadata_nodes",
+    "commit_seq",
+    "checkpoint_count",
+    "gc_epoch",
+    "pending_release_evidence",
+    "sqlite_wal_bytes",
+    "maintenance_dirty_bytes",
+    "maintenance_reclaimable_bytes",
+    "maintenance_sealed_logs",
+    "event_buffer_len",
+    "event_buffer_capacity",
+    "last_event_sequence",
+];
+
+/// Process-local monotonic counters for provider diagnostics.
+///
+/// These counters are observation state, not user-visible storage state. A
+/// provider may reset them on process restart, while durable facts remain in
+/// metadata rows, storage-node catalogs, data logs, and timelines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiagnosticsCounters {
+    pub observability_events_recorded: u64,
+    pub observability_events_dropped: u64,
+    pub coordinator_write_attempts: u64,
+    pub coordinator_write_publish_successes: u64,
+    pub coordinator_write_publish_failures: u64,
+    pub coordinator_write_unavailable: u64,
+    pub coordinator_write_idempotency_hits: u64,
+    pub metadata_stale_fences: u64,
+    pub metadata_custodian_runs: u64,
+    pub storage_node_custodian_runs: u64,
+    pub storage_segment_writes: u64,
+    pub storage_segment_duplicate_writes: u64,
+    pub storage_segment_references: u64,
+    pub storage_segment_releases: u64,
+    pub maintenance_plans: u64,
+    pub maintenance_ticks: u64,
+    pub maintenance_logs_selected: u64,
+    pub maintenance_logs_skipped: u64,
+    pub maintenance_bytes_copied: u64,
+    pub maintenance_bytes_deleted: u64,
+    pub grants_issued: u64,
+    pub grant_rejections: u64,
+    pub receipts_verified: u64,
+    pub receipt_rejections: u64,
+    pub receipt_rejected_bad_proof: u64,
+    pub receipt_rejected_scope: u64,
+    pub receipt_rejected_epoch: u64,
+    pub receipt_rejected_replay: u64,
+}
+
+/// Point-in-time provider gauges derived from authoritative storage state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiagnosticsGauges {
+    pub live_device_heads: u64,
+    pub deleted_device_heads: u64,
+    pub live_keyspace_heads: u64,
+    pub metadata_nodes: u64,
+    pub commit_seq: u64,
+    pub checkpoint_count: u64,
+    pub gc_epoch: u64,
+    pub pending_release_evidence: u64,
+    pub sqlite_wal_bytes: u64,
+    pub maintenance_dirty_bytes: u64,
+    pub maintenance_reclaimable_bytes: u64,
+    pub maintenance_sealed_logs: u64,
+    pub event_buffer_len: u64,
+    pub event_buffer_capacity: u64,
+    pub last_event_sequence: u64,
+}
+
+/// Per-storage-node diagnostics derived from node-local catalogs and logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsNodeSnapshot {
+    pub storage_node: StorageNodeId,
+    pub reserved_segments: u64,
+    pub writing_segments: u64,
+    pub durable_pending_segments: u64,
+    pub pending_orphan_segments: u64,
+    pub referenced_segments: u64,
+    pub released_segments: u64,
+    pub freed_segments: u64,
+    pub active_log_bytes: u64,
+    pub sealed_log_count: u64,
+    pub sealed_log_bytes: u64,
+    pub dirty_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
+/// Stable event kinds for bounded diagnostic event buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StorageEventKind {
+    CoordinatorWriteStarted,
+    CoordinatorWriteUnavailable,
+    StorageSegmentWritten,
+    StorageSegmentWriteRetried,
+    StorageSegmentReferenced,
+    StorageSegmentReleased,
+    MetadataPublishSucceeded,
+    MetadataPublishFailed,
+    DeviceForked,
+    DeviceRestored,
+    KeyspaceRestored,
+    MetadataCustodianRan,
+    StorageNodeCustodianRan,
+    MaintenancePlanned,
+    MaintenanceTicked,
+    GrantIssued,
+    GrantRejected,
+    ReceiptVerified,
+    ReceiptRejected,
+}
+
+/// Stable event-kind names for golden tests and adapter mapping.
+pub const STORAGE_EVENT_KIND_NAMES: &[&str] = &[
+    "CoordinatorWriteStarted",
+    "CoordinatorWriteUnavailable",
+    "StorageSegmentWritten",
+    "StorageSegmentWriteRetried",
+    "StorageSegmentReferenced",
+    "StorageSegmentReleased",
+    "MetadataPublishSucceeded",
+    "MetadataPublishFailed",
+    "DeviceForked",
+    "DeviceRestored",
+    "KeyspaceRestored",
+    "MetadataCustodianRan",
+    "StorageNodeCustodianRan",
+    "MaintenancePlanned",
+    "MaintenanceTicked",
+    "GrantIssued",
+    "GrantRejected",
+    "ReceiptVerified",
+    "ReceiptRejected",
+];
+
+/// One bounded diagnostic event.
+///
+/// Events are breadcrumbs for troubleshooting and tests. They are not durable
+/// history; authoritative history remains in metadata timelines, node
+/// catalogs, and data logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageEvent {
+    pub sequence: u64,
+    pub kind: StorageEventKind,
+    pub storage_node: Option<StorageNodeId>,
+    pub segment_id: Option<SegmentId>,
+    pub commit_seq: Option<CommitSeq>,
+    pub reason: Option<&'static str>,
+}
+
+/// Read-only provider diagnostic snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsSnapshot {
+    pub counters: DiagnosticsCounters,
+    pub gauges: DiagnosticsGauges,
+    pub nodes: Vec<DiagnosticsNodeSnapshot>,
+    pub recent_events: Vec<StorageEvent>,
+}
+
+/// Provider-native observability surface.
+///
+/// Implementations must not change logical or durable state when these methods
+/// are called. Exporters such as Prometheus or OpenTelemetry adapters should be
+/// built above this typed surface.
+pub trait ObservableProvider: Send + Sync {
+    /// Return a read-only snapshot of counters, gauges, node diagnostics, and
+    /// bounded recent events.
+    fn diagnostics_snapshot(&self) -> Result<DiagnosticsSnapshot>;
+
+    /// Drain at most `max` recent diagnostic events, oldest first.
+    ///
+    /// Draining events does not reset counters or change user-visible storage
+    /// state.
+    fn drain_events(&self, max: usize) -> Result<Vec<StorageEvent>>;
+}
+
 /// Boundary responsible for grant and receipt proof verification.
 pub trait GrantReceiptAuthority: Send + Sync {
     /// Issue a scoped storage write grant.

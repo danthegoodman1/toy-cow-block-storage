@@ -51,11 +51,14 @@ pub use local::{
     SegmentLifecycleState, WriteAdmission,
 };
 pub use provider::{
-    GrantHash, GrantReceiptAuthority, MetadataNodeWrite, PlacementPolicy, ProofScheme, ProofTag,
-    ReferenceEvidence, SegmentReceiptLifecycle, SegmentWriteReceipt, StorageNodeCustodianReport,
-    StorageNodeDirectory, StorageNodeMaintenanceObservation, StorageNodeMaintenanceReport,
-    StorageNodeRequest, StorageNodeResponse, StorageNodeTransport, VerifiedSegmentReceipt,
-    WriteGrant, WriteGrantIntent, WriteGrantRequest,
+    DIAGNOSTICS_COUNTER_NAMES, DIAGNOSTICS_GAUGE_NAMES, DiagnosticsCounters, DiagnosticsGauges,
+    DiagnosticsNodeSnapshot, DiagnosticsSnapshot, GrantHash, GrantReceiptAuthority,
+    MetadataNodeWrite, ObservableProvider, PlacementPolicy, ProofScheme, ProofTag,
+    ReferenceEvidence, STORAGE_EVENT_KIND_NAMES, SegmentReceiptLifecycle, SegmentWriteReceipt,
+    StorageEvent, StorageEventKind, StorageNodeCustodianReport, StorageNodeDirectory,
+    StorageNodeMaintenanceObservation, StorageNodeMaintenanceReport, StorageNodeRequest,
+    StorageNodeResponse, StorageNodeTransport, VerifiedSegmentReceipt, WriteGrant,
+    WriteGrantIntent, WriteGrantRequest,
 };
 pub use sim::{
     FailureArtifact, FaultInjector, FaultKind, ObjectGraphSummary, minimize_trace_by_deletion,

@@ -497,6 +497,7 @@ fn bench_local_single_shard_write_by_tree_depth(c: &mut Criterion) {
                             metadata_fanout: 4,
                             metadata_leaf_blocks: leaf_blocks,
                             storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                            observability_event_capacity: 1024,
                         })
                         .unwrap();
                         let head = store
@@ -540,6 +541,7 @@ fn bench_local_multi_shard_atomic_write(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 8,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    observability_event_capacity: 1024,
                 })
                 .unwrap();
                 let server =
@@ -578,6 +580,7 @@ fn bench_local_read_by_mapping_count(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 4,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    observability_event_capacity: 1024,
                 })
                 .unwrap();
                 let server =
@@ -667,6 +670,7 @@ fn bench_local_native_large_append(c: &mut Criterion) {
         metadata_fanout: 4,
         metadata_leaf_blocks: LARGE_BLOCKS,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        observability_event_capacity: 1024,
     };
 
     group.bench_function("normal_single_32mib_append", |b| {
@@ -831,6 +835,7 @@ fn bench_local_fork_vs_device_size(c: &mut Criterion) {
                             metadata_fanout: 4,
                             metadata_leaf_blocks: logical_blocks,
                             storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                            observability_event_capacity: 1024,
                         })
                         .unwrap();
                         let server = std::sync::Arc::new(
@@ -877,6 +882,7 @@ fn bench_local_checkpoint_restore(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 16,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    observability_event_capacity: 1024,
                 })
                 .unwrap();
                 let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(
@@ -925,6 +931,7 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
                     metadata_fanout: 4,
                     metadata_leaf_blocks: 16,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+                    observability_event_capacity: 1024,
                 })
                 .unwrap();
                 let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(
@@ -986,6 +993,7 @@ fn bench_roots_for_gc_with_deleted_retention(c: &mut Criterion) {
         metadata_fanout: 4,
         metadata_leaf_blocks: 16,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        observability_event_capacity: 1024,
     })
     .unwrap();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store.clone()));
@@ -1027,6 +1035,7 @@ fn bench_metadata_gc_mark_traversal(c: &mut Criterion) {
         metadata_fanout: 4,
         metadata_leaf_blocks: 8,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        observability_event_capacity: 1024,
     })
     .unwrap();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store.clone()));
@@ -1108,6 +1117,7 @@ fn native_scaling_config() -> LocalStoreConfig {
         metadata_fanout: 2,
         metadata_leaf_blocks: 1_000_000,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        observability_event_capacity: 1024,
     }
 }
 
@@ -1554,6 +1564,7 @@ fn durable_bench_config() -> LocalStoreConfig {
         metadata_fanout: 4,
         metadata_leaf_blocks: 16,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
+        observability_event_capacity: 1024,
     }
 }
 
@@ -1817,6 +1828,71 @@ fn bench_durable_provider(c: &mut Criterion) {
                 black_box(elapsed)
             })
         })
+    });
+
+    group.bench_function(
+        "block_write_4k_acknowledged_observability_not_drained",
+        |b| {
+            b.iter_custom(|iters| {
+                elapsed_durable_iters(iters, || {
+                    let root = durable_bench_root("block-write-ack-observability");
+                    let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
+                    let device_id = create_durable_block_device(&store, 1024);
+                    let payload = vec![3; 4096];
+                    let started = Instant::now();
+                    store
+                        .write_device(
+                            black_box(device_id),
+                            black_box(0),
+                            black_box(&payload),
+                            WriteDurability::Acknowledged,
+                        )
+                        .unwrap();
+                    let elapsed = started.elapsed();
+                    cleanup_durable_bench_root(&root);
+                    black_box(elapsed)
+                })
+            })
+        },
+    );
+
+    group.bench_function("diagnostics_snapshot_after_32_block_writes", |b| {
+        let root = durable_bench_root("diagnostics-snapshot");
+        let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
+        let device_id = create_durable_block_device(&store, 1024);
+        seed_durable_block_history_with_durability(&store, device_id, 32, WriteDurability::Flushed);
+        b.iter(|| black_box(store.diagnostics_snapshot().unwrap()));
+        drop(store);
+        cleanup_durable_bench_root(&root);
+    });
+
+    group.bench_function("drain_events_after_4k_write", |b| {
+        b.iter_batched(
+            || {
+                let store = LocalCoordinator::with_config(LocalStoreConfig::default()).unwrap();
+                let head = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest {
+                        spec: DeviceSpec {
+                            logical_blocks: 1024,
+                            block_size: 4096,
+                        },
+                        name: None,
+                    })
+                    .unwrap();
+                store
+                    .write_device(
+                        head.device_id,
+                        0,
+                        &vec![9; 4096],
+                        WriteDurability::Acknowledged,
+                    )
+                    .unwrap();
+                store
+            },
+            |store| black_box(store.drain_events(usize::MAX).unwrap()),
+            BatchSize::SmallInput,
+        )
     });
 
     group.bench_function("block_write_4k_flushed_fresh", |b| {

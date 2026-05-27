@@ -284,6 +284,50 @@ maintenance limit, durable writes return `StorageError::Unavailable` with a
 stable reason. Reads, forks, snapshots, restores, and flush semantics do not
 change.
 
+## Operational Signals
+
+The provider exposes typed diagnostics through `ObservableProvider`; it does
+not bake in Prometheus, OpenTelemetry, or a hosted metrics shape. Exporters can
+poll `diagnostics_snapshot()` and `drain_events(max)` and translate the stable
+counters, gauges, node snapshots, and event kinds into whatever system your
+service uses.
+
+```rust
+use toy_cow_block_storage::{ObservableProvider, StorageEventKind};
+
+let snapshot = store.diagnostics_snapshot()?;
+let recent = store.drain_events(64)?;
+
+if snapshot.gauges.maintenance_reclaimable_bytes > 0 {
+    // Schedule bounded maintenance when your service is ready for the work.
+}
+
+assert!(recent
+    .iter()
+    .all(|event| event.kind != StorageEventKind::MetadataPublishFailed));
+```
+
+The most useful signals during normal operation are:
+
+- `pending_orphan_segments`: bytes reached storage but did not become visible
+  yet. This should usually fall after custodian work.
+- `maintenance_dirty_bytes` and `maintenance_reclaimable_bytes`: compaction
+  debt. Rising debt means PITR, release evidence, or copy budgets may need
+  attention.
+- `sqlite_wal_bytes`: metadata WAL pressure. Data-log compaction and SQLite
+  maintenance are separate knobs.
+- `coordinator_write_publish_failures`: storage writes succeeded but metadata
+  publish did not. The data should stay invisible and become reclaimable.
+- `coordinator_write_unavailable`: writes were throttled or rejected by policy.
+  Treat the stable reason on recent events as the operator-facing cause.
+- `receipt_rejected_*`: proof, scope, epoch, or replay failures. These are the
+  first things to inspect when introducing remote or trusted-client transports.
+
+Events are bounded breadcrumbs, not durable history. If the ring buffer
+overwrites unread events, `observability_events_dropped` increases. Long-lived
+truth should come from counters, gauges, metadata timelines, storage-node
+catalogs, and data logs.
+
 ## Phase Gates
 
 Run these before advancing past the project harness and public contract phases:
