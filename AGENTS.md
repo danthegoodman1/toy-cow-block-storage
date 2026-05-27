@@ -45,6 +45,12 @@ before adding code.
   `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test`, `cargo doc --no-deps`, and
   `cargo bench --bench regression -- --test`.
+- Criterion comparison data is persisted in the `criterion-history` Docker
+  volume at `target/criterion`. The `-- --test` benchmark smoke checks that the
+  suite runs; use `cargo bench --bench regression` when you want Criterion to
+  record measurements for comparison. Normal `docker compose down` keeps the
+  history; use `docker compose down -v` only when intentionally discarding Cargo
+  caches, Linux build artifacts, and benchmark history.
 - Shut the development container down with `docker compose down` when finished.
 - Keep git operations on the macOS host, such as `git status`, `git diff`,
   `git add`, `git commit`, and `git push`. The repo is bind-mounted into the

@@ -14,6 +14,7 @@ services:
       - .:/workspace
       - cargo-cache:/cargo
       - target-linux:/workspace/target
+      - criterion-history:/workspace/target/criterion
     stdin_open: true
     tty: true
     command: sleep infinity
@@ -21,3 +22,4 @@ services:
 volumes:
   cargo-cache:
   target-linux:
+  criterion-history:

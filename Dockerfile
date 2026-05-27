@@ -9,8 +9,8 @@ RUN apt-get update \
         pkg-config \
         sqlite3 \
     && rustup component add clippy rustfmt \
-    && mkdir -p /cargo /workspace/target \
-    && chmod 0777 /cargo /workspace /workspace/target \
+    && mkdir -p /cargo /workspace/target/criterion \
+    && chmod 0777 /cargo /workspace /workspace/target /workspace/target/criterion \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_HOME=/cargo \
