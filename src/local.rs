@@ -170,7 +170,7 @@ fn normalize_storage_nodes(
 ) -> Vec<StorageNodeId> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
-    for node_id in std::iter::once(primary).chain(storage_nodes.into_iter()) {
+    for node_id in std::iter::once(primary).chain(storage_nodes) {
         if seen.insert(node_id) {
             out.push(node_id);
         }
@@ -1954,26 +1954,27 @@ impl LocalCoordinator {
         let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
             StorageError::invalid_argument("native write segment length overflows usize")
         })?;
-        let segment_bytes = if offset % block_size == 0 && data_len % block_size == 0 {
-            data.to_vec()
-        } else {
-            let mut bytes = vec![0; segment_len_usize];
-            self.read_metadata_node(&root, write_range, block_size, &mut bytes)?;
-            let write_offset = usize::try_from(offset - requested_start).map_err(|_| {
-                StorageError::invalid_argument("native write segment offset overflows usize")
-            })?;
-            let write_len = usize::try_from(data_len).map_err(|_| {
-                StorageError::invalid_argument("native write length overflows usize")
-            })?;
-            let write_end = write_offset
-                .checked_add(write_len)
-                .ok_or_else(|| StorageError::invalid_argument("native write end overflows"))?;
-            let target = bytes.get_mut(write_offset..write_end).ok_or_else(|| {
-                StorageError::corrupt("native write segment range does not cover payload")
-            })?;
-            target.copy_from_slice(data);
-            bytes
-        };
+        let segment_bytes =
+            if offset.is_multiple_of(block_size) && data_len.is_multiple_of(block_size) {
+                data.to_vec()
+            } else {
+                let mut bytes = vec![0; segment_len_usize];
+                self.read_metadata_node(&root, write_range, block_size, &mut bytes)?;
+                let write_offset = usize::try_from(offset - requested_start).map_err(|_| {
+                    StorageError::invalid_argument("native write segment offset overflows usize")
+                })?;
+                let write_len = usize::try_from(data_len).map_err(|_| {
+                    StorageError::invalid_argument("native write length overflows usize")
+                })?;
+                let write_end = write_offset
+                    .checked_add(write_len)
+                    .ok_or_else(|| StorageError::invalid_argument("native write end overflows"))?;
+                let target = bytes.get_mut(write_offset..write_end).ok_or_else(|| {
+                    StorageError::corrupt("native write segment range does not cover payload")
+                })?;
+                target.copy_from_slice(data);
+                bytes
+            };
 
         let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
             WriteGrantIntent::NativeWrite {
@@ -3647,20 +3648,15 @@ pub struct DurableCompactionReport {
 }
 
 /// Runtime mode for durable maintenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MaintenanceMode {
     /// No background work. Callers explicitly observe, plan, and run ticks.
+    #[default]
     Manual,
     /// A write may run one bounded maintenance tick before it is admitted.
     Opportunistic,
     /// A local worker runs bounded ticks after writes or custodian work notify it.
     AlwaysOn,
-}
-
-impl Default for MaintenanceMode {
-    fn default() -> Self {
-        Self::Manual
-    }
 }
 
 /// Policy knobs for deterministic durable maintenance and write admission.
@@ -7487,10 +7483,7 @@ fn maintenance_worker_loop(
         guard.notified = false;
         drop(guard);
 
-        loop {
-            let Ok(report) = run_maintenance_tick_parts(&parts, 0, 0) else {
-                break;
-            };
+        while let Ok(report) = run_maintenance_tick_parts(&parts, 0, 0) {
             if report.plan.commands.is_empty() {
                 break;
             }
@@ -17922,8 +17915,8 @@ mod tests {
             let mut deleted = BTreeSet::new();
 
             for step in 0..36 {
-                let paused_gc = harness.rng.next_u64() % 3 == 0;
-                let policy = if harness.rng.next_u64() % 2 == 0 {
+                let paused_gc = harness.rng.next_u64().is_multiple_of(3);
+                let policy = if harness.rng.next_u64().is_multiple_of(2) {
                     RetentionPolicy::retain_deleted_devices()
                 } else {
                     RetentionPolicy::expire_deleted_immediately()
@@ -18009,7 +18002,7 @@ mod tests {
                         sweep.deleted_metadata_nodes.len(),
                         sweep.released_segments.len()
                     ));
-                } else if harness.rng.next_u64() % 2 == 0 {
+                } else if harness.rng.next_u64().is_multiple_of(2) {
                     let report = store.run_metadata_custodian(policy).unwrap();
                     harness.trace.record(format!(
                         "gc step={step} epoch={} deleted_nodes={} released_segments={}",
@@ -18160,7 +18153,7 @@ mod tests {
                                 .record(format!("fault duplicate_effect step={step}"));
                         }
                         crate::sim::FaultKind::DelayedEffect => {
-                            let policy = if harness.rng.next_u64() % 2 == 0 {
+                            let policy = if harness.rng.next_u64().is_multiple_of(2) {
                                 RetentionPolicy::retain_deleted_devices()
                             } else {
                                 RetentionPolicy::expire_deleted_immediately()
@@ -18349,7 +18342,7 @@ mod tests {
                             .record(format!("append step={step} file={file_id} byte={byte}"));
                     }
                     _ => {
-                        let policy = if harness.rng.next_u64() % 2 == 0 {
+                        let policy = if harness.rng.next_u64().is_multiple_of(2) {
                             RetentionPolicy::retain_deleted_devices()
                         } else {
                             RetentionPolicy::expire_deleted_immediately()
@@ -23166,29 +23159,30 @@ mod tests {
                     break;
                 }
                 let byte = (1 + harness.rng.next_u64() % 254) as u8;
-                let expected_version = if model.is_empty() || harness.rng.next_u64() % 2 == 0 {
-                    let remaining = capacity - model.len();
-                    let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
-                    harness
-                        .trace
-                        .record(format!("append step={step} len={len} byte={byte}"));
-                    let lease = file.acquire_append().unwrap();
-                    let payload = vec![byte; len];
-                    let commit = file.append_with_lease(lease, &payload).unwrap();
-                    model.extend_from_slice(&payload);
-                    commit.version
-                } else {
-                    let offset = harness.rng.next_u64() as usize % (model.len() + 1);
-                    let remaining = capacity - offset;
-                    let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
-                    let payload = vec![byte; len];
-                    harness.trace.record(format!(
-                        "write step={step} offset={offset} len={len} byte={byte}"
-                    ));
-                    let commit = file.write_at(offset as u64, &payload).unwrap();
-                    apply_model_write(&mut model, offset, &payload);
-                    commit.version
-                };
+                let expected_version =
+                    if model.is_empty() || harness.rng.next_u64().is_multiple_of(2) {
+                        let remaining = capacity - model.len();
+                        let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
+                        harness
+                            .trace
+                            .record(format!("append step={step} len={len} byte={byte}"));
+                        let lease = file.acquire_append().unwrap();
+                        let payload = vec![byte; len];
+                        let commit = file.append_with_lease(lease, &payload).unwrap();
+                        model.extend_from_slice(&payload);
+                        commit.version
+                    } else {
+                        let offset = harness.rng.next_u64() as usize % (model.len() + 1);
+                        let remaining = capacity - offset;
+                        let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
+                        let payload = vec![byte; len];
+                        harness.trace.record(format!(
+                            "write step={step} offset={offset} len={len} byte={byte}"
+                        ));
+                        let commit = file.write_at(offset as u64, &payload).unwrap();
+                        apply_model_write(&mut model, offset, &payload);
+                        commit.version
+                    };
 
                 let info = file.info().unwrap();
                 assert_eq!(info.size, model.len() as u64);
@@ -23326,7 +23320,7 @@ mod tests {
             let mut models = BTreeMap::from([(root_id, vec![0u8; 32])]);
 
             for step in 0..32 {
-                let fork = harness.rng.next_u64() % 3 == 0 && device_ids.len() < 8;
+                let fork = harness.rng.next_u64().is_multiple_of(3) && device_ids.len() < 8;
                 if fork {
                     let source_index = harness.rng.choose_index(device_ids.len()).unwrap();
                     let source_id = device_ids[source_index];
@@ -23672,7 +23666,7 @@ mod tests {
                     model[block as usize] = byte;
                 }
                 history.push((commit.commit_seq, model.clone()));
-                if harness.rng.next_u64() % 4 == 0 {
+                if harness.rng.next_u64().is_multiple_of(4) {
                     store.metadata().checkpoint(device_id).unwrap();
                 }
             }
@@ -24569,7 +24563,7 @@ mod tests {
             let capacity = 32 * 4096;
 
             for step in 0..18 {
-                let (file_id, handle) = if harness.rng.next_u64() % 2 == 0 {
+                let (file_id, handle) = if harness.rng.next_u64().is_multiple_of(2) {
                     (file_a, &handle_a)
                 } else {
                     (file_b, &handle_b)
@@ -24577,7 +24571,8 @@ mod tests {
                 let byte = (1 + harness.rng.next_u64() % 254) as u8;
                 let file_model = model.get_mut(&file_id).unwrap();
                 let commit_seq = if file_model.bytes.is_empty()
-                    || (file_model.bytes.len() < capacity && harness.rng.next_u64() % 2 == 0)
+                    || (file_model.bytes.len() < capacity
+                        && harness.rng.next_u64().is_multiple_of(2))
                 {
                     let remaining = capacity - file_model.bytes.len();
                     let len = 1 + harness.rng.next_u64() as usize % remaining.min(5000);
@@ -24614,7 +24609,7 @@ mod tests {
                     .validate_keyspace_catalog_for_test(keyspace_id)
                     .unwrap();
                 history.push((commit_seq, model.clone()));
-                if harness.rng.next_u64() % 4 == 0 {
+                if harness.rng.next_u64().is_multiple_of(4) {
                     client.checkpoint_keyspace(keyspace_id).unwrap();
                 }
             }

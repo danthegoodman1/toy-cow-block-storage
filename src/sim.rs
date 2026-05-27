@@ -28,7 +28,7 @@ impl FaultInjector {
         value ^= value << 13;
         value ^= value >> 7;
         value ^= value << 17;
-        value % 11 == 0
+        value.is_multiple_of(11)
     }
 }
 

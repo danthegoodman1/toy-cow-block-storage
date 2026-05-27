@@ -1,0 +1,23 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: toy-cow-block-storage-dev
+    working_dir: /workspace
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      CARGO_HOME: /cargo
+      CARGO_TARGET_DIR: /workspace/target
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace
+      - cargo-cache:/cargo
+      - target-linux:/workspace/target
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+
+volumes:
+  cargo-cache:
+  target-linux:

@@ -80,7 +80,9 @@ impl ByteRange {
 
     pub fn is_aligned_to(self, block_size: u32) -> bool {
         let block_size = u64::from(block_size);
-        block_size != 0 && self.offset % block_size == 0 && self.len % block_size == 0
+        block_size != 0
+            && self.offset.is_multiple_of(block_size)
+            && self.len.is_multiple_of(block_size)
     }
 
     pub fn validate_for_device(self, spec: &DeviceSpec) -> Result<()> {

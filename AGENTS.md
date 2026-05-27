@@ -34,6 +34,23 @@ Before changing code, read:
 If the implementation plan and design spec disagree, stop and update the docs
 before adding code.
 
+## Development Environment
+
+- Run development commands and tests inside the Linux container defined by
+  `Dockerfile` and `docker-compose.yml`.
+- Start the container with `docker compose up -d dev`, then run work through
+  `docker compose exec dev ...` or one-shot commands through
+  `docker compose run --rm dev ...`.
+- Run the full Rust gate from inside the container:
+  `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test`, `cargo doc --no-deps`, and
+  `cargo bench --bench regression -- --test`.
+- Shut the development container down with `docker compose down` when finished.
+- Keep git operations on the macOS host, such as `git status`, `git diff`,
+  `git add`, `git commit`, and `git push`. The repo is bind-mounted into the
+  container, while Cargo caches and Linux build artifacts live in Docker
+  volumes.
+
 ## Operating Rules
 
 - Build in the order defined by `docs/implementation-plan.md`.
