@@ -38,6 +38,11 @@ more intent. It keeps snapshots at the keyspace level, rejects stale append
 writers, supports ordinary file writes, and lets high-throughput callers batch
 large appends without creating thousands of tiny file-version commits.
 
+The planned POSIX/FUSE path is a third sibling layer, not a wrapper around
+`NativeFile`. POSIX needs first-class inode, directory, rename, unlink,
+truncate, open-handle, and fsync semantics while still reusing the same segment
+substrate and commit machinery.
+
 ```rust
 use std::sync::Arc;
 

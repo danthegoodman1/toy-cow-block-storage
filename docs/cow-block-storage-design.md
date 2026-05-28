@@ -58,6 +58,9 @@ reachability-based garbage collection.
 - Develop a native extent/file API beside the block API for append-heavy custom
   filesystems and direct users that need writer epochs, append leases, and stale
   writer rejection.
+- Add a POSIX namespace API as a sibling mapping layer for FUSE-style use,
+  without forcing POSIX directory, inode, rename, unlink, truncate, or fsync
+  semantics into the lower native file API.
 - Make fork O(1) by copying shard-root pointers only.
 - Make writes copy only the changed shard's root-to-leaf metadata path.
 - Preserve snapshot and fork safety by making metadata nodes and data segments
@@ -103,6 +106,8 @@ reachability-based garbage collection.
 - Optimizations that cannot be represented in the deterministic simulator.
 - Forcing native file/extent semantics through the block API when that loses
   append ownership, file versioning, or stale-writer fencing information.
+- Treating a FUSE adapter as the POSIX metadata model. The adapter should be a
+  thin transport over an explicit POSIX namespace layer.
 
 ## 4. Core Model
 
@@ -369,6 +374,49 @@ Public native guarantees:
 
 The native API must not be implemented on top of the block API. Both APIs share
 the lower substrate; they do not stack on each other.
+
+### POSIX Namespace and FUSE Layer
+
+A POSIX filesystem should be a third first-class mapping layer over the shared
+segment substrate, not a wrapper that smuggles directory and inode state through
+ordinary `NativeFile` contents. The intended layering is:
+
+```text
+shared segment substrate
+shared metadata / commit groups / grants / receipts / custodians
+        |
+   block API
+   native keyspace/file API
+   POSIX namespace API
+        |
+      FUSE adapter
+```
+
+The POSIX namespace layer owns the semantics that make a filesystem different
+from a bag of files:
+
+- inode identity and generation;
+- directory entries and path lookup;
+- link counts and unlink-while-open behavior;
+- file mode/uid/gid-like metadata and deterministic logical timestamps;
+- symlink targets if supported;
+- atomic rename across source directory, destination directory, old target, and
+  affected inodes;
+- truncate, sparse extension, and read-as-zero behavior;
+- fsync and checkpoint boundaries.
+
+File data in the POSIX layer still uses immutable segment-backed file metadata
+trees, write grants/receipts, metadata publish fences, PITR roots, GC, and
+storage-node custodians. POSIX namespace roots should snapshot and restore by
+copying root pointers, just like block device forks and native keyspace
+snapshots. Directory and inode metadata must therefore live in immutable
+namespace roots and catalog shards, not in mutable side tables or opaque
+mini-databases stored inside regular files.
+
+The FUSE adapter is an integration surface, not the source of correctness. It
+translates kernel/user-space filesystem operations into the POSIX namespace API
+and contains no storage placement, GC, PITR, grant/receipt, or segment lifecycle
+decisions.
 
 ### Native Keyspace Scaling Decision
 
@@ -1483,8 +1531,16 @@ Provider and service boundaries:
 - `NativeServer`: actor boundary that handles native keyspace/file requests.
 - `NativeTransport`: typed request/response transport for native keyspace/file
   requests.
+- `PosixNamespaceClient`: planned public POSIX namespace control handle for
+  filesystem-level create, lookup, rename, unlink, truncate, fsync, checkpoint,
+  snapshot, and restore operations.
+- `PosixFile`: planned POSIX file handle with open-handle semantics distinct
+  from ordinary native file handles.
+- `PosixServer`: planned actor boundary for POSIX namespace requests.
+- `PosixTransport`: planned typed request/response transport for POSIX
+  namespace and file requests.
 - `MetadataPlane`: device catalog, metadata nodes, commit groups, PITR, and GC
-  roots for both block and native file metadata.
+  roots for block, native file, and POSIX namespace metadata.
 - `LocalCoordinator`: embedded trusted coordinator that sequences storage-node
   receipts, metadata publishes, reference marking, reads, GC releases, and
   maintenance routing.
@@ -1583,7 +1639,8 @@ V1 does not use:
 - Kernel integration.
 - Real network transport for block/native servers.
 - Cross-machine replication.
-- A full POSIX filesystem implementation.
+- A full POSIX filesystem implementation before the dedicated POSIX namespace
+  phase.
 - Compression, encryption, or deduplication.
 - Segment compaction.
 - Online shard splitting.

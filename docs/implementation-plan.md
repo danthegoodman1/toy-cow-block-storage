@@ -517,7 +517,11 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 29 owns production proof and key lifecycle: real signature-backed
   proof verification, durable key registries, key rotation, revocation, and
   deterministic tests for trust-boundary failures.
-- Phase 30 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 30 owns a first-class POSIX namespace and FUSE adapter over the shared
+  substrate: inodes, directories, rename/unlink/truncate/fsync semantics,
+  open-handle behavior, and POSIX metadata transactions without stuffing those
+  semantics into the native file API.
+- Phase 31 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -1741,7 +1745,78 @@ Exit gate:
   test and production schemes share the same canonical bodies and verifier
   boundary.
 
-## Phase 30: Storage Replication
+## Phase 30: POSIX Namespace and FUSE Adapter
+
+Status: not started.
+
+Add a POSIX-shaped namespace as a first-class sibling mapping layer over the
+shared segment substrate. This is not just FUSE glue over `NativeFile`, and it
+must not turn the native keyspace/file API into a POSIX API. The POSIX layer
+owns inode identity, directory entries, link counts, file metadata, open-handle
+state, and POSIX namespace transactions while reusing existing segment writes,
+metadata roots, commit groups, write grants/receipts, GC, custodians, PITR, and
+maintenance.
+
+Non-goals:
+
+- No kernel integration beyond a toy FUSE adapter in this phase.
+- No production NFS/SMB/export daemon.
+- No hard links beyond the minimal link-count semantics needed for correct
+  unlink/open behavior unless deterministic tests require them.
+- No xattrs, ACLs, quotas, advisory locks, mmap coherence, or distributed
+  cache invalidation.
+- No implementation that stores the namespace as an opaque mini-database inside
+  ordinary native files.
+- No change to the existing block or native file APIs.
+
+Deliverables:
+
+- [ ] Design `PosixNamespaceClient`, `PosixFile`, `PosixServer`, and
+  `PosixTransport` provider-public traits with documented implementor
+  guarantees.
+- [ ] Immutable POSIX namespace root and sharded directory/catalog metadata
+  shape for inode records, directory entries, file data roots, symlink targets,
+  link counts, mode/uid/gid-like metadata, and logical timestamps supplied by an
+  injected deterministic clock.
+- [ ] Namespace-level checkpoint, snapshot, restore, and PITR commit records so
+  a whole mounted filesystem can restore coherently.
+- [ ] Atomic commit-group operations for `create`, `mkdir`, `unlink`,
+  `rmdir`, `rename`, `truncate`, metadata update, file data write, and fsync
+  boundary publication.
+- [ ] Open-handle model for unlink-while-open: namespace removal must not free
+  file data until link count, open references, PITR retention, and GC all agree.
+- [ ] Truncate semantics that can shrink mappings, extend sparse ranges, and
+  preserve POSIX read-as-zero behavior without leaking stale segment bytes.
+- [ ] FUSE adapter that translates path/inode operations into the POSIX
+  namespace API and contains no core storage decisions.
+- [ ] Reference model for a small POSIX subset and generated deterministic
+  traces for create/write/read/rename/unlink/truncate/fsync/snapshot/restore.
+- [ ] Benchmarks for path lookup, create/unlink, rename, sequential writes,
+  random writes, truncate, fsync, snapshot/restore, and FUSE smoke operations.
+
+Exit gate:
+
+- [ ] POSIX namespace operations do not call through the block API and do not
+  encode POSIX state as ad hoc data inside ordinary native files.
+- [ ] Existing block and native keyspace/file APIs remain unchanged and pass the
+  same conformance tests.
+- [ ] Atomic rename is all-or-nothing across source directory, destination
+  directory, old target inode if any, and affected link counts.
+- [ ] Unlink while open preserves existing open-handle reads/writes and makes
+  the name disappear from path lookup without reclaiming live data too early.
+- [ ] Truncate, sparse extension, and overwrite never expose stale bytes.
+- [ ] `fsync` and keyspace checkpoint semantics are documented and tested
+  against durable reopen/crash traces.
+- [ ] POSIX snapshots/restores copy namespace-root pointers and do not walk file
+  contents, directory trees, or segment payloads.
+- [ ] GC and storage-node custodians treat POSIX namespace roots and open
+  orphan inodes as reachability roots until retention permits release.
+- [ ] FUSE adapter failures cannot corrupt committed metadata and cannot make
+  uncommitted segment bytes visible.
+- [ ] Criterion and FUSE smoke tests show whether the POSIX layer is usable for
+  internal workloads before any production claims are made.
+
+## Phase 31: Storage Replication
 
 Status: not started.
 
@@ -1750,10 +1825,12 @@ compaction and Phase 22 proves segment placement across multiple local storage
 nodes, after Phase 26 proves authenticated storage-node receipts and chaos
 delivery for the one-replica path, after Phase 27 makes operational debt
 observable, after Phase 28 provides verification/admin tooling, and after Phase
-29 proves production key lifecycle for proof-carrying writes. The local and
-durable providers must pass the same conformance suite, remote transport
-behavior must be deterministic, and the real network transport must have proven
-the wire contract across a process boundary.
+29 proves production key lifecycle for proof-carrying writes. If the replicated
+provider is expected to serve POSIX mounts, Phase 30 POSIX namespace semantics
+must be in the conformance suite before replication is called complete. The
+local and durable providers must pass the same conformance suite, remote
+transport behavior must be deterministic, and the real network transport must
+have proven the wire contract across a process boundary.
 
 Deliverables:
 
@@ -1772,7 +1849,7 @@ Deliverables:
 - [ ] Per-storage-node apply cursor tables and idempotent apply paths for
   referenced and released logical segments.
 - [ ] Repair path that can add missing background replicas after metadata
-  publish without changing public block or native APIs.
+  publish without changing public block, native, or POSIX APIs.
 - [ ] SQLite-backed repair job table and per-node repair cursors for idempotent
   copy, source selection, checksum validation, and restart after interrupted
   repair. External work queues are optional later adapters, not the base model.
@@ -1784,7 +1861,8 @@ Deliverables:
 
 Exit gate:
 
-- [ ] `BlockDevice` and `NativeFile` callers do not coordinate replicas.
+- [ ] `BlockDevice`, `NativeFile`, and POSIX namespace callers do not
+  coordinate replicas.
 - [ ] Metadata leaves still reference logical `SegmentId`s, not physical
   replica placements.
 - [ ] A write is acknowledged only after the configured replica durability and
@@ -1803,9 +1881,10 @@ Exit gate:
 - [ ] Stale placement decisions cannot overwrite, free, or repair the wrong
   logical segment or replica placement.
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
-  suite as single-replica providers.
+  suite as single-replica providers, including POSIX namespace conformance once
+  Phase 30 is implemented.
 
-## Phase 31: Linux io_uring Storage Node Backend
+## Phase 32: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1846,7 +1925,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 32: Optional ublk Adapter
+## Phase 33: Optional ublk Adapter
 
 Status: not started.
 
