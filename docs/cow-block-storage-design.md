@@ -896,6 +896,27 @@ must still not publish metadata, assign file versions, or mark a segment
 referenced from a client's word alone. Reference state follows
 metadata-produced evidence after publish.
 
+### Remote Storage-Node Transport
+
+The coordinator-to-storage-node boundary is a separate network surface from the
+public block/native client transports. A remote storage-node transport carries
+the same typed messages as the in-process `StorageNodeTransport`: write segment
+with grant, read segment, mark referenced with metadata evidence, release,
+custodian, and maintenance requests.
+
+Remote storage nodes remain storage authorities only. They own local data logs,
+catalog lifecycle, payload checksums, storage-node incarnation, and local
+maintenance. They do not read metadata roots, choose logical placement, publish
+device or keyspace heads, or infer deletion from current metadata. The
+coordinator remains the only role that talks to both metadata and storage nodes.
+
+A real remote transport must be retry-safe and restart-safe before replication:
+request IDs, deadlines, bounded frames, stale-response rejection, corrupt-frame
+rejection, server-incarnation fencing, duplicate write idempotency, and
+deterministic chaos tests are part of the storage-node transport contract. This
+single-replica remote path should be proven before quorum behavior adds more
+ways to be wrong.
+
 ### Future Storage Replication
 
 Replication belongs below the public block/native APIs and above individual

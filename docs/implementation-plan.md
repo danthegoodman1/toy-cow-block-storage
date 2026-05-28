@@ -514,14 +514,17 @@ remote, replayable, or concurrent boundary in the owning future phase:
   coordinator, storage-node, maintenance, GC, and proof paths.
 - Phase 28 owns recovery and admin tooling: offline verification, inspection,
   corruption explanation, state export, and explicit safe repair commands.
-- Phase 29 owns production proof and key lifecycle: real signature-backed
+- Phase 29 owns a real remote storage-node transport for the
+  coordinator-to-storage-node boundary while preserving the one-replica
+  semantics and grant/receipt ordering already proven in-process.
+- Phase 30 owns production proof and key lifecycle: real signature-backed
   proof verification, durable key registries, key rotation, revocation, and
   deterministic tests for trust-boundary failures.
-- Phase 30 owns a first-class POSIX namespace and FUSE adapter over the shared
+- Phase 31 owns a first-class POSIX namespace and FUSE adapter over the shared
   substrate: inodes, directories, rename/unlink/truncate/fsync semantics,
   open-handle behavior, and POSIX metadata transactions without stuffing those
   semantics into the native file API.
-- Phase 31 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 32 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -1653,7 +1656,7 @@ Deliverables:
 - [ ] Read-only inspection by default, including root/head summaries, segment
   owner lookup, lifecycle counts, data-log inventory, orphan inventory,
   compaction debt, PITR retention windows, and key/proof registry summaries
-  after Phase 29.
+  after Phase 30.
 - [ ] Explicit safe repairs for classes already proven by reopen logic, such as
   reference-state repair from committed metadata, orphan cleanup through
   custodian evidence, cursor reconstruction when all IDs are provably above
@@ -1681,7 +1684,86 @@ Exit gate:
 - [ ] Verifier and inspect benchmarks cover small stores and large stores with
   many segments, histories, and data logs.
 
-## Phase 29: Production Proof and Key Lifecycle
+## Phase 29: Real Remote Storage-Node Transport
+
+Status: not started.
+
+Implement an actual network transport for the coordinator-to-storage-node
+boundary while keeping the storage model single-replica. This phase proves that
+the Phase 25/26 role split survives process and network boundaries before
+replication adds quorum behavior. The coordinator still owns logical publish
+ordering, metadata still owns visibility, and each storage node owns its local
+catalog, data logs, custodian, and maintenance state.
+
+This is a real remote storage-node transport phase, not production
+authentication. Until Phase 30, remote storage-node tests may still use the
+deterministic proof scheme from Phase 26 and trusted test keys. The transport
+must preserve the production-shaped grant/receipt envelopes so Phase 30 can
+replace the proof implementation without changing request flow.
+
+Non-goals:
+
+- No replication or quorum durability.
+- No public exposure of storage-node selection to ordinary block/native
+  clients.
+- No production cryptographic trust claim across untrusted networks.
+- No metadata service network protocol beyond what is needed to exercise the
+  coordinator-to-storage-node boundary.
+- No custom queue, outbox, or compatibility layer beside the current typed
+  storage-node request/response contract.
+
+Deliverables:
+
+- [ ] Crate-owned storage-node wire codec for `StorageNodeRequest`,
+  `StorageNodeResponse`, grants, receipts, reference evidence, maintenance
+  observations, maintenance reports, and typed storage errors.
+- [ ] Remote `StorageNodeServer` that exposes one node's segment write/read,
+  mark-referenced, release, custodian, observe-maintenance, and
+  run-maintenance-tick operations without reading metadata roots or timelines.
+- [ ] Remote `StorageNodeTransport` client with request IDs, deadlines, bounded
+  frame sizes, stale-response rejection, duplicate/retry handling, corrupt-frame
+  rejection, and server-incarnation fencing.
+- [ ] `StorageNodeDirectory` implementation that can mix local in-process nodes
+  and remote nodes while preserving provider-private placement.
+- [ ] Deterministic chaos wrapper around the remote storage-node transport for
+  drop, delay, duplicate, reorder, corrupt frame, stale response, disconnect,
+  reconnect, and server restart scenarios.
+- [ ] Integration tests for block writes, native writes/appends, reserved
+  append commits, reads, failed metadata publish, reference marking, release
+  evidence, storage-node custodians, and maintenance ticks over remote nodes.
+- [ ] Crash/restart tests where the storage node restarts after durable pending
+  writes, after metadata publish but before mark-referenced retry, during
+  custodian cleanup, and during bounded maintenance.
+- [ ] Observability integration for remote request failures, retries,
+  stale-response rejections, transport disconnects, and node-incarnation
+  changes without exposing placement decisions to ordinary APIs.
+- [ ] Benchmarks comparing in-process storage-node transport, serialized chaos
+  transport, and real network storage-node transport for 4 KiB writes, large
+  appends, reads, reference marking, custodian runs, and maintenance ticks.
+
+Exit gate:
+
+- [ ] The same provider conformance suite passes with all-local storage nodes,
+  all-remote storage nodes, and a mixed local/remote node directory.
+- [ ] Write ordering remains storage write receipt -> metadata publish -> mark
+  referenced, including after retries, duplicated replies, dropped replies, and
+  storage-node restart.
+- [ ] Failed metadata publish over remote storage leaves no visible logical
+  change and leaves only reclaimable durable-pending orphans on the selected
+  storage node.
+- [ ] Remote storage nodes reject writes without valid Phase 26 grants and
+  reject mark-referenced calls without metadata-produced reference evidence.
+- [ ] Reads resolve `SegmentId` through the provider-private directory and fail
+  deterministically on missing, stale, or wrong-incarnation placement instead
+  of returning zeroes.
+- [ ] Remote custodian and maintenance operations are idempotent under retry and
+  can resume safely after coordinator or storage-node restart.
+- [ ] The transport never lets ordinary block/native clients choose storage
+  nodes, compact logs, release segments, or mark segments referenced.
+- [ ] Network overhead and tail-latency benchmarks are recorded before Phase 30
+  proof/key work and before Phase 32 replication.
+
+## Phase 30: Production Proof and Key Lifecycle
 
 Status: not started.
 
@@ -1745,7 +1827,7 @@ Exit gate:
   test and production schemes share the same canonical bodies and verifier
   boundary.
 
-## Phase 30: POSIX Namespace and FUSE Adapter
+## Phase 31: POSIX Namespace and FUSE Adapter
 
 Status: not started.
 
@@ -1816,7 +1898,7 @@ Exit gate:
 - [ ] Criterion and FUSE smoke tests show whether the POSIX layer is usable for
   internal workloads before any production claims are made.
 
-## Phase 31: Storage Replication
+## Phase 32: Storage Replication
 
 Status: not started.
 
@@ -1824,9 +1906,10 @@ Add replicated segment storage only after Phase 21 proves incremental
 compaction and Phase 22 proves segment placement across multiple local storage
 nodes, after Phase 26 proves authenticated storage-node receipts and chaos
 delivery for the one-replica path, after Phase 27 makes operational debt
-observable, after Phase 28 provides verification/admin tooling, and after Phase
-29 proves production key lifecycle for proof-carrying writes. If the replicated
-provider is expected to serve POSIX mounts, Phase 30 POSIX namespace semantics
+observable, after Phase 28 provides verification/admin tooling, after Phase 29
+proves real remote storage-node transport semantics, and after Phase 30 proves
+production key lifecycle for proof-carrying writes. If the replicated provider
+is expected to serve POSIX mounts, Phase 31 POSIX namespace semantics
 must be in the conformance suite before replication is called complete. The
 local and durable providers must pass the same conformance suite, remote
 transport behavior must be deterministic, and the real network transport must
@@ -1882,9 +1965,9 @@ Exit gate:
   logical segment or replica placement.
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers, including POSIX namespace conformance once
-  Phase 30 is implemented.
+  Phase 31 is implemented.
 
-## Phase 32: Linux io_uring Storage Node Backend
+## Phase 33: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -1925,7 +2008,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 33: Optional ublk Adapter
+## Phase 34: Optional ublk Adapter
 
 Status: not started.
 
