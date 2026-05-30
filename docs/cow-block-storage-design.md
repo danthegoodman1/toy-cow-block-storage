@@ -9,7 +9,7 @@ This project is a toy copy-on-write storage system built around immutable data
 segments and immutable metadata roots. The first compatibility surface is a
 block device, but the block layer is only one mapping layer over a shared
 segment substrate. A native extent/file API should develop alongside it for
-workloads that need file-level append sessions, writer fencing, and lower
+workloads that need file-level append streams, writer fencing, and lower
 metadata amplification than a generic block interface can provide.
 
 A block device is represented by a small device head:
@@ -56,7 +56,7 @@ reachability-based garbage collection.
 - Keep block storage as the compatibility mapping layer, not the whole storage
   system.
 - Develop a native extent/file API beside the block API for append-heavy custom
-  filesystems and direct users that need writer epochs, append sessions, and
+  filesystems and direct users that need writer epochs, append streams, and
   stale writer rejection.
 - Add a POSIX namespace API as a sibling mapping layer for FUSE-style use,
   without forcing POSIX directory, inode, rename, unlink, truncate, or fsync
@@ -142,10 +142,10 @@ file_head {
 }
 ```
 
-`file_version` is the fencing identity for file extent commits. Append sessions
-carry writer epochs, and append reservations fence a specific offset and length,
-so a stolen session can reject stale writers even when they durably wrote
-segment bytes before attempting metadata commit.
+`file_version` is the fencing identity for ordinary file extent commits. Append
+streams carry writer epochs and separate private durable ingest from visible
+publish, so a stolen stream can reject stale writers even when they durably
+wrote private segment bytes before attempting metadata publish.
 
 Each shard root points to a persistent immutable tree:
 
@@ -367,12 +367,11 @@ Public native guarantees:
 - Keyspace snapshots and restores are atomic namespace-level operations.
 - File writes are ordinary byte-offset mutations fenced by the committed file
   version.
-- File appends are separately fenced by append sessions and reservations with
-  writer epochs.
+- File appends are separately fenced by append streams with writer epochs.
 - Native file reads, writes, and appends are byte-oriented; block alignment is an
   implementation-private segment detail.
-- The metadata plane rejects stale append commits whose session, reservation, or
-  writer epoch no longer matches the keyspace-scoped file.
+- The metadata plane rejects stale append stream operations whose stream token
+  or writer epoch no longer matches the keyspace-scoped file.
 - A successful mutating write or append commit advances the file version and
   keyspace catalog root atomically.
 - Segment bytes are durable before file extent metadata references them.
@@ -469,9 +468,9 @@ Phase 15 local baseline ranges on this workstation:
 | file info | ~200 ns | ~250 ns | ~4.5 us |
 | 4 KiB file read | ~470 ns | ~520 ns | ~4.9 us |
 | 4 KiB `write_at` | ~8.4 us | ~8.4 us | ~40 us |
-| 1-byte append with fresh session | ~18 us | ~18 us | ~53 us |
+| 1-byte append with fresh stream | ~18 us | ~18 us | ~53 us |
 | create file | ~65-80 us | ~65-80 us | ~65-80 us |
-| stale session rejection | ~0.6 us | ~0.6 us | ~9 us |
+| stale stream rejection | ~0.6 us | ~0.6 us | ~9 us |
 | checkpoint root copy | ~90 ns | ~100 ns | ~90 ns |
 | snapshot root copy | ~170 ns | ~170 ns | ~170 ns |
 | checkpoint restore root copy | ~170 ns | ~190 ns | ~200 ns |
@@ -480,8 +479,8 @@ Alignment and concurrency baselines:
 
 - aligned 4 KiB native write: ~8.3 us
 - unaligned partial-block native write: ~8.5 us
-- aligned 4 KiB append with a fresh session: ~12 us
-- unaligned 17-byte append with a fresh session: ~12 us
+- aligned 4 KiB append with a fresh stream: ~12 us
+- unaligned 17-byte append with a fresh stream: ~12 us
 - aligned 4 KiB native read: ~0.6 us
 - unaligned 17-byte native read: ~0.5 us
 - four-thread independent write batch: ~71 us
@@ -510,7 +509,7 @@ transport can be an in-process call or channel. A remote transport should be an
 implementation swap, not a redesign of the block API.
 
 Transport envelopes carry request identity, optional deadline, and client epoch
-or session identity so that retries and stale responses can be modeled
+or stream identity so that retries and stale responses can be modeled
 deterministically.
 
 ### Phase 17 Remote Transport Choice
@@ -699,14 +698,16 @@ catalogs, stale placements, catalog lifecycle gaps, or segment descriptors
 whose data-log bytes are missing or corrupt.
 
 Each data-log record carries a fixed magic, version, segment ID, payload length,
-CRC64-ECMA payload checksum, and payload bytes. Reopen rejects a current
-placement if the record checksum, segment ID, or payload length disagrees with
-SQLite placement state.
+a payload-integrity tag, the tag's checksum field, and payload bytes. Verified
+payloads use CRC32C; unchecked payloads store an unchecked tag and zero checksum
+field. Reopen rejects a current verified placement if the record checksum,
+segment ID, payload length, or integrity tag disagrees with SQLite placement
+state. Unchecked placements are accepted without payload checksum verification.
 
 Committed segment placement becomes:
 
 ```text
-segment_id -> storage_node_id, data_log_id, offset, length, crc64_ecma
+segment_id -> storage_node_id, data_log_id, offset, length, payload_integrity
 ```
 
 Metadata leaves and native file extents still reference only logical
@@ -885,12 +886,12 @@ intent, write intent, segment identity or reservation class, byte length,
 placement node or placement-policy result, durability requirement, caller
 identity, expiration, and metadata epoch. A segment receipt should bind storage
 node, storage-node incarnation, segment ID, grant ID/hash, write intent, owner,
-bytes, checksum, durability reached, durable-pending lifecycle state, receipt
-epoch/expiration, node key ID, proof scheme, and proof bytes.
+bytes, payload integrity, durability reached, durable-pending lifecycle state,
+receipt epoch/expiration, node key ID, proof scheme, and proof bytes.
 
 Receipt proofs use a canonical crate-owned binary receipt body with a domain
 separator such as `TCOW_SEGMENT_RECEIPT_V1`. The proof covers the payload
-checksum and all logical/placement fields, not the full payload bytes. Phase 30
+integrity mode/value and all logical/placement fields, not the full payload bytes. Phase 30
 turns this into the minimal production proof boundary: remote or
 trusted-client production modes must reject deterministic test proofs and use a
 real keyed proof scheme verified through a persisted active key registry. A
@@ -1028,9 +1029,9 @@ not become permanent shortcuts:
 - PITR retention is deterministic commit-age policy in v1. Durable providers may
   add richer per-owner policies, but expiration must still be driven by injected
   logical time or commit epochs, not hidden wall-clock reads.
-- Native append session stealing is local metadata state in v1. Durable
-  providers need restart-safe session identities, writer epochs, and tests where
-  stale writers race after durable segment writes.
+- Native append stream stealing is local metadata state in v1. Durable providers
+  need restart-safe stream identities, writer epochs, and tests where stale
+  writers race after durable private segment writes.
 - Caches are ordinary in-memory maps in v1. Durable or remote implementations
   must document cache coherence, invalidation, and fence/version checks instead
   of relying on provider-local object identity.
@@ -1047,8 +1048,8 @@ server:
 1. Selects the local storage endpoint in v1, or a replica set in a later
    replicated implementation, that will hold the new segment bytes.
 2. Creates a stable write-intent identity for the request or commit group. For
-   native appends, this write intent is tied to the append session, reservation,
-   and writer epoch.
+   native append streams, this write intent is tied to the stream, append
+   ticket, and writer epoch.
 3. Reserves segment space in each selected storage endpoint's
    `LocalSegmentCatalog` under that write intent.
 4. Writes bytes through each selected `SegmentStore`.
@@ -1236,42 +1237,48 @@ Invariants:
 - Failed writes leave the previous file version readable.
 - Segment/block alignment is not exposed to native callers.
 
-### Open Append Session And Reserve
+### Append Streams, Durable Marks, And Visible Publish
 
-A native append session grants one writer the right to reserve append offsets
-against a specific file and writer epoch. The metadata plane may steal the
-session by issuing a newer writer epoch for the same file. A reservation assigns
-one monotonically increasing offset and length within that session.
-
-Invariants:
-
-- Append sessions carry `keyspace_id`, `file_id`, `session_id`,
-  `base_version`, and `writer_epoch`.
-- Append reservations carry `session_id`, `reservation_id`, `offset`, `len`, and
-  `writer_epoch`.
-- A stale session or reservation cannot publish file metadata.
-- Session stealing does not delete durable data; failed old writers leave orphans
-  if their segment writes already became durable.
-
-### Native Append Commit
-
-A native append commit:
-
-1. Validates the append reservation against the active session, reserved offset,
-   current file size, and writer epoch.
-2. Creates a write intent tied to that session and reservation.
-3. Reserves and writes durable segment bytes.
-4. Builds file extent metadata for the append range.
-5. Publishes the new file root with append-reservation and writer-epoch fencing.
-6. Marks local segment catalog entries as referenced.
-7. Returns the new file version.
+A native append stream grants one writer the right to ingest private append
+bytes against a specific file and writer epoch. Appended bytes are not visible
+to file readers when they are ingested. A stream flush makes private bytes
+durable through a returned high-water mark, and a publish converts a durable
+range into visible file metadata in one file-version transition.
 
 Invariants:
 
-- A successful append advances the file version atomically.
+- Append streams carry `keyspace_id`, `file_id`, `stream_id`, `base_version`,
+  `visible_base_size`, and `writer_epoch`.
+- Append tickets identify the private byte range accepted by a stream append;
+  they are diagnostic evidence, not metadata publish authority.
+- `flush_append_stream` persists private append records and returns a durable
+  mark, but does not advance the visible file head.
+- `publish_append_stream` may only reference private records covered by a
+  durable mark.
+- A stale stream cannot ingest, flush, or publish private data.
+- Opening a new stream or committing a same-file `write_at` fences the previous
+  active stream for that file.
+- Writers take over at the visible file head. Durable-but-unpublished private
+  bytes belong to the fenced stream token and are not inherited by a new writer.
+
+### Native Append Publish
+
+A native append publish:
+
+1. Validates the append stream and durable mark against the active stream state.
+2. Verifies the visible file head still matches the stream's published boundary.
+3. Builds file extent metadata for the durable private range being made visible.
+4. Publishes the new file root with append-stream and writer-epoch fencing.
+5. Marks referenced segment catalog entries after metadata publish succeeds.
+6. Returns the new file version.
+
+Invariants:
+
+- A successful publish advances the file version atomically.
 - Stale writers are rejected by metadata fencing.
-- Failed or stale append commits never become readable file data.
-- Durable segment data from failed append commits is reclaimed as orphan data.
+- Flush without publish never becomes readable file data.
+- Durable private data from fenced, aborted, or abandoned streams is reclaimable
+  once it stops acting as an active stream GC root.
 
 ## 8. Sharding
 
@@ -1392,9 +1399,9 @@ root set.
 
 The native restore API creates a new keyspace from the reconstructed
 `KeyspaceRoot`. This is intentionally not a per-file restore: every file in the
-catalog is restored together, and a stale append session from the source
-keyspace cannot publish into the restored keyspace because sessions and
-reservations carry `keyspace_id`.
+catalog is restored together, and a stale append stream from the source
+keyspace cannot publish into the restored keyspace because append streams carry
+`keyspace_id`.
 
 Invariants:
 
@@ -1572,8 +1579,8 @@ Provider and service boundaries:
 - `BlockServer`: actor boundary that handles block requests.
 - `BlockTransport`: typed request/response transport.
 - `NativeKeyspaceClient`: public native keyspace control handle.
-- `NativeFile`: public native file handle with byte writes, append sessions,
-  reservations, and file-version commits.
+- `NativeFile`: public native file handle with byte writes, append streams,
+  durable marks, visible publish, and file-version commits.
 - `NativeServer`: actor boundary that handles native keyspace/file requests.
 - `NativeTransport`: typed request/response transport for native keyspace/file
   requests.
@@ -1600,7 +1607,7 @@ Provider and service boundaries:
 - `PartitionedDataLogStore`: durable manager for rolled segment payload logs,
   manifests, checksums, and replay of data-log tails.
 - `SqliteMetadataStore`: durable metadata provider for roots, commits,
-  placement index, lifecycle state, PITR, append-session state, manifests, and
+  placement index, lifecycle state, PITR, append-stream state, manifests, and
   custodian evidence.
 - `CompactionPlanner`: deterministic maintenance policy that selects sealed
   data logs for deletion or live-payload relocation.
@@ -1634,10 +1641,10 @@ command:
   publish.
 - Reads after writes return the latest committed bytes for the target device.
 - Public writes spanning shards are atomic at request granularity.
-- Native append commits are atomic at file-version and keyspace-catalog
+- Native append publishes are atomic at file-version and keyspace-catalog
   granularity.
-- Stale native append sessions/reservations cannot publish file metadata across
-  keyspace lineage boundaries.
+- Stale native append streams cannot publish file metadata across keyspace
+  lineage boundaries.
 - Forked devices initially read identically to their parent.
 - After divergence, writes to one fork do not change reads from the other fork.
 - A failed publish does not expose partially written metadata.

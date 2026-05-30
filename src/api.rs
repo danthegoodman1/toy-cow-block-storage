@@ -232,6 +232,21 @@ pub enum WriteDurability {
     Flushed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum PayloadIntegrity {
+    #[default]
+    Verified,
+    Unchecked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ReadVerification {
+    #[default]
+    Default,
+    RequireVerified,
+    Skip,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FlushScope {
     Device,
@@ -302,7 +317,17 @@ pub trait BlockDevice: Send + Sync {
     /// The implementation must fill the whole buffer or return an error. A
     /// zero-length buffer is a no-op. Reads must reject unaligned or
     /// out-of-bounds ranges before exposing data.
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.read_at_with_verification(offset, buf, ReadVerification::Default)
+    }
+
+    /// Read bytes with an explicit payload verification policy.
+    fn read_at_with_verification(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()>;
 
     /// Write bytes at a block-aligned offset.
     ///
@@ -310,7 +335,17 @@ pub trait BlockDevice: Send + Sync {
     /// perspective. A failed write must not expose a partial mapping, even if
     /// segment bytes were already written and later need custodian cleanup. A
     /// zero-length write is a no-op and must not allocate segment data.
-    fn write_at(&self, offset: u64, data: &[u8]) -> Result<WriteCommit>;
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<WriteCommit> {
+        self.write_at_with_integrity(offset, data, PayloadIntegrity::Verified)
+    }
+
+    /// Write bytes with an explicit payload integrity policy.
+    fn write_at_with_integrity(
+        &self,
+        offset: u64,
+        data: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<WriteCommit>;
 
     /// Flush previously acknowledged writes for this device.
     ///
@@ -380,11 +415,13 @@ pub enum BlockRequest {
     Read {
         device_id: DeviceId,
         range: ByteRange,
+        verification: ReadVerification,
     },
     Write {
         device_id: DeviceId,
         offset: u64,
         bytes: Vec<u8>,
+        payload_integrity: PayloadIntegrity,
         durability: WriteDurability,
     },
     Flush {
@@ -786,6 +823,7 @@ mod tests {
             device_id,
             offset: 0,
             bytes: vec![1, 2, 3, 4],
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
 
@@ -807,6 +845,7 @@ mod tests {
         let read = BlockRequest::Read {
             device_id: DeviceId::from_raw(1),
             range: ByteRange::new(4096, 8192),
+            verification: ReadVerification::Default,
         };
         assert_eq!(read.operation(), BlockOperation::Read);
         assert_eq!(read.byte_range().unwrap(), Some(ByteRange::new(4096, 8192)));
@@ -815,6 +854,7 @@ mod tests {
             device_id: DeviceId::from_raw(1),
             offset: 4096,
             bytes: vec![0; 8192],
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
         assert_eq!(write.operation(), BlockOperation::Write);
@@ -831,6 +871,7 @@ mod tests {
             device_id: DeviceId::from_raw(1),
             offset: 0,
             bytes: vec![0; 4096],
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
         assert!(aligned.validate_for_existing_device(&spec).is_ok());
@@ -839,6 +880,7 @@ mod tests {
             device_id: DeviceId::from_raw(1),
             offset: 1,
             bytes: vec![0; 4096],
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
         assert!(unaligned.validate_for_existing_device(&spec).is_err());
@@ -846,6 +888,7 @@ mod tests {
         let past_end = BlockRequest::Read {
             device_id: DeviceId::from_raw(1),
             range: ByteRange::new(8 * 4096, 4096),
+            verification: ReadVerification::Default,
         };
         assert!(past_end.validate_for_existing_device(&spec).is_err());
     }
@@ -865,6 +908,7 @@ mod tests {
         let read = BlockRequest::Read {
             device_id: DeviceId::from_raw(1),
             range: ByteRange::new(0, 4096),
+            verification: ReadVerification::Default,
         };
 
         assert!(read.validate_for_new_device().is_err());

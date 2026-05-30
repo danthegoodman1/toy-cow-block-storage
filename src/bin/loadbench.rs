@@ -14,10 +14,11 @@ use toy_cow_block_storage::provider::{
     MetadataPlane,
 };
 use toy_cow_block_storage::{
-    AppendReservation, AppendSession, ByteRange, CreateDeviceRequest, CreateFileRequest,
-    CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableCoordinator, DurableDataLogPolicy,
-    DurablePersistProfile, FileId, FileSpec, FlushResult, KeyspaceId, LocalCoordinator,
-    LocalStoreConfig, Result, StorageError, StorageNodeId, WriteDurability,
+    AppendStream, AppendTicket, ByteRange, CreateDeviceRequest, CreateFileRequest,
+    CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableAppendMark, DurableCoordinator,
+    DurableDataLogPolicy, DurablePersistProfile, FileId, FileSpec, FlushResult, KeyspaceId,
+    LocalCoordinator, LocalStoreConfig, PayloadIntegrity, ReadVerification, Result, StorageError,
+    StorageNodeId, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -26,7 +27,7 @@ const BLOCK_SIZE: u32 = 4096;
 const DEFAULT_DEVICE_BLOCKS: u64 = 1_048_576;
 const DEFAULT_FILE_ROOT_BLOCKS: u64 = 1_048_576;
 const DEFAULT_FILE_CAPACITY_BYTES: u64 = DEFAULT_FILE_ROOT_BLOCKS * BLOCK_SIZE as u64;
-const SESSION_APPEND_FILE_STRIDE: usize = 64;
+const STREAM_APPEND_FILE_STRIDE: usize = 64;
 const DEFAULT_PROFILE_CAPACITY: usize = 1_000_000;
 
 fn main() {
@@ -39,7 +40,7 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse()?;
     println!(
-        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,p50_us,p90_us,p99_us,p999_us,max_us,samples"
+        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,durable_mbps,published_mbps,durable_bytes,published_bytes,p50_us,p90_us,p99_us,p999_us,max_us,samples"
     );
 
     for workload in &args.workloads {
@@ -70,6 +71,10 @@ struct Args {
     device_blocks: u64,
     samples_per_worker: usize,
     durable_profile_csv: Option<PathBuf>,
+    stream_flush_bytes: Option<u64>,
+    stream_publish_bytes: Option<u64>,
+    payload_integrity: PayloadIntegrity,
+    read_verification: ReadVerification,
 }
 
 impl Args {
@@ -91,6 +96,10 @@ impl Args {
             device_blocks: DEFAULT_DEVICE_BLOCKS,
             samples_per_worker: 200_000,
             durable_profile_csv: None,
+            stream_flush_bytes: None,
+            stream_publish_bytes: None,
+            payload_integrity: PayloadIntegrity::Verified,
+            read_verification: ReadVerification::Default,
         };
 
         let mut raw = env::args().skip(1);
@@ -137,6 +146,22 @@ impl Args {
                         &mut raw,
                         "--durable-profile-csv",
                     )?));
+                }
+                "--stream-flush-mib" => {
+                    let mib: u64 = parse_next(&mut raw, "--stream-flush-mib")?;
+                    args.stream_flush_bytes = Some(mib_to_bytes(mib, "--stream-flush-mib")?);
+                }
+                "--stream-publish-mib" => {
+                    let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
+                    args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
+                }
+                "--payload-integrity" => {
+                    let value: String = parse_next(&mut raw, "--payload-integrity")?;
+                    args.payload_integrity = parse_payload_integrity(&value)?;
+                }
+                "--read-verification" => {
+                    let value: String = parse_next(&mut raw, "--read-verification")?;
+                    args.read_verification = parse_read_verification(&value)?;
                 }
                 other => {
                     return Err(StorageError::invalid_argument(format!(
@@ -218,18 +243,23 @@ options:\n\
   --provider local|durable                 default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch, append-session\n\
+                                           aliases: north-star, append-batch, append-stream\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-shard-lanes, block-read-4k,\n\
-                                           block-write-1m, native-read-4k,\n\
+                                           block-write-1m, block-write-1m-shard-lanes,\n\
+                                           native-read-4k,\n\
                                            native-write-4k, native-write-1m,\n\
                                            native-write-4m, native-write-32m,\n\
                                            native-append-4k, native-append-1m,\n\
                                            native-append-4m, native-append-32m,\n\
-                                           native-session-append-4k,\n\
-                                           native-session-append-1m,\n\
-                                           native-session-append-4m,\n\
-                                           native-session-append-32m,\n\
+                                           native-stream-ingest-1m,\n\
+                                           native-stream-ingest-4m,\n\
+                                           native-stream-ingest-32m,\n\
+                                           native-stream-append-flush-1m,\n\
+                                           native-stream-append-flush-4m,\n\
+                                           native-stream-append-flush-32m,\n\
+                                           native-stream-publish-preflushed-1m,\n\
+                                           native-stream-flush-publish-1m,\n\
                                            native-hot-append-4k\n\
   --concurrency LIST                       default: 1,4,16\n\
   --duration-ms N                          default: 1000\n\
@@ -243,6 +273,11 @@ options:\n\
   --device-blocks N                        logical device blocks, default: 1048576\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
   --durable-profile-csv PATH               append durable persist profiles to CSV\n\
+  --stream-flush-mib N                     flush append streams after N MiB per stream\n\
+  --stream-publish-mib N                   publish append streams after N MiB per stream\n\
+  --payload-integrity verified|unchecked   write payload integrity, default: verified\n\
+  --read-verification default|require-verified|skip\n\
+                                           read verification policy, default: default\n\
   --root PATH                              durable scratch root"
     );
 }
@@ -270,13 +305,40 @@ fn parse_usize_list(value: &str, flag: &str) -> Result<Vec<usize>> {
         .collect()
 }
 
+fn mib_to_bytes(mib: u64, flag: &str) -> Result<u64> {
+    mib.checked_mul(1024 * 1024)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| StorageError::invalid_argument(format!("{flag} must be greater than zero")))
+}
+
+fn parse_payload_integrity(value: &str) -> Result<PayloadIntegrity> {
+    match value {
+        "verified" | "crc32c" => Ok(PayloadIntegrity::Verified),
+        "unchecked" | "none" | "no-verify" => Ok(PayloadIntegrity::Unchecked),
+        _ => Err(StorageError::invalid_argument(format!(
+            "unknown payload integrity {value}"
+        ))),
+    }
+}
+
+fn parse_read_verification(value: &str) -> Result<ReadVerification> {
+    match value {
+        "default" => Ok(ReadVerification::Default),
+        "require-verified" | "required" => Ok(ReadVerification::RequireVerified),
+        "skip" | "none" | "no-verify" => Ok(ReadVerification::Skip),
+        _ => Err(StorageError::invalid_argument(format!(
+            "unknown read verification {value}"
+        ))),
+    }
+}
+
 fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
     let mut workloads = Vec::new();
     for part in value.split(',') {
         match part {
             "north-star" | "all" => workloads.extend(Workload::north_star_suite()),
             "append-batch" => workloads.extend(Workload::append_batch_suite()),
-            "append-session" => workloads.extend(Workload::append_session_suite()),
+            "append-stream" => workloads.extend(Workload::append_stream_suite()),
             _ => workloads.push(Workload::from_str(part)?),
         }
     }
@@ -393,6 +455,7 @@ enum Workload {
     BlockWrite4kShardLanes,
     BlockRead4k,
     BlockWrite1m,
+    BlockWrite1mShardLanes,
     NativeRead4k,
     NativeWrite4k,
     NativeWrite1m,
@@ -402,10 +465,14 @@ enum Workload {
     NativeAppend1m,
     NativeAppend4m,
     NativeAppend32m,
-    NativeSessionAppend4k,
-    NativeSessionAppend1m,
-    NativeSessionAppend4m,
-    NativeSessionAppend32m,
+    NativeStreamIngest1m,
+    NativeStreamIngest4m,
+    NativeStreamIngest32m,
+    NativeStreamAppendFlush1m,
+    NativeStreamAppendFlush4m,
+    NativeStreamAppendFlush32m,
+    NativeStreamPublishPreflushed1m,
+    NativeStreamFlushPublish1m,
     NativeHotAppend4k,
 }
 
@@ -416,6 +483,7 @@ impl Workload {
             Self::BlockWrite4kShardLanes,
             Self::BlockRead4k,
             Self::BlockWrite1m,
+            Self::BlockWrite1mShardLanes,
             Self::NativeRead4k,
             Self::NativeWrite4k,
             Self::NativeAppend4k,
@@ -436,16 +504,19 @@ impl Workload {
         ]
     }
 
-    fn append_session_suite() -> Vec<Self> {
+    fn append_stream_suite() -> Vec<Self> {
         vec![
-            Self::NativeSessionAppend4k,
-            Self::NativeSessionAppend1m,
-            Self::NativeSessionAppend4m,
-            Self::NativeSessionAppend32m,
-            Self::NativeWrite4k,
             Self::NativeWrite1m,
             Self::NativeWrite4m,
             Self::NativeWrite32m,
+            Self::NativeStreamIngest1m,
+            Self::NativeStreamIngest4m,
+            Self::NativeStreamIngest32m,
+            Self::NativeStreamAppendFlush1m,
+            Self::NativeStreamAppendFlush4m,
+            Self::NativeStreamAppendFlush32m,
+            Self::NativeStreamPublishPreflushed1m,
+            Self::NativeStreamFlushPublish1m,
         ]
     }
 
@@ -455,6 +526,7 @@ impl Workload {
             Self::BlockWrite4kShardLanes => "block-write-4k-shard-lanes",
             Self::BlockRead4k => "block-read-4k",
             Self::BlockWrite1m => "block-write-1m",
+            Self::BlockWrite1mShardLanes => "block-write-1m-shard-lanes",
             Self::NativeRead4k => "native-read-4k",
             Self::NativeWrite4k => "native-write-4k",
             Self::NativeWrite1m => "native-write-1m",
@@ -464,10 +536,14 @@ impl Workload {
             Self::NativeAppend1m => "native-append-1m",
             Self::NativeAppend4m => "native-append-4m",
             Self::NativeAppend32m => "native-append-32m",
-            Self::NativeSessionAppend4k => "native-session-append-4k",
-            Self::NativeSessionAppend1m => "native-session-append-1m",
-            Self::NativeSessionAppend4m => "native-session-append-4m",
-            Self::NativeSessionAppend32m => "native-session-append-32m",
+            Self::NativeStreamIngest1m => "native-stream-ingest-1m",
+            Self::NativeStreamIngest4m => "native-stream-ingest-4m",
+            Self::NativeStreamIngest32m => "native-stream-ingest-32m",
+            Self::NativeStreamAppendFlush1m => "native-stream-append-flush-1m",
+            Self::NativeStreamAppendFlush4m => "native-stream-append-flush-4m",
+            Self::NativeStreamAppendFlush32m => "native-stream-append-flush-32m",
+            Self::NativeStreamPublishPreflushed1m => "native-stream-publish-preflushed-1m",
+            Self::NativeStreamFlushPublish1m => "native-stream-flush-publish-1m",
             Self::NativeHotAppend4k => "native-hot-append-4k",
         }
     }
@@ -475,22 +551,27 @@ impl Workload {
     fn op_size(self) -> usize {
         match self {
             Self::BlockWrite1m
+            | Self::BlockWrite1mShardLanes
             | Self::NativeWrite1m
             | Self::NativeAppend1m
-            | Self::NativeSessionAppend1m => 1024 * 1024,
-            Self::NativeWrite4m | Self::NativeAppend4m | Self::NativeSessionAppend4m => {
-                4 * 1024 * 1024
-            }
-            Self::NativeWrite32m | Self::NativeAppend32m | Self::NativeSessionAppend32m => {
-                32 * 1024 * 1024
-            }
+            | Self::NativeStreamIngest1m
+            | Self::NativeStreamAppendFlush1m
+            | Self::NativeStreamPublishPreflushed1m
+            | Self::NativeStreamFlushPublish1m => 1024 * 1024,
+            Self::NativeWrite4m
+            | Self::NativeAppend4m
+            | Self::NativeStreamIngest4m
+            | Self::NativeStreamAppendFlush4m => 4 * 1024 * 1024,
+            Self::NativeWrite32m
+            | Self::NativeAppend32m
+            | Self::NativeStreamIngest32m
+            | Self::NativeStreamAppendFlush32m => 32 * 1024 * 1024,
             Self::BlockWrite4k
             | Self::BlockWrite4kShardLanes
             | Self::BlockRead4k
             | Self::NativeWrite4k
             | Self::NativeRead4k
             | Self::NativeAppend4k
-            | Self::NativeSessionAppend4k
             | Self::NativeHotAppend4k => 4096,
         }
     }
@@ -516,14 +597,42 @@ impl Workload {
         )
     }
 
-    fn is_native_session_append(self) -> bool {
+    fn is_native_stream(self) -> bool {
         matches!(
             self,
-            Self::NativeSessionAppend4k
-                | Self::NativeSessionAppend1m
-                | Self::NativeSessionAppend4m
-                | Self::NativeSessionAppend32m
+            Self::NativeStreamIngest1m
+                | Self::NativeStreamIngest4m
+                | Self::NativeStreamIngest32m
+                | Self::NativeStreamAppendFlush1m
+                | Self::NativeStreamAppendFlush4m
+                | Self::NativeStreamAppendFlush32m
+                | Self::NativeStreamPublishPreflushed1m
+                | Self::NativeStreamFlushPublish1m
         )
+    }
+
+    fn is_native_stream_ingest(self) -> bool {
+        matches!(
+            self,
+            Self::NativeStreamIngest1m | Self::NativeStreamIngest4m | Self::NativeStreamIngest32m
+        )
+    }
+
+    fn is_native_stream_append_flush(self) -> bool {
+        matches!(
+            self,
+            Self::NativeStreamAppendFlush1m
+                | Self::NativeStreamAppendFlush4m
+                | Self::NativeStreamAppendFlush32m
+        )
+    }
+
+    fn is_native_stream_publish_preflushed(self) -> bool {
+        matches!(self, Self::NativeStreamPublishPreflushed1m)
+    }
+
+    fn is_native_stream_flush_publish(self) -> bool {
+        matches!(self, Self::NativeStreamFlushPublish1m)
     }
 
     fn is_block(self) -> bool {
@@ -533,6 +642,7 @@ impl Workload {
                 | Self::BlockWrite4kShardLanes
                 | Self::BlockRead4k
                 | Self::BlockWrite1m
+                | Self::BlockWrite1mShardLanes
         )
     }
 }
@@ -546,6 +656,7 @@ impl FromStr for Workload {
             "block-write-4k-shard-lanes" => Ok(Self::BlockWrite4kShardLanes),
             "block-read-4k" => Ok(Self::BlockRead4k),
             "block-write-1m" => Ok(Self::BlockWrite1m),
+            "block-write-1m-shard-lanes" => Ok(Self::BlockWrite1mShardLanes),
             "native-read-4k" => Ok(Self::NativeRead4k),
             "native-write-4k" => Ok(Self::NativeWrite4k),
             "native-write-1m" => Ok(Self::NativeWrite1m),
@@ -555,10 +666,14 @@ impl FromStr for Workload {
             "native-append-1m" => Ok(Self::NativeAppend1m),
             "native-append-4m" => Ok(Self::NativeAppend4m),
             "native-append-32m" => Ok(Self::NativeAppend32m),
-            "native-session-append-4k" => Ok(Self::NativeSessionAppend4k),
-            "native-session-append-1m" => Ok(Self::NativeSessionAppend1m),
-            "native-session-append-4m" => Ok(Self::NativeSessionAppend4m),
-            "native-session-append-32m" => Ok(Self::NativeSessionAppend32m),
+            "native-stream-ingest-1m" => Ok(Self::NativeStreamIngest1m),
+            "native-stream-ingest-4m" => Ok(Self::NativeStreamIngest4m),
+            "native-stream-ingest-32m" => Ok(Self::NativeStreamIngest32m),
+            "native-stream-append-flush-1m" => Ok(Self::NativeStreamAppendFlush1m),
+            "native-stream-append-flush-4m" => Ok(Self::NativeStreamAppendFlush4m),
+            "native-stream-append-flush-32m" => Ok(Self::NativeStreamAppendFlush32m),
+            "native-stream-publish-preflushed-1m" => Ok(Self::NativeStreamPublishPreflushed1m),
+            "native-stream-flush-publish-1m" => Ok(Self::NativeStreamFlushPublish1m),
             "native-hot-append-4k" => Ok(Self::NativeHotAppend4k),
             _ => Err(StorageError::invalid_argument(format!(
                 "unknown workload {value}"
@@ -636,18 +751,41 @@ impl BenchStore {
         offset: u64,
         data: &[u8],
         durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => store.write_device(device_id, offset, data, durability),
-            Self::Durable(store) => store.write_device(device_id, offset, data, durability),
+            Self::Local(store) => store.write_device_with_integrity(
+                device_id,
+                offset,
+                data,
+                durability,
+                payload_integrity,
+            ),
+            Self::Durable(store) => store.write_device_with_integrity(
+                device_id,
+                offset,
+                data,
+                durability,
+                payload_integrity,
+            ),
         }
         .map(|_| ())
     }
 
-    fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+    fn read_device(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()> {
         match self {
-            Self::Local(store) => store.read_device(device_id, range, buf),
-            Self::Durable(store) => store.read_device(device_id, range, buf),
+            Self::Local(store) => {
+                store.read_device_with_verification(device_id, range, buf, verification)
+            }
+            Self::Durable(store) => {
+                store.read_device_with_verification(device_id, range, buf, verification)
+            }
         }
     }
 
@@ -671,26 +809,33 @@ impl BenchStore {
         offset: u64,
         data: &[u8],
         durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => {
-                store.write_file_at(keyspace_id, file_id, offset, data, durability)
-            }
-            Self::Durable(store) => {
-                store.write_file_at(keyspace_id, file_id, offset, data, durability)
-            }
+            Self::Local(store) => store.write_file_at_with_integrity(
+                keyspace_id,
+                file_id,
+                offset,
+                data,
+                durability,
+                payload_integrity,
+            ),
+            Self::Durable(store) => store.write_file_at_with_integrity(
+                keyspace_id,
+                file_id,
+                offset,
+                data,
+                durability,
+                payload_integrity,
+            ),
         }
         .map(|_| ())
     }
 
-    fn open_append_session(
-        &self,
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-    ) -> Result<AppendSession> {
+    fn open_append_stream(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<AppendStream> {
         match self {
-            Self::Local(store) => store.open_append_session(keyspace_id, file_id),
-            Self::Durable(store) => store.open_append_session(keyspace_id, file_id),
+            Self::Local(store) => store.open_append_stream(keyspace_id, file_id),
+            Self::Durable(store) => store.open_append_stream(keyspace_id, file_id),
         }
     }
 
@@ -700,31 +845,44 @@ impl BenchStore {
         file_id: FileId,
         data: &[u8],
         durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<()> {
-        let session = self.open_append_session(keyspace_id, file_id)?;
-        let reservation = match self {
-            Self::Local(store) => store.reserve_append(&session, data.len() as u64),
-            Self::Durable(store) => store.reserve_append(&session, data.len() as u64),
-        }?;
-        self.append_reserved(reservation, data, durability)
+        let stream = self.open_append_stream(keyspace_id, file_id)?;
+        self.append_stream(&stream, data, durability, payload_integrity)?;
+        let mark = self.flush_append_stream(&stream)?;
+        self.publish_append_stream(&stream, &mark)
     }
 
-    fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation> {
+    fn append_stream(
+        &self,
+        stream: &AppendStream,
+        data: &[u8],
+        durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<AppendTicket> {
         match self {
-            Self::Local(store) => store.reserve_append(session, len),
-            Self::Durable(store) => store.reserve_append(session, len),
+            Self::Local(store) => {
+                store.append_stream_with_integrity(stream, data, durability, payload_integrity)
+            }
+            Self::Durable(store) => {
+                store.append_stream_with_integrity(stream, data, durability, payload_integrity)
+            }
         }
     }
 
-    fn append_reserved(
-        &self,
-        reservation: AppendReservation,
-        data: &[u8],
-        durability: WriteDurability,
-    ) -> Result<()> {
+    fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
         match self {
-            Self::Local(store) => store.append_reserved(reservation, data, durability),
-            Self::Durable(store) => store.append_reserved(reservation, data, durability),
+            Self::Local(store) => store.flush_append_stream(stream),
+            Self::Durable(store) => store.flush_append_stream(stream),
+        }
+    }
+
+    fn publish_append_stream(&self, stream: &AppendStream, mark: &DurableAppendMark) -> Result<()> {
+        match self {
+            Self::Local(store) => {
+                store.publish_append_stream(stream, mark, WriteDurability::Acknowledged)
+            }
+            Self::Durable(store) => store.publish_append_stream(stream, mark),
         }
         .map(|_| ())
     }
@@ -735,10 +893,15 @@ impl BenchStore {
         file_id: FileId,
         range: ByteRange,
         buf: &mut [u8],
+        verification: ReadVerification,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => store.read_file(keyspace_id, file_id, range, buf),
-            Self::Durable(store) => store.read_file(keyspace_id, file_id, range, buf),
+            Self::Local(store) => {
+                store.read_file_with_verification(keyspace_id, file_id, range, buf, verification)
+            }
+            Self::Durable(store) => {
+                store.read_file_with_verification(keyspace_id, file_id, range, buf, verification)
+            }
         }
     }
 
@@ -924,7 +1087,8 @@ fn setup_context(args: &Args, workload: Workload, store: BenchStore) -> Result<B
                     file_id,
                     0,
                     &payload,
-                    WriteDurability::Acknowledged,
+                    WriteDurability::Flushed,
+                    args.payload_integrity,
                 )?;
             }
             files.push(file_id);
@@ -956,6 +1120,7 @@ fn seed_block_read_workload(
             block * u64::from(BLOCK_SIZE),
             payload,
             WriteDurability::Acknowledged,
+            args.payload_integrity,
         )?;
     }
     store.flush_device(device_id)?;
@@ -980,6 +1145,10 @@ fn execute_load(
         delay_mode: args.delay_mode,
         durability: args.durability,
         samples_per_worker: args.samples_per_worker,
+        stream_flush_bytes: args.stream_flush_bytes,
+        stream_publish_bytes: args.stream_publish_bytes,
+        payload_integrity: args.payload_integrity,
+        read_verification: args.read_verification,
     };
 
     let reports = thread::scope(|scope| {
@@ -1014,6 +1183,10 @@ struct WorkerConfig {
     delay_mode: DelayMode,
     durability: DurabilityMode,
     samples_per_worker: usize,
+    stream_flush_bytes: Option<u64>,
+    stream_publish_bytes: Option<u64>,
+    payload_integrity: PayloadIntegrity,
+    read_verification: ReadVerification,
 }
 
 fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Result<WorkerReport> {
@@ -1027,6 +1200,7 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
     };
 
     while Instant::now() < config.deadline {
+        prepare_for_timed_op(&context, worker, &mut state, &config)?;
         let started = Instant::now();
         if !config.modeled_delay.is_zero() {
             apply_modeled_delay(config.modeled_delay, config.delay_mode);
@@ -1039,21 +1213,25 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
             &config,
             &mut read_buf,
         )
-        .and_then(|_| {
-            maybe_flush(
+        .and_then(|mut progress| {
+            progress.merge(maybe_flush(
                 &context,
                 config.workload,
                 config.durability,
                 report.attempts + 1,
                 worker,
-                state.last_native_file_index,
-            )
+                &mut state,
+            )?);
+            Ok(progress)
         });
         let elapsed = started.elapsed();
         let latency_nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let progress = result.as_ref().copied().unwrap_or_default();
         report.record(
             latency_nanos,
             context.op_size as u64,
+            progress.durable_bytes,
+            progress.published_bytes,
             result.is_ok(),
             &mut rng,
         );
@@ -1064,8 +1242,8 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
 
 #[derive(Default)]
 struct WorkerState {
-    session_append: Option<SessionAppendState>,
-    next_session_file_index: Option<usize>,
+    stream_append: Option<StreamAppendState>,
+    next_stream_file_index: Option<usize>,
     native_file_op: u64,
     last_native_file_index: Option<usize>,
 }
@@ -1085,10 +1263,112 @@ impl WorkerState {
     }
 }
 
-struct SessionAppendState {
+struct StreamAppendState {
     file_index: usize,
-    session: AppendSession,
+    stream: AppendStream,
     next_offset: u64,
+    durable_offset: u64,
+    published_offset: u64,
+    durable_mark: Option<DurableAppendMark>,
+}
+
+fn advance_stream_lane(state: &mut WorkerState, files_len: usize) {
+    if let Some(stream) = state.stream_append.as_ref() {
+        state.next_stream_file_index =
+            Some((stream.file_index + STREAM_APPEND_FILE_STRIDE) % files_len);
+    }
+    state.stream_append = None;
+}
+
+fn ensure_stream_append_state(
+    context: &BenchContext,
+    keyspace_id: KeyspaceId,
+    files: &[FileId],
+    worker: u64,
+    state: &mut WorkerState,
+    payload_len: u64,
+) -> Result<()> {
+    if let Some(stream) = state.stream_append.as_ref() {
+        let would_exceed = stream
+            .next_offset
+            .checked_add(payload_len)
+            .is_none_or(|end| end > DEFAULT_FILE_CAPACITY_BYTES);
+        if would_exceed {
+            advance_stream_lane(state, files.len());
+        }
+    }
+    if state.stream_append.is_none() {
+        let file_index = *state
+            .next_stream_file_index
+            .get_or_insert_with(|| worker as usize % files.len());
+        let file_id = files[file_index];
+        let stream = context.store.open_append_stream(keyspace_id, file_id)?;
+        let visible_base_size = stream.visible_base_size;
+        state.stream_append = Some(StreamAppendState {
+            file_index,
+            stream,
+            next_offset: visible_base_size,
+            durable_offset: visible_base_size,
+            published_offset: visible_base_size,
+            durable_mark: None,
+        });
+    }
+    Ok(())
+}
+
+fn prepare_for_timed_op(
+    context: &BenchContext,
+    worker: u64,
+    state: &mut WorkerState,
+    config: &WorkerConfig,
+) -> Result<()> {
+    if !config.workload.is_native_stream_publish_preflushed() {
+        return Ok(());
+    }
+    let Target::Native { keyspace_id, files } = &context.target else {
+        return Ok(());
+    };
+    let payload_len = context.payload.len() as u64;
+    ensure_stream_append_state(context, *keyspace_id, files, worker, state, payload_len)?;
+    let needs_preflush = state
+        .stream_append
+        .as_ref()
+        .is_none_or(|stream| stream.durable_mark.is_none());
+    if !needs_preflush {
+        return Ok(());
+    }
+    let stream = state
+        .stream_append
+        .as_ref()
+        .map(|stream| stream.stream.clone())
+        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+    let ticket = context.store.append_stream(
+        &stream,
+        &context.payload,
+        WriteDurability::Acknowledged,
+        config.payload_integrity,
+    )?;
+    let mark = context.store.flush_append_stream(&stream)?;
+    if let Some(stream_state) = state.stream_append.as_mut() {
+        stream_state.next_offset = ticket.range.offset.saturating_add(ticket.range.len);
+        stream_state.durable_offset = mark.durable_through;
+        stream_state.durable_mark = Some(mark);
+        state.last_native_file_index = Some(stream_state.file_index);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OpProgress {
+    durable_bytes: u64,
+    published_bytes: u64,
+}
+
+impl OpProgress {
+    fn merge(&mut self, other: Self) {
+        self.durable_bytes = self.durable_bytes.saturating_add(other.durable_bytes);
+        self.published_bytes = self.published_bytes.saturating_add(other.published_bytes);
+    }
 }
 
 fn apply_modeled_delay(delay: Duration, mode: DelayMode) {
@@ -1110,7 +1390,7 @@ fn run_one_op(
     rng: &mut Lcg,
     config: &WorkerConfig,
     read_buf: &mut [u8],
-) -> Result<()> {
+) -> Result<OpProgress> {
     let workload = config.workload;
     let concurrency = config.concurrency;
     let durability = config.durability.write_durability();
@@ -1125,12 +1405,16 @@ fn run_one_op(
             Workload::BlockWrite4k,
         ) => {
             let block = rng.below(*logical_blocks);
-            context.store.write_device(
-                *device_id,
-                block * u64::from(BLOCK_SIZE),
-                &context.payload,
-                durability,
-            )
+            context
+                .store
+                .write_device(
+                    *device_id,
+                    block * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
         }
         (
             Target::Block {
@@ -1152,12 +1436,16 @@ fn run_one_op(
                 .ok_or_else(|| StorageError::invalid_argument("shard end overflows"))?
                 / shard_count;
             let block = start + rng.below(end - start);
-            context.store.write_device(
-                *device_id,
-                block * u64::from(BLOCK_SIZE),
-                &context.payload,
-                durability,
-            )
+            context
+                .store
+                .write_device(
+                    *device_id,
+                    block * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
         }
         (
             Target::Block {
@@ -1169,12 +1457,49 @@ fn run_one_op(
         ) => {
             let blocks = (context.op_size as u64) / u64::from(BLOCK_SIZE);
             let start = rng.below(logical_blocks.saturating_sub(blocks).saturating_add(1));
-            context.store.write_device(
-                *device_id,
-                start * u64::from(BLOCK_SIZE),
-                &context.payload,
-                durability,
-            )
+            context
+                .store
+                .write_device(
+                    *device_id,
+                    start * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
+        }
+        (
+            Target::Block {
+                device_id,
+                logical_blocks,
+                shard_count,
+                ..
+            },
+            Workload::BlockWrite1mShardLanes,
+        ) => {
+            let blocks = (context.op_size as u64) / u64::from(BLOCK_SIZE);
+            let shard_count = *shard_count as u64;
+            let shard = worker % shard_count;
+            let start = logical_blocks
+                .checked_mul(shard)
+                .ok_or_else(|| StorageError::invalid_argument("shard start overflows"))?
+                / shard_count;
+            let end = logical_blocks
+                .checked_mul(shard + 1)
+                .ok_or_else(|| StorageError::invalid_argument("shard end overflows"))?
+                / shard_count;
+            let span = end.saturating_sub(start);
+            let block = start + rng.below(span.saturating_sub(blocks).saturating_add(1));
+            context
+                .store
+                .write_device(
+                    *device_id,
+                    block * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
         }
         (
             Target::Block {
@@ -1185,107 +1510,195 @@ fn run_one_op(
             Workload::BlockRead4k,
         ) => {
             let block = rng.below(*hot_blocks);
-            context.store.read_device(
-                *device_id,
-                ByteRange::new(block * u64::from(BLOCK_SIZE), context.op_size as u64),
-                read_buf,
-            )
+            context
+                .store
+                .read_device(
+                    *device_id,
+                    ByteRange::new(block * u64::from(BLOCK_SIZE), context.op_size as u64),
+                    read_buf,
+                    config.read_verification,
+                )
+                .map(|_| OpProgress::default())
         }
         (Target::Native { keyspace_id, files }, workload) if workload.is_native_write() => {
             let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());
             let file_id = files[file_index];
             context
                 .store
-                .write_file_at(*keyspace_id, file_id, 0, &context.payload, durability)
+                .write_file_at(
+                    *keyspace_id,
+                    file_id,
+                    0,
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
         }
         (Target::Native { keyspace_id, files }, Workload::NativeRead4k) => {
             let file_id = files[rng.below(files.len() as u64) as usize];
-            context.store.read_file(
-                *keyspace_id,
-                file_id,
-                ByteRange::new(0, context.op_size as u64),
-                read_buf,
-            )
+            context
+                .store
+                .read_file(
+                    *keyspace_id,
+                    file_id,
+                    ByteRange::new(0, context.op_size as u64),
+                    read_buf,
+                    config.read_verification,
+                )
+                .map(|_| OpProgress::default())
         }
         (Target::Native { keyspace_id, files }, workload) if workload.is_native_append() => {
             let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());
             let file_id = files[file_index];
             context
                 .store
-                .append_file_once(*keyspace_id, file_id, &context.payload, durability)
+                .append_file_once(
+                    *keyspace_id,
+                    file_id,
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, workload)
-            if workload.is_native_session_append() =>
-        {
+        (Target::Native { keyspace_id, files }, workload) if workload.is_native_stream() => {
             let payload_len = context.payload.len() as u64;
             for _ in 0..files.len() {
-                if let Some(session) = state.session_append.as_ref() {
-                    let would_exceed = session
-                        .next_offset
-                        .checked_add(payload_len)
-                        .is_none_or(|end| end > DEFAULT_FILE_CAPACITY_BYTES);
-                    if would_exceed {
-                        state.next_session_file_index =
-                            Some((session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len());
-                        state.session_append = None;
-                    }
+                let mut progress = OpProgress::default();
+                ensure_stream_append_state(
+                    context,
+                    *keyspace_id,
+                    files,
+                    worker,
+                    state,
+                    payload_len,
+                )?;
+                if workload.is_native_stream_publish_preflushed() {
+                    let stream = state
+                        .stream_append
+                        .as_ref()
+                        .map(|stream| stream.stream.clone())
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+                    let mark = state
+                        .stream_append
+                        .as_ref()
+                        .and_then(|stream| stream.durable_mark.clone())
+                        .ok_or_else(|| {
+                            StorageError::conflict("append stream has no durable mark")
+                        })?;
+                    let previous_published = state
+                        .stream_append
+                        .as_ref()
+                        .map(|stream| stream.published_offset)
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+                    context.store.publish_append_stream(&stream, &mark)?;
+                    progress.published_bytes = progress
+                        .published_bytes
+                        .saturating_add(mark.durable_through.saturating_sub(previous_published));
+                    advance_stream_lane(state, files.len());
+                    return Ok(progress);
                 }
-                if state.session_append.is_none() {
-                    let file_index = state
-                        .next_session_file_index
-                        .get_or_insert_with(|| worker as usize % files.len());
-                    let file_id = files[*file_index];
-                    let session = context.store.open_append_session(*keyspace_id, file_id)?;
-                    state.session_append = Some(SessionAppendState {
-                        file_index: *file_index,
-                        session,
-                        next_offset: 0,
-                    });
-                }
-                let session = state
-                    .session_append
+                let stream = state
+                    .stream_append
                     .as_ref()
-                    .map(|session| &session.session)
-                    .ok_or_else(|| StorageError::conflict("append session state missing"))?;
-                let reservation = match context.store.reserve_append(session, payload_len) {
-                    Ok(reservation) => reservation,
+                    .map(|stream| &stream.stream)
+                    .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+                let ticket = match context.store.append_stream(
+                    stream,
+                    &context.payload,
+                    WriteDurability::Acknowledged,
+                    config.payload_integrity,
+                ) {
+                    Ok(ticket) => ticket,
                     Err(error) => {
-                        if let Some(session) = state.session_append.as_ref() {
-                            state.next_session_file_index = Some(
-                                (session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len(),
-                            );
-                        }
-                        state.session_append = None;
+                        advance_stream_lane(state, files.len());
                         return Err(error);
                     }
                 };
-                let next_offset = reservation.offset.saturating_add(reservation.len);
+                let next_offset = ticket.range.offset.saturating_add(ticket.range.len);
                 if next_offset > DEFAULT_FILE_CAPACITY_BYTES {
-                    if let Some(session) = state.session_append.as_ref() {
-                        state.next_session_file_index =
-                            Some((session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len());
-                    }
-                    state.session_append = None;
+                    advance_stream_lane(state, files.len());
                     continue;
                 }
-                let result =
-                    context
-                        .store
-                        .append_reserved(reservation, &context.payload, durability);
-                if result.is_err() {
-                    if let Some(session) = state.session_append.as_ref() {
-                        state.next_session_file_index =
-                            Some((session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len());
-                    }
-                    state.session_append = None;
-                } else if let Some(session) = state.session_append.as_mut() {
-                    session.next_offset = next_offset;
-                    state.last_native_file_index = Some(session.file_index);
+                if let Some(stream) = state.stream_append.as_mut() {
+                    stream.next_offset = next_offset;
+                    stream.durable_mark = None;
+                    state.last_native_file_index = Some(stream.file_index);
                 }
-                return result;
+                let threshold_flush = state
+                    .stream_append
+                    .as_ref()
+                    .zip(config.stream_flush_bytes)
+                    .is_some_and(|(stream, threshold)| {
+                        stream.next_offset.saturating_sub(stream.durable_offset) >= threshold
+                    });
+                if workload.is_native_stream_append_flush()
+                    || workload.is_native_stream_flush_publish()
+                    || threshold_flush
+                {
+                    let stream = state
+                        .stream_append
+                        .as_ref()
+                        .map(|stream| stream.stream.clone())
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+                    let previous_durable = state
+                        .stream_append
+                        .as_ref()
+                        .map(|stream| stream.durable_offset)
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+                    let mark = context.store.flush_append_stream(&stream)?;
+                    if let Some(stream_state) = state.stream_append.as_mut() {
+                        progress.durable_bytes = progress
+                            .durable_bytes
+                            .saturating_add(mark.durable_through.saturating_sub(previous_durable));
+                        stream_state.durable_offset = mark.durable_through;
+                        stream_state.durable_mark = Some(mark);
+                    }
+                }
+                let threshold_publish = state
+                    .stream_append
+                    .as_ref()
+                    .zip(config.stream_publish_bytes)
+                    .is_some_and(|(stream, threshold)| {
+                        stream
+                            .durable_offset
+                            .saturating_sub(stream.published_offset)
+                            >= threshold
+                    });
+                if workload.is_native_stream_flush_publish() || threshold_publish {
+                    let stream = state
+                        .stream_append
+                        .as_ref()
+                        .map(|stream| stream.stream.clone())
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+                    let mark = state
+                        .stream_append
+                        .as_ref()
+                        .and_then(|stream| stream.durable_mark.clone())
+                        .ok_or_else(|| {
+                            StorageError::conflict("append stream has no durable mark")
+                        })?;
+                    let previous_published = state
+                        .stream_append
+                        .as_ref()
+                        .map(|stream| stream.published_offset)
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+                    context.store.publish_append_stream(&stream, &mark)?;
+                    if let Some(stream_state) = state.stream_append.as_mut() {
+                        progress.published_bytes = progress.published_bytes.saturating_add(
+                            mark.durable_through.saturating_sub(previous_published),
+                        );
+                        stream_state.published_offset = mark.durable_through;
+                    }
+                    if workload.is_native_stream_flush_publish() {
+                        advance_stream_lane(state, files.len());
+                    }
+                }
+                return Ok(progress);
             }
             Err(StorageError::conflict(
-                "append-session benchmark exhausted every file lane",
+                "append-stream benchmark exhausted every file lane",
             ))
         }
         (Target::Native { keyspace_id, files }, Workload::NativeHotAppend4k) => {
@@ -1293,7 +1706,14 @@ fn run_one_op(
             state.last_native_file_index = Some(0);
             context
                 .store
-                .append_file_once(*keyspace_id, file_id, &context.payload, durability)
+                .append_file_once(
+                    *keyspace_id,
+                    file_id,
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
         }
         _ => Err(StorageError::invalid_argument(
             "workload does not match benchmark target",
@@ -1307,24 +1727,46 @@ fn maybe_flush(
     durability: DurabilityMode,
     attempts_after_op: u64,
     worker: u64,
-    last_native_file_index: Option<usize>,
-) -> Result<()> {
+    state: &mut WorkerState,
+) -> Result<OpProgress> {
     let DurabilityMode::AckFlushEvery(every) = durability else {
-        return Ok(());
+        return Ok(OpProgress::default());
     };
     if !attempts_after_op.is_multiple_of(every) {
-        return Ok(());
+        return Ok(OpProgress::default());
     }
 
     match &context.target {
-        Target::Block { device_id, .. } => context.store.flush_device(*device_id).map(|_| ()),
+        Target::Block { device_id, .. } => context
+            .store
+            .flush_device(*device_id)
+            .map(|_| OpProgress::default()),
+        Target::Native { .. } if workload.is_native_stream_ingest() => {
+            if let Some(stream_state) = state.stream_append.as_mut() {
+                let previous_durable = stream_state.durable_offset;
+                let mark = context.store.flush_append_stream(&stream_state.stream)?;
+                let durable_through = mark.durable_through;
+                stream_state.durable_offset = durable_through;
+                stream_state.durable_mark = Some(mark);
+                return Ok(OpProgress {
+                    durable_bytes: durable_through.saturating_sub(previous_durable),
+                    published_bytes: 0,
+                });
+            }
+            Ok(OpProgress::default())
+        }
         Target::Native { keyspace_id, files } => {
             let file_id = if matches!(workload, Workload::NativeHotAppend4k) {
                 files[0]
             } else {
-                files[last_native_file_index.unwrap_or(worker as usize % files.len())]
+                files[state
+                    .last_native_file_index
+                    .unwrap_or(worker as usize % files.len())]
             };
-            context.store.flush_file(*keyspace_id, file_id).map(|_| ())
+            context
+                .store
+                .flush_file(*keyspace_id, file_id)
+                .map(|_| OpProgress::default())
         }
     }
 }
@@ -1387,6 +1829,8 @@ struct WorkerReport {
     successes: u64,
     errors: u64,
     bytes: u64,
+    durable_bytes: u64,
+    published_bytes: u64,
     max_latency_nanos: u64,
     latency_seen: u64,
     latencies: Vec<u64>,
@@ -1400,6 +1844,8 @@ impl WorkerReport {
             successes: 0,
             errors: 0,
             bytes: 0,
+            durable_bytes: 0,
+            published_bytes: 0,
             max_latency_nanos: 0,
             latency_seen: 0,
             latencies: Vec::with_capacity(sample_limit.min(1024)),
@@ -1407,13 +1853,23 @@ impl WorkerReport {
         }
     }
 
-    fn record(&mut self, latency_nanos: u64, bytes: u64, success: bool, rng: &mut Lcg) {
+    fn record(
+        &mut self,
+        latency_nanos: u64,
+        bytes: u64,
+        durable_bytes: u64,
+        published_bytes: u64,
+        success: bool,
+        rng: &mut Lcg,
+    ) {
         self.attempts = self.attempts.saturating_add(1);
         self.latency_seen = self.latency_seen.saturating_add(1);
         self.max_latency_nanos = self.max_latency_nanos.max(latency_nanos);
         if success {
             self.successes = self.successes.saturating_add(1);
             self.bytes = self.bytes.saturating_add(bytes);
+            self.durable_bytes = self.durable_bytes.saturating_add(durable_bytes);
+            self.published_bytes = self.published_bytes.saturating_add(published_bytes);
         } else {
             self.errors = self.errors.saturating_add(1);
         }
@@ -1443,6 +1899,8 @@ struct BenchReport {
     successes: u64,
     errors: u64,
     bytes: u64,
+    durable_bytes: u64,
+    published_bytes: u64,
     p50_nanos: u64,
     p90_nanos: u64,
     p99_nanos: u64,
@@ -1457,6 +1915,8 @@ impl BenchReport {
         let mut successes = 0_u64;
         let mut errors = 0_u64;
         let mut bytes = 0_u64;
+        let mut durable_bytes = 0_u64;
+        let mut published_bytes = 0_u64;
         let mut max_nanos = 0_u64;
         let mut samples = Vec::new();
 
@@ -1465,6 +1925,8 @@ impl BenchReport {
             successes = successes.saturating_add(worker.successes);
             errors = errors.saturating_add(worker.errors);
             bytes = bytes.saturating_add(worker.bytes);
+            durable_bytes = durable_bytes.saturating_add(worker.durable_bytes);
+            published_bytes = published_bytes.saturating_add(worker.published_bytes);
             max_nanos = max_nanos.max(worker.max_latency_nanos);
             samples.extend(worker.latencies);
         }
@@ -1483,6 +1945,8 @@ impl BenchReport {
             successes,
             errors,
             bytes,
+            durable_bytes,
+            published_bytes,
             p50_nanos: percentile(&samples, 0.50),
             p90_nanos: percentile(&samples, 0.90),
             p99_nanos: percentile(&samples, 0.99),
@@ -1497,8 +1961,10 @@ impl BenchReport {
         let success_iops = self.successes as f64 / seconds;
         let attempt_iops = self.attempts as f64 / seconds;
         let mbps = self.bytes as f64 / seconds / 1_000_000.0;
+        let durable_mbps = self.durable_bytes as f64 / seconds / 1_000_000.0;
+        let published_mbps = self.published_bytes as f64 / seconds / 1_000_000.0;
         println!(
-            "{},{},{},{},{},{},{},{:.6},{},{},{},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+            "{},{},{},{},{},{},{},{:.6},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
             self.workload.name(),
             self.provider,
             self.durability,
@@ -1513,6 +1979,10 @@ impl BenchReport {
             success_iops,
             attempt_iops,
             mbps,
+            durable_mbps,
+            published_mbps,
+            self.durable_bytes,
+            self.published_bytes,
             nanos_to_micros(self.p50_nanos),
             nanos_to_micros(self.p90_nanos),
             nanos_to_micros(self.p99_nanos),
@@ -1601,5 +2071,45 @@ mod tests {
         assert_eq!(file_index, 8);
         assert_eq!(state.last_native_file_index, Some(8));
         assert_eq!(state.native_file_op, 1);
+    }
+
+    #[test]
+    fn append_stream_suite_uses_explicit_ingest_flush_and_publish_names() {
+        let suite = Workload::append_stream_suite();
+        assert!(suite.contains(&Workload::NativeStreamIngest1m));
+        assert!(suite.contains(&Workload::NativeStreamAppendFlush1m));
+        assert!(suite.contains(&Workload::NativeStreamPublishPreflushed1m));
+        assert!(suite.contains(&Workload::NativeStreamFlushPublish1m));
+        assert!(Workload::from_str("native-stream-append-1m").is_err());
+        assert!(Workload::from_str("native-stream-publish-1m").is_err());
+    }
+
+    #[test]
+    fn integrity_flags_parse_explicit_modes() {
+        assert_eq!(
+            parse_payload_integrity("unchecked").unwrap(),
+            PayloadIntegrity::Unchecked
+        );
+        assert_eq!(
+            parse_read_verification("require-verified").unwrap(),
+            ReadVerification::RequireVerified
+        );
+        assert!(parse_payload_integrity("maybe").is_err());
+        assert!(parse_read_verification("maybe").is_err());
+    }
+
+    #[test]
+    fn bench_report_aggregates_durable_and_published_bytes() {
+        let mut first = WorkerReport::new(8);
+        let mut second = WorkerReport::new(8);
+        let mut rng = Lcg::new(1);
+
+        first.record(10, 100, 64, 32, true, &mut rng);
+        second.record(20, 200, 128, 96, true, &mut rng);
+
+        let report = BenchReport::from_workers(Duration::from_secs(1), vec![first, second]);
+        assert_eq!(report.bytes, 300);
+        assert_eq!(report.durable_bytes, 192);
+        assert_eq!(report.published_bytes, 128);
     }
 }

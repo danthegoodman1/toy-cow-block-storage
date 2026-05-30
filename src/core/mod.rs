@@ -293,7 +293,7 @@ mod tests {
                 segment_id: SegmentId::from_raw(2),
                 blocks: BlockCount::from_raw(1),
                 bytes: 4096,
-                checksum: Some(99),
+                integrity: crate::object::SegmentPayloadIntegrity::Crc32c(99),
             },
             placement: SegmentReplicaPlacement {
                 segment_id: SegmentId::from_raw(2),

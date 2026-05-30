@@ -21,21 +21,22 @@ pub use api::{
     BlockClient, BlockDevice, BlockOperation, BlockRange, BlockRequest, BlockRequestEnvelope,
     BlockResponse, BlockResponseEnvelope, BlockServer, BlockTransport, ByteRange,
     CreateDeviceRequest, DeleteResult, DeviceInfo, DeviceSpec, FlushResult, FlushScope,
-    ForkRequest, ReadResponse, RestorePoint, WriteCommit, WriteDurability,
+    ForkRequest, PayloadIntegrity, ReadResponse, ReadVerification, RestorePoint, WriteCommit,
+    WriteDurability,
 };
 pub use error::{Result, StorageError};
 pub use extent::{
-    AppendCommit, AppendReservation, AppendSession, CreateFileRequest, CreateKeyspaceRequest,
-    FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient,
-    NativeOperation, NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope,
-    NativeServer, NativeTransport, SnapshotKeyspaceRequest,
+    AppendPublishCommit, AppendStream, AppendTicket, CreateFileRequest, CreateKeyspaceRequest,
+    DurableAppendMark, FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo, NativeFile,
+    NativeKeyspaceClient, NativeOperation, NativeRequest, NativeRequestEnvelope, NativeResponse,
+    NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
 };
 pub use id::{
-    AppendReservationId, AppendSessionId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
-    CommitSeq, DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, GrantEpoch, GrantId,
-    GrantNonce, KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId,
-    LogicalDeadline, LogicalTime, PrincipalId, RequestId, ServerIncarnation, StorageNodeId,
-    StorageNodeKeyId, TenantId, WriteIntentId, WriterEpoch,
+    AppendStreamId, AppendTicketId, BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq,
+    DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion, GrantEpoch, GrantId, GrantNonce,
+    KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline,
+    LogicalTime, PrincipalId, RequestId, ServerIncarnation, StorageNodeId, StorageNodeKeyId,
+    TenantId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
     ChaosRemoteWireTransport, ChaosStorageNodeTransport, ChaosTransportMetrics,
@@ -50,6 +51,7 @@ pub use local::{
     RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport,
     RemoteWireTransport, SegmentLifecycleState, WriteAdmission,
 };
+pub use object::SegmentPayloadIntegrity;
 pub use provider::{
     DIAGNOSTICS_COUNTER_NAMES, DIAGNOSTICS_GAUGE_NAMES, DiagnosticsCounters, DiagnosticsGauges,
     DiagnosticsNodeSnapshot, DiagnosticsSnapshot, GrantHash, GrantReceiptAuthority,

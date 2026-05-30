@@ -1,8 +1,11 @@
-use crate::api::{ByteRange, FlushResult, ReadResponse, RestorePoint, WriteDurability};
+use crate::api::{
+    ByteRange, FlushResult, PayloadIntegrity, ReadResponse, ReadVerification, RestorePoint,
+    WriteDurability,
+};
 use crate::error::{Result, StorageError};
 use crate::id::{
-    AppendReservationId, AppendSessionId, CheckpointId, ClientEpoch, CommitSeq, ExtentId, FileId,
-    FileVersion, KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
+    AppendStreamId, AppendTicketId, CheckpointId, ClientEpoch, CommitSeq, FileId, FileVersion,
+    KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,30 +46,38 @@ pub struct FileInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppendSession {
+pub struct AppendStream {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
-    pub session_id: AppendSessionId,
+    pub stream_id: AppendStreamId,
     pub writer_epoch: WriterEpoch,
     pub base_version: FileVersion,
+    pub visible_base_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppendReservation {
+pub struct AppendTicket {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
-    pub session_id: AppendSessionId,
-    pub reservation_id: AppendReservationId,
+    pub stream_id: AppendStreamId,
+    pub ticket_id: AppendTicketId,
     pub writer_epoch: WriterEpoch,
-    pub offset: u64,
-    pub len: u64,
+    pub range: ByteRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppendCommit {
+pub struct DurableAppendMark {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
-    pub extent_id: ExtentId,
+    pub stream_id: AppendStreamId,
+    pub writer_epoch: WriterEpoch,
+    pub durable_through: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppendPublishCommit {
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
     pub range: ByteRange,
     pub version: FileVersion,
     pub commit_seq: CommitSeq,
@@ -91,9 +102,11 @@ pub enum NativeOperation {
     FileInfo,
     Read,
     Write,
-    OpenAppendSession,
-    ReserveAppend,
-    AppendReserved,
+    OpenAppendStream,
+    AppendStream,
+    FlushAppendStream,
+    PublishAppendStream,
+    AbortAppendStream,
     Flush,
     CheckpointKeyspace,
     SnapshotKeyspace,
@@ -103,22 +116,18 @@ pub enum NativeOperation {
 /// User-facing native file handle.
 ///
 /// This API is a sibling of the block API over the shared segment substrate. It
-/// preserves file-level intent such as byte writes, append sessions, and writer
-/// epochs while keeping snapshots at the keyspace/filesystem boundary.
+/// keeps file-level writer intent visible to the coordinator instead of forcing
+/// append ownership through block writes.
 ///
 /// Minimal implementor guarantees:
 ///
-/// - Successful writes and appends are atomic file-version transitions inside
-///   one keyspace catalog commit.
-/// - Stale append sessions, stale reservations, and stale writer epochs fail
-///   without exposing partial file contents.
-/// - Reads observe the latest committed file root/version in this file's
-///   keyspace.
-/// - Failed writes and appends leave the previous committed file version
-///   readable, even when durable segment bytes later need custodian cleanup.
-/// - Native file operations share write-intent, segment lifecycle, metadata,
-///   and custodian machinery with the block mapping layer instead of being
-///   implemented as ordinary block writes.
+/// - Successful writes are atomic file-version transitions.
+/// - Append streams separate durable ingest from visible publish: durable
+///   private bytes remain invisible until `publish_append_stream` succeeds.
+/// - Stale append stream tokens fail without exposing partial file contents.
+/// - Reads observe the latest visible file root/version in this keyspace.
+/// - Failed writes and publishes leave the previous visible file version
+///   readable, even when durable private bytes later need custodian cleanup.
 pub trait NativeFile: Send + Sync {
     /// Return the stable ID of this file handle's keyspace.
     fn keyspace_id(&self) -> KeyspaceId;
@@ -126,56 +135,82 @@ pub trait NativeFile: Send + Sync {
     /// Return the stable ID of this file handle within its keyspace.
     fn file_id(&self) -> FileId;
 
-    /// Return committed file information.
-    ///
-    /// The returned size and version must describe committed state, not an
-    /// in-flight append.
+    /// Return committed visible file information.
     fn info(&self) -> Result<FileInfo>;
 
-    /// Read bytes from committed file extents.
-    ///
-    /// Implementors must fill the whole buffer or return an error. Reads may
-    /// start and end at arbitrary byte offsets; segment/block alignment is an
-    /// implementation detail. A zero-length buffer is a no-op. Reads past the
-    /// committed file size must fail rather than synthesize data.
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    /// Read bytes from committed visible file extents.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.read_at_with_verification(offset, buf, ReadVerification::Default)
+    }
+
+    /// Read visible file bytes with an explicit payload verification policy.
+    fn read_at_with_verification(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()>;
 
     /// Write bytes at an arbitrary file offset.
     ///
-    /// Success means the byte payload is durable and committed as one
-    /// file-version transition. Writes may overwrite existing bytes or extend
-    /// the file from its current end; sparse writes beyond the current end must
-    /// fail. Segment/block alignment is an implementation detail. A zero-length
-    /// write is a no-op and must not allocate segment data.
-    fn write_at(&self, offset: u64, data: &[u8]) -> Result<FileWriteCommit>;
+    /// Success means the byte payload is durable and committed as one visible
+    /// file-version transition. Any active append stream for this same file is
+    /// fenced before the write can publish.
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<FileWriteCommit> {
+        self.write_at_with_integrity(offset, data, PayloadIntegrity::Verified)
+    }
 
-    /// Open an append session for this file.
-    ///
-    /// A session carries the keyspace, file version, and writer epoch needed to
-    /// fence stale append commits. Opening a new session for the same file
-    /// invalidates older sessions.
-    fn open_append_session(&self) -> Result<AppendSession>;
+    /// Write bytes at an arbitrary file offset with an explicit payload
+    /// integrity policy.
+    fn write_at_with_integrity(
+        &self,
+        offset: u64,
+        data: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<FileWriteCommit>;
 
-    /// Reserve append space inside an open session.
+    /// Open an append stream for this file.
     ///
-    /// Reservations assign monotonically increasing file offsets from the
-    /// session's volatile reserved tail. V1 implementations may require
-    /// reservations to commit in offset order.
-    fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation>;
+    /// Opening a new stream for the same file fences the previous active stream.
+    /// The new stream starts at the current visible file size.
+    fn open_append_stream(&self) -> Result<AppendStream>;
 
-    /// Append bytes using a previously acquired reservation.
+    /// Ingest append bytes into the private stream.
     ///
-    /// Success means the byte payload is durable and committed as one
-    /// file-version transition. Payload length does not need to be block
-    /// aligned. Stale sessions/reservations must fail without exposing partial
-    /// file data. A zero-length append is invalid because it creates no useful
-    /// extent or version transition.
-    fn append_reserved(&self, reservation: AppendReservation, data: &[u8]) -> Result<AppendCommit>;
+    /// Success reserves a monotonically increasing byte range in the stream and
+    /// stores the bytes privately. Readers do not see the bytes until a later
+    /// publish. A zero-length append is invalid.
+    fn append_stream(&self, stream: &AppendStream, data: &[u8]) -> Result<AppendTicket> {
+        self.append_stream_with_integrity(stream, data, PayloadIntegrity::Verified)
+    }
+
+    /// Ingest append bytes with an explicit payload integrity policy.
+    fn append_stream_with_integrity(
+        &self,
+        stream: &AppendStream,
+        data: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<AppendTicket>;
+
+    /// Make private stream bytes durable through the returned high-water mark.
+    ///
+    /// Success does not advance visible file metadata. The returned mark can be
+    /// used by `publish_append_stream`.
+    fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark>;
+
+    /// Publish durable private stream bytes as one visible file-version
+    /// transition.
+    fn publish_append_stream(
+        &self,
+        stream: &AppendStream,
+        mark: &DurableAppendMark,
+    ) -> Result<AppendPublishCommit>;
+
+    /// Abandon the active stream. Durable private bytes are no longer GC roots
+    /// after abort and may be reclaimed by custodians.
+    fn abort_append_stream(&self, stream: &AppendStream) -> Result<()>;
 
     /// Flush previously acknowledged native file writes.
-    ///
-    /// Success means every acknowledged commit through the returned sequence has
-    /// reached the durability level promised by the implementation.
     fn flush(&self) -> Result<FlushResult>;
 }
 
@@ -185,31 +220,19 @@ pub trait NativeFile: Send + Sync {
 /// root layout, segment placement, or provider topology.
 pub trait NativeKeyspaceClient: Send + Sync {
     /// Create an empty native keyspace.
-    ///
-    /// Success means an empty immutable keyspace catalog root is committed.
     fn create_keyspace(&self, request: CreateKeyspaceRequest) -> Result<KeyspaceId>;
 
     /// Return committed information for a native keyspace.
     fn keyspace_info(&self, keyspace_id: KeyspaceId) -> Result<KeyspaceInfo>;
 
     /// Create a native file inside a keyspace.
-    ///
-    /// Success means the keyspace catalog has atomically advanced to include
-    /// the initial empty file root.
     fn create_file(&self, keyspace_id: KeyspaceId, request: CreateFileRequest) -> Result<FileId>;
 
-    /// Return committed information for a native file in a keyspace.
+    /// Return visible committed information for a native file in a keyspace.
     fn file_info(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileInfo>;
 
-    /// Open an append session for a native file.
-    ///
-    /// The session must be fenced by the committed file version observed by the
-    /// server and a writer epoch that stale writers cannot reuse successfully.
-    fn open_append_session(
-        &self,
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-    ) -> Result<AppendSession>;
+    /// Open an append stream for a native file.
+    fn open_append_stream(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<AppendStream>;
 
     /// Checkpoint a native keyspace catalog root for PITR replay.
     fn checkpoint_keyspace(&self, keyspace_id: KeyspaceId) -> Result<CheckpointId>;
@@ -245,30 +268,42 @@ pub enum NativeRequest {
         keyspace_id: KeyspaceId,
         file_id: FileId,
         range: ByteRange,
+        verification: ReadVerification,
     },
     Write {
         keyspace_id: KeyspaceId,
         file_id: FileId,
         offset: u64,
         bytes: Vec<u8>,
+        payload_integrity: PayloadIntegrity,
         durability: WriteDurability,
     },
-    OpenAppendSession {
+    OpenAppendStream {
         keyspace_id: KeyspaceId,
         file_id: FileId,
     },
-    ReserveAppend {
+    AppendStream {
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        session: AppendSession,
-        len: u64,
-    },
-    AppendReserved {
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        reservation: AppendReservation,
+        stream: AppendStream,
         bytes: Vec<u8>,
-        durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    },
+    FlushAppendStream {
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        stream: AppendStream,
+    },
+    PublishAppendStream {
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        stream: AppendStream,
+        mark: DurableAppendMark,
+    },
+    AbortAppendStream {
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        stream: AppendStream,
     },
     Flush {
         keyspace_id: KeyspaceId,
@@ -296,9 +331,11 @@ impl NativeRequest {
             Self::FileInfo { .. } => NativeOperation::FileInfo,
             Self::Read { .. } => NativeOperation::Read,
             Self::Write { .. } => NativeOperation::Write,
-            Self::OpenAppendSession { .. } => NativeOperation::OpenAppendSession,
-            Self::ReserveAppend { .. } => NativeOperation::ReserveAppend,
-            Self::AppendReserved { .. } => NativeOperation::AppendReserved,
+            Self::OpenAppendStream { .. } => NativeOperation::OpenAppendStream,
+            Self::AppendStream { .. } => NativeOperation::AppendStream,
+            Self::FlushAppendStream { .. } => NativeOperation::FlushAppendStream,
+            Self::PublishAppendStream { .. } => NativeOperation::PublishAppendStream,
+            Self::AbortAppendStream { .. } => NativeOperation::AbortAppendStream,
             Self::Flush { .. } => NativeOperation::Flush,
             Self::CheckpointKeyspace { .. } => NativeOperation::CheckpointKeyspace,
             Self::SnapshotKeyspace { .. } => NativeOperation::SnapshotKeyspace,
@@ -313,9 +350,11 @@ impl NativeRequest {
             | Self::FileInfo { keyspace_id, .. }
             | Self::Read { keyspace_id, .. }
             | Self::Write { keyspace_id, .. }
-            | Self::OpenAppendSession { keyspace_id, .. }
-            | Self::ReserveAppend { keyspace_id, .. }
-            | Self::AppendReserved { keyspace_id, .. }
+            | Self::OpenAppendStream { keyspace_id, .. }
+            | Self::AppendStream { keyspace_id, .. }
+            | Self::FlushAppendStream { keyspace_id, .. }
+            | Self::PublishAppendStream { keyspace_id, .. }
+            | Self::AbortAppendStream { keyspace_id, .. }
             | Self::Flush { keyspace_id, .. }
             | Self::CheckpointKeyspace { keyspace_id } => Some(*keyspace_id),
             Self::SnapshotKeyspace { source, .. } | Self::RestoreKeyspace { source, .. } => {
@@ -330,9 +369,11 @@ impl NativeRequest {
             Self::FileInfo { file_id, .. }
             | Self::Read { file_id, .. }
             | Self::Write { file_id, .. }
-            | Self::OpenAppendSession { file_id, .. }
-            | Self::ReserveAppend { file_id, .. }
-            | Self::AppendReserved { file_id, .. }
+            | Self::OpenAppendStream { file_id, .. }
+            | Self::AppendStream { file_id, .. }
+            | Self::FlushAppendStream { file_id, .. }
+            | Self::PublishAppendStream { file_id, .. }
+            | Self::AbortAppendStream { file_id, .. }
             | Self::Flush { file_id, .. } => Some(*file_id),
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
@@ -352,20 +393,20 @@ impl NativeRequest {
                 })?;
                 Ok(Some(ByteRange::new(*offset, len)))
             }
-            Self::AppendReserved {
-                reservation, bytes, ..
-            } => {
+            Self::AppendStream { stream, bytes, .. } => {
                 let len = u64::try_from(bytes.len()).map_err(|_| {
                     StorageError::invalid_argument("append byte length overflows u64")
                 })?;
-                Ok(Some(ByteRange::new(reservation.offset, len)))
+                Ok(Some(ByteRange::new(stream.visible_base_size, len)))
             }
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
             | Self::CreateFile { .. }
             | Self::FileInfo { .. }
-            | Self::OpenAppendSession { .. }
-            | Self::ReserveAppend { .. }
+            | Self::OpenAppendStream { .. }
+            | Self::FlushAppendStream { .. }
+            | Self::PublishAppendStream { .. }
+            | Self::AbortAppendStream { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -390,9 +431,11 @@ impl NativeRequest {
             | Self::FileInfo { .. }
             | Self::Read { .. }
             | Self::Write { .. }
-            | Self::OpenAppendSession { .. }
-            | Self::ReserveAppend { .. }
-            | Self::AppendReserved { .. }
+            | Self::OpenAppendStream { .. }
+            | Self::AppendStream { .. }
+            | Self::FlushAppendStream { .. }
+            | Self::PublishAppendStream { .. }
+            | Self::AbortAppendStream { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -414,30 +457,10 @@ impl NativeRequest {
                 ByteRange::new(*offset, len).end_exclusive()?;
                 Ok(())
             }
-            Self::ReserveAppend {
+            Self::AppendStream {
                 keyspace_id,
                 file_id,
-                session,
-                len,
-            } => {
-                if *len == 0 {
-                    return Err(StorageError::invalid_argument(
-                        "append reservation length must not be zero",
-                    ));
-                }
-
-                if *keyspace_id != session.keyspace_id || *file_id != session.file_id {
-                    return Err(StorageError::invalid_argument(
-                        "append session target does not match request target",
-                    ));
-                }
-
-                Ok(())
-            }
-            Self::AppendReserved {
-                keyspace_id,
-                file_id,
-                reservation,
+                stream,
                 bytes,
                 ..
             } => {
@@ -446,17 +469,45 @@ impl NativeRequest {
                         "append payload must not be empty",
                     ));
                 }
-                let len = u64::try_from(bytes.len()).map_err(|_| {
-                    StorageError::invalid_argument("append byte length overflows u64")
-                })?;
-                if len != reservation.len {
+                if *keyspace_id != stream.keyspace_id || *file_id != stream.file_id {
                     return Err(StorageError::invalid_argument(
-                        "append payload length does not match reservation",
+                        "append stream target does not match request target",
                     ));
                 }
-                if *keyspace_id != reservation.keyspace_id || *file_id != reservation.file_id {
+                Ok(())
+            }
+            Self::FlushAppendStream {
+                keyspace_id,
+                file_id,
+                stream,
+            }
+            | Self::AbortAppendStream {
+                keyspace_id,
+                file_id,
+                stream,
+            } => {
+                if *keyspace_id != stream.keyspace_id || *file_id != stream.file_id {
                     return Err(StorageError::invalid_argument(
-                        "append reservation target does not match request target",
+                        "append stream target does not match request target",
+                    ));
+                }
+                Ok(())
+            }
+            Self::PublishAppendStream {
+                keyspace_id,
+                file_id,
+                stream,
+                mark,
+            } => {
+                if *keyspace_id != stream.keyspace_id
+                    || *file_id != stream.file_id
+                    || *keyspace_id != mark.keyspace_id
+                    || *file_id != mark.file_id
+                    || stream.stream_id != mark.stream_id
+                    || stream.writer_epoch != mark.writer_epoch
+                {
+                    return Err(StorageError::invalid_argument(
+                        "append publish target does not match stream and mark",
                     ));
                 }
                 Ok(())
@@ -465,7 +516,7 @@ impl NativeRequest {
             | Self::KeyspaceInfo { .. }
             | Self::FileInfo { .. }
             | Self::Read { .. }
-            | Self::OpenAppendSession { .. }
+            | Self::OpenAppendStream { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -482,9 +533,11 @@ pub enum NativeResponse {
     FileInfo(FileInfo),
     Read(ReadResponse),
     Write(FileWriteCommit),
-    Append(AppendCommit),
-    AppendSession(AppendSession),
-    AppendReservation(AppendReservation),
+    AppendStreamOpened(AppendStream),
+    AppendTicket(AppendTicket),
+    DurableAppendMark(DurableAppendMark),
+    AppendPublished(AppendPublishCommit),
+    AppendAborted,
     Flush(FlushResult),
     KeyspaceCheckpointed(CheckpointId),
     KeyspaceSnapshotted(KeyspaceId),
@@ -533,40 +586,12 @@ pub struct NativeResponseEnvelope {
 }
 
 /// Actor boundary for native keyspace/file requests.
-///
-/// `NativeServer` is a request coordinator for native keyspace semantics.
-/// Future storage replication should be coordinated below this API and above
-/// individual `SegmentStore` endpoints.
-///
-/// Minimal implementor guarantees:
-///
-/// - Preserve request identity in the response envelope.
-/// - Validate public request shape before mutating provider state.
-/// - Fence conflicting append writers with keyspace, sessions, reservations,
-///   file versions, and writer epochs.
-/// - Translate native operations into shared substrate operations without
-///   routing them through block-device logical mappings.
-/// - Keep retries idempotent or reject them deterministically by request ID and
-///   client epoch.
 pub trait NativeServer: Send + Sync {
     /// Handle one native request envelope.
-    ///
-    /// Success returns exactly one response for the supplied request ID.
-    /// Failure must not leave caller-visible partial state.
     fn handle(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope>;
 }
 
 /// Transport boundary for native keyspace/file requests.
-///
-/// Minimal implementor guarantees:
-///
-/// - The transport may be local or remote, but it must not change native
-///   keyspace or file semantics.
-/// - Responses must match the submitted request ID.
-/// - Duplicate, delayed, reordered, or stale responses must be rejected or
-///   surfaced as errors rather than silently applied to the wrong request.
-/// - Transport failure does not imply storage failure; callers may need to
-///   retry with the same request identity.
 pub trait NativeTransport: Send + Sync {
     /// Send one native request and return the matching response envelope.
     fn call(&self, request: NativeRequestEnvelope) -> Result<NativeResponseEnvelope>;
@@ -576,25 +601,24 @@ pub trait NativeTransport: Send + Sync {
 mod tests {
     use super::*;
 
-    fn session(keyspace_id: KeyspaceId, file_id: FileId) -> AppendSession {
-        AppendSession {
+    fn stream(keyspace_id: KeyspaceId, file_id: FileId) -> AppendStream {
+        AppendStream {
             keyspace_id,
             file_id,
-            session_id: AppendSessionId::from_raw(9),
+            stream_id: AppendStreamId::from_raw(9),
             writer_epoch: WriterEpoch::from_raw(3),
             base_version: FileVersion::from_raw(2),
+            visible_base_size: 11,
         }
     }
 
-    fn reservation(keyspace_id: KeyspaceId, file_id: FileId) -> AppendReservation {
-        AppendReservation {
+    fn mark(keyspace_id: KeyspaceId, file_id: FileId) -> DurableAppendMark {
+        DurableAppendMark {
             keyspace_id,
             file_id,
-            session_id: AppendSessionId::from_raw(9),
-            reservation_id: AppendReservationId::from_raw(10),
+            stream_id: AppendStreamId::from_raw(9),
             writer_epoch: WriterEpoch::from_raw(3),
-            offset: 11,
-            len: 3,
+            durable_through: 14,
         }
     }
 
@@ -602,12 +626,12 @@ mod tests {
     fn native_requests_expose_operation_and_targets() {
         let keyspace_id = KeyspaceId::from_raw(5);
         let file_id = FileId::from_raw(7);
-        let request = NativeRequest::OpenAppendSession {
+        let request = NativeRequest::OpenAppendStream {
             keyspace_id,
             file_id,
         };
 
-        assert_eq!(request.operation(), NativeOperation::OpenAppendSession);
+        assert_eq!(request.operation(), NativeOperation::OpenAppendStream);
         assert_eq!(request.target_keyspace_id(), Some(keyspace_id));
         assert_eq!(request.target_file_id(), Some(file_id));
         let write = NativeRequest::Write {
@@ -615,6 +639,7 @@ mod tests {
             file_id,
             offset: 16,
             bytes: vec![1, 2, 3],
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
         assert_eq!(write.operation(), NativeOperation::Write);
@@ -660,62 +685,43 @@ mod tests {
     }
 
     #[test]
-    fn append_validation_requires_matching_session_reservation_and_payload() {
+    fn append_stream_validation_requires_matching_targets_and_payload() {
         let keyspace_id = KeyspaceId::from_raw(5);
         let file_id = FileId::from_raw(7);
-        let reserve = NativeRequest::ReserveAppend {
+        let valid = NativeRequest::AppendStream {
             keyspace_id,
             file_id,
-            session: session(keyspace_id, file_id),
-            len: 3,
-        };
-        assert!(reserve.validate_for_existing_file().is_ok());
-
-        let valid = NativeRequest::AppendReserved {
-            keyspace_id,
-            file_id,
-            reservation: reservation(keyspace_id, file_id),
+            stream: stream(keyspace_id, file_id),
             bytes: vec![1, 2, 3],
-            durability: WriteDurability::Acknowledged,
+            payload_integrity: PayloadIntegrity::Verified,
         };
         assert!(valid.validate_for_existing_file().is_ok());
 
-        let empty_reserve = NativeRequest::ReserveAppend {
+        let empty = NativeRequest::AppendStream {
             keyspace_id,
             file_id,
-            session: session(keyspace_id, file_id),
-            len: 0,
-        };
-        assert!(empty_reserve.validate_for_existing_file().is_err());
-
-        let empty = NativeRequest::AppendReserved {
-            keyspace_id,
-            file_id,
-            reservation: AppendReservation {
-                len: 0,
-                ..reservation(keyspace_id, file_id)
-            },
+            stream: stream(keyspace_id, file_id),
             bytes: Vec::new(),
-            durability: WriteDurability::Acknowledged,
+            payload_integrity: PayloadIntegrity::Verified,
         };
         assert!(empty.validate_for_existing_file().is_err());
 
-        let mismatched_session = NativeRequest::ReserveAppend {
+        let mismatched_stream = NativeRequest::AppendStream {
             keyspace_id,
             file_id,
-            session: session(keyspace_id, FileId::from_raw(8)),
-            len: 1,
-        };
-        assert!(mismatched_session.validate_for_existing_file().is_err());
-
-        let mismatched_reservation = NativeRequest::AppendReserved {
-            keyspace_id,
-            file_id,
-            reservation: reservation(keyspace_id, FileId::from_raw(8)),
+            stream: stream(keyspace_id, FileId::from_raw(8)),
             bytes: vec![1],
-            durability: WriteDurability::Acknowledged,
+            payload_integrity: PayloadIntegrity::Verified,
         };
-        assert!(mismatched_reservation.validate_for_existing_file().is_err());
+        assert!(mismatched_stream.validate_for_existing_file().is_err());
+
+        let publish = NativeRequest::PublishAppendStream {
+            keyspace_id,
+            file_id,
+            stream: stream(keyspace_id, file_id),
+            mark: mark(keyspace_id, file_id),
+        };
+        assert!(publish.validate_for_existing_file().is_ok());
     }
 
     #[test]
@@ -727,6 +733,7 @@ mod tests {
             file_id,
             offset: 9,
             bytes: Vec::new(),
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
         assert!(empty.validate_for_existing_file().is_ok());
@@ -736,6 +743,7 @@ mod tests {
             file_id,
             offset: u64::MAX,
             bytes: vec![1],
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
         assert!(overflowing.validate_for_existing_file().is_err());

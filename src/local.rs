@@ -22,18 +22,18 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::api::{
     BlockClient, BlockDevice, BlockRequest, BlockRequestEnvelope, BlockResponse,
     BlockResponseEnvelope, BlockServer, BlockTransport, ByteRange, CreateDeviceRequest,
-    DeleteResult, DeviceInfo, FlushResult, FlushScope, ForkRequest, ReadResponse, RestorePoint,
-    WriteCommit, WriteDurability,
+    DeleteResult, DeviceInfo, FlushResult, FlushScope, ForkRequest, PayloadIntegrity, ReadResponse,
+    ReadVerification, RestorePoint, WriteCommit, WriteDurability,
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
-    AppendCommit, AppendReservation, AppendSession, CreateFileRequest, CreateKeyspaceRequest,
-    FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo, NativeFile, NativeKeyspaceClient,
-    NativeRequest, NativeRequestEnvelope, NativeResponse, NativeResponseEnvelope, NativeServer,
-    NativeTransport, SnapshotKeyspaceRequest,
+    AppendPublishCommit, AppendStream, AppendTicket, CreateFileRequest, CreateKeyspaceRequest,
+    DurableAppendMark, FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo, NativeFile,
+    NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope, NativeResponse,
+    NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
 };
 use crate::id::{
-    AppendReservationId, AppendSessionId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
+    AppendStreamId, AppendTicketId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
     CommitGroupId, CommitSeq, DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion,
     GrantEpoch, GrantId, GrantNonce, KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId,
     KeyspaceRootId, LogicalDeadline, LogicalTime, MetadataNodeId, PrincipalId, RequestId,
@@ -44,7 +44,7 @@ use crate::object::{
     Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
     ForkRecord, KeyspaceCatalogShard, KeyspaceCommit, KeyspaceFile, KeyspaceHead, KeyspaceRoot,
     LeafEntry, MappingOwner, MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate,
-    SegmentDescriptor, ShardCommit, ShardRootUpdate,
+    SegmentDescriptor, SegmentPayloadIntegrity, ShardCommit, ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, DiagnosticsCounters, DiagnosticsGauges, DiagnosticsNodeSnapshot,
@@ -449,7 +449,7 @@ impl LocalGrantReceiptAuthority {
             write_intent: grant.write_intent,
             intent: grant.intent,
             bytes: grant.max_bytes,
-            checksum: commit.descriptor.checksum,
+            integrity: commit.descriptor.integrity,
             durability: grant.durability,
             lifecycle: SegmentReceiptLifecycle::DurablePendingMetadata,
             receipt_epoch: grant.grant_epoch,
@@ -540,6 +540,7 @@ impl GrantReceiptAuthority for LocalGrantReceiptAuthority {
             segment_id: request.segment_id,
             storage_node: request.storage_node,
             max_bytes: request.max_bytes,
+            payload_integrity: request.payload_integrity,
             durability: request.durability,
             key_id,
             proof_scheme: ProofScheme::DeterministicTestMacV1,
@@ -633,9 +634,9 @@ impl GrantReceiptAuthority for LocalGrantReceiptAuthority {
                 "receipt byte count does not match descriptor and placement",
             ));
         }
-        if receipt.checksum != receipt.descriptor.checksum {
+        if receipt.integrity != receipt.descriptor.integrity {
             return Err(StorageError::conflict(
-                "receipt checksum does not match descriptor",
+                "receipt payload integrity does not match descriptor",
             ));
         }
         Ok(VerifiedSegmentReceipt {
@@ -829,7 +830,8 @@ impl StorageNodeTransport for LocalStorageNode {
                     if receipt.grant_id == grant.grant_id
                         && receipt.grant_hash == grant_hash
                         && receipt.bytes == bytes_len
-                        && receipt.checksum == Some(checksum64(&bytes))
+                        && receipt.integrity
+                            == segment_payload_integrity(grant.payload_integrity, &bytes)
                     {
                         let existing_len = usize::try_from(bytes_len).map_err(|_| {
                             StorageError::invalid_argument(
@@ -875,9 +877,11 @@ impl StorageNodeTransport for LocalStorageNode {
                     .segment_catalog
                     .reserve_segment_with_id(grant.segment_id, intent)?;
                 self.segment_catalog.begin_write(&reservation)?;
-                let commit = self
-                    .segment_store
-                    .write_segment_owned(&reservation, bytes)?;
+                let commit = self.segment_store.write_segment_owned(
+                    &reservation,
+                    bytes,
+                    grant.payload_integrity,
+                )?;
                 self.segment_store.sync_segment(reservation.segment_id)?;
                 let receipt = self.authority.create_segment_receipt_after_verified_write(
                     &grant,
@@ -1109,6 +1113,65 @@ impl StorageNodeRegistry {
             current_segments,
             new_segments,
         ))
+    }
+
+    fn state_for_segment_ids(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<(SelectedStorageNodeState, Vec<DurableSegmentPayload>)> {
+        let mut nodes = BTreeMap::new();
+        let mut payloads = Vec::new();
+        if segment_ids.is_empty() {
+            return Ok((nodes, payloads));
+        }
+        for (ordinal, node_id) in self.node_order.iter().enumerate() {
+            let node = self.node(*node_id)?;
+            let catalog = node.segment_catalog.state_inner()?;
+            let selected: Vec<_> = segment_ids
+                .iter()
+                .copied()
+                .filter(|segment_id| catalog.entries.contains_key(segment_id))
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            for segment_id in selected {
+                payloads.push(
+                    node.segment_store
+                        .payload_for_segment(*node_id, segment_id)?,
+                );
+            }
+            nodes.insert(
+                *node_id,
+                (
+                    ordinal,
+                    StorageNodeInner {
+                        segment_store: SegmentStoreInner {
+                            next_offset: node.segment_store.next_offset()?,
+                            segments: BTreeMap::new(),
+                        },
+                        segment_catalog: catalog,
+                    },
+                ),
+            );
+        }
+        let found: BTreeSet<_> = payloads.iter().map(|payload| payload.segment_id).collect();
+        if &found != segment_ids {
+            return Err(StorageError::corrupt(
+                "stream flush references segments missing from storage-node catalogs",
+            ));
+        }
+        Ok((nodes, payloads))
+    }
+
+    fn verify_segment_payload_for_read(
+        &self,
+        segment_id: SegmentId,
+        verification: ReadVerification,
+    ) -> Result<()> {
+        self.owner_node_for_segment(segment_id)?
+            .segment_store
+            .verify_segment_payload_for_read(segment_id, verification)
     }
 
     fn segment_ids(&self) -> Result<BTreeSet<SegmentId>> {
@@ -1393,13 +1456,27 @@ impl LocalCoordinator {
         BTreeSet<SegmentId>,
         Vec<DurableSegmentPayload>,
     )> {
-        let (storage_nodes, current_segments, new_segments) = self
+        let mut metadata = self.metadata.state_inner()?;
+        let unflushed_private_segments = metadata.unflushed_append_stream_segment_ids();
+        metadata.prune_append_streams_for_durable_export();
+
+        let (mut storage_nodes, mut current_segments, mut new_segments) = self
             .storage_nodes
             .state_inner_for_persist(previous_segments)?;
+        if !unflushed_private_segments.is_empty() {
+            current_segments.retain(|segment_id| !unflushed_private_segments.contains(segment_id));
+            new_segments
+                .retain(|payload| !unflushed_private_segments.contains(&payload.segment_id));
+            for node in storage_nodes.nodes.values_mut() {
+                node.segment_catalog
+                    .entries
+                    .retain(|segment_id, _| !unflushed_private_segments.contains(segment_id));
+            }
+        }
         Ok((
             DurableStoreState {
                 config: self.metadata.config,
-                metadata: self.metadata.state_inner()?,
+                metadata,
                 storage_nodes,
                 next_write_intent: *lock(&self.next_write_intent)?,
                 next_extent_id: *lock(&self.next_extent_id)?,
@@ -1407,6 +1484,50 @@ impl LocalCoordinator {
             current_segments,
             new_segments,
         ))
+    }
+
+    fn state_for_segment_ids(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<(SelectedStorageNodeState, Vec<DurableSegmentPayload>)> {
+        self.storage_nodes.state_for_segment_ids(segment_ids)
+    }
+
+    fn durable_export_cursor(&self) -> Result<DurableExportCursor> {
+        let metadata = lock(&self.metadata.inner)?;
+        Ok(DurableExportCursor {
+            config: self.metadata.config,
+            next_device_id: metadata.next_device_id,
+            next_keyspace_id: metadata.next_keyspace_id,
+            next_file_id: metadata.next_file_id,
+            next_metadata_node_id: metadata.next_metadata_node_id,
+            next_keyspace_root_id: metadata.next_keyspace_root_id,
+            next_keyspace_catalog_shard_id: metadata.next_keyspace_catalog_shard_id,
+            next_commit_group_id: metadata.next_commit_group_id,
+            next_commit_seq: metadata.next_commit_seq,
+            next_checkpoint_id: metadata.next_checkpoint_id,
+            next_gc_epoch: metadata.next_gc_epoch,
+            next_write_intent: *lock(&self.next_write_intent)?,
+            next_extent_id: *lock(&self.next_extent_id)?,
+            next_segment_id: *lock(&self.storage_nodes.next_segment_id)?,
+            next_placement_index: *lock(&self.storage_nodes.next_placement_index)?,
+        })
+    }
+
+    fn metadata_state_inner(&self) -> Result<MetadataInner> {
+        self.metadata.state_inner()
+    }
+
+    fn verify_segment_payloads_for_read(
+        &self,
+        segment_ids: BTreeSet<SegmentId>,
+        verification: ReadVerification,
+    ) -> Result<()> {
+        for segment_id in segment_ids {
+            self.storage_nodes
+                .verify_segment_payload_for_read(segment_id, verification)?;
+        }
+        Ok(())
     }
 
     fn segment_ids(&self) -> Result<BTreeSet<SegmentId>> {
@@ -1567,6 +1688,23 @@ impl LocalCoordinator {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<WriteCommit> {
+        self.write_device_with_integrity(
+            device_id,
+            offset,
+            data,
+            durability,
+            PayloadIntegrity::Verified,
+        )
+    }
+
+    pub fn write_device_with_integrity(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<WriteCommit> {
         let info = self.metadata.device_info(device_id)?;
         let len = u64::try_from(data.len())
             .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
@@ -1638,6 +1776,7 @@ impl LocalCoordinator {
                 write_intent,
                 chunk_bytes.to_vec(),
                 durability,
+                payload_integrity,
             )?;
             let segment_id = verified_receipt.descriptor.segment_id;
 
@@ -1769,24 +1908,30 @@ impl LocalCoordinator {
         })
     }
 
-    pub fn open_append_session(
+    pub fn open_append_stream(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-    ) -> Result<AppendSession> {
-        self.metadata.open_append_session(keyspace_id, file_id)
+    ) -> Result<AppendStream> {
+        self.metadata.open_append_stream(keyspace_id, file_id)
     }
 
-    pub fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation> {
-        self.metadata.reserve_append(session, len)
-    }
-
-    pub fn append_reserved(
+    pub fn append_stream(
         &self,
-        reservation: AppendReservation,
+        stream: &AppendStream,
         data: &[u8],
         durability: crate::api::WriteDurability,
-    ) -> Result<AppendCommit> {
+    ) -> Result<AppendTicket> {
+        self.append_stream_with_integrity(stream, data, durability, PayloadIntegrity::Verified)
+    }
+
+    pub fn append_stream_with_integrity(
+        &self,
+        stream: &AppendStream,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<AppendTicket> {
         if data.is_empty() {
             return Err(StorageError::invalid_argument(
                 "append payload must not be empty",
@@ -1805,28 +1950,206 @@ impl LocalCoordinator {
         );
         let data_len = u64::try_from(data.len())
             .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
-        if data_len != reservation.len {
-            return Err(StorageError::invalid_argument(
-                "append payload length does not match reservation",
-            ));
-        }
+        let block_size = u64::from(self.metadata.config.block_size);
+        let segment_blocks = blocks_for_bytes(data_len, block_size)?;
+        let segment_len = segment_blocks.checked_mul(block_size).ok_or_else(|| {
+            StorageError::invalid_argument("append segment byte length overflows")
+        })?;
+        let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
+            StorageError::invalid_argument("append segment byte length overflows usize")
+        })?;
+        let segment_bytes = if data_len == segment_len {
+            data.to_vec()
+        } else {
+            let mut segment_bytes = Vec::with_capacity(segment_len_usize);
+            segment_bytes.extend_from_slice(data);
+            segment_bytes.resize(segment_len_usize, 0);
+            segment_bytes
+        };
+        let ticket_id = self.metadata.next_append_ticket_id()?;
+        let ticket_range = self
+            .metadata
+            .reserve_append_stream_range(stream, data_len)?;
 
+        let verified_receipt = match self.write_segment_for_intent_with_id_owned_verified(
+            WriteGrantIntent::NativeAppendStream {
+                keyspace_id: stream.keyspace_id,
+                file_id: stream.file_id,
+                stream_id: stream.stream_id,
+                ticket_id,
+                append_offset: ticket_range.offset,
+                bytes: data_len,
+                writer_epoch: stream.writer_epoch,
+            },
+            self.next_write_intent()?,
+            segment_bytes,
+            durability,
+            payload_integrity,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = self.metadata.abort_append_stream(stream);
+                return Err(error);
+            }
+        };
+        self.metadata.append_stream_record(
+            stream,
+            ticket_id,
+            ticket_range,
+            verified_receipt.descriptor.segment_id,
+            verified_receipt.descriptor.bytes,
+        )
+    }
+
+    pub fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+        self.metadata.mark_append_stream_durable(stream)
+    }
+
+    pub fn publish_append_stream(
+        &self,
+        stream: &AppendStream,
+        mark: &DurableAppendMark,
+        durability: crate::api::WriteDurability,
+    ) -> Result<AppendPublishCommit> {
+        let state = self.metadata.validate_append_stream_mark(stream, mark)?;
         let head = self
             .metadata
-            .get_file_head(reservation.keyspace_id, reservation.file_id)?;
-        if head.size != reservation.offset {
+            .get_file_head(stream.keyspace_id, stream.file_id)?;
+        if head.size != state.published_through {
             return Err(StorageError::conflict(
-                "append reservation commits out of order",
+                "append stream no longer matches visible file head",
             ));
         }
-        self.metadata.validate_append_reservation(&reservation)?;
+        if mark.durable_through == state.published_through {
+            return Ok(AppendPublishCommit {
+                keyspace_id: stream.keyspace_id,
+                file_id: stream.file_id,
+                range: ByteRange::new(mark.durable_through, 0),
+                version: head.version,
+                commit_seq: head.latest_commit,
+                durability,
+            });
+        }
 
-        let owner = MappingOwner::NativeKeyspace(reservation.keyspace_id);
+        let block_size = u64::from(self.metadata.config.block_size);
+        let unpublished: Vec<_> = state
+            .records
+            .iter()
+            .filter(|record| {
+                record.offset >= state.published_through
+                    && record.offset < mark.durable_through
+                    && record.offset.saturating_add(record.len) <= mark.durable_through
+            })
+            .cloned()
+            .collect();
+        if unpublished.is_empty() {
+            return Err(StorageError::conflict(
+                "append stream mark has no durable records to publish",
+            ));
+        }
+
+        let mut direct = head.size % block_size == 0;
+        let mut expected_offset = head.size;
+        for (index, record) in unpublished.iter().enumerate() {
+            direct &= record.offset == expected_offset;
+            direct &= record.offset % block_size == 0;
+            if index + 1 != unpublished.len() {
+                direct &= record.len % block_size == 0;
+            }
+            expected_offset = record
+                .offset
+                .checked_add(record.len)
+                .ok_or_else(|| StorageError::invalid_argument("append record end overflows"))?;
+        }
+        direct &= expected_offset == mark.durable_through;
+
+        let (new_root, receipts) = if direct {
+            let mut root = head.root;
+            let mut receipts = Vec::with_capacity(unpublished.len());
+            for record in &unpublished {
+                let segment_blocks = blocks_for_bytes(record.len, block_size)?;
+                let append_range = crate::api::BlockRange::new(
+                    BlockIndex::from_raw(record.offset / block_size),
+                    BlockCount::from_raw(segment_blocks),
+                );
+                let receipt = self.storage_nodes.receipt_for_segment(record.segment_id)?;
+                let verified = self.verify_segment_receipt(&receipt)?;
+                root = self
+                    .replace_tree_range_with_receipts(
+                        root,
+                        TreeRangeEdit {
+                            range: append_range,
+                            replacement: Some(SegmentReplacement {
+                                segment_id: record.segment_id,
+                                segment_base: append_range.start,
+                            }),
+                        },
+                        std::slice::from_ref(&verified),
+                    )?
+                    .root;
+                receipts.push(receipt);
+            }
+            (root, receipts)
+        } else {
+            self.publish_append_stream_coalesced(
+                stream.keyspace_id,
+                &head,
+                &unpublished,
+                mark.durable_through,
+            )?
+        };
+
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
+            owner: MappingOwner::NativeKeyspace(stream.keyspace_id),
+            fence: MetadataFence::AppendStream {
+                stream_id: stream.stream_id,
+                writer_epoch: stream.writer_epoch,
+            },
+            updates: vec![RootUpdate::FileRoot {
+                file_id: stream.file_id,
+                old_root: head.root,
+                new_root,
+                new_size: mark.durable_through,
+            }],
+        })?;
+        for receipt in &receipts {
+            self.storage_nodes.mark_segment_referenced(
+                receipt,
+                commit_group.commit_seq,
+                self.authority.as_ref(),
+            )?;
+        }
+        self.metadata
+            .mark_append_stream_published(stream, mark.durable_through)?;
+        let committed = self
+            .metadata
+            .get_file_head(stream.keyspace_id, stream.file_id)?;
+
+        Ok(AppendPublishCommit {
+            keyspace_id: stream.keyspace_id,
+            file_id: stream.file_id,
+            range: ByteRange::new(head.size, mark.durable_through - head.size),
+            version: committed.version,
+            commit_seq: committed.latest_commit,
+            durability,
+        })
+    }
+
+    fn publish_append_stream_coalesced(
+        &self,
+        keyspace_id: KeyspaceId,
+        head: &FileHead,
+        records: &[AppendStreamSegment],
+        durable_through: u64,
+    ) -> Result<(MetadataNodeId, Vec<SegmentWriteReceipt>)> {
         let block_size = u64::from(self.metadata.config.block_size);
         let tail_bytes = head.size % block_size;
         let segment_start_block = head.size / block_size;
+        let append_len = durable_through
+            .checked_sub(head.size)
+            .ok_or_else(|| StorageError::invalid_argument("append publish size regresses"))?;
         let segment_payload_len = tail_bytes
-            .checked_add(data_len)
+            .checked_add(append_len)
             .ok_or_else(|| StorageError::invalid_argument("append segment length overflows"))?;
         let segment_blocks = blocks_for_bytes(segment_payload_len, block_size)?;
         let segment_len = segment_blocks.checked_mul(block_size).ok_or_else(|| {
@@ -1835,127 +2158,88 @@ impl LocalCoordinator {
         let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
             StorageError::invalid_argument("append segment byte length overflows usize")
         })?;
-        let segment_bytes = if tail_bytes == 0 && data_len == segment_len {
-            data.to_vec()
-        } else {
-            let mut segment_bytes = Vec::with_capacity(segment_len_usize);
-
-            if tail_bytes != 0 {
-                let tail_range = crate::api::BlockRange::new(
-                    BlockIndex::from_raw(segment_start_block),
-                    BlockCount::from_raw(1),
-                );
-                if !self.tree_has_mappings(head.root, tail_range)? {
-                    return Err(StorageError::corrupt(
-                        "unaligned native file size has no tail block mapping",
-                    ));
-                }
-                let block_size_usize = usize::try_from(block_size)
-                    .map_err(|_| StorageError::invalid_argument("block size overflows usize"))?;
-                let tail_bytes_usize = usize::try_from(tail_bytes).map_err(|_| {
-                    StorageError::invalid_argument("tail byte count overflows usize")
-                })?;
-                let mut tail_block = vec![0; block_size_usize];
-                let root = self.metadata.get_metadata_node(head.root)?;
-                self.read_metadata_node(&root, tail_range, block_size, &mut tail_block)?;
-                segment_bytes.extend_from_slice(&tail_block[..tail_bytes_usize]);
+        let mut segment_bytes = Vec::with_capacity(segment_len_usize);
+        if tail_bytes != 0 {
+            let tail_range = crate::api::BlockRange::new(
+                BlockIndex::from_raw(segment_start_block),
+                BlockCount::from_raw(1),
+            );
+            if !self.tree_has_mappings(head.root, tail_range)? {
+                return Err(StorageError::corrupt(
+                    "unaligned native file size has no tail block mapping",
+                ));
             }
+            let block_size_usize = usize::try_from(block_size)
+                .map_err(|_| StorageError::invalid_argument("block size overflows usize"))?;
+            let tail_bytes_usize = usize::try_from(tail_bytes)
+                .map_err(|_| StorageError::invalid_argument("tail byte count overflows usize"))?;
+            let mut tail_block = vec![0; block_size_usize];
+            let root = self.metadata.get_metadata_node(head.root)?;
+            self.read_metadata_node(&root, tail_range, block_size, &mut tail_block)?;
+            segment_bytes.extend_from_slice(&tail_block[..tail_bytes_usize]);
+        }
 
-            segment_bytes.extend_from_slice(data);
-            segment_bytes.resize(segment_len_usize, 0);
-            segment_bytes
-        };
+        let append_len_usize = usize::try_from(append_len)
+            .map_err(|_| StorageError::invalid_argument("append length overflows usize"))?;
+        let mut append_bytes = vec![0; append_len_usize];
+        for record in records {
+            let record_offset = record
+                .offset
+                .checked_sub(head.size)
+                .ok_or_else(|| StorageError::invalid_argument("append record precedes head"))?;
+            let record_offset = usize::try_from(record_offset).map_err(|_| {
+                StorageError::invalid_argument("append record offset overflows usize")
+            })?;
+            let record_len = usize::try_from(record.len)
+                .map_err(|_| StorageError::invalid_argument("append record len overflows usize"))?;
+            let record_end = record_offset
+                .checked_add(record_len)
+                .ok_or_else(|| StorageError::invalid_argument("append record end overflows"))?;
+            let out = append_bytes
+                .get_mut(record_offset..record_end)
+                .ok_or_else(|| {
+                    StorageError::corrupt("append record range exceeds durable publish range")
+                })?;
+            self.storage_nodes.read_segment(
+                record.segment_id,
+                ByteRange::new(0, record.len),
+                out,
+            )?;
+        }
+        segment_bytes.extend_from_slice(&append_bytes);
+        segment_bytes.resize(segment_len_usize, 0);
 
         let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
-            WriteGrantIntent::NativeAppend {
-                keyspace_id: reservation.keyspace_id,
-                file_id: reservation.file_id,
-                session_id: reservation.session_id,
-                reservation_id: reservation.reservation_id,
-                append_offset: reservation.offset,
-                bytes: data_len,
-                writer_epoch: reservation.writer_epoch,
+            WriteGrantIntent::Internal {
+                owner: MappingOwner::NativeKeyspace(keyspace_id),
             },
             self.next_write_intent()?,
             segment_bytes,
-            durability,
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
         )?;
         let append_range = crate::api::BlockRange::new(
             BlockIndex::from_raw(segment_start_block),
             BlockCount::from_raw(segment_blocks),
         );
-        let new_size = head
-            .size
-            .checked_add(data_len)
-            .ok_or_else(|| StorageError::invalid_argument("file size overflows u64"))?;
-        let edit = TreeRangeEdit {
-            range: append_range,
-            replacement: Some(SegmentReplacement {
-                segment_id: verified_receipt.descriptor.segment_id,
-                segment_base: append_range.start,
-            }),
-        };
-        if tail_bytes == 0 && self.tree_has_mappings(head.root, append_range)? {
-            return Err(StorageError::conflict(
-                "append range overlaps existing file metadata",
-            ));
-        }
-        if tail_bytes != 0 && segment_blocks > 1 {
-            let next_block = segment_start_block
-                .checked_add(1)
-                .ok_or_else(|| StorageError::invalid_argument("append range overflows"))?;
-            let new_blocks = crate::api::BlockRange::new(
-                BlockIndex::from_raw(next_block),
-                BlockCount::from_raw(segment_blocks - 1),
-            );
-            if self.tree_has_mappings(head.root, new_blocks)? {
-                return Err(StorageError::conflict(
-                    "append range overlaps existing file metadata after tail block",
-                ));
-            }
-        }
         let new_root = self
             .replace_tree_range_with_receipts(
                 head.root,
-                edit,
+                TreeRangeEdit {
+                    range: append_range,
+                    replacement: Some(SegmentReplacement {
+                        segment_id: verified_receipt.descriptor.segment_id,
+                        segment_base: append_range.start,
+                    }),
+                },
                 std::slice::from_ref(&verified_receipt),
             )?
             .root;
+        Ok((new_root, vec![verified_receipt.receipt().clone()]))
+    }
 
-        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
-            owner,
-            fence: MetadataFence::AppendReservation {
-                session_id: reservation.session_id,
-                reservation_id: reservation.reservation_id,
-                offset: reservation.offset,
-                len: reservation.len,
-                writer_epoch: reservation.writer_epoch,
-            },
-            updates: vec![RootUpdate::FileRoot {
-                file_id: reservation.file_id,
-                old_root: head.root,
-                new_root,
-                new_size,
-            }],
-        })?;
-        self.storage_nodes.mark_segment_referenced(
-            verified_receipt.receipt(),
-            commit_group.commit_seq,
-            self.authority.as_ref(),
-        )?;
-        let committed = self
-            .metadata
-            .get_file_head(reservation.keyspace_id, reservation.file_id)?;
-
-        Ok(AppendCommit {
-            keyspace_id: reservation.keyspace_id,
-            file_id: reservation.file_id,
-            extent_id: self.next_extent_id()?,
-            range: ByteRange::new(head.size, data_len),
-            version: committed.version,
-            commit_seq: committed.latest_commit,
-            durability,
-        })
+    pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        self.metadata.abort_append_stream(stream)
     }
 
     pub fn write_file_at(
@@ -1965,6 +2249,25 @@ impl LocalCoordinator {
         offset: u64,
         data: &[u8],
         durability: crate::api::WriteDurability,
+    ) -> Result<FileWriteCommit> {
+        self.write_file_at_with_integrity(
+            keyspace_id,
+            file_id,
+            offset,
+            data,
+            durability,
+            PayloadIntegrity::Verified,
+        )
+    }
+
+    pub fn write_file_at_with_integrity(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<FileWriteCommit> {
         let data_len = u64::try_from(data.len())
             .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
@@ -2056,6 +2359,7 @@ impl LocalCoordinator {
             self.next_write_intent()?,
             segment_bytes,
             durability,
+            payload_integrity,
         )?;
         let edit = TreeRangeEdit {
             range: write_range,
@@ -2089,7 +2393,7 @@ impl LocalCoordinator {
             self.authority.as_ref(),
         )?;
         self.metadata
-            .invalidate_append_sessions_for_file(keyspace_id, file_id)?;
+            .invalidate_append_streams_for_file(keyspace_id, file_id)?;
         let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
 
         Ok(FileWriteCommit {
@@ -2295,6 +2599,7 @@ impl LocalCoordinator {
             write_intent,
             data,
             WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
         )
     }
 
@@ -2305,8 +2610,15 @@ impl LocalCoordinator {
         write_intent: WriteIntentId,
         data: &[u8],
         durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<SegmentWriteReceipt> {
-        self.write_segment_for_intent_with_id_owned(intent, write_intent, data.to_vec(), durability)
+        self.write_segment_for_intent_with_id_owned(
+            intent,
+            write_intent,
+            data.to_vec(),
+            durability,
+            payload_integrity,
+        )
     }
 
     #[cfg(test)]
@@ -2316,6 +2628,7 @@ impl LocalCoordinator {
         write_intent: WriteIntentId,
         data: Vec<u8>,
         durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<SegmentWriteReceipt> {
         Ok(self
             .write_segment_for_intent_with_id_owned_verified(
@@ -2323,6 +2636,7 @@ impl LocalCoordinator {
                 write_intent,
                 data,
                 durability,
+                payload_integrity,
             )?
             .receipt)
     }
@@ -2333,6 +2647,7 @@ impl LocalCoordinator {
         write_intent: WriteIntentId,
         data: Vec<u8>,
         durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<VerifiedSegmentReceipt> {
         let max_bytes = u64::try_from(data.len()).map_err(|_| {
             StorageError::invalid_argument("segment reservation byte length overflows u64")
@@ -2348,6 +2663,7 @@ impl LocalCoordinator {
             segment_id,
             storage_node,
             max_bytes,
+            payload_integrity,
             durability,
             expires_at: LOCAL_GRANT_EXPIRATION,
         })?;
@@ -2418,6 +2734,7 @@ impl LocalCoordinator {
             segment_id,
             storage_node,
             max_bytes,
+            payload_integrity: PayloadIntegrity::Verified,
             durability,
             expires_at: LOCAL_GRANT_EXPIRATION,
         })
@@ -2454,50 +2771,7 @@ impl LocalCoordinator {
             segment_id,
             storage_node,
             max_bytes: segment_bytes,
-            durability,
-            expires_at: LOCAL_GRANT_EXPIRATION,
-        })
-    }
-
-    pub fn issue_native_append_grant(
-        &self,
-        reservation: AppendReservation,
-        logical_bytes: u64,
-        segment_bytes: u64,
-        durability: WriteDurability,
-    ) -> Result<WriteGrant> {
-        if logical_bytes == 0 || segment_bytes == 0 {
-            return Err(StorageError::invalid_argument(
-                "native append grant must contain bytes",
-            ));
-        }
-        let head = self
-            .metadata
-            .get_file_head(reservation.keyspace_id, reservation.file_id)?;
-        if head.size != reservation.offset || logical_bytes != reservation.len {
-            return Err(StorageError::conflict("stale append reservation"));
-        }
-        self.metadata.validate_append_reservation(&reservation)?;
-        let candidates = self.storage_nodes.storage_node_ids()?;
-        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
-        let segment_id = self.storage_nodes.allocate_segment_id()?;
-        let write_intent = self.next_write_intent()?;
-        self.issue_write_grant(WriteGrantRequest {
-            tenant: LOCAL_TENANT_ID,
-            principal: LOCAL_PRINCIPAL_ID,
-            intent: WriteGrantIntent::NativeAppend {
-                keyspace_id: reservation.keyspace_id,
-                file_id: reservation.file_id,
-                session_id: reservation.session_id,
-                reservation_id: reservation.reservation_id,
-                append_offset: reservation.offset,
-                bytes: logical_bytes,
-                writer_epoch: reservation.writer_epoch,
-            },
-            write_intent,
-            segment_id,
-            storage_node,
-            max_bytes: segment_bytes,
+            payload_integrity: PayloadIntegrity::Verified,
             durability,
             expires_at: LOCAL_GRANT_EXPIRATION,
         })
@@ -2800,177 +3074,12 @@ impl LocalCoordinator {
             self.authority.as_ref(),
         )?;
         self.metadata
-            .invalidate_append_sessions_for_file(keyspace_id, file_id)?;
+            .invalidate_append_streams_for_file(keyspace_id, file_id)?;
         let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
         Ok(FileWriteCommit {
             keyspace_id,
             file_id,
             range,
-            version: committed.version,
-            commit_seq: committed.latest_commit,
-            durability: receipt.durability,
-        })
-    }
-
-    pub fn submit_native_append_receipt(
-        &self,
-        grant: &WriteGrant,
-        receipt: SegmentWriteReceipt,
-    ) -> Result<AppendCommit> {
-        self.observability.record_with_update(
-            StorageEventKind::CoordinatorWriteStarted,
-            None,
-            None,
-            None,
-            None,
-            |counters| {
-                counters.coordinator_write_attempts =
-                    counters.coordinator_write_attempts.saturating_add(1);
-            },
-        );
-        let verified = self.verify_receipt_matches_grant_observed(grant, &receipt)?;
-        let (
-            keyspace_id,
-            file_id,
-            session_id,
-            reservation_id,
-            append_offset,
-            logical_bytes,
-            writer_epoch,
-        ) = match receipt.intent {
-            WriteGrantIntent::NativeAppend {
-                keyspace_id,
-                file_id,
-                session_id,
-                reservation_id,
-                append_offset,
-                bytes,
-                writer_epoch,
-            }
-            | WriteGrantIntent::NativeReservedAppend {
-                keyspace_id,
-                file_id,
-                session_id,
-                reservation_id,
-                append_offset,
-                bytes,
-                writer_epoch,
-            } => (
-                keyspace_id,
-                file_id,
-                session_id,
-                reservation_id,
-                append_offset,
-                bytes,
-                writer_epoch,
-            ),
-            _ => {
-                return Err(StorageError::invalid_argument(
-                    "trusted native append publish requires a native append receipt",
-                ));
-            }
-        };
-        if receipt.owner != MappingOwner::NativeKeyspace(keyspace_id) {
-            return Err(StorageError::conflict(
-                "receipt owner does not match native keyspace intent",
-            ));
-        }
-        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
-        if head.size != append_offset {
-            return Err(StorageError::conflict("stale native append receipt"));
-        }
-        let reservation = AppendReservation {
-            keyspace_id,
-            file_id,
-            session_id,
-            reservation_id,
-            writer_epoch,
-            offset: append_offset,
-            len: logical_bytes,
-        };
-        self.metadata.validate_append_reservation(&reservation)?;
-        let block_size = u64::from(self.metadata.config.block_size);
-        let tail_bytes = head.size % block_size;
-        let segment_start_block = head.size / block_size;
-        let segment_payload_len = tail_bytes
-            .checked_add(logical_bytes)
-            .ok_or_else(|| StorageError::invalid_argument("append segment length overflows"))?;
-        let segment_blocks = blocks_for_bytes(segment_payload_len, block_size)?;
-        let expected_segment_bytes = segment_blocks.checked_mul(block_size).ok_or_else(|| {
-            StorageError::invalid_argument("append segment byte length overflows")
-        })?;
-        if verified.descriptor.bytes != expected_segment_bytes {
-            return Err(StorageError::conflict(
-                "native append receipt byte count does not match metadata intent",
-            ));
-        }
-        let append_range = crate::api::BlockRange::new(
-            BlockIndex::from_raw(segment_start_block),
-            BlockCount::from_raw(segment_blocks),
-        );
-        if tail_bytes == 0 && self.tree_has_mappings(head.root, append_range)? {
-            return Err(StorageError::conflict(
-                "append range overlaps existing file metadata",
-            ));
-        }
-        if tail_bytes != 0 && segment_blocks > 1 {
-            let next_block = segment_start_block
-                .checked_add(1)
-                .ok_or_else(|| StorageError::invalid_argument("append range overflows"))?;
-            let new_blocks = crate::api::BlockRange::new(
-                BlockIndex::from_raw(next_block),
-                BlockCount::from_raw(segment_blocks - 1),
-            );
-            if self.tree_has_mappings(head.root, new_blocks)? {
-                return Err(StorageError::conflict(
-                    "append range overlaps existing file metadata after tail block",
-                ));
-            }
-        }
-        let new_root = self
-            .replace_tree_range_with_receipts(
-                head.root,
-                TreeRangeEdit {
-                    range: append_range,
-                    replacement: Some(SegmentReplacement {
-                        segment_id: verified.descriptor.segment_id,
-                        segment_base: append_range.start,
-                    }),
-                },
-                std::slice::from_ref(&verified),
-            )?
-            .root;
-        let new_size = head
-            .size
-            .checked_add(logical_bytes)
-            .ok_or_else(|| StorageError::invalid_argument("file size overflows u64"))?;
-        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
-            owner: MappingOwner::NativeKeyspace(keyspace_id),
-            fence: MetadataFence::AppendReservation {
-                session_id,
-                reservation_id,
-                offset: append_offset,
-                len: logical_bytes,
-                writer_epoch,
-            },
-            updates: vec![RootUpdate::FileRoot {
-                file_id,
-                old_root: head.root,
-                new_root,
-                new_size,
-            }],
-        })?;
-        self.storage_nodes.mark_segment_referenced(
-            &receipt,
-            commit_group.commit_seq,
-            self.authority.as_ref(),
-        )?;
-        let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
-        Ok(AppendCommit {
-            keyspace_id,
-            file_id,
-            extent_id: self.next_extent_id()?,
-            range: ByteRange::new(head.size, logical_bytes),
             version: committed.version,
             commit_seq: committed.latest_commit,
             durability: receipt.durability,
@@ -3015,15 +3124,6 @@ impl LocalCoordinator {
         *next = next
             .checked_add(1)
             .ok_or_else(|| StorageError::conflict("write intent id overflow"))?;
-        Ok(id)
-    }
-
-    fn next_extent_id(&self) -> Result<ExtentId> {
-        let mut next = lock(&self.next_extent_id)?;
-        let id = ExtentId::from_raw(*next);
-        *next = next
-            .checked_add(1)
-            .ok_or_else(|| StorageError::conflict("extent id overflow"))?;
         Ok(id)
     }
 
@@ -3333,6 +3433,27 @@ impl LocalCoordinator {
     }
 
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+        self.read_device_with_verification(device_id, range, buf, ReadVerification::Default)
+    }
+
+    pub fn read_device_with_verification(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()> {
+        let segment_ids = self.segment_ids_for_device_read(device_id, range)?;
+        self.read_device_unverified(device_id, range, buf)?;
+        self.verify_segment_payloads_for_read(segment_ids, verification)
+    }
+
+    fn read_device_unverified(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+        buf: &mut [u8],
+    ) -> Result<()> {
         let info = self.metadata.device_info(device_id)?;
         range.validate_for_device(&info.spec)?;
         let buf_len = u64::try_from(buf.len())
@@ -3366,6 +3487,35 @@ impl LocalCoordinator {
     }
 
     pub fn read_file(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        self.read_file_with_verification(
+            keyspace_id,
+            file_id,
+            range,
+            buf,
+            ReadVerification::Default,
+        )
+    }
+
+    pub fn read_file_with_verification(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()> {
+        let segment_ids = self.segment_ids_for_file_read(keyspace_id, file_id, range)?;
+        self.read_file_unverified(keyspace_id, file_id, range, buf)?;
+        self.verify_segment_payloads_for_read(segment_ids, verification)
+    }
+
+    fn read_file_unverified(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
@@ -3423,6 +3573,93 @@ impl LocalCoordinator {
             StorageError::corrupt("native read scratch range does not cover request")
         })?;
         buf.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn segment_ids_for_device_read(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+    ) -> Result<BTreeSet<SegmentId>> {
+        let info = self.metadata.device_info(device_id)?;
+        range.validate_for_device(&info.spec)?;
+        let mut out = BTreeSet::new();
+        if range.len == 0 {
+            return Ok(out);
+        }
+
+        let block_size = u64::from(info.spec.block_size);
+        let requested = crate::api::BlockRange::new(
+            BlockIndex::from_raw(range.offset / block_size),
+            BlockCount::from_raw(range.len / block_size),
+        );
+        let head = self.metadata.get_head(device_id)?;
+        for root in head.shard_roots {
+            let node = self.metadata.get_metadata_node(root)?;
+            if node.covered_range.overlaps(requested)? {
+                self.collect_segment_ids_for_metadata_node(&node, requested, &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn segment_ids_for_file_read(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+    ) -> Result<BTreeSet<SegmentId>> {
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        let end = range.end_exclusive()?;
+        if end > head.size {
+            return Err(StorageError::invalid_argument(
+                "native file read extends past end of file",
+            ));
+        }
+        let mut out = BTreeSet::new();
+        if range.len == 0 {
+            let _ = self.metadata.get_metadata_node(head.root)?;
+            return Ok(out);
+        }
+
+        let block_size = u64::from(self.metadata.config.block_size);
+        let first_block = range.offset / block_size;
+        let requested_start = first_block
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("native read range overflows"))?;
+        let requested_blocks = blocks_for_bytes(end - requested_start, block_size)?;
+        let requested = crate::api::BlockRange::new(
+            BlockIndex::from_raw(first_block),
+            BlockCount::from_raw(requested_blocks),
+        );
+        let root = self.metadata.get_metadata_node(head.root)?;
+        self.collect_segment_ids_for_metadata_node(&root, requested, &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_segment_ids_for_metadata_node(
+        &self,
+        node: &MetadataNode,
+        requested: crate::api::BlockRange,
+        out: &mut BTreeSet<SegmentId>,
+    ) -> Result<()> {
+        match &node.kind {
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    if child.range.overlaps(requested)? {
+                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                        self.collect_segment_ids_for_metadata_node(&child_node, requested, out)?;
+                    }
+                }
+            }
+            MetadataNodeKind::Leaf { entries } => {
+                for entry in entries {
+                    if entry.logical_range().overlaps(requested)? {
+                        out.insert(entry.segment_id);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3659,7 +3896,7 @@ fn initialize_node_catalog_schema(conn: &Connection) -> Result<()> {
           record_bytes INTEGER NOT NULL CHECK (record_bytes > 0),
           payload_offset INTEGER NOT NULL CHECK (payload_offset >= 0),
           payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
-          checksum TEXT NOT NULL,
+          payload_integrity TEXT NOT NULL,
           current INTEGER NOT NULL CHECK (current IN (0, 1)),
           FOREIGN KEY(data_log_id) REFERENCES data_logs(log_id)
         );
@@ -4263,7 +4500,7 @@ struct SegmentPlacementRow {
     record_bytes: u64,
     payload_offset: u64,
     payload_bytes: u64,
-    checksum: u64,
+    integrity: SegmentPayloadIntegrity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4273,6 +4510,11 @@ struct DataLogRow {
     total_bytes: u64,
     live_bytes: u64,
     dead_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataLogSyncMode {
+    Sync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4317,10 +4559,9 @@ impl DurableExportCursor {
 }
 
 const DATA_LOG_MAGIC: &[u8; 8] = b"TCOWDAT!";
-const DATA_LOG_VERSION: u16 = 1;
-const DATA_LOG_HEADER_LEN: usize = 8 + 2 + 16 + 8 + 8;
-const CRC64_ECMA_POLY: u64 = 0x42f0_e1eb_a9ea_3693;
-const CRC64_ECMA_TABLE: [u64; 256] = crc64_ecma_table();
+const DATA_LOG_VERSION: u16 = 2;
+const DATA_LOG_HEADER_LEN: usize = 8 + 2 + 16 + 8 + 1 + 8;
+const MAX_DATA_LOG_SYNC_GROUP_BYTES: u64 = 32 * 1024 * 1024;
 
 impl DurableSqliteStore {
     fn open(
@@ -4380,7 +4621,7 @@ impl DurableSqliteStore {
                 (cursor_storage_node IS NOT NULL AND cursor_log_id IS NOT NULL)
               )
             );
-            CREATE TABLE IF NOT EXISTS append_session_runtime (
+            CREATE TABLE IF NOT EXISTS append_stream_runtime (
               id INTEGER PRIMARY KEY CHECK (id = 1),
               next_incarnation INTEGER NOT NULL CHECK (next_incarnation > 0)
             );
@@ -4416,6 +4657,14 @@ impl DurableSqliteStore {
             );
             CREATE INDEX IF NOT EXISTS idx_file_writer_epochs_file
               ON file_writer_epochs(keyspace_id, file_id);
+            CREATE TABLE IF NOT EXISTS append_streams (
+              stream_id TEXT PRIMARY KEY,
+              keyspace_id TEXT NOT NULL,
+              file_id TEXT NOT NULL,
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_append_streams_file
+              ON append_streams(keyspace_id, file_id);
             CREATE TABLE IF NOT EXISTS metadata_nodes (
               node_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
@@ -4657,6 +4906,7 @@ impl DurableSqliteStore {
         previous_segments: &BTreeSet<SegmentId>,
         current_segments: &BTreeSet<SegmentId>,
         new_segments: Vec<DurableSegmentPayload>,
+        mut pending_append: PendingDataLogAppend,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
     ) -> Result<DurablePersistOutcome> {
         let total_started = Instant::now();
@@ -4678,8 +4928,11 @@ impl DurableSqliteStore {
             .map(|segment| usize_to_u64(segment.bytes.len()))
             .fold(0_u64, u64::saturating_add);
 
+        pending_append.retain_current_placements(current_segments);
         let started = Instant::now();
-        let appended = self.append_segments(new_segments)?;
+        let new_append = self.append_segments_bounded(new_segments, &pending_append)?;
+        sync_pending_data_logs(&self.paths.data_dir, &pending_append)?;
+        pending_append.merge(new_append);
         let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
 
         let started = Instant::now();
@@ -4687,7 +4940,7 @@ impl DurableSqliteStore {
             image,
             previous_segments,
             current_segments,
-            appended,
+            pending_append,
             changed_catalog_segments,
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
@@ -4834,9 +5087,188 @@ impl DurableSqliteStore {
         Ok(touched_node_count)
     }
 
+    fn persist_selected_node_catalog_publish(
+        &self,
+        nodes: &SelectedStorageNodeState,
+        segment_ids: &BTreeSet<SegmentId>,
+        appended: PendingDataLogAppend,
+        pre_root_pending_segments: &BTreeSet<SegmentId>,
+    ) -> Result<u64> {
+        let mut touched_node_count = 0_u64;
+        for (node_id, (ordinal, node)) in nodes {
+            let node_segment_ids: BTreeSet<_> = segment_ids
+                .iter()
+                .copied()
+                .filter(|segment_id| node.segment_catalog.entries.contains_key(segment_id))
+                .collect();
+            if node_segment_ids.is_empty() {
+                continue;
+            }
+
+            let mut conn = self.node_catalogs.lock(*node_id)?;
+            let tx = conn.transaction().map_err(sqlite_error)?;
+            for log in appended
+                .logs
+                .values()
+                .filter(|log| log.storage_node == *node_id)
+            {
+                persist_data_log_manifest(&tx, log)?;
+            }
+            for log_ref in appended
+                .sealed_logs
+                .iter()
+                .filter(|log_ref| log_ref.storage_node == *node_id)
+            {
+                seal_data_log_manifest(&tx, *log_ref)?;
+            }
+            for placement in appended
+                .placements
+                .iter()
+                .filter(|placement| placement.storage_node == *node_id)
+            {
+                persist_segment_placement(&tx, placement)?;
+            }
+            sync_node_catalog_state_for_node(
+                &tx,
+                *ordinal,
+                *node_id,
+                node,
+                SegmentCatalogSync::Only(&node_segment_ids),
+                pre_root_pending_segments,
+            )?;
+            tx.commit().map_err(sqlite_error)?;
+            touched_node_count = touched_node_count.saturating_add(1);
+        }
+        Ok(touched_node_count)
+    }
+
+    fn persist_append_stream_flush(
+        &self,
+        cursor: &DurableExportCursor,
+        streams: &[AppendStreamState],
+        nodes: &SelectedStorageNodeState,
+        segment_ids: &BTreeSet<SegmentId>,
+        segments: Vec<DurableSegmentPayload>,
+    ) -> Result<DurablePersistProfile> {
+        let total_started = Instant::now();
+        #[cfg(test)]
+        {
+            let delay = *lock(&self.persist_delay)?;
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable persist failure",
+                ));
+            }
+        }
+
+        let new_segment_count = usize_to_u64(segments.len());
+        let new_segment_bytes = segments
+            .iter()
+            .map(|segment| usize_to_u64(segment.bytes.len()))
+            .fold(0_u64, u64::saturating_add);
+
+        let started = Instant::now();
+        let appended = self.append_segments(segments, DataLogSyncMode::Sync, None)?;
+        let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
+
+        let started = Instant::now();
+        let touched_node_count =
+            self.persist_selected_node_catalog_publish(nodes, segment_ids, appended, segment_ids)?;
+        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
+
+        let mut conn = lock(&self.conn)?;
+        let previous_cursor = load_export_cursor(&conn)?;
+        let stream_cursor = stream_flush_cursor(previous_cursor.as_ref(), cursor);
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let started = Instant::now();
+        for stream in streams {
+            upsert_file_writer_epoch(&tx, stream.keyspace_id, stream.file_id, stream.writer_epoch)?;
+            upsert_append_stream(&tx, stream)?;
+        }
+        persist_export_cursor(&tx, &stream_cursor)?;
+        let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
+        tx.commit().map_err(sqlite_error)?;
+        let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
+
+        Ok(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            data_log_append_sync_nanos,
+            node_catalog_publish_nanos,
+            root_sqlite_row_sync_nanos,
+            root_sqlite_commit_nanos,
+            new_segment_count,
+            new_segment_bytes,
+            touched_node_count,
+            durable_commit_high_water: stream_cursor.next_commit_seq.saturating_sub(1),
+            ..DurablePersistProfile::default()
+        })
+    }
+
+    fn persist_append_stream_publish_delta(
+        &self,
+        cursor: &DurableExportCursor,
+        metadata: &MetadataInner,
+        nodes: &SelectedStorageNodeState,
+        changed_segments: &BTreeSet<SegmentId>,
+    ) -> Result<DurablePersistProfile> {
+        let total_started = Instant::now();
+        #[cfg(test)]
+        {
+            let delay = *lock(&self.persist_delay)?;
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable persist failure",
+                ));
+            }
+        }
+
+        let started = Instant::now();
+        let touched_node_count = self.persist_selected_node_catalog_publish(
+            nodes,
+            changed_segments,
+            PendingDataLogAppend::default(),
+            &BTreeSet::new(),
+        )?;
+        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
+
+        let mut conn = lock(&self.conn)?;
+        let previous_cursor = load_export_cursor(&conn)?;
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let started = Instant::now();
+        persist_row_native_append_stream_publish_delta(
+            &tx,
+            previous_cursor.as_ref(),
+            metadata,
+            cursor,
+        )?;
+        let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
+        tx.commit().map_err(sqlite_error)?;
+        let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
+
+        Ok(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            node_catalog_publish_nanos,
+            root_sqlite_row_sync_nanos,
+            root_sqlite_commit_nanos,
+            touched_node_count,
+            durable_commit_high_water: cursor.next_commit_seq.saturating_sub(1),
+            ..DurablePersistProfile::default()
+        })
+    }
+
     fn append_segments(
         &self,
         segments: Vec<DurableSegmentPayload>,
+        sync_mode: DataLogSyncMode,
+        pending_base: Option<&PendingDataLogAppend>,
     ) -> Result<PendingDataLogAppend> {
         let mut append = PendingDataLogAppend::default();
         if segments.is_empty() {
@@ -4849,22 +5281,33 @@ impl DurableSqliteStore {
         for segment in segments {
             let segment_id = segment.segment_id;
             let storage_node = segment.storage_node;
+            let integrity = segment.integrity;
             let bytes = segment.bytes;
             let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 active_logs.entry(storage_node)
             {
-                let node_conn = self.node_catalogs.lock(storage_node)?;
-                entry.insert(active_data_log(
-                    &node_conn,
-                    &self.paths.data_dir,
-                    storage_node,
-                )?);
+                let pending_active = match pending_base {
+                    Some(pending) => {
+                        pending.active_log_for_node(storage_node, &self.paths.data_dir)?
+                    }
+                    None => None,
+                };
+                if let Some(active) = pending_active {
+                    entry.insert(active);
+                } else {
+                    let node_conn = self.node_catalogs.lock(storage_node)?;
+                    entry.insert(active_data_log(
+                        &node_conn,
+                        &self.paths.data_dir,
+                        storage_node,
+                    )?);
+                }
             }
             let active = active_logs
                 .get_mut(&storage_node)
                 .ok_or_else(|| StorageError::corrupt("active data-log row missing"))?;
-            let record = encode_data_log_record(segment_id, &bytes)?;
+            let record = encode_data_log_record(segment_id, integrity, &bytes)?;
             let record_len = u64::try_from(record.len()).map_err(|_| {
                 StorageError::invalid_argument("data-log record length overflows u64")
             })?;
@@ -4893,10 +5336,10 @@ impl DurableSqliteStore {
                 log_id: active.log_id,
             };
             if open_log.as_ref().map(|(log_ref, _)| *log_ref) != Some(log_ref) {
-                sync_open_data_log(&mut open_log)?;
+                finish_open_data_log(&mut open_log, sync_mode)?;
                 let data_dir_existed = data_dir.exists();
                 fs::create_dir_all(&data_dir).map_err(fs_error)?;
-                if !data_dir_existed {
+                if sync_mode == DataLogSyncMode::Sync && !data_dir_existed {
                     sync_dir(&self.paths.data_dir)?;
                 }
                 let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
@@ -4946,15 +5389,52 @@ impl DurableSqliteStore {
                 record_bytes: record_len,
                 payload_offset,
                 payload_bytes,
-                checksum: data_log_checksum64(&bytes),
+                integrity,
             });
         }
-        sync_open_data_log(&mut open_log)?;
-        for storage_node in synced_dirs {
-            let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
-            sync_dir(&data_dir)?;
+        finish_open_data_log(&mut open_log, sync_mode)?;
+        if sync_mode == DataLogSyncMode::Sync {
+            for storage_node in synced_dirs {
+                let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+                sync_dir(&data_dir)?;
+            }
         }
         Ok(append)
+    }
+
+    fn append_segments_bounded(
+        &self,
+        segments: Vec<DurableSegmentPayload>,
+        pending_base: &PendingDataLogAppend,
+    ) -> Result<PendingDataLogAppend> {
+        let mut appended = PendingDataLogAppend::default();
+        let mut base = pending_base.clone();
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0_u64;
+
+        for segment in segments {
+            let segment_bytes = usize_to_u64(segment.bytes.len());
+            if !chunk.is_empty()
+                && chunk_bytes.saturating_add(segment_bytes) > MAX_DATA_LOG_SYNC_GROUP_BYTES
+            {
+                let new_append = self.append_segments(
+                    std::mem::take(&mut chunk),
+                    DataLogSyncMode::Sync,
+                    Some(&base),
+                )?;
+                base.merge(new_append.clone());
+                appended.merge(new_append);
+                chunk_bytes = 0;
+            }
+            chunk_bytes = chunk_bytes.saturating_add(segment_bytes);
+            chunk.push(segment);
+        }
+
+        if !chunk.is_empty() {
+            let new_append = self.append_segments(chunk, DataLogSyncMode::Sync, Some(&base))?;
+            appended.merge(new_append);
+        }
+        Ok(appended)
     }
 
     fn read_segment_payload(&self, placement: &SegmentPlacementRow) -> Result<Vec<u8>> {
@@ -4973,7 +5453,7 @@ impl DurableSqliteStore {
         let data = decode_data_log_record(&record)?;
         if data.segment_id != placement.segment_id
             || data.bytes.len() as u64 != placement.payload_bytes
-            || data_log_checksum64(&data.bytes) != placement.checksum
+            || data.integrity != placement.integrity
         {
             return Err(StorageError::corrupt(
                 "data-log record disagrees with SQLite placement",
@@ -5006,7 +5486,7 @@ impl DurableSqliteStore {
         conn.query_row(
             &format!(
                 "SELECT segment_id, data_log_id, record_offset, record_bytes,
-                    payload_offset, payload_bytes, checksum
+                    payload_offset, payload_bytes, payload_integrity
                  FROM {segment_placements}
                  WHERE segment_id = ?1 AND current = 1"
             ),
@@ -5139,13 +5619,13 @@ impl DurableSqliteStore {
         load_maintenance_cursor(&conn)
     }
 
-    fn reserve_append_session_incarnation(&self) -> Result<u64> {
+    fn append_stream_incarnation(&self) -> Result<u64> {
         let mut conn = lock(&self.conn)?;
         let tx = conn.transaction().map_err(sqlite_error)?;
         let current = tx
             .query_row(
                 "SELECT next_incarnation
-                 FROM append_session_runtime
+                 FROM append_stream_runtime
                  WHERE id = 1",
                 [],
                 |row| row.get::<_, i64>(0),
@@ -5158,9 +5638,9 @@ impl DurableSqliteStore {
             .unwrap_or(1);
         let next = current
             .checked_add(1)
-            .ok_or_else(|| StorageError::conflict("append session incarnation overflow"))?;
+            .ok_or_else(|| StorageError::conflict("append stream incarnation overflow"))?;
         tx.execute(
-            "INSERT INTO append_session_runtime(id, next_incarnation)
+            "INSERT INTO append_stream_runtime(id, next_incarnation)
              VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET
                next_incarnation = excluded.next_incarnation",
@@ -5248,10 +5728,11 @@ impl DurableSqliteStore {
                 payloads.push(DurableSegmentPayload {
                     segment_id: placement.segment_id,
                     storage_node: placement.storage_node,
+                    integrity: placement.integrity,
                     bytes: self.read_segment_payload(placement)?,
                 });
             }
-            let appended = self.append_segments(payloads)?;
+            let appended = self.append_segments(payloads, DataLogSyncMode::Sync, None)?;
             let mut node_conn = self.node_catalogs.lock(log.storage_node)?;
             let tx = node_conn.transaction().map_err(sqlite_error)?;
             for manifest in appended.logs.into_values() {
@@ -5334,14 +5815,87 @@ impl DurableSqliteStore {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct PendingDataLogAppend {
     placements: Vec<SegmentPlacementRow>,
     logs: BTreeMap<DurableDataLogRef, PendingDataLogManifest>,
     sealed_logs: Vec<DurableDataLogRef>,
 }
 
-#[derive(Debug)]
+impl PendingDataLogAppend {
+    fn is_empty(&self) -> bool {
+        self.placements.is_empty() && self.logs.is_empty() && self.sealed_logs.is_empty()
+    }
+
+    fn segment_ids(&self) -> BTreeSet<SegmentId> {
+        self.placements
+            .iter()
+            .map(|placement| placement.segment_id)
+            .collect()
+    }
+
+    fn active_log_for_node(
+        &self,
+        storage_node: StorageNodeId,
+        data_dir: &Path,
+    ) -> Result<Option<DataLogRow>> {
+        let sealed: BTreeSet<_> = self
+            .sealed_logs
+            .iter()
+            .copied()
+            .filter(|log_ref| log_ref.storage_node == storage_node)
+            .collect();
+        let Some((log_ref, manifest)) = self
+            .logs
+            .iter()
+            .filter(|(log_ref, manifest)| {
+                log_ref.storage_node == storage_node
+                    && manifest.state == "active"
+                    && !sealed.contains(log_ref)
+            })
+            .max_by_key(|(log_ref, _)| log_ref.log_id)
+        else {
+            return Ok(None);
+        };
+        let path = data_log_path(data_dir, storage_node, log_ref.log_id);
+        let total_bytes = path
+            .metadata()
+            .map(|metadata| metadata.len().max(manifest.total_bytes))
+            .unwrap_or(manifest.total_bytes);
+        Ok(Some(DataLogRow {
+            storage_node,
+            log_id: log_ref.log_id,
+            total_bytes,
+            live_bytes: 0,
+            dead_bytes: 0,
+        }))
+    }
+
+    fn retain_current_placements(&mut self, current_segments: &BTreeSet<SegmentId>) {
+        self.placements
+            .retain(|placement| current_segments.contains(&placement.segment_id));
+    }
+
+    fn merge(&mut self, other: PendingDataLogAppend) {
+        self.placements.extend(other.placements);
+        for (log_ref, manifest) in other.logs {
+            self.logs
+                .entry(log_ref)
+                .and_modify(|existing| {
+                    existing.total_bytes = existing.total_bytes.max(manifest.total_bytes);
+                    existing.state = manifest.state;
+                })
+                .or_insert(manifest);
+        }
+        for log_ref in other.sealed_logs {
+            if !self.sealed_logs.contains(&log_ref) {
+                self.sealed_logs.push(log_ref);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PendingDataLogManifest {
     storage_node: StorageNodeId,
     log_id: u64,
@@ -5360,6 +5914,7 @@ struct DurableStorageNodeRow {
 #[derive(Debug, Clone)]
 struct DataLogSegmentData {
     segment_id: SegmentId,
+    integrity: SegmentPayloadIntegrity,
     bytes: Vec<u8>,
 }
 
@@ -5646,6 +6201,7 @@ fn persist_row_native_state(
         prune_metadata_history,
     )?;
     sync_file_writer_epochs(tx, &image.metadata.file_writer_epochs)?;
+    sync_append_streams(tx, &image.metadata.append_streams)?;
     sync_u128_payload_map_since(
         tx,
         "metadata_nodes",
@@ -5725,6 +6281,110 @@ fn persist_row_native_state(
             .collect(),
     )?;
     persist_export_cursor(tx, &DurableExportCursor::from_state(image))
+}
+
+fn stream_flush_cursor(
+    previous_cursor: Option<&DurableExportCursor>,
+    current: &DurableExportCursor,
+) -> DurableExportCursor {
+    let Some(previous) = previous_cursor else {
+        return current.clone();
+    };
+    let mut cursor = previous.clone();
+    cursor.config = current.config;
+    cursor.next_write_intent = cursor.next_write_intent.max(current.next_write_intent);
+    cursor.next_extent_id = cursor.next_extent_id.max(current.next_extent_id);
+    cursor.next_segment_id = cursor.next_segment_id.max(current.next_segment_id);
+    cursor.next_placement_index = cursor
+        .next_placement_index
+        .max(current.next_placement_index);
+    cursor
+}
+
+fn persist_row_native_append_stream_publish_delta(
+    tx: &rusqlite::Transaction<'_>,
+    previous_cursor: Option<&DurableExportCursor>,
+    metadata: &MetadataInner,
+    cursor: &DurableExportCursor,
+) -> Result<()> {
+    let previous_u128 = |cursor_value: fn(&DurableExportCursor) -> u128| {
+        previous_cursor.map(cursor_value).unwrap_or(0)
+    };
+    let previous_u64 = |cursor_value: fn(&DurableExportCursor) -> u64| {
+        previous_cursor.map(cursor_value).unwrap_or(0)
+    };
+
+    upsert_payload_table_rows(
+        tx,
+        "keyspace_heads",
+        "keyspace_id",
+        metadata
+            .keyspace_heads
+            .iter()
+            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    sync_u128_payload_map_since(
+        tx,
+        "keyspace_roots",
+        "root_id",
+        &metadata.keyspace_roots,
+        |id| id.raw(),
+        previous_u128(|cursor| cursor.next_keyspace_root_id),
+        false,
+    )?;
+    sync_u128_payload_map_since(
+        tx,
+        "keyspace_catalog_shards",
+        "shard_id",
+        &metadata.keyspace_catalog_shards,
+        |id| id.raw(),
+        previous_u128(|cursor| cursor.next_keyspace_catalog_shard_id),
+        false,
+    )?;
+    for ((keyspace_id, file_id), epoch) in &metadata.file_writer_epochs {
+        upsert_file_writer_epoch(tx, *keyspace_id, *file_id, *epoch)?;
+    }
+    for stream in metadata.append_streams.values() {
+        upsert_append_stream(tx, stream)?;
+    }
+    sync_u128_payload_map_since(
+        tx,
+        "metadata_nodes",
+        "node_id",
+        &metadata.metadata_nodes,
+        |id| id.raw(),
+        previous_u128(|cursor| cursor.next_metadata_node_id),
+        false,
+    )?;
+    sync_commit_groups_since(
+        tx,
+        &metadata.commit_groups,
+        previous_u128(|cursor| cursor.next_commit_group_id),
+        false,
+    )?;
+    sync_timeline_table_since(
+        tx,
+        "shard_commits",
+        &metadata.shard_commits,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        false,
+    )?;
+    sync_timeline_table_since(
+        tx,
+        "keyspace_commits",
+        &metadata.keyspace_commits,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        false,
+    )?;
+    sync_timeline_table_since(
+        tx,
+        "file_commits",
+        &metadata.file_commits,
+        previous_u64(|cursor| cursor.next_commit_seq),
+        false,
+    )?;
+    persist_export_cursor(tx, cursor)
 }
 
 trait DurableTimelineRow: DurableCodec {
@@ -5945,7 +6605,7 @@ fn persist_segment_placement(
         &format!(
             "INSERT INTO {segment_placements}(
                segment_id, data_log_id, record_offset, record_bytes,
-               payload_offset, payload_bytes, checksum, current
+               payload_offset, payload_bytes, payload_integrity, current
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
              ON CONFLICT(segment_id) DO UPDATE SET
                data_log_id = excluded.data_log_id,
@@ -5953,7 +6613,7 @@ fn persist_segment_placement(
                record_bytes = excluded.record_bytes,
                payload_offset = excluded.payload_offset,
                payload_bytes = excluded.payload_bytes,
-               checksum = excluded.checksum,
+               payload_integrity = excluded.payload_integrity,
                current = 1"
         ),
         params![
@@ -5963,7 +6623,7 @@ fn persist_segment_placement(
             u64_to_i64(placement.record_bytes)?,
             u64_to_i64(placement.payload_offset)?,
             u64_to_i64(placement.payload_bytes)?,
-            u64_key(placement.checksum),
+            segment_payload_integrity_key(placement.integrity),
         ],
     )
     .map_err(sqlite_error)?;
@@ -6120,6 +6780,24 @@ fn sync_payload_table(
     Ok(())
 }
 
+fn upsert_payload_table_rows(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_col: &str,
+    rows: Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    let sql = format!(
+        "INSERT INTO {table}({key_col}, payload) VALUES (?1, ?2)
+         ON CONFLICT({key_col}) DO UPDATE SET payload = excluded.payload
+         WHERE payload != excluded.payload"
+    );
+    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
+    for (key, payload) in rows {
+        stmt.execute(params![key, payload]).map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
 fn sync_u128_payload_map_since<K, V>(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -6190,6 +6868,94 @@ fn sync_file_writer_epochs(
         ])
         .map_err(sqlite_error)?;
     }
+    Ok(())
+}
+
+fn upsert_file_writer_epoch(
+    tx: &rusqlite::Transaction<'_>,
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    epoch: WriterEpoch,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO file_writer_epochs(file_key, keyspace_id, file_id, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(file_key) DO UPDATE SET
+           keyspace_id = excluded.keyspace_id,
+           file_id = excluded.file_id,
+           payload = excluded.payload
+         WHERE keyspace_id != excluded.keyspace_id
+            OR file_id != excluded.file_id
+            OR payload != excluded.payload",
+        params![
+            file_writer_key(keyspace_id, file_id),
+            keyspace_id.raw().to_string(),
+            file_id.raw().to_string(),
+            encode_row(&epoch)?,
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn sync_append_streams(
+    tx: &rusqlite::Transaction<'_>,
+    streams: &BTreeMap<AppendStreamId, AppendStreamState>,
+) -> Result<()> {
+    let desired: BTreeMap<String, (KeyspaceId, FileId, Vec<u8>)> = streams
+        .iter()
+        .map(|(stream_id, stream)| {
+            Ok((
+                stream_id.raw().to_string(),
+                (stream.keyspace_id, stream.file_id, encode_row(stream)?),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    delete_missing_text_keys(tx, "append_streams", "stream_id", desired.keys())?;
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO append_streams(stream_id, keyspace_id, file_id, payload)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(stream_id) DO UPDATE SET
+               keyspace_id = excluded.keyspace_id,
+               file_id = excluded.file_id,
+               payload = excluded.payload
+             WHERE keyspace_id != excluded.keyspace_id
+                OR file_id != excluded.file_id
+                OR payload != excluded.payload",
+        )
+        .map_err(sqlite_error)?;
+    for (key, (keyspace_id, file_id, payload)) in desired {
+        stmt.execute(params![
+            key,
+            keyspace_id.raw().to_string(),
+            file_id.raw().to_string(),
+            payload,
+        ])
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn upsert_append_stream(tx: &rusqlite::Transaction<'_>, stream: &AppendStreamState) -> Result<()> {
+    tx.execute(
+        "INSERT INTO append_streams(stream_id, keyspace_id, file_id, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(stream_id) DO UPDATE SET
+           keyspace_id = excluded.keyspace_id,
+           file_id = excluded.file_id,
+           payload = excluded.payload
+         WHERE keyspace_id != excluded.keyspace_id
+            OR file_id != excluded.file_id
+            OR payload != excluded.payload",
+        params![
+            stream.stream_id.raw().to_string(),
+            stream.keyspace_id.raw().to_string(),
+            stream.file_id.raw().to_string(),
+            encode_row(stream)?,
+        ],
+    )
+    .map_err(sqlite_error)?;
     Ok(())
 }
 
@@ -6486,6 +7252,7 @@ fn load_metadata_inner(conn: &Connection, cursor: &DurableExportCursor) -> Resul
     metadata.keyspace_roots = load_keyspace_roots(conn)?;
     metadata.keyspace_catalog_shards = load_keyspace_catalog_shards(conn)?;
     metadata.file_writer_epochs = load_file_writer_epochs(conn)?;
+    metadata.append_streams = load_append_streams(conn)?;
     metadata.metadata_nodes = load_metadata_nodes(conn)?;
     metadata.commit_groups = load_commit_groups(conn)?;
     metadata.shard_commits = load_timeline_rows(conn, "shard_commits")?;
@@ -6631,6 +7398,40 @@ fn load_file_writer_epochs(
         let epoch = decode_row(&payload)?;
         if out.insert((keyspace_id, file_id), epoch).is_some() {
             return Err(StorageError::corrupt("duplicate file writer epoch row"));
+        }
+    }
+    Ok(out)
+}
+
+fn load_append_streams(conn: &Connection) -> Result<BTreeMap<AppendStreamId, AppendStreamState>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT stream_id, keyspace_id, file_id, payload
+             FROM append_streams
+             ORDER BY keyspace_id, file_id, stream_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut out = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let stream_id: String = row.get(0).map_err(sqlite_error)?;
+        let keyspace_id: String = row.get(1).map_err(sqlite_error)?;
+        let file_id: String = row.get(2).map_err(sqlite_error)?;
+        let stream_id = AppendStreamId::from_raw(parse_u128_key(&stream_id).map_err(sqlite_error)?);
+        let keyspace_id = KeyspaceId::from_raw(parse_u128_key(&keyspace_id).map_err(sqlite_error)?);
+        let file_id = FileId::from_raw(parse_u128_key(&file_id).map_err(sqlite_error)?);
+        let payload: Vec<u8> = row.get(3).map_err(sqlite_error)?;
+        let stream: AppendStreamState = decode_row(&payload)?;
+        if stream.stream_id != stream_id
+            || stream.keyspace_id != keyspace_id
+            || stream.file_id != file_id
+        {
+            return Err(StorageError::corrupt(
+                "append stream row disagrees with payload",
+            ));
+        }
+        if out.insert(stream_id, stream).is_some() {
+            return Err(StorageError::corrupt("duplicate append stream row"));
         }
     }
     Ok(out)
@@ -7219,11 +8020,39 @@ fn delete_data_log(data_dir: &Path, log_ref: DurableDataLogRef) -> Result<()> {
     }
 }
 
-fn sync_open_data_log(open_log: &mut Option<(DurableDataLogRef, File)>) -> Result<()> {
-    if let Some((_, file)) = open_log.take() {
+fn finish_open_data_log(
+    open_log: &mut Option<(DurableDataLogRef, File)>,
+    sync_mode: DataLogSyncMode,
+) -> Result<()> {
+    if let Some((_, file)) = open_log.take()
+        && sync_mode == DataLogSyncMode::Sync
+    {
         file.sync_data().map_err(fs_error)?;
     }
     Ok(())
+}
+
+fn sync_pending_data_logs(data_dir: &Path, pending: &PendingDataLogAppend) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut storage_nodes = BTreeSet::new();
+    let mut logs = BTreeSet::new();
+    for log_ref in pending.logs.keys() {
+        storage_nodes.insert(log_ref.storage_node);
+        logs.insert(*log_ref);
+    }
+    for log_ref in logs {
+        let path = data_log_path(data_dir, log_ref.storage_node, log_ref.log_id);
+        File::open(&path)
+            .map_err(fs_error)?
+            .sync_data()
+            .map_err(fs_error)?;
+    }
+    for storage_node in storage_nodes {
+        sync_dir(&node_data_log_dir(data_dir, storage_node))?;
+    }
+    sync_dir(data_dir)
 }
 
 fn sync_parent_dir(path: &Path) -> Result<()> {
@@ -7254,15 +8083,29 @@ fn sync_dir(path: &Path) -> Result<()> {
         .map_err(fs_error)
 }
 
-fn encode_data_log_record(segment_id: SegmentId, bytes: &[u8]) -> Result<Vec<u8>> {
+fn encode_data_log_record(
+    segment_id: SegmentId,
+    integrity: SegmentPayloadIntegrity,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
     let payload_len = u64::try_from(bytes.len())
         .map_err(|_| StorageError::invalid_argument("data-log payload length overflows u64"))?;
+    verify_segment_payload_integrity(integrity, bytes)?;
     let mut out = Vec::with_capacity(DATA_LOG_HEADER_LEN + bytes.len());
     out.extend_from_slice(DATA_LOG_MAGIC);
     out.extend_from_slice(&DATA_LOG_VERSION.to_be_bytes());
     out.extend_from_slice(&segment_id.raw().to_be_bytes());
     out.extend_from_slice(&payload_len.to_be_bytes());
-    out.extend_from_slice(&data_log_checksum64(bytes).to_be_bytes());
+    match integrity {
+        SegmentPayloadIntegrity::Crc32c(checksum) => {
+            out.push(1);
+            out.extend_from_slice(&checksum.to_be_bytes());
+        }
+        SegmentPayloadIntegrity::Unchecked => {
+            out.push(2);
+            out.extend_from_slice(&0_u64.to_be_bytes());
+        }
+    }
     out.extend_from_slice(bytes);
     Ok(out)
 }
@@ -7295,7 +8138,9 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
             .try_into()
             .map_err(|_| StorageError::corrupt("bad data-log payload length"))?,
     );
-    let checksum_start = payload_len_start + 8;
+    let integrity_start = payload_len_start + 8;
+    let integrity_tag = record[integrity_start];
+    let checksum_start = integrity_start + 1;
     let expected_checksum = u64::from_be_bytes(
         record[checksum_start..checksum_start + 8]
             .try_into()
@@ -7310,10 +8155,22 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
         return Err(StorageError::corrupt("data-log record length mismatch"));
     }
     let bytes = record[DATA_LOG_HEADER_LEN..].to_vec();
-    if data_log_checksum64(&bytes) != expected_checksum {
-        return Err(StorageError::corrupt("data-log checksum mismatch"));
-    }
-    Ok(DataLogSegmentData { segment_id, bytes })
+    let integrity = match integrity_tag {
+        1 => SegmentPayloadIntegrity::Crc32c(expected_checksum),
+        2 if expected_checksum == 0 => SegmentPayloadIntegrity::Unchecked,
+        2 => {
+            return Err(StorageError::corrupt(
+                "unchecked data-log record has nonzero checksum",
+            ));
+        }
+        _ => return Err(StorageError::corrupt("invalid data-log integrity tag")),
+    };
+    verify_segment_payload_integrity(integrity, &bytes)?;
+    Ok(DataLogSegmentData {
+        segment_id,
+        integrity,
+        bytes,
+    })
 }
 
 fn current_placements_for_log(
@@ -7324,7 +8181,7 @@ fn current_placements_for_log(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT segment_id, data_log_id, record_offset, record_bytes,
-                    payload_offset, payload_bytes, checksum
+                    payload_offset, payload_bytes, payload_integrity
                  FROM {segment_placements}
                  WHERE data_log_id = ?1 AND current = 1
                  ORDER BY record_offset"
@@ -7345,7 +8202,7 @@ fn decode_node_placement_row(
     storage_node: StorageNodeId,
 ) -> rusqlite::Result<SegmentPlacementRow> {
     let segment_id: String = row.get(0)?;
-    let checksum: String = row.get(6)?;
+    let payload_integrity: String = row.get(6)?;
     Ok(SegmentPlacementRow {
         segment_id: SegmentId::from_raw(parse_u128_key(&segment_id)?),
         storage_node,
@@ -7354,7 +8211,7 @@ fn decode_node_placement_row(
         record_bytes: i64_to_u64(row.get(3)?)?,
         payload_offset: i64_to_u64(row.get(4)?)?,
         payload_bytes: i64_to_u64(row.get(5)?)?,
-        checksum: parse_u64_key(&checksum)?,
+        integrity: parse_segment_payload_integrity_key(&payload_integrity)?,
     })
 }
 
@@ -7668,7 +8525,6 @@ fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
 struct DurableMaintenanceParts {
     local: LocalCoordinator,
     durable: DurableSqliteStore,
-    persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     persist_lock: Arc<Mutex<()>>,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_policy: MaintenancePolicy,
@@ -7847,7 +8703,6 @@ fn run_maintenance_tick_parts(
                 }
             }
         }
-        *lock(&parts.persisted_segments)? = parts.local.segment_ids()?;
     }
     if plan.next_cursor != cursor {
         parts.durable.persist_maintenance_cursor(plan.next_cursor)?;
@@ -7880,6 +8735,7 @@ pub struct DurableCoordinator {
     local: LocalCoordinator,
     durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
+    pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     persist_lock: Arc<Mutex<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
@@ -7962,10 +8818,10 @@ impl DurableCoordinator {
         let local = durable
             .load(config)?
             .unwrap_or(LocalCoordinator::with_storage_nodes(config, storage_nodes)?);
-        let append_session_incarnation = durable.reserve_append_session_incarnation()?;
+        let append_stream_incarnation = durable.append_stream_incarnation()?;
         local
             .metadata
-            .use_append_session_incarnation(append_session_incarnation)?;
+            .use_append_stream_incarnation(append_stream_incarnation)?;
         let persisted_segments = local.segment_ids()?;
         let durable_through = durable_commit_high_water_from_local(&local)?;
         let maintenance_cursor = Arc::new(Mutex::new(durable.load_maintenance_cursor()?));
@@ -7974,6 +8830,7 @@ impl DurableCoordinator {
             local,
             durable,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
+            pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             persist_lock: Arc::new(Mutex::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             persist_profiler: Arc::new(Mutex::new(None)),
@@ -7990,7 +8847,6 @@ impl DurableCoordinator {
             let worker = MaintenanceWorker::start(DurableMaintenanceParts {
                 local: self.local.clone(),
                 durable: self.durable.clone(),
-                persisted_segments: Arc::clone(&self.persisted_segments),
                 persist_lock: Arc::clone(&self.persist_lock),
                 maintenance_cursor: Arc::clone(&self.maintenance_cursor),
                 maintenance_policy: self.maintenance_policy,
@@ -8023,7 +8879,6 @@ impl DurableCoordinator {
         DurableMaintenanceParts {
             local: self.local.clone(),
             durable: self.durable.clone(),
-            persisted_segments: Arc::clone(&self.persisted_segments),
             persist_lock: Arc::clone(&self.persist_lock),
             maintenance_cursor: Arc::clone(&self.maintenance_cursor),
             maintenance_policy: self.maintenance_policy,
@@ -8135,6 +8990,10 @@ impl DurableCoordinator {
         }
     }
 
+    fn persist_now(&self) -> Result<()> {
+        self.persist_now_with_catalog_changes(None)
+    }
+
     fn persist_physical(
         &self,
         total_started: Instant,
@@ -8144,17 +9003,22 @@ impl DurableCoordinator {
         let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
         let snapshot_started = Instant::now();
         let previous_segments = lock(&self.persisted_segments)?.clone();
+        let pending_append = lock(&self.pending_data_log_append)?.clone();
+        let mut exported_segments = previous_segments.clone();
+        exported_segments.extend(pending_append.segment_ids());
         let (image, current_segments, new_segments) =
-            self.local.state_for_durable_persist(&previous_segments)?;
+            self.local.state_for_durable_persist(&exported_segments)?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
         let outcome = self.durable.persist(
             &image,
             &previous_segments,
             &current_segments,
             new_segments,
+            pending_append,
             changed_catalog_segments,
         )?;
         *lock(&self.persisted_segments)? = outcome.kept_segments;
+        *lock(&self.pending_data_log_append)? = PendingDataLogAppend::default();
         let mut profile = outcome.profile;
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
@@ -8162,6 +9026,141 @@ impl DurableCoordinator {
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
         self.record_persist_profile(profile)?;
         Ok(durable_through)
+    }
+
+    fn note_durable_commit(&self, durable_through: CommitSeq) -> Result<()> {
+        let mut state = lock(&self.persist_coordinator.inner)?;
+        state.durable_through = state.durable_through.max(durable_through);
+        state.last_error = None;
+        self.persist_coordinator.cvar.notify_all();
+        Ok(())
+    }
+
+    fn persist_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+        loop {
+            let batch = self
+                .local
+                .metadata
+                .append_stream_flush_batch(stream, MAX_DATA_LOG_SYNC_GROUP_BYTES)?;
+            if batch.records.is_empty() {
+                return self
+                    .local
+                    .metadata
+                    .mark_append_stream_durable_through(stream, batch.durable_through);
+            }
+            self.persist_append_stream_batch(stream)?;
+        }
+    }
+
+    fn persist_append_stream_batch(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+        let total_started = Instant::now();
+        let _persist_guard = lock(&self.persist_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
+
+        let snapshot_started = Instant::now();
+        let plans = self
+            .local
+            .metadata
+            .append_stream_flush_plans(stream, MAX_DATA_LOG_SYNC_GROUP_BYTES)?;
+        if plans.is_empty() {
+            let batch = self
+                .local
+                .metadata
+                .append_stream_flush_batch(stream, MAX_DATA_LOG_SYNC_GROUP_BYTES)?;
+            return self
+                .local
+                .metadata
+                .mark_append_stream_durable_through(stream, batch.durable_through);
+        }
+        let segment_ids: BTreeSet<_> = plans
+            .iter()
+            .flat_map(|plan| plan.batch.records.iter().map(|record| record.segment_id))
+            .collect();
+        let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+        let persisted_segments = lock(&self.persisted_segments)?.clone();
+        let payloads: Vec<_> = payloads
+            .into_iter()
+            .filter(|payload| !persisted_segments.contains(&payload.segment_id))
+            .collect();
+        let cursor = self.local.durable_export_cursor()?;
+        let exported_streams: Vec<_> = plans
+            .iter()
+            .map(|plan| {
+                self.local
+                    .metadata
+                    .append_stream_durable_export_at(&plan.stream, plan.batch.durable_through)
+            })
+            .collect::<Result<_>>()?;
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+
+        let mut profile = self.durable.persist_append_stream_flush(
+            &cursor,
+            &exported_streams,
+            &nodes,
+            &segment_ids,
+            payloads,
+        )?;
+        lock(&self.persisted_segments)?.extend(segment_ids);
+        let mut primary_mark = None;
+        for plan in &plans {
+            let mark = self
+                .local
+                .metadata
+                .mark_append_stream_durable_through(&plan.stream, plan.batch.durable_through)?;
+            if plan.stream.stream_id == stream.stream_id {
+                primary_mark = Some(mark);
+            }
+        }
+        let mark = primary_mark.ok_or_else(|| {
+            StorageError::corrupt("append stream flush plan omitted primary stream")
+        })?;
+
+        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.record_persist_profile(profile)?;
+        Ok(mark)
+    }
+
+    fn persist_append_stream_publish_delta(
+        &self,
+        commit_seq: CommitSeq,
+        changed_segments: &BTreeSet<SegmentId>,
+    ) -> Result<()> {
+        let total_started = Instant::now();
+        let _persist_guard = lock(&self.persist_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
+
+        let snapshot_started = Instant::now();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let pending_append = lock(&self.pending_data_log_append)?.clone();
+        let mut exported_segments = previous_segments.clone();
+        exported_segments.extend(pending_append.segment_ids());
+        let (_, current_segments, new_segments) =
+            self.local.state_for_durable_persist(&exported_segments)?;
+        if !new_segments.is_empty() || !pending_append.is_empty() {
+            drop(_persist_guard);
+            return self.persist_until(commit_seq);
+        }
+        let (nodes, _) = self.local.state_for_segment_ids(changed_segments)?;
+        let cursor = self.local.durable_export_cursor()?;
+        let mut metadata = self.local.metadata_state_inner()?;
+        metadata.prune_append_streams_for_durable_export();
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+
+        let mut profile = self.durable.persist_append_stream_publish_delta(
+            &cursor,
+            &metadata,
+            &nodes,
+            changed_segments,
+        )?;
+        *lock(&self.persisted_segments)? = current_segments;
+        self.note_durable_commit(commit_seq)?;
+
+        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.record_persist_profile(profile)
     }
 
     /// Return the maintenance policy configured for this store.
@@ -8356,16 +9355,12 @@ impl DurableCoordinator {
         })
     }
 
-    pub fn open_append_session(
+    pub fn open_append_stream(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-    ) -> Result<AppendSession> {
-        self.local.open_append_session(keyspace_id, file_id)
-    }
-
-    pub fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation> {
-        self.local.reserve_append(session, len)
+    ) -> Result<AppendStream> {
+        self.local.open_append_stream(keyspace_id, file_id)
     }
 
     pub fn checkpoint(&self, device_id: DeviceId) -> Result<CheckpointId> {
@@ -8404,6 +9399,23 @@ impl DurableCoordinator {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<WriteCommit> {
+        self.write_device_with_integrity(
+            device_id,
+            offset,
+            data,
+            durability,
+            PayloadIntegrity::Verified,
+        )
+    }
+
+    pub fn write_device_with_integrity(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<WriteCommit> {
         let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
         let admission = self.admit_write(
             u64::try_from(data.len())
@@ -8412,7 +9424,7 @@ impl DurableCoordinator {
         )?;
         let result = self
             .local
-            .write_device(device_id, offset, data, durability)
+            .write_device_with_integrity(device_id, offset, data, durability, payload_integrity)
             .and_then(|commit| {
                 if flushed {
                     self.persist_until(commit.commit_seq)?;
@@ -8426,7 +9438,20 @@ impl DurableCoordinator {
     }
 
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
-        self.local.read_device(device_id, range, buf)
+        self.read_device_with_verification(device_id, range, buf, ReadVerification::Default)
+    }
+
+    pub fn read_device_with_verification(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()> {
+        let segment_ids = self.local.segment_ids_for_device_read(device_id, range)?;
+        self.local.read_device_unverified(device_id, range, buf)?;
+        self.local
+            .verify_segment_payloads_for_read(segment_ids, verification)
     }
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
@@ -8472,6 +9497,25 @@ impl DurableCoordinator {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<FileWriteCommit> {
+        self.write_file_at_with_integrity(
+            keyspace_id,
+            file_id,
+            offset,
+            data,
+            durability,
+            PayloadIntegrity::Verified,
+        )
+    }
+
+    pub fn write_file_at_with_integrity(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<FileWriteCommit> {
         let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
         let admission = self.admit_write(
             u64::try_from(data.len())
@@ -8480,7 +9524,14 @@ impl DurableCoordinator {
         )?;
         let result = self
             .local
-            .write_file_at(keyspace_id, file_id, offset, data, durability)
+            .write_file_at_with_integrity(
+                keyspace_id,
+                file_id,
+                offset,
+                data,
+                durability,
+                payload_integrity,
+            )
             .and_then(|commit| {
                 if flushed {
                     self.persist_until(commit.commit_seq)?;
@@ -8493,12 +9544,22 @@ impl DurableCoordinator {
         result
     }
 
-    pub fn append_reserved(
+    pub fn append_stream(
         &self,
-        reservation: AppendReservation,
+        stream: &AppendStream,
         data: &[u8],
         durability: crate::api::WriteDurability,
-    ) -> Result<AppendCommit> {
+    ) -> Result<AppendTicket> {
+        self.append_stream_with_integrity(stream, data, durability, PayloadIntegrity::Verified)
+    }
+
+    pub fn append_stream_with_integrity(
+        &self,
+        stream: &AppendStream,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<AppendTicket> {
         let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
         let admission = self.admit_write(
             u64::try_from(data.len())
@@ -8507,17 +9568,55 @@ impl DurableCoordinator {
         )?;
         let result = self
             .local
-            .append_reserved(reservation, data, durability)
-            .and_then(|commit| {
+            .append_stream_with_integrity(stream, data, durability, payload_integrity)
+            .and_then(|ticket| {
                 if flushed {
-                    self.persist_until(commit.commit_seq)?;
+                    self.flush_append_stream(stream)?;
                 }
-                Ok(commit)
+                Ok(ticket)
             });
         if result.is_ok() {
             self.after_successful_write(admission);
         }
         result
+    }
+
+    pub fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+        self.persist_append_stream(stream)
+    }
+
+    pub fn publish_append_stream(
+        &self,
+        stream: &AppendStream,
+        mark: &DurableAppendMark,
+    ) -> Result<AppendPublishCommit> {
+        let state = self
+            .local
+            .metadata
+            .validate_append_stream_mark(stream, mark)?;
+        let changed_segments: BTreeSet<_> = state
+            .records
+            .iter()
+            .filter(|record| {
+                record.offset >= state.published_through
+                    && record.offset < mark.durable_through
+                    && record
+                        .offset
+                        .checked_add(record.len)
+                        .is_some_and(|end| end <= mark.durable_through)
+            })
+            .map(|record| record.segment_id)
+            .collect();
+        let commit = self
+            .local
+            .publish_append_stream(stream, mark, WriteDurability::Flushed)?;
+        self.persist_append_stream_publish_delta(commit.commit_seq, &changed_segments)?;
+        Ok(commit)
+    }
+
+    pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        self.local.abort_append_stream(stream)?;
+        self.persist_now()
     }
 
     pub fn read_file(
@@ -8527,7 +9626,30 @@ impl DurableCoordinator {
         range: ByteRange,
         buf: &mut [u8],
     ) -> Result<()> {
-        self.local.read_file(keyspace_id, file_id, range, buf)
+        self.read_file_with_verification(
+            keyspace_id,
+            file_id,
+            range,
+            buf,
+            ReadVerification::Default,
+        )
+    }
+
+    pub fn read_file_with_verification(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()> {
+        let segment_ids = self
+            .local
+            .segment_ids_for_file_read(keyspace_id, file_id, range)?;
+        self.local
+            .read_file_unverified(keyspace_id, file_id, range, buf)?;
+        self.local
+            .verify_segment_payloads_for_read(segment_ids, verification)
     }
 
     pub fn fork_device(&self, source: DeviceId, request: ForkRequest) -> Result<DeviceId> {
@@ -8565,9 +9687,7 @@ impl DurableCoordinator {
         policy: DurableDataLogPolicy,
     ) -> Result<DurableCompactionReport> {
         let _persist_guard = lock(&self.persist_lock)?;
-        let report = self.durable.compact_data_logs(policy)?;
-        *lock(&self.persisted_segments)? = self.local.segment_ids()?;
-        Ok(report)
+        self.durable.compact_data_logs(policy)
     }
 
     pub fn run_metadata_custodian(
@@ -8755,6 +9875,8 @@ struct StorageNodeInner {
     segment_catalog: CatalogInner,
 }
 
+type SelectedStorageNodeState = BTreeMap<StorageNodeId, (usize, StorageNodeInner)>;
+
 fn metadata_referenced_segments(metadata: &MetadataInner) -> BTreeSet<SegmentId> {
     let mut segments = BTreeSet::new();
     for node in metadata.metadata_nodes.values() {
@@ -8833,6 +9955,7 @@ struct MetadataInner {
     keyspace_roots: BTreeMap<KeyspaceRootId, KeyspaceRoot>,
     keyspace_catalog_shards: BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>,
     file_writer_epochs: BTreeMap<(KeyspaceId, FileId), WriterEpoch>,
+    append_streams: BTreeMap<AppendStreamId, AppendStreamState>,
     metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
     shard_commits: Vec<ShardCommit>,
@@ -8865,6 +9988,7 @@ impl MetadataInner {
             keyspace_roots: BTreeMap::new(),
             keyspace_catalog_shards: BTreeMap::new(),
             file_writer_epochs: BTreeMap::new(),
+            append_streams: BTreeMap::new(),
             metadata_nodes: BTreeMap::new(),
             commit_groups: BTreeMap::new(),
             shard_commits: Vec::new(),
@@ -8876,6 +10000,34 @@ impl MetadataInner {
             metadata_last_mark_epoch: BTreeMap::new(),
             segment_last_mark_epoch: BTreeMap::new(),
         }
+    }
+
+    fn prune_append_streams_for_durable_export(&mut self) {
+        for stream in self.append_streams.values_mut() {
+            stream.records.retain(|record| {
+                record
+                    .offset
+                    .checked_add(record.len)
+                    .is_some_and(|end| end <= stream.durable_through)
+            });
+            stream.reserved_tail = stream.reserved_tail.min(stream.durable_through);
+        }
+    }
+
+    fn unflushed_append_stream_segment_ids(&self) -> BTreeSet<SegmentId> {
+        let mut segments = BTreeSet::new();
+        for stream in self.append_streams.values() {
+            for record in &stream.records {
+                if record
+                    .offset
+                    .checked_add(record.len)
+                    .is_none_or(|end| end > stream.durable_through)
+                {
+                    segments.insert(record.segment_id);
+                }
+            }
+        }
+        segments
     }
 
     fn alloc_device_id(&mut self) -> DeviceId {
@@ -8983,29 +10135,171 @@ impl MetadataInner {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveAppendSession {
-    session_id: AppendSessionId,
-    writer_epoch: WriterEpoch,
-    base_version: FileVersion,
-    reserved_tail: u64,
-    next_commit_offset: u64,
-    reservations: BTreeMap<AppendReservationId, ActiveAppendReservation>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum AppendStreamStatus {
+    Active,
+    Fenced,
+    Aborted,
+    Published,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ActiveAppendReservation {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AppendStreamSegment {
+    ticket_id: AppendTicketId,
     offset: u64,
     len: u64,
+    segment_id: SegmentId,
+    segment_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppendStreamFlushBatch {
+    records: Vec<AppendStreamSegment>,
+    durable_through: u64,
+    segment_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppendStreamFlushPlan {
+    stream: AppendStream,
+    batch: AppendStreamFlushBatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AppendStreamState {
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    stream_id: AppendStreamId,
+    writer_epoch: WriterEpoch,
+    base_version: FileVersion,
+    visible_base_size: u64,
+    reserved_tail: u64,
+    durable_through: u64,
+    published_through: u64,
+    status: AppendStreamStatus,
+    records: Vec<AppendStreamSegment>,
+}
+
+impl AppendStreamState {
+    fn public_stream(&self) -> AppendStream {
+        AppendStream {
+            keyspace_id: self.keyspace_id,
+            file_id: self.file_id,
+            stream_id: self.stream_id,
+            writer_epoch: self.writer_epoch,
+            base_version: self.base_version,
+            visible_base_size: self.visible_base_size,
+        }
+    }
+
+    fn validate_token(&self, stream: &AppendStream) -> Result<()> {
+        if self.keyspace_id != stream.keyspace_id
+            || self.file_id != stream.file_id
+            || self.stream_id != stream.stream_id
+            || self.writer_epoch != stream.writer_epoch
+            || self.base_version != stream.base_version
+            || self.visible_base_size != stream.visible_base_size
+            || self.status != AppendStreamStatus::Active
+        {
+            return Err(StorageError::conflict("stale append stream"));
+        }
+        Ok(())
+    }
+
+    fn contiguous_record_tail_from(&self, start: u64) -> Result<u64> {
+        let mut expected = start;
+        let mut records = self.records.clone();
+        records.sort_by_key(|record| record.offset);
+        for record in records {
+            let end = record
+                .offset
+                .checked_add(record.len)
+                .ok_or_else(|| StorageError::invalid_argument("append record end overflows"))?;
+            if end <= expected {
+                continue;
+            }
+            if record.offset != expected {
+                break;
+            }
+            expected = end;
+        }
+        Ok(expected)
+    }
+
+    fn flush_batch(&self, max_segment_bytes: u64) -> Result<AppendStreamFlushBatch> {
+        if max_segment_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "append stream flush batch byte cap must be greater than zero",
+            ));
+        }
+        let mut expected = self.durable_through;
+        let mut segment_bytes = 0_u64;
+        let mut selected = Vec::new();
+        let mut records = self.records.clone();
+        records.sort_by_key(|record| record.offset);
+        for record in records {
+            let end = record
+                .offset
+                .checked_add(record.len)
+                .ok_or_else(|| StorageError::invalid_argument("append record end overflows"))?;
+            if end <= expected {
+                continue;
+            }
+            if record.offset != expected {
+                break;
+            }
+            let would_exceed = !selected.is_empty()
+                && segment_bytes
+                    .checked_add(record.segment_bytes)
+                    .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?
+                    > max_segment_bytes;
+            if would_exceed {
+                break;
+            }
+            segment_bytes = segment_bytes
+                .checked_add(record.segment_bytes)
+                .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
+            expected = end;
+            selected.push(record);
+        }
+        Ok(AppendStreamFlushBatch {
+            records: selected,
+            durable_through: expected,
+            segment_bytes,
+        })
+    }
+
+    fn durable_export_at(&self, durable_through: u64) -> Result<Self> {
+        if durable_through < self.durable_through {
+            return Err(StorageError::conflict(
+                "append stream durable export cannot regress",
+            ));
+        }
+        if durable_through > self.contiguous_record_tail_from(self.durable_through)? {
+            return Err(StorageError::conflict(
+                "append stream durable export exceeds contiguous records",
+            ));
+        }
+        let mut exported = self.clone();
+        exported.durable_through = durable_through;
+        exported.reserved_tail = durable_through;
+        exported.records.retain(|record| {
+            record
+                .offset
+                .checked_add(record.len)
+                .is_some_and(|end| end <= durable_through)
+        });
+        Ok(exported)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AppendSessionAllocator {
+struct AppendStreamAllocator {
     incarnation: u64,
     next_counter: u64,
 }
 
-impl AppendSessionAllocator {
+impl AppendStreamAllocator {
     fn new(incarnation: u64) -> Self {
         Self {
             incarnation,
@@ -9018,16 +10312,16 @@ impl AppendSessionAllocator {
         self.next_counter = self
             .next_counter
             .checked_add(1)
-            .ok_or_else(|| StorageError::conflict("append session counter overflow"))?;
+            .ok_or_else(|| StorageError::conflict("append stream counter overflow"))?;
         Ok((u128::from(self.incarnation) << 64) | u128::from(counter))
     }
 
-    fn next_session_id(&mut self) -> Result<AppendSessionId> {
-        self.next_raw().map(AppendSessionId::from_raw)
+    fn next_stream_id(&mut self) -> Result<AppendStreamId> {
+        self.next_raw().map(AppendStreamId::from_raw)
     }
 
-    fn next_reservation_id(&mut self) -> Result<AppendReservationId> {
-        self.next_raw().map(AppendReservationId::from_raw)
+    fn next_ticket_id(&mut self) -> Result<AppendTicketId> {
+        self.next_raw().map(AppendTicketId::from_raw)
     }
 }
 
@@ -9036,8 +10330,7 @@ impl AppendSessionAllocator {
 pub struct InMemoryMetadataPlane {
     config: LocalStoreConfig,
     inner: Mutex<MetadataInner>,
-    active_append_sessions: Mutex<BTreeMap<(KeyspaceId, FileId), ActiveAppendSession>>,
-    append_session_allocator: Mutex<AppendSessionAllocator>,
+    append_stream_allocator: Mutex<AppendStreamAllocator>,
 }
 
 impl InMemoryMetadataPlane {
@@ -9046,8 +10339,7 @@ impl InMemoryMetadataPlane {
         Ok(Self {
             config,
             inner: Mutex::new(MetadataInner::new()),
-            active_append_sessions: Mutex::new(BTreeMap::new()),
-            append_session_allocator: Mutex::new(AppendSessionAllocator::new(0)),
+            append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
         })
     }
 
@@ -9056,8 +10348,7 @@ impl InMemoryMetadataPlane {
         Ok(Self {
             config,
             inner: Mutex::new(inner),
-            active_append_sessions: Mutex::new(BTreeMap::new()),
-            append_session_allocator: Mutex::new(AppendSessionAllocator::new(0)),
+            append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
         })
     }
 
@@ -9065,9 +10356,8 @@ impl InMemoryMetadataPlane {
         Ok(lock(&self.inner)?.clone())
     }
 
-    fn use_append_session_incarnation(&self, incarnation: u64) -> Result<()> {
-        *lock(&self.append_session_allocator)? = AppendSessionAllocator::new(incarnation);
-        lock(&self.active_append_sessions)?.clear();
+    fn use_append_stream_incarnation(&self, incarnation: u64) -> Result<()> {
+        *lock(&self.append_stream_allocator)? = AppendStreamAllocator::new(incarnation);
         Ok(())
     }
 
@@ -9319,13 +10609,26 @@ impl InMemoryMetadataPlane {
         })
     }
 
-    pub fn open_append_session(
+    fn active_append_stream_id_locked(
+        inner: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Option<AppendStreamId> {
+        inner.append_streams.iter().find_map(|(stream_id, stream)| {
+            (stream.keyspace_id == keyspace_id
+                && stream.file_id == file_id
+                && stream.status == AppendStreamStatus::Active)
+                .then_some(*stream_id)
+        })
+    }
+
+    pub fn open_append_stream(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-    ) -> Result<AppendSession> {
-        let session_id = lock(&self.append_session_allocator)?.next_session_id()?;
-        let inner = lock(&self.inner)?;
+    ) -> Result<AppendStream> {
+        let stream_id = lock(&self.append_stream_allocator)?.next_stream_id()?;
+        let mut inner = lock(&self.inner)?;
         let head = Self::file_head_locked(&inner, keyspace_id, file_id)?;
         let key = (keyspace_id, file_id);
         let persisted_epoch = inner
@@ -9333,109 +10636,303 @@ impl InMemoryMetadataPlane {
             .get(&key)
             .copied()
             .unwrap_or_else(|| WriterEpoch::from_raw(0));
-        let mut active = lock(&self.active_append_sessions)?;
-        let current_epoch = active
-            .get(&key)
-            .map(|session| session.writer_epoch)
+        let active_stream_id = Self::active_append_stream_id_locked(&inner, keyspace_id, file_id);
+        let current_epoch = active_stream_id
+            .and_then(|active_id| inner.append_streams.get(&active_id))
+            .map(|stream| stream.writer_epoch)
             .unwrap_or(persisted_epoch);
         let writer_epoch = current_epoch
             .raw()
             .checked_add(1)
             .map(WriterEpoch::from_raw)
             .ok_or_else(|| StorageError::conflict("writer epoch overflow"))?;
-        let session = AppendSession {
+        if let Some(active_id) = active_stream_id
+            && let Some(active_stream) = inner.append_streams.get_mut(&active_id)
+        {
+            active_stream.status = AppendStreamStatus::Fenced;
+        }
+        inner.file_writer_epochs.insert(key, writer_epoch);
+        let stream = AppendStreamState {
             keyspace_id,
             file_id,
-            session_id,
+            stream_id,
             writer_epoch,
             base_version: head.version,
+            visible_base_size: head.size,
+            reserved_tail: head.size,
+            durable_through: head.size,
+            published_through: head.size,
+            status: AppendStreamStatus::Active,
+            records: Vec::new(),
         };
-        active.insert(
-            key,
-            ActiveAppendSession {
-                session_id,
-                writer_epoch,
-                base_version: head.version,
-                reserved_tail: head.size,
-                next_commit_offset: head.size,
-                reservations: BTreeMap::new(),
-            },
-        );
-        Ok(session)
+        let public = stream.public_stream();
+        inner.append_streams.insert(stream_id, stream);
+        Ok(public)
     }
 
-    pub fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation> {
+    pub fn next_append_ticket_id(&self) -> Result<AppendTicketId> {
+        lock(&self.append_stream_allocator)?.next_ticket_id()
+    }
+
+    pub fn reserve_append_stream_range(
+        &self,
+        stream: &AppendStream,
+        len: u64,
+    ) -> Result<ByteRange> {
         if len == 0 {
             return Err(StorageError::invalid_argument(
-                "append reservation length must not be zero",
+                "append payload must not be empty",
             ));
         }
-        let inner = lock(&self.inner)?;
-        Self::file_head_locked(&inner, session.keyspace_id, session.file_id)?;
-        drop(inner);
-
-        let reservation_id = lock(&self.append_session_allocator)?.next_reservation_id()?;
-        let mut active = lock(&self.active_append_sessions)?;
-        let current = active
-            .get_mut(&(session.keyspace_id, session.file_id))
-            .ok_or_else(|| StorageError::conflict("stale append session"))?;
-        if current.session_id != session.session_id
-            || current.writer_epoch != session.writer_epoch
-            || current.base_version != session.base_version
-        {
-            return Err(StorageError::conflict("stale append session"));
-        }
-        let offset = current.reserved_tail;
-        current.reserved_tail = current
+        let mut inner = lock(&self.inner)?;
+        Self::file_head_locked(&inner, stream.keyspace_id, stream.file_id)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        let offset = state.reserved_tail;
+        let next_tail = state
             .reserved_tail
             .checked_add(len)
-            .ok_or_else(|| StorageError::invalid_argument("append reservation overflows file"))?;
-        let reservation = AppendReservation {
-            keyspace_id: session.keyspace_id,
-            file_id: session.file_id,
-            session_id: session.session_id,
-            reservation_id,
-            writer_epoch: session.writer_epoch,
-            offset,
-            len,
-        };
-        current
-            .reservations
-            .insert(reservation_id, ActiveAppendReservation { offset, len });
-        Ok(reservation)
+            .ok_or_else(|| StorageError::invalid_argument("append stream tail overflows file"))?;
+        state.reserved_tail = next_tail;
+        Ok(ByteRange::new(offset, len))
     }
 
-    pub fn validate_append_reservation(&self, reservation: &AppendReservation) -> Result<()> {
+    pub fn append_stream_record(
+        &self,
+        stream: &AppendStream,
+        ticket_id: AppendTicketId,
+        range: ByteRange,
+        segment_id: SegmentId,
+        segment_bytes: u64,
+    ) -> Result<AppendTicket> {
+        if range.len == 0 {
+            return Err(StorageError::invalid_argument(
+                "append payload must not be empty",
+            ));
+        }
+        let mut inner = lock(&self.inner)?;
+        Self::file_head_locked(&inner, stream.keyspace_id, stream.file_id)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        if range.end_exclusive()? > state.reserved_tail {
+            return Err(StorageError::conflict(
+                "append stream record exceeds reserved tail",
+            ));
+        }
+        state.records.push(AppendStreamSegment {
+            ticket_id,
+            offset: range.offset,
+            len: range.len,
+            segment_id,
+            segment_bytes,
+        });
+        Ok(AppendTicket {
+            keyspace_id: stream.keyspace_id,
+            file_id: stream.file_id,
+            stream_id: stream.stream_id,
+            ticket_id,
+            writer_epoch: stream.writer_epoch,
+            range,
+        })
+    }
+
+    pub fn mark_append_stream_durable(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+        let mut inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        state.durable_through = state.contiguous_record_tail_from(state.durable_through)?;
+        Ok(DurableAppendMark {
+            keyspace_id: stream.keyspace_id,
+            file_id: stream.file_id,
+            stream_id: stream.stream_id,
+            writer_epoch: stream.writer_epoch,
+            durable_through: state.durable_through,
+        })
+    }
+
+    fn append_stream_flush_batch(
+        &self,
+        stream: &AppendStream,
+        max_segment_bytes: u64,
+    ) -> Result<AppendStreamFlushBatch> {
         let inner = lock(&self.inner)?;
-        Self::file_head_locked(&inner, reservation.keyspace_id, reservation.file_id)?;
-        drop(inner);
-
-        let active = lock(&self.active_append_sessions)?;
-        let current = active
-            .get(&(reservation.keyspace_id, reservation.file_id))
-            .ok_or_else(|| StorageError::conflict("stale append session"))?;
-        if current.session_id != reservation.session_id
-            || current.writer_epoch != reservation.writer_epoch
-        {
-            return Err(StorageError::conflict("stale append session"));
-        }
-        match current.reservations.get(&reservation.reservation_id) {
-            Some(active_reservation)
-                if active_reservation.offset == reservation.offset
-                    && active_reservation.len == reservation.len =>
-            {
-                Ok(())
-            }
-            Some(_) | None => Err(StorageError::conflict("stale append reservation")),
-        }
+        let state = inner
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        state.flush_batch(max_segment_bytes)
     }
 
-    pub fn invalidate_append_sessions_for_file(
+    fn append_stream_flush_plans(
+        &self,
+        stream: &AppendStream,
+        max_segment_bytes: u64,
+    ) -> Result<Vec<AppendStreamFlushPlan>> {
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+
+        let primary = state.flush_batch(max_segment_bytes)?;
+        if primary.records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut total_bytes = primary.segment_bytes;
+        let mut plans = vec![AppendStreamFlushPlan {
+            stream: stream.clone(),
+            batch: primary,
+        }];
+
+        for (stream_id, state) in &inner.append_streams {
+            if *stream_id == stream.stream_id || state.status != AppendStreamStatus::Active {
+                continue;
+            }
+            let batch = state.flush_batch(max_segment_bytes)?;
+            if batch.records.is_empty() {
+                continue;
+            }
+            let would_exceed = total_bytes
+                .checked_add(batch.segment_bytes)
+                .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?
+                > max_segment_bytes;
+            if would_exceed {
+                continue;
+            }
+            total_bytes = total_bytes
+                .checked_add(batch.segment_bytes)
+                .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
+            plans.push(AppendStreamFlushPlan {
+                stream: state.public_stream(),
+                batch,
+            });
+        }
+
+        Ok(plans)
+    }
+
+    fn append_stream_durable_export_at(
+        &self,
+        stream: &AppendStream,
+        durable_through: u64,
+    ) -> Result<AppendStreamState> {
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        state.durable_export_at(durable_through)
+    }
+
+    fn mark_append_stream_durable_through(
+        &self,
+        stream: &AppendStream,
+        durable_through: u64,
+    ) -> Result<DurableAppendMark> {
+        let mut inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        if durable_through < state.durable_through
+            || durable_through > state.contiguous_record_tail_from(state.durable_through)?
+        {
+            return Err(StorageError::conflict(
+                "append stream durable high-water is not valid",
+            ));
+        }
+        state.durable_through = durable_through;
+        Ok(DurableAppendMark {
+            keyspace_id: stream.keyspace_id,
+            file_id: stream.file_id,
+            stream_id: stream.stream_id,
+            writer_epoch: stream.writer_epoch,
+            durable_through,
+        })
+    }
+
+    fn validate_append_stream_mark(
+        &self,
+        stream: &AppendStream,
+        mark: &DurableAppendMark,
+    ) -> Result<AppendStreamState> {
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        if mark.keyspace_id != stream.keyspace_id
+            || mark.file_id != stream.file_id
+            || mark.stream_id != stream.stream_id
+            || mark.writer_epoch != stream.writer_epoch
+            || mark.durable_through > state.durable_through
+            || mark.durable_through < state.published_through
+        {
+            return Err(StorageError::conflict("stale append stream mark"));
+        }
+        Ok(state.clone())
+    }
+
+    pub fn mark_append_stream_published(
+        &self,
+        stream: &AppendStream,
+        durable_through: u64,
+    ) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        state.published_through = durable_through;
+        state.records.retain(|record| {
+            record
+                .offset
+                .checked_add(record.len)
+                .is_none_or(|end| end > durable_through)
+        });
+        Ok(())
+    }
+
+    pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        state.status = AppendStreamStatus::Aborted;
+        Ok(())
+    }
+
+    pub fn invalidate_append_streams_for_file(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
     ) -> Result<()> {
-        lock(&self.active_append_sessions)?.remove(&(keyspace_id, file_id));
+        let mut inner = lock(&self.inner)?;
+        for stream in inner.append_streams.values_mut() {
+            if stream.keyspace_id == keyspace_id
+                && stream.file_id == file_id
+                && stream.status == AppendStreamStatus::Active
+            {
+                stream.status = AppendStreamStatus::Fenced;
+            }
+        }
         Ok(())
     }
 
@@ -10359,6 +11856,26 @@ impl InMemoryMetadataPlane {
         for node in inner.metadata_nodes.values() {
             Self::collect_node_segments(node, &mut segments);
         }
+        for stream in inner.append_streams.values() {
+            for record in &stream.records {
+                segments.insert(record.segment_id);
+            }
+        }
+        segments
+    }
+
+    fn collect_private_append_stream_segments_locked(inner: &MetadataInner) -> BTreeSet<SegmentId> {
+        let mut segments = BTreeSet::new();
+        for stream in inner.append_streams.values() {
+            if stream.status != AppendStreamStatus::Active {
+                continue;
+            }
+            for record in &stream.records {
+                if record.offset >= stream.published_through {
+                    segments.insert(record.segment_id);
+                }
+            }
+        }
         segments
     }
 
@@ -10400,7 +11917,8 @@ impl InMemoryMetadataPlane {
         Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
         let epoch = inner.alloc_gc_epoch()?;
         let roots = Self::roots_for_gc_locked(&inner, policy.clone())?;
-        let (nodes, segments) = Self::collect_reachable_locked(&inner, &roots)?;
+        let (nodes, mut segments) = Self::collect_reachable_locked(&inner, &roots)?;
+        segments.extend(Self::collect_private_append_stream_segments_locked(&inner));
 
         for node_id in &nodes {
             inner.metadata_last_mark_epoch.insert(*node_id, epoch);
@@ -10435,8 +11953,10 @@ impl InMemoryMetadataPlane {
         Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
 
         let roots = Self::roots_for_gc_locked(&inner, policy.clone())?;
-        let (currently_reachable_nodes, currently_reachable_segments) =
+        let (currently_reachable_nodes, mut currently_reachable_segments) =
             Self::collect_reachable_locked(&inner, &roots)?;
+        currently_reachable_segments
+            .extend(Self::collect_private_append_stream_segments_locked(&inner));
         let all_segments = Self::collect_all_segments_locked(&inner);
         let mut deleted_metadata_nodes = Vec::new();
 
@@ -10517,6 +12037,15 @@ impl InMemoryMetadataPlane {
             inner.fork_records.retain(|_, record| {
                 !expired_devices.contains(&record.source)
                     && !expired_devices.contains(&record.target)
+            });
+            let protected_private_segments =
+                Self::collect_private_append_stream_segments_locked(&inner);
+            inner.append_streams.retain(|_, stream| {
+                stream.status == AppendStreamStatus::Active
+                    || stream
+                        .records
+                        .iter()
+                        .any(|record| protected_private_segments.contains(&record.segment_id))
             });
         }
 
@@ -10903,47 +12432,31 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 let current_entry =
                     Self::keyspace_file_in_root_locked(&inner, current_catalog.root_id, file_id)?;
                 let current = current_entry.head.clone();
-                let append_reservation_commit = match intent.fence {
+                let append_stream_commit = match intent.fence {
                     MetadataFence::FileVersion(version) if version == current.version => None,
                     MetadataFence::FileVersion(_) => {
                         return Err(StorageError::conflict("stale file version fence"));
                     }
-                    MetadataFence::AppendReservation {
-                        session_id,
-                        reservation_id,
-                        offset,
-                        len,
+                    MetadataFence::AppendStream {
+                        stream_id,
                         writer_epoch,
                     } => {
-                        if current.size != offset {
-                            return Err(StorageError::conflict(
-                                "append reservation commits out of order",
-                            ));
-                        }
-                        let active = lock(&self.active_append_sessions)?;
-                        let Some(session) = active.get(&(keyspace_id, file_id)) else {
-                            return Err(StorageError::conflict("stale append session"));
+                        let Some(stream) = inner.append_streams.get(&stream_id) else {
+                            return Err(StorageError::conflict("stale append stream"));
                         };
-                        if session.session_id != session_id
-                            || session.writer_epoch != writer_epoch
-                            || session.next_commit_offset != offset
+                        if stream.keyspace_id != keyspace_id
+                            || stream.file_id != file_id
+                            || stream.writer_epoch != writer_epoch
+                            || stream.published_through != current.size
+                            || stream.status != AppendStreamStatus::Active
                         {
-                            return Err(StorageError::conflict("stale append reservation"));
+                            return Err(StorageError::conflict("stale append stream"));
                         }
-                        match session.reservations.get(&reservation_id) {
-                            Some(reservation)
-                                if reservation.offset == offset && reservation.len == len =>
-                            {
-                                Some((session_id, reservation_id, offset, len, writer_epoch))
-                            }
-                            Some(_) | None => {
-                                return Err(StorageError::conflict("stale append reservation"));
-                            }
-                        }
+                        Some((stream_id, writer_epoch))
                     }
                     _ => {
                         return Err(StorageError::invalid_argument(
-                            "native file commit requires file-version or append-reservation fence",
+                            "native file commit requires file-version or append-stream fence",
                         ));
                     }
                 };
@@ -11026,21 +12539,14 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 inner
                     .commit_groups
                     .insert(commit_group.commit_group, commit_group.clone());
-                if let Some((session_id, reservation_id, offset, len, writer_epoch)) =
-                    append_reservation_commit
-                {
+                if let Some((stream_id, writer_epoch)) = append_stream_commit {
                     inner
                         .file_writer_epochs
                         .insert((keyspace_id, file_id), writer_epoch);
-                    let mut active = lock(&self.active_append_sessions)?;
-                    if let Some(session) = active.get_mut(&(keyspace_id, file_id))
-                        && session.session_id == session_id
-                        && session.writer_epoch == writer_epoch
+                    if let Some(stream) = inner.append_streams.get_mut(&stream_id)
+                        && stream.writer_epoch == writer_epoch
                     {
-                        session.reservations.remove(&reservation_id);
-                        session.next_commit_offset = offset.checked_add(len).ok_or_else(|| {
-                            StorageError::invalid_argument("append reservation end overflows")
-                        })?;
+                        stream.published_through = new_size;
                     }
                 }
                 Ok(commit_group)
@@ -11303,6 +12809,7 @@ struct SegmentRecord {
 struct DurableSegmentPayload {
     segment_id: SegmentId,
     storage_node: StorageNodeId,
+    integrity: SegmentPayloadIntegrity,
     bytes: Vec<u8>,
 }
 
@@ -11357,6 +12864,7 @@ impl InMemorySegmentStore {
                 new_segments.push(DurableSegmentPayload {
                     segment_id: *segment_id,
                     storage_node,
+                    integrity: record.commit.descriptor.integrity,
                     bytes: record.bytes.clone(),
                 });
             }
@@ -11369,6 +12877,57 @@ impl InMemorySegmentStore {
             current_segments,
             new_segments,
         ))
+    }
+
+    fn payload_for_segment(
+        &self,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+    ) -> Result<DurableSegmentPayload> {
+        let inner = lock(&self.inner)?;
+        let record = inner
+            .segments
+            .get(&segment_id)
+            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+        Ok(DurableSegmentPayload {
+            segment_id,
+            storage_node,
+            integrity: record.commit.descriptor.integrity,
+            bytes: record.bytes.clone(),
+        })
+    }
+
+    fn verify_segment_payload_for_read(
+        &self,
+        segment_id: SegmentId,
+        verification: ReadVerification,
+    ) -> Result<()> {
+        if matches!(verification, ReadVerification::Skip) {
+            return Ok(());
+        }
+        let inner = lock(&self.inner)?;
+        let record = inner
+            .segments
+            .get(&segment_id)
+            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+        match record.commit.descriptor.integrity {
+            SegmentPayloadIntegrity::Unchecked => {
+                if matches!(verification, ReadVerification::RequireVerified) {
+                    Err(StorageError::conflict(
+                        "read requires verified payload but segment is unchecked",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            integrity @ SegmentPayloadIntegrity::Crc32c(_) => {
+                verify_segment_payload_integrity(integrity, &record.bytes)
+            }
+        }
+    }
+
+    fn next_offset(&self) -> Result<u64> {
+        Ok(lock(&self.inner)?.next_offset)
     }
 
     fn segment_ids(&self) -> Result<BTreeSet<SegmentId>> {
@@ -11392,6 +12951,7 @@ impl InMemorySegmentStore {
         &self,
         reservation: &SegmentReservation,
         bytes: Vec<u8>,
+        payload_integrity: PayloadIntegrity,
     ) -> Result<SegmentReplicaCommit> {
         self.config.validate()?;
 
@@ -11431,12 +12991,13 @@ impl InMemorySegmentStore {
             .checked_add(reservation.bytes)
             .ok_or_else(|| StorageError::conflict("local segment offset overflow"))?;
         let blocks = reservation.bytes / u64::from(self.config.block_size);
+        let integrity = segment_payload_integrity(payload_integrity, &bytes);
         let commit = SegmentReplicaCommit {
             descriptor: SegmentDescriptor {
                 segment_id: reservation.segment_id,
                 blocks: BlockCount::from_raw(blocks),
                 bytes: reservation.bytes,
-                checksum: Some(checksum64(&bytes)),
+                integrity,
             },
             placement: SegmentReplicaPlacement {
                 segment_id: reservation.segment_id,
@@ -11463,7 +13024,7 @@ impl SegmentStore for InMemorySegmentStore {
         reservation: &SegmentReservation,
         bytes: &[u8],
     ) -> Result<SegmentReplicaCommit> {
-        self.write_segment_owned(reservation, bytes.to_vec())
+        self.write_segment_owned(reservation, bytes.to_vec(), PayloadIntegrity::Verified)
     }
 
     fn read_segment(&self, segment_id: SegmentId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
@@ -11995,22 +13556,37 @@ impl BlockServer for LocalBlockServer {
                 BlockRequest::Info { device_id } => Ok(BlockResponse::Info(
                     self.store.metadata.device_info(device_id)?,
                 )),
-                BlockRequest::Read { device_id, range } => {
+                BlockRequest::Read {
+                    device_id,
+                    range,
+                    verification,
+                } => {
                     let len = usize::try_from(range.len).map_err(|_| {
                         StorageError::invalid_argument("read byte length overflows usize")
                     })?;
                     let mut bytes = vec![0; len];
-                    self.store.read_device(device_id, range, &mut bytes)?;
+                    self.store.read_device_with_verification(
+                        device_id,
+                        range,
+                        &mut bytes,
+                        verification,
+                    )?;
                     Ok(BlockResponse::Read(ReadResponse { bytes }))
                 }
                 BlockRequest::Write {
                     device_id,
                     offset,
                     bytes,
+                    payload_integrity,
                     durability,
                 } => Ok(BlockResponse::Write(
-                    self.store
-                        .write_device(device_id, offset, &bytes, durability)?,
+                    self.store.write_device_with_integrity(
+                        device_id,
+                        offset,
+                        &bytes,
+                        durability,
+                        payload_integrity,
+                    )?,
                 )),
                 BlockRequest::WriteZeroes { device_id, range } => Ok(BlockResponse::Write(
                     self.store
@@ -12142,13 +13718,19 @@ impl NativeServer for LocalNativeServer {
                     keyspace_id,
                     file_id,
                     range,
+                    verification,
                 } => {
                     let len = usize::try_from(range.len).map_err(|_| {
                         StorageError::invalid_argument("read byte length overflows usize")
                     })?;
                     let mut bytes = vec![0; len];
-                    self.store
-                        .read_file(keyspace_id, file_id, range, &mut bytes)?;
+                    self.store.read_file_with_verification(
+                        keyspace_id,
+                        file_id,
+                        range,
+                        &mut bytes,
+                        verification,
+                    )?;
                     Ok(NativeResponse::Read(ReadResponse { bytes }))
                 }
                 NativeRequest::Write {
@@ -12156,53 +13738,93 @@ impl NativeServer for LocalNativeServer {
                     file_id,
                     offset,
                     bytes,
+                    payload_integrity,
                     durability,
-                } => Ok(NativeResponse::Write(self.store.write_file_at(
-                    keyspace_id,
-                    file_id,
-                    offset,
-                    &bytes,
-                    durability,
-                )?)),
-                NativeRequest::OpenAppendSession {
-                    keyspace_id,
-                    file_id,
-                } => Ok(NativeResponse::AppendSession(
-                    self.store.open_append_session(keyspace_id, file_id)?,
+                } => Ok(NativeResponse::Write(
+                    self.store.write_file_at_with_integrity(
+                        keyspace_id,
+                        file_id,
+                        offset,
+                        &bytes,
+                        durability,
+                        payload_integrity,
+                    )?,
                 )),
-                NativeRequest::ReserveAppend {
+                NativeRequest::OpenAppendStream {
                     keyspace_id,
                     file_id,
-                    session,
-                    len,
+                } => Ok(NativeResponse::AppendStreamOpened(
+                    self.store.open_append_stream(keyspace_id, file_id)?,
+                )),
+                NativeRequest::AppendStream {
+                    keyspace_id,
+                    file_id,
+                    stream,
+                    bytes,
+                    payload_integrity,
                 } => {
-                    if keyspace_id != session.keyspace_id || file_id != session.file_id {
+                    if keyspace_id != stream.keyspace_id || file_id != stream.file_id {
                         Err(StorageError::invalid_argument(
-                            "append session target does not match request target",
+                            "append stream target does not match request target",
                         ))
                     } else {
-                        Ok(NativeResponse::AppendReservation(
-                            self.store.reserve_append(&session, len)?,
+                        Ok(NativeResponse::AppendTicket(
+                            self.store.append_stream_with_integrity(
+                                &stream,
+                                &bytes,
+                                WriteDurability::Acknowledged,
+                                payload_integrity,
+                            )?,
                         ))
                     }
                 }
-                NativeRequest::AppendReserved {
+                NativeRequest::FlushAppendStream {
                     keyspace_id,
                     file_id,
-                    reservation,
-                    bytes,
-                    durability,
+                    stream,
                 } => {
-                    if keyspace_id != reservation.keyspace_id || file_id != reservation.file_id {
+                    if keyspace_id != stream.keyspace_id || file_id != stream.file_id {
                         Err(StorageError::invalid_argument(
-                            "append reservation target does not match request target",
+                            "append stream target does not match request target",
                         ))
                     } else {
-                        Ok(NativeResponse::Append(self.store.append_reserved(
-                            reservation,
-                            &bytes,
-                            durability,
-                        )?))
+                        Ok(NativeResponse::DurableAppendMark(
+                            self.store.flush_append_stream(&stream)?,
+                        ))
+                    }
+                }
+                NativeRequest::PublishAppendStream {
+                    keyspace_id,
+                    file_id,
+                    stream,
+                    mark,
+                } => {
+                    if keyspace_id != stream.keyspace_id || file_id != stream.file_id {
+                        Err(StorageError::invalid_argument(
+                            "append stream target does not match request target",
+                        ))
+                    } else {
+                        Ok(NativeResponse::AppendPublished(
+                            self.store.publish_append_stream(
+                                &stream,
+                                &mark,
+                                WriteDurability::Acknowledged,
+                            )?,
+                        ))
+                    }
+                }
+                NativeRequest::AbortAppendStream {
+                    keyspace_id,
+                    file_id,
+                    stream,
+                } => {
+                    if keyspace_id != stream.keyspace_id || file_id != stream.file_id {
+                        Err(StorageError::invalid_argument(
+                            "append stream target does not match request target",
+                        ))
+                    } else {
+                        self.store.abort_append_stream(&stream)?;
+                        Ok(NativeResponse::AppendAborted)
                     }
                 }
                 NativeRequest::Flush {
@@ -13899,7 +15521,12 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_at_with_verification(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()> {
         let len = u64::try_from(buf.len())
             .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
         let response = self.transport.call(BlockRequestEnvelope::new(
@@ -13909,6 +15536,7 @@ impl BlockDevice for LocalBlockDevice {
             BlockRequest::Read {
                 device_id: self.device_id,
                 range: ByteRange::new(offset, len),
+                verification,
             },
         ))?;
         match response.response {
@@ -13925,7 +15553,12 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn write_at(&self, offset: u64, data: &[u8]) -> Result<WriteCommit> {
+    fn write_at_with_integrity(
+        &self,
+        offset: u64,
+        data: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<WriteCommit> {
         let response = self.transport.call(BlockRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
@@ -13934,6 +15567,7 @@ impl BlockDevice for LocalBlockDevice {
                 device_id: self.device_id,
                 offset,
                 bytes: data.to_vec(),
+                payload_integrity,
                 durability: crate::api::WriteDurability::Acknowledged,
             },
         ))?;
@@ -14135,23 +15769,19 @@ impl NativeKeyspaceClient for LocalNativeClient {
         }
     }
 
-    fn open_append_session(
-        &self,
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-    ) -> Result<AppendSession> {
+    fn open_append_stream(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<AppendStream> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::OpenAppendSession {
+            NativeRequest::OpenAppendStream {
                 keyspace_id,
                 file_id,
             },
         ))?;
         match response.response {
-            NativeResponse::AppendSession(session) => Ok(session),
-            _ => Err(StorageError::corrupt("unexpected append-session response")),
+            NativeResponse::AppendStreamOpened(stream) => Ok(stream),
+            _ => Err(StorageError::corrupt("unexpected append-stream response")),
         }
     }
 
@@ -14246,7 +15876,12 @@ impl NativeFile for LocalNativeFile {
         }
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_at_with_verification(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        verification: ReadVerification,
+    ) -> Result<()> {
         let len = u64::try_from(buf.len())
             .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
         let response = self.transport.call(NativeRequestEnvelope::new(
@@ -14257,6 +15892,7 @@ impl NativeFile for LocalNativeFile {
                 keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
                 range: ByteRange::new(offset, len),
+                verification,
             },
         ))?;
         match response.response {
@@ -14273,7 +15909,12 @@ impl NativeFile for LocalNativeFile {
         }
     }
 
-    fn write_at(&self, offset: u64, data: &[u8]) -> Result<FileWriteCommit> {
+    fn write_at_with_integrity(
+        &self,
+        offset: u64,
+        data: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<FileWriteCommit> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
@@ -14283,6 +15924,7 @@ impl NativeFile for LocalNativeFile {
                 file_id: self.file_id,
                 offset,
                 bytes: data.to_vec(),
+                payload_integrity,
                 durability: crate::api::WriteDurability::Acknowledged,
             },
         ))?;
@@ -14292,58 +15934,99 @@ impl NativeFile for LocalNativeFile {
         }
     }
 
-    fn open_append_session(&self) -> Result<AppendSession> {
+    fn open_append_stream(&self) -> Result<AppendStream> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::OpenAppendSession {
+            NativeRequest::OpenAppendStream {
                 keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
             },
         ))?;
         match response.response {
-            NativeResponse::AppendSession(session) => Ok(session),
-            _ => Err(StorageError::corrupt("unexpected append-session response")),
+            NativeResponse::AppendStreamOpened(stream) => Ok(stream),
+            _ => Err(StorageError::corrupt("unexpected append-stream response")),
         }
     }
 
-    fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation> {
+    fn append_stream_with_integrity(
+        &self,
+        stream: &AppendStream,
+        data: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<AppendTicket> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::ReserveAppend {
+            NativeRequest::AppendStream {
                 keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
-                session: session.clone(),
-                len,
-            },
-        ))?;
-        match response.response {
-            NativeResponse::AppendReservation(reservation) => Ok(reservation),
-            _ => Err(StorageError::corrupt(
-                "unexpected append-reservation response",
-            )),
-        }
-    }
-
-    fn append_reserved(&self, reservation: AppendReservation, data: &[u8]) -> Result<AppendCommit> {
-        let response = self.transport.call(NativeRequestEnvelope::new(
-            self.next_request_id()?,
-            self.client_epoch,
-            None,
-            NativeRequest::AppendReserved {
-                keyspace_id: self.keyspace_id,
-                file_id: self.file_id,
-                reservation,
+                stream: stream.clone(),
                 bytes: data.to_vec(),
-                durability: crate::api::WriteDurability::Acknowledged,
+                payload_integrity,
             },
         ))?;
         match response.response {
-            NativeResponse::Append(commit) => Ok(commit),
-            _ => Err(StorageError::corrupt("unexpected native-append response")),
+            NativeResponse::AppendTicket(ticket) => Ok(ticket),
+            _ => Err(StorageError::corrupt("unexpected append-ticket response")),
+        }
+    }
+
+    fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::FlushAppendStream {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                stream: stream.clone(),
+            },
+        ))?;
+        match response.response {
+            NativeResponse::DurableAppendMark(mark) => Ok(mark),
+            _ => Err(StorageError::corrupt("unexpected append-flush response")),
+        }
+    }
+
+    fn publish_append_stream(
+        &self,
+        stream: &AppendStream,
+        mark: &DurableAppendMark,
+    ) -> Result<AppendPublishCommit> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::PublishAppendStream {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                stream: stream.clone(),
+                mark: mark.clone(),
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendPublished(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt("unexpected append-publish response")),
+        }
+    }
+
+    fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::AbortAppendStream {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                stream: stream.clone(),
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendAborted => Ok(()),
+            _ => Err(StorageError::corrupt("unexpected append-abort response")),
         }
     }
 
@@ -14762,8 +16445,8 @@ macro_rules! durable_id_codec_u32 {
 }
 
 durable_id_codec_u128!(
-    AppendReservationId,
-    AppendSessionId,
+    AppendStreamId,
+    AppendTicketId,
     CheckpointId,
     CommitGroupId,
     DeviceId,
@@ -15065,12 +16748,32 @@ impl DurableCodec for MetadataNode {
     }
 }
 
+impl DurableCodec for SegmentPayloadIntegrity {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Crc32c(checksum) => {
+                1u8.encode(out)?;
+                checksum.encode(out)
+            }
+            Self::Unchecked => 2u8.encode(out),
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Crc32c(u64::decode(input)?)),
+            2 => Ok(Self::Unchecked),
+            _ => Err(durable_codec_error("invalid segment payload integrity tag")),
+        }
+    }
+}
+
 impl DurableCodec for SegmentDescriptor {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.segment_id.encode(out)?;
         self.blocks.encode(out)?;
         self.bytes.encode(out)?;
-        self.checksum.encode(out)
+        self.integrity.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -15078,7 +16781,7 @@ impl DurableCodec for SegmentDescriptor {
             segment_id: SegmentId::decode(input)?,
             blocks: BlockCount::decode(input)?,
             bytes: u64::decode(input)?,
-            checksum: Option::decode(input)?,
+            integrity: SegmentPayloadIntegrity::decode(input)?,
         })
     }
 }
@@ -15460,11 +17163,11 @@ impl DurableCodec for WriteGrantIntent {
                 range.encode(out)?;
                 base_version.encode(out)
             }
-            Self::NativeAppend {
+            Self::NativeAppendStream {
                 keyspace_id,
                 file_id,
-                session_id,
-                reservation_id,
+                stream_id,
+                ticket_id,
                 append_offset,
                 bytes,
                 writer_epoch,
@@ -15472,32 +17175,14 @@ impl DurableCodec for WriteGrantIntent {
                 3u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
-                session_id.encode(out)?;
-                reservation_id.encode(out)?;
-                append_offset.encode(out)?;
-                bytes.encode(out)?;
-                writer_epoch.encode(out)
-            }
-            Self::NativeReservedAppend {
-                keyspace_id,
-                file_id,
-                session_id,
-                reservation_id,
-                append_offset,
-                bytes,
-                writer_epoch,
-            } => {
-                4u8.encode(out)?;
-                keyspace_id.encode(out)?;
-                file_id.encode(out)?;
-                session_id.encode(out)?;
-                reservation_id.encode(out)?;
+                stream_id.encode(out)?;
+                ticket_id.encode(out)?;
                 append_offset.encode(out)?;
                 bytes.encode(out)?;
                 writer_epoch.encode(out)
             }
             Self::Internal { owner } => {
-                5u8.encode(out)?;
+                4u8.encode(out)?;
                 owner.encode(out)
             }
         }
@@ -15518,25 +17203,16 @@ impl DurableCodec for WriteGrantIntent {
                 range: ByteRange::decode(input)?,
                 base_version: FileVersion::decode(input)?,
             }),
-            3 => Ok(Self::NativeAppend {
+            3 => Ok(Self::NativeAppendStream {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
-                session_id: AppendSessionId::decode(input)?,
-                reservation_id: AppendReservationId::decode(input)?,
+                stream_id: AppendStreamId::decode(input)?,
+                ticket_id: AppendTicketId::decode(input)?,
                 append_offset: u64::decode(input)?,
                 bytes: u64::decode(input)?,
                 writer_epoch: WriterEpoch::decode(input)?,
             }),
-            4 => Ok(Self::NativeReservedAppend {
-                keyspace_id: KeyspaceId::decode(input)?,
-                file_id: FileId::decode(input)?,
-                session_id: AppendSessionId::decode(input)?,
-                reservation_id: AppendReservationId::decode(input)?,
-                append_offset: u64::decode(input)?,
-                bytes: u64::decode(input)?,
-                writer_epoch: WriterEpoch::decode(input)?,
-            }),
-            5 => Ok(Self::Internal {
+            4 => Ok(Self::Internal {
                 owner: MappingOwner::decode(input)?,
             }),
             _ => Err(durable_codec_error("invalid write grant intent tag")),
@@ -15572,7 +17248,7 @@ impl DurableCodec for SegmentWriteReceipt {
         self.write_intent.encode(out)?;
         self.intent.encode(out)?;
         self.bytes.encode(out)?;
-        self.checksum.encode(out)?;
+        self.integrity.encode(out)?;
         self.durability.encode(out)?;
         self.lifecycle.encode(out)?;
         self.receipt_epoch.encode(out)?;
@@ -15597,7 +17273,7 @@ impl DurableCodec for SegmentWriteReceipt {
             write_intent: WriteIntentId::decode(input)?,
             intent: WriteGrantIntent::decode(input)?,
             bytes: u64::decode(input)?,
-            checksum: Option::decode(input)?,
+            integrity: SegmentPayloadIntegrity::decode(input)?,
             durability: WriteDurability::decode(input)?,
             lifecycle: SegmentReceiptLifecycle::decode(input)?,
             receipt_epoch: GrantEpoch::decode(input)?,
@@ -15668,6 +17344,42 @@ impl DurableCodec for WriteDurability {
             1 => Ok(Self::Acknowledged),
             2 => Ok(Self::Flushed),
             _ => Err(durable_codec_error("invalid write durability tag")),
+        }
+    }
+}
+
+impl DurableCodec for PayloadIntegrity {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Verified => 1u8.encode(out),
+            Self::Unchecked => 2u8.encode(out),
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Verified),
+            2 => Ok(Self::Unchecked),
+            _ => Err(durable_codec_error("invalid payload integrity tag")),
+        }
+    }
+}
+
+impl DurableCodec for ReadVerification {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Default => 1u8.encode(out),
+            Self::RequireVerified => 2u8.encode(out),
+            Self::Skip => 3u8.encode(out),
+        }
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Default),
+            2 => Ok(Self::RequireVerified),
+            3 => Ok(Self::Skip),
+            _ => Err(durable_codec_error("invalid read verification tag")),
         }
     }
 }
@@ -15832,21 +17544,28 @@ impl DurableCodec for BlockRequest {
                 2u8.encode(out)?;
                 device_id.encode(out)
             }
-            Self::Read { device_id, range } => {
+            Self::Read {
+                device_id,
+                range,
+                verification,
+            } => {
                 3u8.encode(out)?;
                 device_id.encode(out)?;
-                range.encode(out)
+                range.encode(out)?;
+                verification.encode(out)
             }
             Self::Write {
                 device_id,
                 offset,
                 bytes,
+                payload_integrity,
                 durability,
             } => {
                 4u8.encode(out)?;
                 device_id.encode(out)?;
                 offset.encode(out)?;
                 bytes.encode(out)?;
+                payload_integrity.encode(out)?;
                 durability.encode(out)
             }
             Self::Flush { device_id, scope } => {
@@ -15892,11 +17611,13 @@ impl DurableCodec for BlockRequest {
             3 => Ok(Self::Read {
                 device_id: DeviceId::decode(input)?,
                 range: ByteRange::decode(input)?,
+                verification: ReadVerification::decode(input)?,
             }),
             4 => Ok(Self::Write {
                 device_id: DeviceId::decode(input)?,
                 offset: u64::decode(input)?,
                 bytes: Vec::decode(input)?,
+                payload_integrity: PayloadIntegrity::decode(input)?,
                 durability: WriteDurability::decode(input)?,
             }),
             5 => Ok(Self::Flush {
@@ -16098,55 +17819,74 @@ impl DurableCodec for FileInfo {
     }
 }
 
-impl DurableCodec for AppendSession {
+impl DurableCodec for AppendStream {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.keyspace_id.encode(out)?;
         self.file_id.encode(out)?;
-        self.session_id.encode(out)?;
+        self.stream_id.encode(out)?;
         self.writer_epoch.encode(out)?;
-        self.base_version.encode(out)
+        self.base_version.encode(out)?;
+        self.visible_base_size.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
         Ok(Self {
             keyspace_id: KeyspaceId::decode(input)?,
             file_id: FileId::decode(input)?,
-            session_id: AppendSessionId::decode(input)?,
+            stream_id: AppendStreamId::decode(input)?,
             writer_epoch: WriterEpoch::decode(input)?,
             base_version: FileVersion::decode(input)?,
+            visible_base_size: u64::decode(input)?,
         })
     }
 }
 
-impl DurableCodec for AppendReservation {
+impl DurableCodec for AppendTicket {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.keyspace_id.encode(out)?;
         self.file_id.encode(out)?;
-        self.session_id.encode(out)?;
-        self.reservation_id.encode(out)?;
+        self.stream_id.encode(out)?;
+        self.ticket_id.encode(out)?;
         self.writer_epoch.encode(out)?;
-        self.offset.encode(out)?;
-        self.len.encode(out)
+        self.range.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
         Ok(Self {
             keyspace_id: KeyspaceId::decode(input)?,
             file_id: FileId::decode(input)?,
-            session_id: AppendSessionId::decode(input)?,
-            reservation_id: AppendReservationId::decode(input)?,
+            stream_id: AppendStreamId::decode(input)?,
+            ticket_id: AppendTicketId::decode(input)?,
             writer_epoch: WriterEpoch::decode(input)?,
-            offset: u64::decode(input)?,
-            len: u64::decode(input)?,
+            range: ByteRange::decode(input)?,
         })
     }
 }
 
-impl DurableCodec for AppendCommit {
+impl DurableCodec for DurableAppendMark {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.keyspace_id.encode(out)?;
         self.file_id.encode(out)?;
-        self.extent_id.encode(out)?;
+        self.stream_id.encode(out)?;
+        self.writer_epoch.encode(out)?;
+        self.durable_through.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            stream_id: AppendStreamId::decode(input)?,
+            writer_epoch: WriterEpoch::decode(input)?,
+            durable_through: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendPublishCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
         self.range.encode(out)?;
         self.version.encode(out)?;
         self.commit_seq.encode(out)?;
@@ -16157,7 +17897,6 @@ impl DurableCodec for AppendCommit {
         Ok(Self {
             keyspace_id: KeyspaceId::decode(input)?,
             file_id: FileId::decode(input)?,
-            extent_id: ExtentId::decode(input)?,
             range: ByteRange::decode(input)?,
             version: FileVersion::decode(input)?,
             commit_seq: CommitSeq::decode(input)?,
@@ -16184,6 +17923,80 @@ impl DurableCodec for FileWriteCommit {
             version: FileVersion::decode(input)?,
             commit_seq: CommitSeq::decode(input)?,
             durability: WriteDurability::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendStreamStatus {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        match self {
+            Self::Active => 1u8,
+            Self::Fenced => 2,
+            Self::Aborted => 3,
+            Self::Published => 4,
+        }
+        .encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self::Active),
+            2 => Ok(Self::Fenced),
+            3 => Ok(Self::Aborted),
+            4 => Ok(Self::Published),
+            _ => Err(durable_codec_error("invalid append stream status tag")),
+        }
+    }
+}
+
+impl DurableCodec for AppendStreamSegment {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.ticket_id.encode(out)?;
+        self.offset.encode(out)?;
+        self.len.encode(out)?;
+        self.segment_id.encode(out)?;
+        self.segment_bytes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            ticket_id: AppendTicketId::decode(input)?,
+            offset: u64::decode(input)?,
+            len: u64::decode(input)?,
+            segment_id: SegmentId::decode(input)?,
+            segment_bytes: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendStreamState {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.stream_id.encode(out)?;
+        self.writer_epoch.encode(out)?;
+        self.base_version.encode(out)?;
+        self.visible_base_size.encode(out)?;
+        self.reserved_tail.encode(out)?;
+        self.durable_through.encode(out)?;
+        self.published_through.encode(out)?;
+        self.status.encode(out)?;
+        self.records.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            stream_id: AppendStreamId::decode(input)?,
+            writer_epoch: WriterEpoch::decode(input)?,
+            base_version: FileVersion::decode(input)?,
+            visible_base_size: u64::decode(input)?,
+            reserved_tail: u64::decode(input)?,
+            durable_through: u64::decode(input)?,
+            published_through: u64::decode(input)?,
+            status: AppendStreamStatus::decode(input)?,
+            records: Vec::decode(input)?,
         })
     }
 }
@@ -16219,17 +18032,20 @@ impl DurableCodec for NativeRequest {
                 keyspace_id,
                 file_id,
                 range,
+                verification,
             } => {
                 5u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
-                range.encode(out)
+                range.encode(out)?;
+                verification.encode(out)
             }
             Self::Write {
                 keyspace_id,
                 file_id,
                 offset,
                 bytes,
+                payload_integrity,
                 durability,
             } => {
                 6u8.encode(out)?;
@@ -16237,9 +18053,10 @@ impl DurableCodec for NativeRequest {
                 file_id.encode(out)?;
                 offset.encode(out)?;
                 bytes.encode(out)?;
+                payload_integrity.encode(out)?;
                 durability.encode(out)
             }
-            Self::OpenAppendSession {
+            Self::OpenAppendStream {
                 keyspace_id,
                 file_id,
             } => {
@@ -16247,51 +18064,71 @@ impl DurableCodec for NativeRequest {
                 keyspace_id.encode(out)?;
                 file_id.encode(out)
             }
-            Self::ReserveAppend {
+            Self::AppendStream {
                 keyspace_id,
                 file_id,
-                session,
-                len,
+                stream,
+                bytes,
+                payload_integrity,
             } => {
                 8u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
-                session.encode(out)?;
-                len.encode(out)
+                stream.encode(out)?;
+                bytes.encode(out)?;
+                payload_integrity.encode(out)
             }
-            Self::AppendReserved {
+            Self::FlushAppendStream {
                 keyspace_id,
                 file_id,
-                reservation,
-                bytes,
-                durability,
+                stream,
             } => {
                 9u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
-                reservation.encode(out)?;
-                bytes.encode(out)?;
-                durability.encode(out)
+                stream.encode(out)
+            }
+            Self::PublishAppendStream {
+                keyspace_id,
+                file_id,
+                stream,
+                mark,
+            } => {
+                10u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                stream.encode(out)?;
+                mark.encode(out)
+            }
+            Self::AbortAppendStream {
+                keyspace_id,
+                file_id,
+                stream,
+            } => {
+                11u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                stream.encode(out)
             }
             Self::Flush {
                 keyspace_id,
                 file_id,
             } => {
-                10u8.encode(out)?;
+                12u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)
             }
             Self::CheckpointKeyspace { keyspace_id } => {
-                11u8.encode(out)?;
+                13u8.encode(out)?;
                 keyspace_id.encode(out)
             }
             Self::SnapshotKeyspace { source, request } => {
-                12u8.encode(out)?;
+                14u8.encode(out)?;
                 source.encode(out)?;
                 request.encode(out)
             }
             Self::RestoreKeyspace { source, point } => {
-                13u8.encode(out)?;
+                15u8.encode(out)?;
                 source.encode(out)?;
                 point.encode(out)
             }
@@ -16318,43 +18155,55 @@ impl DurableCodec for NativeRequest {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
                 range: ByteRange::decode(input)?,
+                verification: ReadVerification::decode(input)?,
             }),
             6 => Ok(Self::Write {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
                 offset: u64::decode(input)?,
                 bytes: Vec::decode(input)?,
+                payload_integrity: PayloadIntegrity::decode(input)?,
                 durability: WriteDurability::decode(input)?,
             }),
-            7 => Ok(Self::OpenAppendSession {
+            7 => Ok(Self::OpenAppendStream {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
             }),
-            8 => Ok(Self::ReserveAppend {
+            8 => Ok(Self::AppendStream {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
-                session: AppendSession::decode(input)?,
-                len: u64::decode(input)?,
-            }),
-            9 => Ok(Self::AppendReserved {
-                keyspace_id: KeyspaceId::decode(input)?,
-                file_id: FileId::decode(input)?,
-                reservation: AppendReservation::decode(input)?,
+                stream: AppendStream::decode(input)?,
                 bytes: Vec::decode(input)?,
-                durability: WriteDurability::decode(input)?,
+                payload_integrity: PayloadIntegrity::decode(input)?,
             }),
-            10 => Ok(Self::Flush {
+            9 => Ok(Self::FlushAppendStream {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                stream: AppendStream::decode(input)?,
+            }),
+            10 => Ok(Self::PublishAppendStream {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                stream: AppendStream::decode(input)?,
+                mark: DurableAppendMark::decode(input)?,
+            }),
+            11 => Ok(Self::AbortAppendStream {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                stream: AppendStream::decode(input)?,
+            }),
+            12 => Ok(Self::Flush {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
             }),
-            11 => Ok(Self::CheckpointKeyspace {
+            13 => Ok(Self::CheckpointKeyspace {
                 keyspace_id: KeyspaceId::decode(input)?,
             }),
-            12 => Ok(Self::SnapshotKeyspace {
+            14 => Ok(Self::SnapshotKeyspace {
                 source: KeyspaceId::decode(input)?,
                 request: SnapshotKeyspaceRequest::decode(input)?,
             }),
-            13 => Ok(Self::RestoreKeyspace {
+            15 => Ok(Self::RestoreKeyspace {
                 source: KeyspaceId::decode(input)?,
                 point: RestorePoint::decode(input)?,
             }),
@@ -16390,32 +18239,37 @@ impl DurableCodec for NativeResponse {
                 6u8.encode(out)?;
                 commit.encode(out)
             }
-            Self::Append(commit) => {
+            Self::AppendStreamOpened(stream) => {
                 7u8.encode(out)?;
+                stream.encode(out)
+            }
+            Self::AppendTicket(ticket) => {
+                8u8.encode(out)?;
+                ticket.encode(out)
+            }
+            Self::DurableAppendMark(mark) => {
+                9u8.encode(out)?;
+                mark.encode(out)
+            }
+            Self::AppendPublished(commit) => {
+                10u8.encode(out)?;
                 commit.encode(out)
             }
-            Self::AppendSession(session) => {
-                8u8.encode(out)?;
-                session.encode(out)
-            }
-            Self::AppendReservation(reservation) => {
-                9u8.encode(out)?;
-                reservation.encode(out)
-            }
+            Self::AppendAborted => 11u8.encode(out),
             Self::Flush(flush) => {
-                10u8.encode(out)?;
+                12u8.encode(out)?;
                 flush.encode(out)
             }
             Self::KeyspaceCheckpointed(checkpoint_id) => {
-                11u8.encode(out)?;
+                13u8.encode(out)?;
                 checkpoint_id.encode(out)
             }
             Self::KeyspaceSnapshotted(keyspace_id) => {
-                12u8.encode(out)?;
+                14u8.encode(out)?;
                 keyspace_id.encode(out)
             }
             Self::KeyspaceRestored(keyspace_id) => {
-                13u8.encode(out)?;
+                15u8.encode(out)?;
                 keyspace_id.encode(out)
             }
         }
@@ -16429,13 +18283,15 @@ impl DurableCodec for NativeResponse {
             4 => Ok(Self::FileInfo(FileInfo::decode(input)?)),
             5 => Ok(Self::Read(ReadResponse::decode(input)?)),
             6 => Ok(Self::Write(FileWriteCommit::decode(input)?)),
-            7 => Ok(Self::Append(AppendCommit::decode(input)?)),
-            8 => Ok(Self::AppendSession(AppendSession::decode(input)?)),
-            9 => Ok(Self::AppendReservation(AppendReservation::decode(input)?)),
-            10 => Ok(Self::Flush(FlushResult::decode(input)?)),
-            11 => Ok(Self::KeyspaceCheckpointed(CheckpointId::decode(input)?)),
-            12 => Ok(Self::KeyspaceSnapshotted(KeyspaceId::decode(input)?)),
-            13 => Ok(Self::KeyspaceRestored(KeyspaceId::decode(input)?)),
+            7 => Ok(Self::AppendStreamOpened(AppendStream::decode(input)?)),
+            8 => Ok(Self::AppendTicket(AppendTicket::decode(input)?)),
+            9 => Ok(Self::DurableAppendMark(DurableAppendMark::decode(input)?)),
+            10 => Ok(Self::AppendPublished(AppendPublishCommit::decode(input)?)),
+            11 => Ok(Self::AppendAborted),
+            12 => Ok(Self::Flush(FlushResult::decode(input)?)),
+            13 => Ok(Self::KeyspaceCheckpointed(CheckpointId::decode(input)?)),
+            14 => Ok(Self::KeyspaceSnapshotted(KeyspaceId::decode(input)?)),
+            15 => Ok(Self::KeyspaceRestored(KeyspaceId::decode(input)?)),
             _ => Err(durable_codec_error("invalid native response tag")),
         }
     }
@@ -16541,11 +18397,7 @@ fn validate_durable_segment_bytes(
             "durable segment record key disagrees with descriptor",
         ));
     }
-    if record.commit.descriptor.checksum != Some(checksum64(bytes)) {
-        return Err(StorageError::corrupt(
-            "durable segment checksum does not match journal data",
-        ));
-    }
+    verify_segment_payload_integrity(record.commit.descriptor.integrity, bytes)?;
     Ok(())
 }
 
@@ -16558,64 +18410,48 @@ fn next_request_id(next: &Mutex<u128>) -> Result<RequestId> {
     Ok(request_id)
 }
 
-fn checksum64(bytes: &[u8]) -> u64 {
-    let mut a = 0xcbf2_9ce4_8422_2325u64 ^ (bytes.len() as u64);
-    let mut b = 0x9e37_79b1_85eb_ca87u64.wrapping_add(bytes.len() as u64);
-
-    let mut chunks = bytes.chunks_exact(32);
-    for chunk in &mut chunks {
-        let w0 = u64::from_le_bytes(chunk[0..8].try_into().expect("fixed chunk width"));
-        let w1 = u64::from_le_bytes(chunk[8..16].try_into().expect("fixed chunk width"));
-        let w2 = u64::from_le_bytes(chunk[16..24].try_into().expect("fixed chunk width"));
-        let w3 = u64::from_le_bytes(chunk[24..32].try_into().expect("fixed chunk width"));
-        a = a.wrapping_add(w0).rotate_left(5) ^ w2;
-        b = b.wrapping_add(w1).rotate_left(17) ^ w3;
-    }
-
-    let mut words = chunks.remainder().chunks_exact(8);
-    for word in &mut words {
-        let value = u64::from_le_bytes(word.try_into().expect("chunks_exact yields 8 bytes"));
-        a = a.wrapping_add(value).rotate_left(9) ^ b;
-    }
-    for byte in words.remainder() {
-        b ^= u64::from(*byte);
-        b = b.rotate_left(3).wrapping_add(0x100);
-    }
-
-    a ^= b.rotate_left(31);
-    a ^= a >> 33;
-    a = a.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    a ^= a >> 33;
-    a
+fn data_log_checksum(bytes: &[u8]) -> u64 {
+    u64::from(crc32c::crc32c(bytes))
 }
 
-fn data_log_checksum64(bytes: &[u8]) -> u64 {
-    let mut crc = 0u64;
-    for byte in bytes {
-        let index = ((crc >> 56) as u8 ^ *byte) as usize;
-        crc = (crc << 8) ^ CRC64_ECMA_TABLE[index];
+fn segment_payload_integrity(mode: PayloadIntegrity, bytes: &[u8]) -> SegmentPayloadIntegrity {
+    match mode {
+        PayloadIntegrity::Verified => SegmentPayloadIntegrity::Crc32c(data_log_checksum(bytes)),
+        PayloadIntegrity::Unchecked => SegmentPayloadIntegrity::Unchecked,
     }
-    crc
 }
 
-const fn crc64_ecma_table() -> [u64; 256] {
-    let mut table = [0u64; 256];
-    let mut index = 0;
-    while index < 256 {
-        let mut crc = (index as u64) << 56;
-        let mut bit = 0;
-        while bit < 8 {
-            if crc & 0x8000_0000_0000_0000 != 0 {
-                crc = (crc << 1) ^ CRC64_ECMA_POLY;
-            } else {
-                crc <<= 1;
-            }
-            bit += 1;
+fn verify_segment_payload_integrity(
+    integrity: SegmentPayloadIntegrity,
+    bytes: &[u8],
+) -> Result<()> {
+    match integrity {
+        SegmentPayloadIntegrity::Crc32c(expected) if data_log_checksum(bytes) != expected => {
+            Err(StorageError::corrupt("segment payload checksum mismatch"))
         }
-        table[index] = crc;
-        index += 1;
+        SegmentPayloadIntegrity::Crc32c(_) | SegmentPayloadIntegrity::Unchecked => Ok(()),
     }
-    table
+}
+
+fn segment_payload_integrity_key(integrity: SegmentPayloadIntegrity) -> String {
+    match integrity {
+        SegmentPayloadIntegrity::Crc32c(checksum) => format!("crc32c:{}", u64_key(checksum)),
+        SegmentPayloadIntegrity::Unchecked => "unchecked".to_string(),
+    }
+}
+
+fn parse_segment_payload_integrity_key(value: &str) -> rusqlite::Result<SegmentPayloadIntegrity> {
+    if value == "unchecked" {
+        return Ok(SegmentPayloadIntegrity::Unchecked);
+    }
+    let Some(checksum) = value.strip_prefix("crc32c:") else {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("invalid payload integrity {value}").into(),
+        ));
+    };
+    parse_u64_key(checksum).map(SegmentPayloadIntegrity::Crc32c)
 }
 
 fn replace_leaf_entries(
@@ -17170,6 +19006,7 @@ mod tests {
                 segment_id: commit.descriptor.segment_id,
                 storage_node: commit.placement.storage_node,
                 max_bytes: commit.descriptor.bytes,
+                payload_integrity: PayloadIntegrity::Verified,
                 durability: WriteDurability::Acknowledged,
                 expires_at: LOCAL_GRANT_EXPIRATION,
             })
@@ -17204,6 +19041,7 @@ mod tests {
                 segment_id,
                 storage_node,
                 max_bytes: bytes,
+                payload_integrity: PayloadIntegrity::Verified,
                 durability: WriteDurability::Acknowledged,
                 expires_at: LOCAL_GRANT_EXPIRATION,
             })
@@ -17267,7 +19105,7 @@ mod tests {
             keyspace_id: KeyspaceId,
             file_id: FileId,
             data: &[u8],
-        ) -> Result<AppendCommit>;
+        ) -> Result<AppendPublishCommit>;
         fn read_file_for_conformance(
             &self,
             keyspace_id: KeyspaceId,
@@ -17370,10 +19208,11 @@ mod tests {
             keyspace_id: KeyspaceId,
             file_id: FileId,
             data: &[u8],
-        ) -> Result<AppendCommit> {
-            let session = self.open_append_session(keyspace_id, file_id)?;
-            let reservation = self.reserve_append(&session, data.len() as u64)?;
-            self.append_reserved(reservation, data, WriteDurability::Acknowledged)
+        ) -> Result<AppendPublishCommit> {
+            let stream = self.open_append_stream(keyspace_id, file_id)?;
+            self.append_stream(&stream, data, WriteDurability::Acknowledged)?;
+            let mark = self.flush_append_stream(&stream)?;
+            self.publish_append_stream(&stream, &mark, WriteDurability::Acknowledged)
         }
 
         fn read_file_for_conformance(
@@ -17459,10 +19298,11 @@ mod tests {
             keyspace_id: KeyspaceId,
             file_id: FileId,
             data: &[u8],
-        ) -> Result<AppendCommit> {
-            let session = self.open_append_session(keyspace_id, file_id)?;
-            let reservation = self.reserve_append(&session, data.len() as u64)?;
-            self.append_reserved(reservation, data, WriteDurability::Flushed)
+        ) -> Result<AppendPublishCommit> {
+            let stream = self.open_append_stream(keyspace_id, file_id)?;
+            self.append_stream(&stream, data, WriteDurability::Acknowledged)?;
+            let mark = self.flush_append_stream(&stream)?;
+            self.publish_append_stream(&stream, &mark)
         }
 
         fn read_file_for_conformance(
@@ -17701,7 +19541,7 @@ mod tests {
             segment_id: SegmentId::from_raw(700),
             blocks: BlockCount::from_raw(1),
             bytes: 4096,
-            checksum: None,
+            integrity: SegmentPayloadIntegrity::Unchecked,
         };
         let node = MetadataNode {
             node_id: MetadataNodeId::from_raw(700),
@@ -18558,17 +20398,17 @@ mod tests {
                                 file_id
                             };
                             let file = native_client.open_file(native_keyspace, file_id).unwrap();
-                            let stale = file.open_append_session().unwrap();
-                            let fresh = file.open_append_session().unwrap();
+                            let stale = file.open_append_stream().unwrap();
+                            let fresh = file.open_append_stream().unwrap();
                             assert!(
-                                append_native_file_with_session(
+                                append_native_file_with_stream(
                                     &file,
                                     &stale,
                                     &repeated_blocks(1, 1)
                                 )
                                 .is_err()
                             );
-                            append_native_file_with_session(&file, &fresh, &repeated_blocks(1, 2))
+                            append_native_file_with_stream(&file, &fresh, &repeated_blocks(1, 2))
                                 .unwrap();
                             file_models.get_mut(&file_id).unwrap().push(2);
                             harness
@@ -19359,6 +21199,312 @@ mod tests {
     }
 
     #[test]
+    fn durable_acknowledged_write_does_not_touch_data_log_before_flush() {
+        let root = durable_temp_dir("ack-no-data-log-before-flush");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 21),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        let data_log = data_log_path(&root.join("data"), cfg.storage_node, 1);
+        assert!(!data_log.exists());
+        assert!(store.durable.data_log_rows_for_test().unwrap().is_empty());
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut hidden = vec![99; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut hidden)
+            .unwrap();
+        assert_eq!(hidden, vec![0; 4096]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_acknowledged_append_stream_does_not_touch_data_log_before_flush() {
+        let root = durable_temp_dir("stream-ack-no-data-log-before-flush");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(
+                &stream,
+                &repeated_blocks(1, 31),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        assert!(!data_log_path(&root.join("data"), cfg.storage_node, 1).exists());
+        assert!(store.durable.data_log_rows_for_test().unwrap().is_empty());
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        assert!(reopened.flush_append_stream(&stream).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_append_stream_flush_profiles_are_bounded_sync_groups() {
+        let root = durable_temp_dir("stream-flush-bounded-groups");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store.enable_persist_profiling(16).unwrap();
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        let one_mib = vec![41; 1024 * 1024];
+        for _ in 0..40 {
+            store
+                .append_stream(&stream, &one_mib, WriteDurability::Acknowledged)
+                .unwrap();
+        }
+
+        let mark = store.flush_append_stream(&stream).unwrap();
+        assert_eq!(mark.durable_through, 40 * 1024 * 1024);
+        let profiles = store.drain_persist_profiles(16).unwrap();
+        assert!(
+            profiles.len() >= 2,
+            "40MiB stream flush should require multiple bounded physical persists"
+        );
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.new_segment_bytes <= MAX_DATA_LOG_SYNC_GROUP_BYTES)
+        );
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.new_segment_bytes)
+                .sum::<u64>(),
+            40 * 1024 * 1024
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_stream_publish_does_not_flush_unrelated_private_stream_data() {
+        let root = durable_temp_dir("stream-publish-leaves-private-data-unflushed");
+        let cfg = LocalStoreConfig {
+            file_root_blocks: 16 * 1024,
+            ..config()
+        };
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let target_file = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("target".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let private_file = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("private".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store.enable_persist_profiling(16).unwrap();
+
+        let one_mib = vec![17; 1024 * 1024];
+        let target_stream = store.open_append_stream(keyspace_id, target_file).unwrap();
+        store
+            .append_stream(&target_stream, &one_mib, WriteDurability::Acknowledged)
+            .unwrap();
+        let target_mark = store.flush_append_stream(&target_stream).unwrap();
+        assert_eq!(target_mark.durable_through, 1024 * 1024);
+        let _ = store.drain_persist_profiles(16).unwrap();
+
+        let private_stream = store.open_append_stream(keyspace_id, private_file).unwrap();
+        for _ in 0..40 {
+            store
+                .append_stream(&private_stream, &one_mib, WriteDurability::Acknowledged)
+                .unwrap();
+        }
+
+        store
+            .publish_append_stream(&target_stream, &target_mark)
+            .unwrap();
+        let profiles = store.drain_persist_profiles(16).unwrap();
+        assert!(
+            !profiles.is_empty(),
+            "publish should still record a physical metadata persist"
+        );
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.new_segment_bytes <= MAX_DATA_LOG_SYNC_GROUP_BYTES)
+        );
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.new_segment_bytes)
+                .sum::<u64>(),
+            0,
+            "publishing one stream must not persist unrelated unflushed private bytes"
+        );
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let private_mark = reopened.flush_append_stream(&private_stream).unwrap();
+        assert_eq!(
+            private_mark.durable_through, private_stream.visible_base_size,
+            "unflushed private stream bytes must not become resumable through unrelated publish"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_append_stream_publish_delta_does_not_reappend_flushed_payloads() {
+        let root = durable_temp_dir("stream-publish-no-reappend");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store.enable_persist_profiling(8).unwrap();
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        let payload = repeated_blocks(1, 51);
+        store
+            .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+            .unwrap();
+        let mark = store.flush_append_stream(&stream).unwrap();
+        let flush_profiles = store.drain_persist_profiles(8).unwrap();
+        assert_eq!(flush_profiles.len(), 1);
+        assert_eq!(flush_profiles[0].new_segment_bytes, 4096);
+
+        store.publish_append_stream(&stream, &mark).unwrap();
+        let publish_profiles = store.drain_persist_profiles(8).unwrap();
+        assert_eq!(publish_profiles.len(), 1);
+        assert_eq!(publish_profiles[0].new_segment_count, 0);
+        assert_eq!(publish_profiles[0].new_segment_bytes, 0);
+        assert_eq!(publish_profiles[0].data_log_append_sync_nanos, 0);
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; payload.len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, payload.len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, payload);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_flush_persists_acknowledged_segment_once() {
+        let root = durable_temp_dir("ack-flush-persists-segment-once");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store.enable_persist_profiling(8).unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 22),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let data_log = data_log_path(&root.join("data"), cfg.storage_node, 1);
+        assert!(!data_log.exists());
+
+        store.flush_device(device_id).unwrap();
+        let postflush_len = data_log.metadata().unwrap().len();
+        assert!(postflush_len > 4096);
+        let profiles = store.drain_persist_profiles(8).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].new_segment_count, 1);
+        assert_eq!(profiles[0].new_segment_bytes, 4096);
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 22));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn durable_persist_profiling_is_opt_in_and_records_physical_persists() {
         let root = durable_temp_dir("persist-profile");
         let cfg = config();
@@ -19452,6 +21598,7 @@ mod tests {
             "concurrent flush waiters should share one physical persist"
         );
         assert_eq!(profiles[0].new_segment_count, 4);
+        assert_eq!(profiles[0].new_segment_bytes, 4 * 4096);
 
         drop(store);
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -19742,8 +21889,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_sqlite_repairs_native_referenced_pending_catalog_rows_on_reopen() {
-        let root = durable_temp_dir("pending-native-catalog-reference-repair");
+    fn durable_sqlite_persists_native_stream_references_on_publish() {
+        let root = durable_temp_dir("native-stream-reference-persist");
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
         let keyspace_id = store
@@ -19773,7 +21920,7 @@ mod tests {
 
         assert_eq!(
             node_catalog_entry(&root, cfg.storage_node, segment_id).state,
-            SegmentLifecycleState::DurablePendingMetadata
+            SegmentLifecycleState::Referenced
         );
 
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -20196,8 +22343,8 @@ mod tests {
     }
 
     #[test]
-    fn data_log_checksum_uses_crc64_ecma_golden_value() {
-        assert_eq!(data_log_checksum64(b"123456789"), 0x6c40_df5f_0b49_7347);
+    fn data_log_checksum_uses_crc32c_golden_value() {
+        assert_eq!(data_log_checksum(b"123456789"), 0xe306_9283);
     }
 
     #[test]
@@ -20357,16 +22504,27 @@ mod tests {
         drop(store);
 
         let data_log = data_log_path(&root.join("data"), cfg.storage_node, 1);
+        let unplaced = repeated_blocks(1, 9);
         OpenOptions::new()
             .append(true)
             .open(&data_log)
             .unwrap()
             .write_all(
-                &encode_data_log_record(SegmentId::from_raw(999), &repeated_blocks(1, 9)).unwrap(),
+                &encode_data_log_record(
+                    SegmentId::from_raw(999),
+                    segment_payload_integrity(PayloadIntegrity::Verified, &unplaced),
+                    &unplaced,
+                )
+                .unwrap(),
             )
             .unwrap();
-        let torn =
-            encode_data_log_record(SegmentId::from_raw(1000), &repeated_blocks(1, 10)).unwrap();
+        let torn_payload = repeated_blocks(1, 10);
+        let torn = encode_data_log_record(
+            SegmentId::from_raw(1000),
+            segment_payload_integrity(PayloadIntegrity::Verified, &torn_payload),
+            &torn_payload,
+        )
+        .unwrap();
         OpenOptions::new()
             .append(true)
             .open(&data_log)
@@ -20463,7 +22621,7 @@ mod tests {
             .open(path)
             .unwrap();
         let checksum_offset =
-            placement.record_offset + u64::try_from(DATA_LOG_MAGIC.len() + 2 + 16 + 8).unwrap();
+            placement.record_offset + u64::try_from(DATA_LOG_MAGIC.len() + 2 + 16 + 8 + 1).unwrap();
         file.seek(SeekFrom::Start(checksum_offset)).unwrap();
         let mut byte = [0; 1];
         file.read_exact(&mut byte).unwrap();
@@ -20472,6 +22630,185 @@ mod tests {
         file.sync_data().unwrap();
 
         assert!(DurableCoordinator::open(&root, cfg).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_read_device_rejects_in_memory_payload_corruption_by_default() {
+        let root = durable_temp_dir("read-device-memory-corruption");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 4),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let segment_id = first_device_segment(&store, device_id);
+        let placement = store.durable.placement_for_test(segment_id).unwrap();
+        corrupt_in_memory_segment_payload(&store, &placement, segment_id);
+
+        let mut bytes = vec![0; 4096];
+        assert!(
+            store
+                .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_read_file_rejects_in_memory_payload_corruption_by_default() {
+        let root = durable_temp_dir("read-file-memory-corruption");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest { name: None })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            )
+            .unwrap();
+        store
+            .write_file_at(
+                keyspace_id,
+                file_id,
+                0,
+                &repeated_blocks(1, 5),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let segment_id = file_segment_ids(&store.metadata(), keyspace_id, file_id)
+            .into_iter()
+            .next()
+            .unwrap();
+        let placement = store.durable.placement_for_test(segment_id).unwrap();
+        corrupt_in_memory_segment_payload(&store, &placement, segment_id);
+
+        let mut bytes = vec![0; 4096];
+        assert!(
+            store
+                .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_unchecked_block_payload_allows_default_read_but_not_required_verification() {
+        let root = durable_temp_dir("unchecked-block-payload");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        let payload = repeated_blocks(1, 44);
+        store
+            .write_device_with_integrity(
+                device_id,
+                0,
+                &payload,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Unchecked,
+            )
+            .unwrap();
+
+        let mut bytes = vec![0; 4096];
+        store
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, payload);
+        assert!(
+            store
+                .read_device_with_verification(
+                    device_id,
+                    ByteRange::new(0, 4096),
+                    &mut bytes,
+                    ReadVerification::RequireVerified,
+                )
+                .is_err()
+        );
+
+        let segment_id = first_device_segment(&store, device_id);
+        let placement = store.durable.placement_for_test(segment_id).unwrap();
+        corrupt_in_memory_segment_payload(&store, &placement, segment_id);
+        store
+            .read_device_with_verification(
+                device_id,
+                ByteRange::new(0, 4096),
+                &mut bytes,
+                ReadVerification::Skip,
+            )
+            .unwrap();
+        assert_ne!(bytes, payload);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_unchecked_native_payload_allows_default_read_but_not_required_verification() {
+        let root = durable_temp_dir("unchecked-native-payload");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest { name: None })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec { name: None },
+                },
+            )
+            .unwrap();
+        let payload = repeated_blocks(1, 45);
+        store
+            .write_file_at_with_integrity(
+                keyspace_id,
+                file_id,
+                0,
+                &payload,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Unchecked,
+            )
+            .unwrap();
+
+        let mut bytes = vec![0; 4096];
+        store
+            .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, payload);
+        assert!(
+            store
+                .read_file_with_verification(
+                    keyspace_id,
+                    file_id,
+                    ByteRange::new(0, 4096),
+                    &mut bytes,
+                    ReadVerification::RequireVerified,
+                )
+                .is_err()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21620,16 +23957,11 @@ mod tests {
                     }
                     2 => {
                         let byte = (1 + rng.next_u64() % 254) as u8;
-                        append_durable_store_once(
-                            &store,
-                            keyspace_id,
-                            file_id,
-                            &[byte; 4096],
-                            WriteDurability::Acknowledged,
-                        )
-                        .unwrap();
-                        live_file.push(byte);
-                        trace.push(format!("step={step} append_ack byte={byte}"));
+                        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+                        store
+                            .append_stream(&stream, &[byte; 4096], WriteDurability::Acknowledged)
+                            .unwrap();
+                        trace.push(format!("step={step} append_private_ack byte={byte}"));
                     }
                     3 => {
                         let byte = (1 + rng.next_u64() % 254) as u8;
@@ -21677,7 +24009,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_append_session_open_does_not_persist_writer_epoch() {
+    fn durable_append_stream_open_does_not_persist_writer_epoch() {
         let root = durable_temp_dir("native-restart");
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -21704,14 +24036,14 @@ mod tests {
             before.file_writer_epochs.get(&(keyspace_id, file_id)),
             Some(&WriterEpoch::from_raw(0))
         );
-        let session = store.open_append_session(keyspace_id, file_id).unwrap();
-        assert_eq!(session.writer_epoch, WriterEpoch::from_raw(1));
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        assert_eq!(stream.writer_epoch, WriterEpoch::from_raw(1));
         let after_acquire = store.metadata().state_inner().unwrap();
         assert_eq!(
             after_acquire
                 .file_writer_epochs
                 .get(&(keyspace_id, file_id)),
-            Some(&WriterEpoch::from_raw(0))
+            Some(&WriterEpoch::from_raw(1))
         );
         drop(store);
 
@@ -21725,8 +24057,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_uncommitted_append_sessions_fail_after_reopen_even_when_epoch_repeats() {
-        let root = durable_temp_dir("native-restart-stale-session");
+    fn durable_unflushed_append_streams_fail_after_reopen_even_when_epoch_repeats() {
+        let root = durable_temp_dir("native-restart-stale-stream");
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
         let keyspace_id = store
@@ -21744,16 +24076,16 @@ mod tests {
                 },
             )
             .unwrap();
-        let stale = store.open_append_session(keyspace_id, file_id).unwrap();
+        let stale = store.open_append_stream(keyspace_id, file_id).unwrap();
         assert_eq!(stale.writer_epoch, WriterEpoch::from_raw(1));
         drop(store);
 
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
-        let fresh = reopened.open_append_session(keyspace_id, file_id).unwrap();
+        let fresh = reopened.open_append_stream(keyspace_id, file_id).unwrap();
         assert_eq!(fresh.writer_epoch, stale.writer_epoch);
-        assert_ne!(fresh.session_id, stale.session_id);
+        assert_ne!(fresh.stream_id, stale.stream_id);
         assert!(
-            append_durable_store_with_session(
+            append_durable_store_with_stream(
                 &reopened,
                 &stale,
                 b"stale",
@@ -21761,7 +24093,7 @@ mod tests {
             )
             .is_err()
         );
-        append_durable_store_with_session(&reopened, &fresh, b"durable", WriteDurability::Flushed)
+        append_durable_store_with_stream(&reopened, &fresh, b"durable", WriteDurability::Flushed)
             .unwrap();
         let mut bytes = vec![0; b"durable".len()];
         reopened
@@ -21799,19 +24131,19 @@ mod tests {
     }
 
     #[test]
-    fn append_session_stealing_is_scoped_to_one_file() {
+    fn append_stream_stealing_is_scoped_to_one_file() {
         let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (file_a, _) = create_local_file(&client, keyspace_id);
         let (file_b, _) = create_local_file(&client, keyspace_id);
 
-        let file_b_session = store.open_append_session(keyspace_id, file_b).unwrap();
-        let stale_file_a = store.open_append_session(keyspace_id, file_a).unwrap();
-        let fresh_file_a = store.open_append_session(keyspace_id, file_a).unwrap();
+        let file_b_stream = store.open_append_stream(keyspace_id, file_b).unwrap();
+        let stale_file_a = store.open_append_stream(keyspace_id, file_a).unwrap();
+        let fresh_file_a = store.open_append_stream(keyspace_id, file_a).unwrap();
 
         assert!(
-            append_local_store_with_session(
+            append_local_store_with_stream(
                 &store,
                 &stale_file_a,
                 b"stale",
@@ -21819,14 +24151,9 @@ mod tests {
             )
             .is_err()
         );
-        append_local_store_with_session(
-            &store,
-            &file_b_session,
-            b"b",
-            WriteDurability::Acknowledged,
-        )
-        .unwrap();
-        append_local_store_with_session(&store, &fresh_file_a, b"a", WriteDurability::Acknowledged)
+        append_local_store_with_stream(&store, &file_b_stream, b"b", WriteDurability::Acknowledged)
+            .unwrap();
+        append_local_store_with_stream(&store, &fresh_file_a, b"a", WriteDurability::Acknowledged)
             .unwrap();
 
         let mut file_a_bytes = vec![0; 1];
@@ -21842,19 +24169,19 @@ mod tests {
     }
 
     #[test]
-    fn same_file_write_at_invalidates_append_session_without_touching_other_files() {
+    fn same_file_write_at_invalidates_append_stream_without_touching_other_files() {
         let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (file_a_id, file_a) = create_local_file(&client, keyspace_id);
         let (_file_b_id, file_b) = create_local_file(&client, keyspace_id);
 
-        let stale_a = file_a.open_append_session().unwrap();
-        let live_b = file_b.open_append_session().unwrap();
+        let stale_a = file_a.open_append_stream().unwrap();
+        let live_b = file_b.open_append_stream().unwrap();
         file_a.write_at(0, b"base").unwrap();
 
-        assert!(append_native_file_with_session(&file_a, &stale_a, b"x").is_err());
-        append_native_file_with_session(&file_b, &live_b, b"b").unwrap();
+        assert!(append_native_file_with_stream(&file_a, &stale_a, b"x").is_err());
+        append_native_file_with_stream(&file_b, &live_b, b"b").unwrap();
         append_native_file_once(&file_a, b"x").unwrap();
 
         let mut file_a_bytes = vec![0; b"basex".len()];
@@ -21873,8 +24200,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_reopen_invalidates_uncommitted_append_reservations() {
-        let root = durable_temp_dir("native-restart-stale-reservation");
+    fn durable_reopen_invalidates_unflushed_append_streams() {
+        let root = durable_temp_dir("native-restart-stale-stream");
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
         let keyspace_id = store
@@ -21892,18 +24219,14 @@ mod tests {
                 },
             )
             .unwrap();
-        let session = store.open_append_session(keyspace_id, file_id).unwrap();
-        let stale = store
-            .reserve_append(&session, b"stale".len() as u64)
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(&stream, b"stale", WriteDurability::Acknowledged)
             .unwrap();
         drop(store);
 
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
-        assert!(
-            reopened
-                .append_reserved(stale, b"stale", WriteDurability::Acknowledged)
-                .is_err()
-        );
+        assert!(reopened.flush_append_stream(&stream).is_err());
         append_durable_store_once(
             &reopened,
             keyspace_id,
@@ -21924,6 +24247,251 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, b"durable");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unrelated_persist_does_not_make_unflushed_append_bytes_resumable() {
+        let root = durable_temp_dir("native-stream-unflushed-private-pruned");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("target".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let other_file = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("other".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(&stream, b"private", WriteDurability::Acknowledged)
+            .unwrap();
+        store
+            .write_file_at(
+                keyspace_id,
+                other_file,
+                0,
+                b"other",
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mark = reopened.flush_append_stream(&stream).unwrap();
+        assert_eq!(mark.durable_through, stream.visible_base_size);
+        let no_op = reopened.publish_append_stream(&stream, &mark).unwrap();
+        assert_eq!(no_op.range.len, 0);
+        assert_eq!(
+            reopened
+                .metadata()
+                .get_file_head(keyspace_id, file_id)
+                .unwrap()
+                .size,
+            0
+        );
+
+        append_durable_store_with_stream(&reopened, &stream, b"new", WriteDurability::Acknowledged)
+            .unwrap();
+        let mut bytes = vec![0; b"new".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, b"new".len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"new");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_append_stream_flush_is_invisible_until_publish_and_resumable_after_reopen() {
+        let root = durable_temp_dir("native-stream-flush-invisible");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(&stream, b"private", WriteDurability::Acknowledged)
+            .unwrap();
+        let mark = store.flush_append_stream(&stream).unwrap();
+        assert_eq!(mark.durable_through, b"private".len() as u64);
+        assert_eq!(
+            store
+                .metadata()
+                .get_file_head(keyspace_id, file_id)
+                .unwrap()
+                .size,
+            0
+        );
+        let mut hidden = vec![0; b"private".len()];
+        assert!(
+            store
+                .read_file(
+                    keyspace_id,
+                    file_id,
+                    ByteRange::new(0, hidden.len() as u64),
+                    &mut hidden
+                )
+                .is_err()
+        );
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        assert_eq!(
+            reopened
+                .metadata()
+                .get_file_head(keyspace_id, file_id)
+                .unwrap()
+                .size,
+            0
+        );
+        reopened.publish_append_stream(&stream, &mark).unwrap();
+        let mut visible = vec![0; b"private".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, visible.len() as u64),
+                &mut visible,
+            )
+            .unwrap();
+        assert_eq!(visible, b"private");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_append_stream_fences_old_private_data_and_starts_at_visible_head() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, _) = create_local_file(&client, keyspace_id);
+        append_local_store_once(
+            &store,
+            keyspace_id,
+            file_id,
+            b"base",
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+
+        let old = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(&old, b"old", WriteDurability::Acknowledged)
+            .unwrap();
+        let old_mark = store.flush_append_stream(&old).unwrap();
+        let fresh = store.open_append_stream(keyspace_id, file_id).unwrap();
+        assert_eq!(fresh.visible_base_size, b"base".len() as u64);
+        assert!(
+            store
+                .publish_append_stream(&old, &old_mark, WriteDurability::Acknowledged)
+                .is_err()
+        );
+
+        store
+            .append_stream(&fresh, b"new", WriteDurability::Acknowledged)
+            .unwrap();
+        let fresh_mark = store.flush_append_stream(&fresh).unwrap();
+        store
+            .publish_append_stream(&fresh, &fresh_mark, WriteDurability::Acknowledged)
+            .unwrap();
+        let mut bytes = vec![0; b"basenew".len()];
+        store
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, bytes.len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"basenew");
+    }
+
+    #[test]
+    fn gc_roots_active_private_stream_data_and_reclaims_fenced_private_data() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_id, _) = create_local_file(&client, keyspace_id);
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(&stream, b"private", WriteDurability::Acknowledged)
+            .unwrap();
+        let private_segment = store
+            .metadata()
+            .state_inner()
+            .unwrap()
+            .append_streams
+            .get(&stream.stream_id)
+            .unwrap()
+            .records
+            .first()
+            .unwrap()
+            .segment_id;
+
+        let active_mark = store
+            .mark_reachable_for_gc(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        assert!(active_mark.segments.contains(&private_segment));
+
+        let _fresh = store.open_append_stream(keyspace_id, file_id).unwrap();
+        let fenced_mark = store
+            .mark_reachable_for_gc(RetentionPolicy::expire_deleted_immediately())
+            .unwrap();
+        assert!(!fenced_mark.segments.contains(&private_segment));
+        let sweep = store
+            .sweep_metadata_after_mark(
+                RetentionPolicy::expire_deleted_immediately(),
+                fenced_mark.epoch,
+            )
+            .unwrap();
+        assert!(sweep.released_segments.contains(&private_segment));
+        let expired_intent = store
+            .segment_catalog()
+            .intent_for_segment(private_segment)
+            .unwrap()
+            .write_intent;
+        let custodian = store
+            .run_storage_node_custodian(&BTreeSet::from([expired_intent]))
+            .unwrap();
+        assert_eq!(custodian.orphan_segments, vec![private_segment]);
+        assert_eq!(
+            store.segment_catalog().state(private_segment).unwrap(),
+            SegmentLifecycleState::Freed
+        );
     }
 
     #[test]
@@ -22183,7 +24751,7 @@ mod tests {
                                 segment_id: reservation.segment_id,
                                 blocks: BlockCount::from_raw(1),
                                 bytes: 4096,
-                                checksum: None,
+                                integrity: SegmentPayloadIntegrity::Unchecked,
                             },
                             placement: SegmentReplicaPlacement {
                                 segment_id: reservation.segment_id,
@@ -22371,6 +24939,7 @@ mod tests {
                 keyspace_id,
                 file_id,
                 range: ByteRange::new(0, 1),
+                verification: ReadVerification::Default,
             },
         );
         assert!(native_transport.call(invalid_read.clone()).is_err());
@@ -22605,6 +25174,7 @@ mod tests {
                 device_id,
                 offset: 0,
                 bytes: vec![7; 4096],
+                payload_integrity: PayloadIntegrity::Verified,
                 durability: WriteDurability::Acknowledged,
             },
         );
@@ -22629,6 +25199,7 @@ mod tests {
             BlockRequest::Read {
                 device_id,
                 range: ByteRange::new(0, 4096),
+                verification: ReadVerification::Default,
             },
         );
         chaos.delay_next_response().unwrap();
@@ -22648,6 +25219,7 @@ mod tests {
             BlockRequest::Read {
                 device_id,
                 range: ByteRange::new(0, 4096),
+                verification: ReadVerification::Default,
             },
         );
         chaos.delay_next_response().unwrap();
@@ -22819,6 +25391,7 @@ mod tests {
                 file_id,
                 offset: 0,
                 bytes: b"native".to_vec(),
+                payload_integrity: PayloadIntegrity::Verified,
                 durability: WriteDurability::Acknowledged,
             },
         );
@@ -22843,6 +25416,7 @@ mod tests {
                 keyspace_id,
                 file_id,
                 range: ByteRange::new(0, b"native".len() as u64),
+                verification: ReadVerification::Default,
             },
         );
         chaos.delay_next_response().unwrap();
@@ -23206,6 +25780,7 @@ mod tests {
                 device_id,
                 offset: 0,
                 bytes: vec![8; 4096],
+                payload_integrity: PayloadIntegrity::Verified,
                 durability: WriteDurability::Acknowledged,
             },
         );
@@ -23241,6 +25816,7 @@ mod tests {
                 BlockRequest::Read {
                     device_id,
                     range: ByteRange::new(0, 4096),
+                    verification: ReadVerification::Default,
                 },
             ))
             .unwrap();
@@ -24511,23 +27087,23 @@ mod tests {
     }
 
     #[test]
-    fn native_append_sessions_reuse_and_stealing_are_deterministic() {
+    fn native_append_streams_reuse_and_stealing_are_deterministic() {
         let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
         let (file_id, file) = create_local_file(&client, keyspace_id);
 
-        let first = file.open_append_session().unwrap();
-        let stolen = file.open_append_session().unwrap();
-        let stolen_session_id = stolen.session_id;
-        assert!(append_native_file_with_session(&file, &first, &repeated_blocks(1, 1)).is_err());
+        let first = file.open_append_stream().unwrap();
+        let stolen = file.open_append_stream().unwrap();
+        let stolen_stream_id = stolen.stream_id;
+        assert!(append_native_file_with_stream(&file, &first, &repeated_blocks(1, 1)).is_err());
 
         let commit =
-            append_native_file_with_session(&file, &stolen, &repeated_blocks(2, 2)).unwrap();
+            append_native_file_with_stream(&file, &stolen, &repeated_blocks(2, 2)).unwrap();
         assert_eq!(commit.version, FileVersion::from_raw(1));
         assert_eq!(commit.range, ByteRange::new(0, 2 * 4096));
         let second =
-            append_native_file_with_session(&file, &stolen, &repeated_blocks(1, 3)).unwrap();
+            append_native_file_with_stream(&file, &stolen, &repeated_blocks(1, 3)).unwrap();
         assert_eq!(second.version, FileVersion::from_raw(2));
         assert_eq!(second.range, ByteRange::new(2 * 4096, 4096));
 
@@ -24556,7 +27132,7 @@ mod tests {
             .unwrap();
         assert_ne!(
             intent.write_intent,
-            WriteIntentId::from_raw(stolen_session_id.raw())
+            WriteIntentId::from_raw(stolen_stream_id.raw())
         );
     }
 
@@ -24886,9 +27462,9 @@ mod tests {
             .get_keyspace_head(keyspace_id)
             .unwrap()
             .root;
-        let stale_source_session = file_a.open_append_session().unwrap();
+        let stale_source_stream = file_a.open_append_stream().unwrap();
 
-        append_native_file_with_session(&file_a, &stale_source_session, &repeated_blocks(1, 3))
+        append_native_file_with_stream(&file_a, &stale_source_stream, &repeated_blocks(1, 3))
             .unwrap();
 
         let nodes_before_restore = store.metadata().metadata_node_count().unwrap();
@@ -24953,9 +27529,9 @@ mod tests {
         );
 
         assert!(
-            append_native_file_with_session(
+            append_native_file_with_stream(
                 &restored_a,
-                &stale_source_session,
+                &stale_source_stream,
                 &repeated_blocks(1, 4)
             )
             .is_err()
@@ -25472,20 +28048,19 @@ mod tests {
             RequestId::from_raw(11),
             ClientEpoch::from_raw(1),
             None,
-            NativeRequest::AppendReserved {
+            NativeRequest::AppendStream {
                 keyspace_id,
                 file_id: FileId::from_raw(1),
-                reservation: crate::extent::AppendReservation {
+                stream: crate::extent::AppendStream {
                     keyspace_id,
                     file_id: FileId::from_raw(1),
-                    session_id: crate::id::AppendSessionId::from_raw(1),
-                    reservation_id: crate::id::AppendReservationId::from_raw(2),
+                    stream_id: crate::id::AppendStreamId::from_raw(1),
                     writer_epoch: WriterEpoch::from_raw(0),
-                    offset: 0,
-                    len: 1,
+                    base_version: FileVersion::from_raw(0),
+                    visible_base_size: 0,
                 },
                 bytes: vec![1],
-                durability: WriteDurability::Acknowledged,
+                payload_integrity: PayloadIntegrity::Verified,
             },
         ));
 
@@ -25593,6 +28168,7 @@ mod tests {
                 segment_id,
                 storage_node: cfg.storage_node,
                 max_bytes: intent.bytes,
+                payload_integrity: PayloadIntegrity::Verified,
                 durability: WriteDurability::Acknowledged,
                 expires_at: LOCAL_GRANT_EXPIRATION,
             })
@@ -25961,7 +28537,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_native_grant_receipt_flow_publishes_append_and_write() {
+    fn trusted_native_grant_receipt_flow_publishes_write_and_stream_append() {
         let store = LocalCoordinator::with_config(config()).unwrap();
         let keyspace = store
             .metadata()
@@ -25978,32 +28554,21 @@ mod tests {
                 },
             })
             .unwrap();
-        let session = store
-            .open_append_session(keyspace.keyspace_id, file.file_id)
+        let stream = store
+            .open_append_stream(keyspace.keyspace_id, file.file_id)
             .unwrap();
-        let reservation = store.reserve_append(&session, 4096).unwrap();
-        let append_grant = store
-            .issue_native_append_grant(reservation, 4096, 4096, WriteDurability::Acknowledged)
+        store
+            .append_stream(
+                &stream,
+                &repeated_blocks(1, 21),
+                WriteDurability::Acknowledged,
+            )
             .unwrap();
-        let append_receipt = store
-            .write_granted_segment(&append_grant, repeated_blocks(1, 21))
-            .unwrap();
+        let mark = store.flush_append_stream(&stream).unwrap();
         let append = store
-            .submit_native_append_receipt(&append_grant, append_receipt.clone())
+            .publish_append_stream(&stream, &mark, WriteDurability::Acknowledged)
             .unwrap();
         assert_eq!(append.range, ByteRange::new(0, 4096));
-        assert_eq!(
-            store
-                .storage_nodes
-                .state(append_receipt.segment_id)
-                .unwrap(),
-            SegmentLifecycleState::Referenced
-        );
-        assert!(
-            store
-                .submit_native_append_receipt(&append_grant, append_receipt.clone())
-                .is_err()
-        );
         assert_eq!(
             store
                 .metadata()
@@ -26456,18 +29021,19 @@ mod tests {
         (file_id, file)
     }
 
-    fn append_native_file_once(file: &LocalNativeFile, data: &[u8]) -> Result<AppendCommit> {
-        let session = file.open_append_session()?;
-        append_native_file_with_session(file, &session, data)
+    fn append_native_file_once(file: &LocalNativeFile, data: &[u8]) -> Result<AppendPublishCommit> {
+        let stream = file.open_append_stream()?;
+        append_native_file_with_stream(file, &stream, data)
     }
 
-    fn append_native_file_with_session(
+    fn append_native_file_with_stream(
         file: &LocalNativeFile,
-        session: &AppendSession,
+        stream: &AppendStream,
         data: &[u8],
-    ) -> Result<AppendCommit> {
-        let reservation = file.reserve_append(session, data.len() as u64)?;
-        file.append_reserved(reservation, data)
+    ) -> Result<AppendPublishCommit> {
+        file.append_stream(stream, data)?;
+        let mark = file.flush_append_stream(stream)?;
+        file.publish_append_stream(stream, &mark)
     }
 
     fn append_local_store_once(
@@ -26476,19 +29042,20 @@ mod tests {
         file_id: FileId,
         data: &[u8],
         durability: WriteDurability,
-    ) -> Result<AppendCommit> {
-        let session = store.open_append_session(keyspace_id, file_id)?;
-        append_local_store_with_session(store, &session, data, durability)
+    ) -> Result<AppendPublishCommit> {
+        let stream = store.open_append_stream(keyspace_id, file_id)?;
+        append_local_store_with_stream(store, &stream, data, durability)
     }
 
-    fn append_local_store_with_session(
+    fn append_local_store_with_stream(
         store: &LocalCoordinator,
-        session: &AppendSession,
+        stream: &AppendStream,
         data: &[u8],
         durability: WriteDurability,
-    ) -> Result<AppendCommit> {
-        let reservation = store.reserve_append(session, data.len() as u64)?;
-        store.append_reserved(reservation, data, durability)
+    ) -> Result<AppendPublishCommit> {
+        store.append_stream(stream, data, durability)?;
+        let mark = store.flush_append_stream(stream)?;
+        store.publish_append_stream(stream, &mark, durability)
     }
 
     fn append_durable_store_once(
@@ -26497,19 +29064,20 @@ mod tests {
         file_id: FileId,
         data: &[u8],
         durability: WriteDurability,
-    ) -> Result<AppendCommit> {
-        let session = store.open_append_session(keyspace_id, file_id)?;
-        append_durable_store_with_session(store, &session, data, durability)
+    ) -> Result<AppendPublishCommit> {
+        let stream = store.open_append_stream(keyspace_id, file_id)?;
+        append_durable_store_with_stream(store, &stream, data, durability)
     }
 
-    fn append_durable_store_with_session(
+    fn append_durable_store_with_stream(
         store: &DurableCoordinator,
-        session: &AppendSession,
+        stream: &AppendStream,
         data: &[u8],
         durability: WriteDurability,
-    ) -> Result<AppendCommit> {
-        let reservation = store.reserve_append(session, data.len() as u64)?;
-        store.append_reserved(reservation, data, durability)
+    ) -> Result<AppendPublishCommit> {
+        store.append_stream(stream, data, durability)?;
+        let mark = store.flush_append_stream(stream)?;
+        store.publish_append_stream(stream, &mark)
     }
 
     fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {
@@ -26521,6 +29089,20 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    fn corrupt_in_memory_segment_payload(
+        store: &DurableCoordinator,
+        placement: &SegmentPlacementRow,
+        segment_id: SegmentId,
+    ) {
+        let segment_store = store
+            .local
+            .segment_store_for_node(placement.storage_node)
+            .unwrap();
+        let mut inner = lock(&segment_store.inner).unwrap();
+        let record = inner.segments.get_mut(&segment_id).unwrap();
+        record.bytes[0] ^= 0xff;
     }
 
     fn node_catalog_conn(root: &Path, storage_node: StorageNodeId) -> Connection {

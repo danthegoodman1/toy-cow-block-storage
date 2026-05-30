@@ -6,9 +6,10 @@ keyspace/file API for callers that can speak in files, appends, snapshots, and
 writer fencing directly.
 
 The simple performance rule is: when you are writing a large stream, batch on
-the caller side and append a large buffer at once. One large append becomes one
-logical segment and one file-version transition, which is the shape you want
-for both write cost and later sequential reads.
+the caller side and append large buffers into an append stream. Appended bytes
+become durable at explicit stream flush boundaries and become visible to readers
+only when the stream is published, so data ingest can stay sequential while file
+metadata moves at coarser checkpoints.
 
 ## Two Public APIs
 
@@ -22,8 +23,8 @@ metadata substrate:
 - **Native keyspace/files**: `NativeKeyspaceClient` and `NativeFile`, shaped for
   custom filesystems or append-heavy users. Files live inside a keyspace so
   checkpoint, snapshot, and restore are filesystem-level operations, not
-  per-file snapshots. Appends are byte-oriented and fenced by append
-  sessions/reservations.
+  per-file snapshots. Appends are byte-oriented and fenced by append streams
+  with separate durable and visible boundaries.
 
 The local implementation runs in one process, but the API already goes through
 server and transport boundaries so durable or remote implementations can replace
@@ -135,7 +136,7 @@ Block API guarantees to care about:
 ### Native Keyspace/File Flow
 
 Use the native API when the caller wants file/keyspace intent preserved by the
-storage layer: byte-oriented writes, append sessions, stale-writer rejection, and
+storage layer: byte-oriented writes, append streams, stale-writer rejection, and
 filesystem-level snapshots. A keyspace snapshot is the native API's fork-like
 operation: it creates a new keyspace lineage that initially shares immutable
 catalog and file roots.
@@ -214,10 +215,11 @@ Native API guarantees to care about:
 
 - Keyspaces are the snapshot and restore boundary.
 - File IDs are scoped by keyspace.
-- Writes and appends are byte-oriented and committed as file-version
-  transitions.
-- Append sessions carry writer epochs, and reservations fence each append offset
-  and length so stale writers fail without partial file visibility.
+- Writes and appends are byte-oriented. Normal writes commit as file-version
+  transitions; append streams ingest private bytes, flush durable marks, and
+  publish visible file versions explicitly.
+- Append streams carry writer epochs so stale writers fail without partial file
+  visibility.
 - A successful non-empty file write publishes a new immutable keyspace catalog
   root.
 - Snapshot and restore copy retained keyspace-root pointers rather than walking
@@ -232,6 +234,12 @@ receipt commit before root metadata references them, so a failed metadata
 publish leaves an invisible orphan for cleanup instead of a half-visible write.
 Maintenance is explicit by default: callers can observe dirty/reclaimable
 bytes, ask the deterministic scheduler for a plan, and run one bounded tick.
+Acknowledged writes stay in the live in-process segment state until an explicit
+flush or stronger write asks for stable storage. After a restart, unflushed
+acknowledged bytes are ignored; a successful flush appends and syncs the
+selected segment payloads before publishing catalog placement or root metadata.
+Physical data-log sync groups are bounded so large flushes do not become one
+unbounded tail spike.
 
 ```rust
 use toy_cow_block_storage::{
@@ -362,7 +370,7 @@ cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --war
 cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,16,64 --files 1024 --storage-nodes 4 --rtt-us 200
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:16 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-session --rtt-us 200
+cargo run --release --bin loadbench -- --provider durable --durability ack --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-stream --rtt-us 200 --stream-flush-mib 16 --stream-publish-mib 128
 ```
 
 `loadbench` is the north-star integration benchmark: it exercises the public
@@ -372,11 +380,22 @@ RTT between service boundaries. Treat its output as the current implementation's
 happy-environment performance baseline, while Criterion remains the narrow
 regression suite for individual mechanisms.
 
+Use the `*-shard-lanes` block write workloads when the goal is happy-path
+throughput. The plain random block write workloads are intentionally allowed to
+collide at high concurrency and are better read as conflict behavior controls.
+
+For append-stream workloads, the normal `mbps` column is accepted ingest
+throughput. The `durable_mbps` and `published_mbps` columns separately report
+how many bytes crossed the stream durability boundary and the reader-visible
+publish boundary during the run. A short run with a large publish interval can
+show high ingest throughput and low published throughput simply because it ends
+with private-but-valid stream data still waiting for the next publish boundary.
+
 The normal native write and append workloads partition files by worker so the
 happy-path rows measure throughput across independent file lanes instead of
 accidental same-file fencing conflicts. `native-hot-append-4k` is the explicit
 contention workload; conflicts or errors in the other append-batch and
-append-session rows should be treated as benchmark or implementation failures,
+append-stream rows should be treated as benchmark or implementation failures,
 not as expected noise.
 
 For durable-provider tail analysis, add `--durable-profile-csv <path>` to append
@@ -384,20 +403,31 @@ one row per physical persist. The profile breaks total persist time into lock
 wait, local state export, data-log append/sync, node-catalog publish, root
 SQLite row sync, and root SQLite commit phases.
 
+Payload integrity is explicit in the benchmark harness. The default
+`--payload-integrity verified` stores CRC32C integrity metadata and default
+reads verify verified payloads. `--payload-integrity unchecked` skips checksum
+creation for applications that already protect their own bytes; default reads
+accept unchecked segments, `--read-verification require-verified` rejects them,
+and `--read-verification skip` bypasses read-time verification.
+
 The opt-in `append-batch` workload suite compares `native-append-4k`,
 `native-append-1m`, `native-append-4m`, and `native-append-32m` against matching
 `native-write-*` controls. Use it to diagnose client-side batching effects: if
 append throughput rises with payload size, fixed per-append overhead dominates;
-if large append remains much slower than same-size write-at, append
-session/reservation publish semantics dominate; if both plateau low, the
-durable data-log or catalog persistence path is the bottleneck.
+if large append remains much slower than same-size write-at, one-shot stream
+open/flush/publish semantics dominate; if both plateau low, the durable data-log
+or catalog persistence path is the bottleneck.
 
-The opt-in `append-session` workload suite compares
-`native-session-append-4k`, `native-session-append-1m`,
-`native-session-append-4m`, and `native-session-append-32m` against matching
-`native-write-*` controls. The session workloads keep one append session open
-per worker/file lane and reserve one append offset per operation, which
-separates session-open overhead from per-append data movement and metadata
-publish cost. Large durable write controls can retain substantial in-flight
-segment bytes before an `ack-flush:N` boundary; on memory-constrained Docker
-hosts, reduce `--files`, concurrency, or workload size for exploratory runs.
+The opt-in `append-stream` workload suite compares `native-stream-ingest-*`,
+`native-stream-append-flush-*`, `native-stream-publish-preflushed-1m`, and
+`native-stream-flush-publish-1m` against `native-write-*` controls. Ingest rows
+keep one stream open per worker/file lane and measure private accepted bytes.
+Use `--stream-flush-mib 16` or `--stream-flush-mib 32` with ingest rows to model
+coarse durable ingest intervals, and `--stream-publish-mib 128` to model
+batched reader visibility. `native-stream-append-flush-*` measures append plus
+durable mark per operation. `native-stream-publish-preflushed-1m` times the
+visibility boundary for already-flushed private data.
+`native-stream-flush-publish-1m` measures the full append, durable, and visible path. Large durable
+write controls can retain substantial in-flight segment bytes before an
+`ack-flush:N` boundary; on memory-constrained Docker hosts, reduce `--files`,
+concurrency, or workload size for exploratory runs.

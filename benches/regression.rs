@@ -13,7 +13,9 @@ use toy_cow_block_storage::local::{
     ChaosStorageNodeTransport, DurableCoordinator, DurableDataLogPolicy, InMemoryMetadataPlane,
     InMemorySegmentStore, LocalCoordinator, LocalStoreConfig, MaintenanceMode, MaintenancePolicy,
 };
-use toy_cow_block_storage::object::{LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor};
+use toy_cow_block_storage::object::{
+    LeafEntry, MetadataNode, MetadataNodeKind, SegmentDescriptor, SegmentPayloadIntegrity,
+};
 use toy_cow_block_storage::provider::{
     MetadataCreateDeviceRequest, MetadataCreateFileRequest, MetadataCreateKeyspaceRequest,
     MetadataNodeWrite, MetadataPlane, MetadataSnapshotKeyspaceRequest, RetentionPolicy,
@@ -21,9 +23,9 @@ use toy_cow_block_storage::provider::{
 };
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
-    AppendReservation, AppendReservationId, AppendSessionId, BlockClient, BlockDevice,
-    BlockRequest, ByteRange, DeviceId, DeviceSpec, FileId, ForkRequest, KeyspaceId, NativeFile,
-    NativeKeyspaceClient, NativeRequest, RestorePoint, WriteDurability, WriterEpoch,
+    AppendStream, AppendStreamId, BlockClient, BlockDevice, BlockRequest, ByteRange, DeviceId,
+    DeviceSpec, FileId, ForkRequest, KeyspaceId, NativeFile, NativeKeyspaceClient, NativeRequest,
+    PayloadIntegrity, RestorePoint, WriteDurability, WriterEpoch,
 };
 
 fn bench_byte_range_validation(c: &mut Criterion) {
@@ -47,6 +49,7 @@ fn bench_block_request_validation(c: &mut Criterion) {
         device_id: DeviceId::from_raw(7),
         offset: 128 * 4096,
         bytes: vec![0; 64 * 4096],
+        payload_integrity: PayloadIntegrity::Verified,
         durability: WriteDurability::Acknowledged,
     };
 
@@ -90,13 +93,13 @@ fn bench_metadata_leaf_validation(c: &mut Criterion) {
             segment_id: SegmentId::from_raw(1),
             blocks: BlockCount::from_raw(128),
             bytes: 128 * 4096,
-            checksum: None,
+            integrity: SegmentPayloadIntegrity::Unchecked,
         },
         SegmentDescriptor {
             segment_id: SegmentId::from_raw(2),
             blocks: BlockCount::from_raw(128),
             bytes: 128 * 4096,
-            checksum: None,
+            integrity: SegmentPayloadIntegrity::Unchecked,
         },
     ];
     let node = MetadataNode {
@@ -295,28 +298,29 @@ fn bench_local_grant_receipt_flow(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
-    group.bench_function("trusted_native_append_receipt_publish_4k", |b| {
+    group.bench_function("native_append_stream_publish_4k", |b| {
         b.iter_batched(
             || {
                 let store = LocalCoordinator::new();
                 let (keyspace_id, file_id) = create_native_file_for_bench(&store);
-                let reservation = reserve_local_append(&store, keyspace_id, file_id, 4096);
-                let grant = store
-                    .issue_native_append_grant(
-                        reservation,
-                        4096,
-                        4096,
+                let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+                (store, stream, vec![6; 4096])
+            },
+            |(store, stream, bytes)| {
+                store
+                    .append_stream(
+                        black_box(&stream),
+                        black_box(&bytes),
                         WriteDurability::Acknowledged,
                     )
                     .unwrap();
-                (store, grant, vec![6; 4096])
-            },
-            |(store, grant, bytes)| {
-                let receipt = store
-                    .write_granted_segment(black_box(&grant), black_box(bytes))
-                    .unwrap();
+                let mark = store.flush_append_stream(black_box(&stream)).unwrap();
                 store
-                    .submit_native_append_receipt(black_box(&grant), black_box(receipt))
+                    .publish_append_stream(
+                        black_box(&stream),
+                        black_box(&mark),
+                        WriteDurability::Acknowledged,
+                    )
                     .unwrap()
             },
             BatchSize::SmallInput,
@@ -643,14 +647,15 @@ fn bench_local_native_append(c: &mut Criterion) {
                         },
                     })
                     .unwrap();
-                let reservation =
-                    reserve_local_append(&store, keyspace.keyspace_id, head.file_id, 4096);
-                (store, reservation, vec![4; 4096])
+                let stream = store
+                    .open_append_stream(keyspace.keyspace_id, head.file_id)
+                    .unwrap();
+                (store, stream, vec![4; 4096])
             },
-            |(store, reservation, bytes)| {
+            |(store, stream, bytes)| {
                 store
-                    .append_reserved(
-                        black_box(reservation),
+                    .append_stream(
+                        black_box(&stream),
                         black_box(&bytes),
                         WriteDurability::Acknowledged,
                     )
@@ -699,18 +704,15 @@ fn bench_local_native_large_append(c: &mut Criterion) {
                         },
                     })
                     .unwrap();
-                let reservation = reserve_local_append(
-                    &store,
-                    keyspace.keyspace_id,
-                    file.file_id,
-                    LARGE_BYTES as u64,
-                );
-                (store, reservation, vec![7; LARGE_BYTES])
+                let stream = store
+                    .open_append_stream(keyspace.keyspace_id, file.file_id)
+                    .unwrap();
+                (store, stream, vec![7; LARGE_BYTES])
             },
-            |(store, reservation, payload)| {
+            |(store, stream, payload)| {
                 store
-                    .append_reserved(
-                        reservation,
+                    .append_stream(
+                        black_box(&stream),
                         black_box(&payload),
                         WriteDurability::Acknowledged,
                     )
@@ -804,7 +806,7 @@ fn bench_local_native_write_at(c: &mut Criterion) {
     });
 }
 
-fn bench_local_native_stale_session_rejection(c: &mut Criterion) {
+fn bench_local_native_stale_stream_rejection(c: &mut Criterion) {
     let store = LocalCoordinator::new();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(store));
     let client = toy_cow_block_storage::LocalNativeClient::new(
@@ -822,15 +824,14 @@ fn bench_local_native_stale_session_rejection(c: &mut Criterion) {
         )
         .unwrap();
     let file = client.open_file(keyspace_id, file_id).unwrap();
-    let stale_session = file.open_append_session().unwrap();
-    let stale = file.reserve_append(&stale_session, 4096).unwrap();
-    let _fresh = file.open_append_session().unwrap();
+    let stale_stream = file.open_append_stream().unwrap();
+    let _fresh = file.open_append_stream().unwrap();
     let bytes = vec![1; 4096];
 
-    c.bench_function("local_native_stale_session_rejection", |b| {
+    c.bench_function("local_native_stale_stream_rejection", |b| {
         b.iter(|| {
             black_box(
-                file.append_reserved(black_box(stale.clone()), black_box(&bytes))
+                file.append_stream(black_box(&stale_stream), black_box(&bytes))
                     .is_err(),
             )
         })
@@ -973,9 +974,10 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
                         )
                         .unwrap();
                     let file = client.open_file(keyspace_id, file_id).unwrap();
-                    let session = file.open_append_session().unwrap();
-                    let reservation = file.reserve_append(&session, 4096).unwrap();
-                    file.append_reserved(reservation, &[7; 4096]).unwrap();
+                    let stream = file.open_append_stream().unwrap();
+                    file.append_stream(&stream, &[7; 4096]).unwrap();
+                    let mark = file.flush_append_stream(&stream).unwrap();
+                    file.publish_append_stream(&stream, &mark).unwrap();
                 }
                 let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
                 let file_id = client
@@ -987,9 +989,10 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
                     )
                     .unwrap();
                 let file = client.open_file(keyspace_id, file_id).unwrap();
-                let session = file.open_append_session().unwrap();
-                let reservation = file.reserve_append(&session, 4096).unwrap();
-                file.append_reserved(reservation, &[9; 4096]).unwrap();
+                let stream = file.open_append_stream().unwrap();
+                file.append_stream(&stream, &[9; 4096]).unwrap();
+                let mark = file.flush_append_stream(&stream).unwrap();
+                file.publish_append_stream(&stream, &mark).unwrap();
                 (client, keyspace_id, checkpoint)
             },
             |(client, keyspace_id, checkpoint)| {
@@ -1094,20 +1097,19 @@ fn bench_metadata_gc_mark_traversal(c: &mut Criterion) {
 fn bench_native_append_validation(c: &mut Criterion) {
     let keyspace_id = KeyspaceId::from_raw(5);
     let file_id = FileId::from_raw(9);
-    let request = NativeRequest::AppendReserved {
+    let request = NativeRequest::AppendStream {
         keyspace_id,
         file_id,
-        reservation: AppendReservation {
+        stream: AppendStream {
             keyspace_id,
             file_id,
-            session_id: AppendSessionId::from_raw(7),
-            reservation_id: AppendReservationId::from_raw(8),
+            stream_id: AppendStreamId::from_raw(7),
             writer_epoch: WriterEpoch::from_raw(3),
-            offset: 0,
-            len: 64 * 4096,
+            base_version: toy_cow_block_storage::id::FileVersion::from_raw(0),
+            visible_base_size: 0,
         },
         bytes: vec![0; 64 * 4096],
-        durability: WriteDurability::Acknowledged,
+        payload_integrity: PayloadIntegrity::Verified,
     };
 
     c.bench_function("native_append_validation", |b| {
@@ -1121,6 +1123,7 @@ fn bench_native_write_validation(c: &mut Criterion) {
         file_id: FileId::from_raw(9),
         offset: 128,
         bytes: vec![0; 64 * 4096],
+        payload_integrity: PayloadIntegrity::Verified,
         durability: WriteDurability::Acknowledged,
     };
 
@@ -1172,14 +1175,12 @@ fn create_native_file_for_bench(store: &LocalCoordinator) -> (KeyspaceId, FileId
     (keyspace_id, file_id)
 }
 
-fn reserve_local_append(
+fn open_local_append_stream(
     store: &LocalCoordinator,
     keyspace_id: KeyspaceId,
     file_id: FileId,
-    bytes: u64,
-) -> AppendReservation {
-    let session = store.open_append_session(keyspace_id, file_id).unwrap();
-    store.reserve_append(&session, bytes).unwrap()
+) -> AppendStream {
+    store.open_append_stream(keyspace_id, file_id).unwrap()
 }
 
 fn append_local_file_once(
@@ -1189,9 +1190,11 @@ fn append_local_file_once(
     bytes: &[u8],
     durability: WriteDurability,
 ) {
-    let reservation = reserve_local_append(store, keyspace_id, file_id, bytes.len() as u64);
+    let stream = open_local_append_stream(store, keyspace_id, file_id);
+    store.append_stream(&stream, bytes, durability).unwrap();
+    let mark = store.flush_append_stream(&stream).unwrap();
     store
-        .append_reserved(reservation, bytes, durability)
+        .publish_append_stream(&stream, &mark, durability)
         .unwrap();
 }
 
@@ -1276,7 +1279,7 @@ fn bench_native_keyspace_scaling(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("append_1b_with_fresh_session", file_count),
+            BenchmarkId::new("append_1b_with_fresh_stream", file_count),
             &file_count,
             |b, _| {
                 b.iter(|| {
@@ -1291,18 +1294,17 @@ fn bench_native_keyspace_scaling(c: &mut Criterion) {
             },
         );
 
-        let stale_session = store.open_append_session(keyspace_id, target).unwrap();
-        let stale = store.reserve_append(&stale_session, 1).unwrap();
-        let _fresh = store.open_append_session(keyspace_id, target).unwrap();
+        let stale_stream = store.open_append_stream(keyspace_id, target).unwrap();
+        let _fresh = store.open_append_stream(keyspace_id, target).unwrap();
         group.bench_with_input(
-            BenchmarkId::new("stale_session_rejection", file_count),
+            BenchmarkId::new("stale_stream_rejection", file_count),
             &file_count,
             |b, _| {
                 b.iter(|| {
                     black_box(
                         store
-                            .append_reserved(
-                                black_box(stale.clone()),
+                            .append_stream(
+                                black_box(&stale_stream),
                                 black_box(&[1]),
                                 WriteDurability::Acknowledged,
                             )
@@ -1371,14 +1373,13 @@ fn bench_native_alignment_paths(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let (store, keyspace_id, files) = seed_native_keyspace(1);
-                let reservation =
-                    reserve_local_append(&store, keyspace_id, files[0], aligned.len() as u64);
-                (store, reservation, aligned.clone())
+                let stream = open_local_append_stream(&store, keyspace_id, files[0]);
+                (store, stream, aligned.clone())
             },
-            |(store, reservation, payload)| {
+            |(store, stream, payload)| {
                 store
-                    .append_reserved(
-                        reservation,
+                    .append_stream(
+                        black_box(&stream),
                         black_box(&payload),
                         WriteDurability::Acknowledged,
                     )
@@ -1392,14 +1393,13 @@ fn bench_native_alignment_paths(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let (store, keyspace_id, files) = seed_native_keyspace(1);
-                let reservation =
-                    reserve_local_append(&store, keyspace_id, files[0], unaligned.len() as u64);
-                (store, reservation, unaligned.clone())
+                let stream = open_local_append_stream(&store, keyspace_id, files[0]);
+                (store, stream, unaligned.clone())
             },
-            |(store, reservation, payload)| {
+            |(store, stream, payload)| {
                 store
-                    .append_reserved(
-                        reservation,
+                    .append_stream(
+                        black_box(&stream),
                         black_box(&payload),
                         WriteDurability::Acknowledged,
                     )
@@ -1583,16 +1583,16 @@ fn bench_native_concurrent_batches(c: &mut Criterion) {
 
     group.bench_function("conflicting_appends_4_threads", |b| {
         b.iter(|| {
-            let reservations: Vec<_> = (0..thread_count)
-                .map(|_| reserve_local_append(&store, keyspace_id, conflict_file, 1))
+            let streams: Vec<_> = (0..thread_count)
+                .map(|_| open_local_append_stream(&store, keyspace_id, conflict_file))
                 .collect();
             let successes = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
-                for reservation in reservations {
+                for stream in streams {
                     let store = store.clone();
                     handles.push(scope.spawn(move || {
                         store
-                            .append_reserved(reservation, &[6], WriteDurability::Acknowledged)
+                            .append_stream(&stream, &[6], WriteDurability::Acknowledged)
                             .is_ok()
                     }));
                 }
@@ -2496,13 +2496,12 @@ fn bench_durable_provider(c: &mut Criterion) {
                 let root = durable_bench_root("native-append-ack-fresh");
                 let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
-                let session = store.open_append_session(keyspace_id, file_id).unwrap();
-                let reservation = store.reserve_append(&session, 4096).unwrap();
+                let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
                 let payload = vec![5; 4096];
                 let started = Instant::now();
                 store
-                    .append_reserved(
-                        black_box(reservation),
+                    .append_stream(
+                        black_box(&stream),
                         black_box(&payload),
                         WriteDurability::Acknowledged,
                     )
@@ -2520,13 +2519,12 @@ fn bench_durable_provider(c: &mut Criterion) {
                 let root = durable_bench_root("native-append-flushed-fresh");
                 let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
                 let (keyspace_id, file_id) = create_durable_native_file(&store);
-                let session = store.open_append_session(keyspace_id, file_id).unwrap();
-                let reservation = store.reserve_append(&session, 4096).unwrap();
+                let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
                 let payload = vec![5; 4096];
                 let started = Instant::now();
                 store
-                    .append_reserved(
-                        black_box(reservation),
+                    .append_stream(
+                        black_box(&stream),
                         black_box(&payload),
                         WriteDurability::Flushed,
                     )
@@ -2544,6 +2542,6 @@ fn bench_durable_provider(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_grant_receipt_flow, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_large_append, bench_local_native_write_at, bench_local_native_stale_session_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_grant_receipt_flow, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_large_append, bench_local_native_write_at, bench_local_native_stale_stream_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
 }
 criterion_main!(regression);

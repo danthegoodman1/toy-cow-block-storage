@@ -2,20 +2,20 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::api::{
-    BlockRange, ByteRange, CreateDeviceRequest, DeleteResult, DeviceSpec, RestorePoint,
-    WriteDurability,
+    BlockRange, ByteRange, CreateDeviceRequest, DeleteResult, DeviceSpec, PayloadIntegrity,
+    RestorePoint, WriteDurability,
 };
 use crate::error::Result;
 use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileInfo, KeyspaceInfo};
 use crate::id::{
-    AppendReservationId, AppendSessionId, CheckpointId, CommitSeq, DeviceGeneration, DeviceId,
-    FileId, FileVersion, GrantEpoch, GrantId, GrantNonce, KeyspaceId, LogicalDeadline,
-    MetadataNodeId, PrincipalId, SegmentId, ServerIncarnation, ShardId, StorageNodeId,
-    StorageNodeKeyId, TenantId, WriteIntentId, WriterEpoch,
+    AppendStreamId, AppendTicketId, CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId,
+    FileVersion, GrantEpoch, GrantId, GrantNonce, KeyspaceId, LogicalDeadline, MetadataNodeId,
+    PrincipalId, SegmentId, ServerIncarnation, ShardId, StorageNodeId, StorageNodeKeyId, TenantId,
+    WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, KeyspaceHead, MappingOwner,
-    MetadataNode, RootUpdate, SegmentDescriptor,
+    MetadataNode, RootUpdate, SegmentDescriptor, SegmentPayloadIntegrity,
 };
 
 /// Physical storage-node maintenance report.
@@ -80,20 +80,11 @@ pub enum WriteGrantIntent {
         range: ByteRange,
         base_version: FileVersion,
     },
-    NativeAppend {
+    NativeAppendStream {
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        session_id: AppendSessionId,
-        reservation_id: AppendReservationId,
-        append_offset: u64,
-        bytes: u64,
-        writer_epoch: WriterEpoch,
-    },
-    NativeReservedAppend {
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        session_id: AppendSessionId,
-        reservation_id: AppendReservationId,
+        stream_id: AppendStreamId,
+        ticket_id: AppendTicketId,
         append_offset: u64,
         bytes: u64,
         writer_epoch: WriterEpoch,
@@ -108,8 +99,7 @@ impl WriteGrantIntent {
         match self {
             Self::BlockWrite { device_id, .. } => MappingOwner::BlockDevice(device_id),
             Self::NativeWrite { keyspace_id, .. }
-            | Self::NativeAppend { keyspace_id, .. }
-            | Self::NativeReservedAppend { keyspace_id, .. } => {
+            | Self::NativeAppendStream { keyspace_id, .. } => {
                 MappingOwner::NativeKeyspace(keyspace_id)
             }
             Self::Internal { owner } => owner,
@@ -127,6 +117,7 @@ pub struct WriteGrantRequest {
     pub segment_id: SegmentId,
     pub storage_node: StorageNodeId,
     pub max_bytes: u64,
+    pub payload_integrity: PayloadIntegrity,
     pub durability: WriteDurability,
     pub expires_at: LogicalDeadline,
 }
@@ -146,6 +137,7 @@ pub struct WriteGrant {
     pub segment_id: SegmentId,
     pub storage_node: StorageNodeId,
     pub max_bytes: u64,
+    pub payload_integrity: PayloadIntegrity,
     pub durability: WriteDurability,
     pub key_id: StorageNodeKeyId,
     pub proof_scheme: ProofScheme,
@@ -179,6 +171,7 @@ impl WriteGrant {
         put_u128(out, self.segment_id.raw());
         put_u128(out, self.storage_node.raw());
         put_u64(out, self.max_bytes);
+        put_payload_integrity(out, self.payload_integrity);
         put_write_durability(out, self.durability);
         put_u128(out, self.key_id.raw());
         put_proof_scheme(out, self.proof_scheme);
@@ -205,7 +198,7 @@ pub struct SegmentWriteReceipt {
     pub write_intent: WriteIntentId,
     pub intent: WriteGrantIntent,
     pub bytes: u64,
-    pub checksum: Option<u64>,
+    pub integrity: SegmentPayloadIntegrity,
     pub durability: WriteDurability,
     pub lifecycle: SegmentReceiptLifecycle,
     pub receipt_epoch: GrantEpoch,
@@ -237,7 +230,7 @@ impl SegmentWriteReceipt {
         put_u128(out, self.write_intent.raw());
         put_write_grant_intent(out, self.intent);
         put_u64(out, self.bytes);
-        put_optional_u64(out, self.checksum);
+        put_segment_payload_integrity(out, self.integrity);
         put_write_durability(out, self.durability);
         put_segment_receipt_lifecycle(out, self.lifecycle);
         put_u64(out, self.receipt_epoch.raw());
@@ -570,7 +563,7 @@ pub trait GrantReceiptAuthority: Send + Sync {
     /// Create a durable-pending segment receipt after bytes are synced.
     ///
     /// Success means the receipt body and proof bind the supplied grant,
-    /// storage-node identity, descriptor, placement, checksum, lifecycle, and
+    /// storage-node identity, descriptor, placement, payload integrity, lifecycle, and
     /// durability. It still does not make metadata reference the segment.
     fn create_segment_receipt(
         &self,
@@ -584,7 +577,7 @@ pub trait GrantReceiptAuthority: Send + Sync {
     /// Success returns an unforgeable-in-crate `VerifiedSegmentReceipt` whose
     /// descriptor may be used to validate metadata leaves. Implementations must
     /// reject stale, corrupt, wrong-node, wrong-lifecycle, wrong-durability, or
-    /// wrong-checksum receipts without consulting storage-node bytes.
+    /// wrong-integrity receipts without consulting storage-node bytes.
     fn verify_segment_receipt(
         &self,
         receipt: &SegmentWriteReceipt,
@@ -637,16 +630,13 @@ pub struct CommitGroupIntent {
 /// update's `old_root` as the write-contention fence, allowing independent
 /// shard updates to commit after another shard advances the device generation.
 /// Native commits must reject a publish when the current file state no longer
-/// matches the supplied file version or append reservation fence.
+/// matches the supplied file version or append stream fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetadataFence {
     DeviceGeneration(DeviceGeneration),
     FileVersion(FileVersion),
-    AppendReservation {
-        session_id: AppendSessionId,
-        reservation_id: AppendReservationId,
-        offset: u64,
-        len: u64,
+    AppendStream {
+        stream_id: AppendStreamId,
         writer_epoch: WriterEpoch,
     },
 }
@@ -864,8 +854,8 @@ pub trait MetadataPlane: Send + Sync {
 
     /// Return the latest committed native file head.
     ///
-    /// Must not return a head from a stale append session/reservation or failed
-    /// append commit.
+    /// Must not return private append-stream bytes, stale stream state, or a
+    /// failed append publish.
     fn get_file_head(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileHead>;
 
     /// Return user-facing native file information derived from committed state.
@@ -1007,7 +997,7 @@ pub trait SegmentStore: Send + Sync {
 pub struct SegmentReservationIntent {
     /// Provider-unique write attempt ID used by custodians to expire failed or
     /// abandoned segment writes. This is separate from file writer epochs or
-    /// append session/reservation IDs so expiring one storage write cannot
+    /// append stream/ticket IDs so expiring one storage write cannot
     /// accidentally free another owner that reused a higher-level fencing token.
     pub write_intent: WriteIntentId,
     pub owner: MappingOwner,
@@ -1332,16 +1322,6 @@ fn put_u128(out: &mut impl CanonicalSink, value: u128) {
     out.append(&value.to_be_bytes());
 }
 
-fn put_optional_u64(out: &mut impl CanonicalSink, value: Option<u64>) {
-    match value {
-        Some(value) => {
-            put_u8(out, 1);
-            put_u64(out, value);
-        }
-        None => put_u8(out, 0),
-    }
-}
-
 fn put_mapping_owner(out: &mut impl CanonicalSink, owner: MappingOwner) {
     match owner {
         MappingOwner::BlockDevice(device_id) => {
@@ -1385,11 +1365,11 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
             put_u64(out, range.len);
             put_u64(out, base_version.raw());
         }
-        WriteGrantIntent::NativeAppend {
+        WriteGrantIntent::NativeAppendStream {
             keyspace_id,
             file_id,
-            session_id,
-            reservation_id,
+            stream_id,
+            ticket_id,
             append_offset,
             bytes,
             writer_epoch,
@@ -1397,32 +1377,14 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
             put_u8(out, 3);
             put_u128(out, keyspace_id.raw());
             put_u128(out, file_id.raw());
-            put_u128(out, session_id.raw());
-            put_u128(out, reservation_id.raw());
-            put_u64(out, append_offset);
-            put_u64(out, bytes);
-            put_u64(out, writer_epoch.raw());
-        }
-        WriteGrantIntent::NativeReservedAppend {
-            keyspace_id,
-            file_id,
-            session_id,
-            reservation_id,
-            append_offset,
-            bytes,
-            writer_epoch,
-        } => {
-            put_u8(out, 4);
-            put_u128(out, keyspace_id.raw());
-            put_u128(out, file_id.raw());
-            put_u128(out, session_id.raw());
-            put_u128(out, reservation_id.raw());
+            put_u128(out, stream_id.raw());
+            put_u128(out, ticket_id.raw());
             put_u64(out, append_offset);
             put_u64(out, bytes);
             put_u64(out, writer_epoch.raw());
         }
         WriteGrantIntent::Internal { owner } => {
-            put_u8(out, 5);
+            put_u8(out, 4);
             put_mapping_owner(out, owner);
         }
     }
@@ -1432,6 +1394,23 @@ fn put_write_durability(out: &mut impl CanonicalSink, durability: WriteDurabilit
     match durability {
         WriteDurability::Acknowledged => put_u8(out, 1),
         WriteDurability::Flushed => put_u8(out, 2),
+    }
+}
+
+fn put_payload_integrity(out: &mut impl CanonicalSink, integrity: PayloadIntegrity) {
+    match integrity {
+        PayloadIntegrity::Verified => put_u8(out, 1),
+        PayloadIntegrity::Unchecked => put_u8(out, 2),
+    }
+}
+
+fn put_segment_payload_integrity(out: &mut impl CanonicalSink, integrity: SegmentPayloadIntegrity) {
+    match integrity {
+        SegmentPayloadIntegrity::Crc32c(checksum) => {
+            put_u8(out, 1);
+            put_u64(out, checksum);
+        }
+        SegmentPayloadIntegrity::Unchecked => put_u8(out, 2),
     }
 }
 
@@ -1452,7 +1431,7 @@ fn put_segment_descriptor(out: &mut impl CanonicalSink, descriptor: &SegmentDesc
     put_u128(out, descriptor.segment_id.raw());
     put_u64(out, descriptor.blocks.raw());
     put_u64(out, descriptor.bytes);
-    put_optional_u64(out, descriptor.checksum);
+    put_segment_payload_integrity(out, descriptor.integrity);
 }
 
 fn put_segment_replica_placement(
@@ -1525,6 +1504,7 @@ mod tests {
             segment_id: SegmentId::from_raw(12),
             storage_node: StorageNodeId::from_raw(13),
             max_bytes: 8192,
+            payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Flushed,
             key_id,
             proof_scheme: ProofScheme::DeterministicTestMacV1,
@@ -1555,7 +1535,7 @@ mod tests {
             segment_id: SegmentId::from_raw(22),
             blocks: BlockCount::from_raw(1),
             bytes: 4096,
-            checksum: Some(0xabc),
+            integrity: SegmentPayloadIntegrity::Crc32c(0xabc),
         };
         let placement = SegmentReplicaPlacement {
             segment_id: descriptor.segment_id,
@@ -1580,7 +1560,7 @@ mod tests {
                 base_version: FileVersion::from_raw(32),
             },
             bytes: descriptor.bytes,
-            checksum: descriptor.checksum,
+            integrity: descriptor.integrity,
             durability: WriteDurability::Acknowledged,
             lifecycle: SegmentReceiptLifecycle::DurablePendingMetadata,
             receipt_epoch: GrantEpoch::from_raw(33),

@@ -8,6 +8,13 @@ use crate::id::{
     LogicalTime, MetadataNodeId, SegmentId, ShardId,
 };
 
+/// Stored payload integrity for one immutable data segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SegmentPayloadIntegrity {
+    Crc32c(u64),
+    Unchecked,
+}
+
 /// Owner namespace for shared metadata roots.
 ///
 /// Commit groups, checkpoints, and GC roots should be keyed by mapping owner so
@@ -314,7 +321,7 @@ pub struct SegmentDescriptor {
     pub segment_id: SegmentId,
     pub blocks: BlockCount,
     pub bytes: u64,
-    pub checksum: Option<u64>,
+    pub integrity: SegmentPayloadIntegrity,
 }
 
 impl SegmentDescriptor {
@@ -615,7 +622,7 @@ mod tests {
             segment_id: SegmentId::from_raw(segment_id),
             blocks: BlockCount::from_raw(blocks),
             bytes: blocks * u64::from(BLOCK_SIZE),
-            checksum: None,
+            integrity: SegmentPayloadIntegrity::Unchecked,
         }
     }
 
