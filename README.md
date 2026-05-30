@@ -372,6 +372,13 @@ RTT between service boundaries. Treat its output as the current implementation's
 happy-environment performance baseline, while Criterion remains the narrow
 regression suite for individual mechanisms.
 
+The normal native write and append workloads partition files by worker so the
+happy-path rows measure throughput across independent file lanes instead of
+accidental same-file fencing conflicts. `native-hot-append-4k` is the explicit
+contention workload; conflicts or errors in the other append-batch and
+append-session rows should be treated as benchmark or implementation failures,
+not as expected noise.
+
 The opt-in `append-batch` workload suite compares `native-append-4k`,
 `native-append-1m`, `native-append-4m`, and `native-append-32m` against matching
 `native-write-*` controls. Use it to diagnose client-side batching effects: if

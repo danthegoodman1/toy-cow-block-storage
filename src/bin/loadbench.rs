@@ -888,6 +888,7 @@ fn execute_load(
     let modeled_delay = args.modeled_delay();
     let worker_config = WorkerConfig {
         workload,
+        concurrency,
         deadline,
         modeled_delay,
         delay_mode: args.delay_mode,
@@ -921,6 +922,7 @@ fn execute_load(
 #[derive(Debug, Clone, Copy)]
 struct WorkerConfig {
     workload: Workload,
+    concurrency: usize,
     deadline: Instant,
     modeled_delay: Duration,
     delay_mode: DelayMode,
@@ -945,26 +947,20 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
         }
         let result = run_one_op(
             &context,
-            config.workload,
             worker,
             &mut state,
             &mut rng,
-            config.durability.write_durability(),
+            &config,
             &mut read_buf,
         )
         .and_then(|_| {
-            let session_file_index = state
-                .session_append
-                .as_ref()
-                .map(|session| session.file_index);
             maybe_flush(
                 &context,
                 config.workload,
                 config.durability,
                 report.attempts + 1,
                 worker,
-                session_file_index,
-                &mut rng,
+                state.last_native_file_index,
             )
         });
         let elapsed = started.elapsed();
@@ -984,6 +980,23 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
 struct WorkerState {
     session_append: Option<SessionAppendState>,
     next_session_file_index: Option<usize>,
+    native_file_op: u64,
+    last_native_file_index: Option<usize>,
+}
+
+impl WorkerState {
+    fn next_partitioned_file_index(
+        &mut self,
+        worker: u64,
+        concurrency: usize,
+        files_len: usize,
+    ) -> usize {
+        let file_index =
+            partitioned_file_index(worker, self.native_file_op, concurrency, files_len);
+        self.native_file_op = self.native_file_op.saturating_add(1);
+        self.last_native_file_index = Some(file_index);
+        file_index
+    }
 }
 
 struct SessionAppendState {
@@ -1006,13 +1019,16 @@ fn apply_modeled_delay(delay: Duration, mode: DelayMode) {
 
 fn run_one_op(
     context: &BenchContext,
-    workload: Workload,
     worker: u64,
     state: &mut WorkerState,
     rng: &mut Lcg,
-    durability: WriteDurability,
+    config: &WorkerConfig,
     read_buf: &mut [u8],
 ) -> Result<()> {
+    let workload = config.workload;
+    let concurrency = config.concurrency;
+    let durability = config.durability.write_durability();
+
     match (&context.target, workload) {
         (
             Target::Block {
@@ -1090,7 +1106,8 @@ fn run_one_op(
             )
         }
         (Target::Native { keyspace_id, files }, workload) if workload.is_native_write() => {
-            let file_id = files[rng.below(files.len() as u64) as usize];
+            let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());
+            let file_id = files[file_index];
             context
                 .store
                 .write_file_at(*keyspace_id, file_id, 0, &context.payload, durability)
@@ -1105,7 +1122,8 @@ fn run_one_op(
             )
         }
         (Target::Native { keyspace_id, files }, workload) if workload.is_native_append() => {
-            let file_id = files[rng.below(files.len() as u64) as usize];
+            let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());
+            let file_id = files[file_index];
             context
                 .store
                 .append_file_once(*keyspace_id, file_id, &context.payload, durability)
@@ -1176,6 +1194,7 @@ fn run_one_op(
                     state.session_append = None;
                 } else if let Some(session) = state.session_append.as_mut() {
                     session.next_offset = next_offset;
+                    state.last_native_file_index = Some(session.file_index);
                 }
                 return result;
             }
@@ -1185,6 +1204,7 @@ fn run_one_op(
         }
         (Target::Native { keyspace_id, files }, Workload::NativeHotAppend4k) => {
             let file_id = files[0];
+            state.last_native_file_index = Some(0);
             context
                 .store
                 .append_file_once(*keyspace_id, file_id, &context.payload, durability)
@@ -1201,8 +1221,7 @@ fn maybe_flush(
     durability: DurabilityMode,
     attempts_after_op: u64,
     worker: u64,
-    session_file_index: Option<usize>,
-    rng: &mut Lcg,
+    last_native_file_index: Option<usize>,
 ) -> Result<()> {
     let DurabilityMode::AckFlushEvery(every) = durability else {
         return Ok(());
@@ -1216,14 +1235,35 @@ fn maybe_flush(
         Target::Native { keyspace_id, files } => {
             let file_id = if matches!(workload, Workload::NativeHotAppend4k) {
                 files[0]
-            } else if workload.is_native_session_append() {
-                files[session_file_index.unwrap_or(worker as usize % files.len())]
             } else {
-                files[rng.below(files.len() as u64) as usize]
+                files[last_native_file_index.unwrap_or(worker as usize % files.len())]
             };
             context.store.flush_file(*keyspace_id, file_id).map(|_| ())
         }
     }
+}
+
+fn partitioned_file_index(
+    worker: u64,
+    op_index: u64,
+    concurrency: usize,
+    files_len: usize,
+) -> usize {
+    if files_len == 0 {
+        return 0;
+    }
+    if concurrency == 0 {
+        return op_index as usize % files_len;
+    }
+    if concurrency > files_len {
+        return worker as usize % files_len;
+    }
+
+    let worker = worker as usize % concurrency;
+    let base = files_len * worker / concurrency;
+    let next_base = files_len * (worker + 1) / concurrency;
+    let span = next_base.saturating_sub(base).max(1);
+    base + (op_index as usize % span)
 }
 
 fn make_payload(bytes: usize) -> Vec<u8> {
@@ -1411,4 +1451,69 @@ fn nanos_to_micros(nanos: u64) -> f64 {
 
 fn fs_error(error: std::io::Error) -> StorageError {
     StorageError::unavailable(format!("filesystem operation failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn partitioned_file_index_gives_unique_lanes_across_workers() {
+        let concurrency = 16;
+        let files_len = 128;
+
+        for op_index in 0..32 {
+            let mut seen = BTreeSet::new();
+            for worker in 0..concurrency {
+                let file_index =
+                    partitioned_file_index(worker as u64, op_index, concurrency, files_len);
+                assert!(
+                    seen.insert(file_index),
+                    "worker {worker} collided on file {file_index} at op {op_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partitioned_file_index_stays_inside_worker_partition() {
+        let concurrency = 4;
+        let files_len = 10;
+
+        for worker in 0..concurrency {
+            let base = files_len * worker / concurrency;
+            let next_base = files_len * (worker + 1) / concurrency;
+            for op_index in 0..32 {
+                let file_index =
+                    partitioned_file_index(worker as u64, op_index, concurrency, files_len);
+                assert!(
+                    (base..next_base).contains(&file_index),
+                    "file {file_index} escaped worker {worker} partition {base}..{next_base}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partitioned_file_index_handles_more_workers_than_files() {
+        let files_len = 3;
+        let concurrency = 8;
+
+        for worker in 0..concurrency {
+            let file_index = partitioned_file_index(worker as u64, 0, concurrency, files_len);
+            assert_eq!(file_index, worker % files_len);
+        }
+    }
+
+    #[test]
+    fn worker_state_remembers_last_partitioned_file_index() {
+        let mut state = WorkerState::default();
+        let file_index = state.next_partitioned_file_index(2, 4, 16);
+
+        assert_eq!(file_index, 8);
+        assert_eq!(state.last_native_file_index, Some(8));
+        assert_eq!(state.native_file_op, 1);
+    }
 }
