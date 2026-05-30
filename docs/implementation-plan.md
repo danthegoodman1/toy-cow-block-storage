@@ -933,13 +933,17 @@ block flushed 4 KiB write 6.5 ms, block flush after 32 acknowledged writes
 7.4 ms, native acknowledged append 19 us, native flushed append 5.5 ms, native
 flush after 32 acknowledged writes 7.7 ms, reopen after 32 block writes 2.6 ms,
 and an explicit no-op compaction pass after 32 block writes 83 us. The remaining
-floor is dominated by host sync latency and full-state commit serialization; a
+floor is dominated by host sync latency and SQLite/catalog publish work; a
 batched flush now pays one data-log sync per touched log plus one SQLite publish
 transaction instead of one payload sync per segment.
 
 Phase 23 later removed the full-state SQLite blob from the production durable
 provider. The Phase 21 numbers remain useful as historical partitioned-log
 baselines, but current durable metadata publish uses row-native SQLite tables.
+The append performance pass after Phase 23 also removed full live-segment byte
+snapshots from the flush hot path: durable publish snapshots metadata and
+storage-node catalog state, then appends only newly acknowledged segment
+payloads to data logs.
 
 ## Phase 21: Partitioned Durable Logs and Incremental Compaction
 

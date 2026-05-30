@@ -1062,6 +1062,7 @@ impl StorageNodeRegistry {
         })
     }
 
+    #[cfg(test)]
     fn state_inner(&self) -> Result<StorageNodeRegistryInner> {
         let mut nodes = BTreeMap::new();
         for (node_id, node) in self.nodes.iter() {
@@ -1079,6 +1080,51 @@ impl StorageNodeRegistry {
             node_order: self.node_order.as_ref().clone(),
             nodes,
         })
+    }
+
+    fn state_inner_for_persist(
+        &self,
+        previous_segments: &BTreeSet<SegmentId>,
+    ) -> Result<(
+        StorageNodeRegistryInner,
+        BTreeSet<SegmentId>,
+        Vec<DurableSegmentPayload>,
+    )> {
+        let mut nodes = BTreeMap::new();
+        let mut image_segments = BTreeSet::new();
+        let mut new_segments = Vec::new();
+        for (node_id, node) in self.nodes.iter() {
+            let (segment_store, node_segments, mut node_new_segments) = node
+                .segment_store
+                .state_inner_for_persist(previous_segments, *node_id)?;
+            image_segments.extend(node_segments);
+            new_segments.append(&mut node_new_segments);
+            nodes.insert(
+                *node_id,
+                StorageNodeInner {
+                    segment_store,
+                    segment_catalog: node.segment_catalog.state_inner()?,
+                },
+            );
+        }
+        Ok((
+            StorageNodeRegistryInner {
+                next_segment_id: *lock(&self.next_segment_id)?,
+                next_placement_index: *lock(&self.next_placement_index)?,
+                node_order: self.node_order.as_ref().clone(),
+                nodes,
+            },
+            image_segments,
+            new_segments,
+        ))
+    }
+
+    fn segment_ids(&self) -> Result<BTreeSet<SegmentId>> {
+        let mut out = BTreeSet::new();
+        for node in self.nodes.values() {
+            out.extend(node.segment_store.segment_ids()?);
+        }
+        Ok(out)
     }
 
     fn primary_node(&self) -> Result<&LocalStorageNode> {
@@ -1347,6 +1393,7 @@ impl LocalCoordinator {
         })
     }
 
+    #[cfg(test)]
     fn state_image(&self) -> Result<DurableStoreImage> {
         Ok(DurableStoreImage {
             config: self.metadata.config,
@@ -1355,6 +1402,34 @@ impl LocalCoordinator {
             next_write_intent: *lock(&self.next_write_intent)?,
             next_extent_id: *lock(&self.next_extent_id)?,
         })
+    }
+
+    fn state_image_for_persist(
+        &self,
+        previous_segments: &BTreeSet<SegmentId>,
+    ) -> Result<(
+        DurableStoreImage,
+        BTreeSet<SegmentId>,
+        Vec<DurableSegmentPayload>,
+    )> {
+        let (storage_nodes, image_segments, new_segments) = self
+            .storage_nodes
+            .state_inner_for_persist(previous_segments)?;
+        Ok((
+            DurableStoreImage {
+                config: self.metadata.config,
+                metadata: self.metadata.state_inner()?,
+                storage_nodes,
+                next_write_intent: *lock(&self.next_write_intent)?,
+                next_extent_id: *lock(&self.next_extent_id)?,
+            },
+            image_segments,
+            new_segments,
+        ))
+    }
+
+    fn segment_ids(&self) -> Result<BTreeSet<SegmentId>> {
+        self.storage_nodes.segment_ids()
     }
 
     pub fn metadata(&self) -> Arc<InMemoryMetadataPlane> {
@@ -4501,27 +4576,15 @@ impl DurableSqliteStore {
         &self,
         image: &DurableStoreImage,
         previous_segments: &BTreeSet<SegmentId>,
+        image_segments: &BTreeSet<SegmentId>,
+        new_segments: Vec<DurableSegmentPayload>,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
     ) -> Result<BTreeSet<SegmentId>> {
-        let image_segments = image.storage_nodes.segment_ids();
-        let mut new_segments = Vec::new();
-        for node in image.storage_nodes.nodes.values() {
-            for (segment_id, record) in &node.segment_store.segments {
-                if !previous_segments.contains(segment_id) {
-                    new_segments.push((
-                        *segment_id,
-                        record.commit.placement.storage_node,
-                        record.bytes.clone(),
-                    ));
-                }
-            }
-        }
-
         let appended = self.append_segments(new_segments)?;
         self.persist_node_catalog_publish(
             image,
             previous_segments,
-            &image_segments,
+            image_segments,
             appended,
             changed_catalog_segments,
         )?;
@@ -4531,7 +4594,7 @@ impl DurableSqliteStore {
         let tx = conn.transaction().map_err(sqlite_error)?;
         persist_row_native_state(&tx, previous_cursor.as_ref(), image)?;
         tx.commit().map_err(sqlite_error)?;
-        Ok(image_segments)
+        Ok(image_segments.clone())
     }
 
     fn persist_node_catalog_publish(
@@ -4649,7 +4712,7 @@ impl DurableSqliteStore {
 
     fn append_segments(
         &self,
-        segments: Vec<(SegmentId, StorageNodeId, Vec<u8>)>,
+        segments: Vec<DurableSegmentPayload>,
     ) -> Result<PendingDataLogAppend> {
         let mut append = PendingDataLogAppend::default();
         if segments.is_empty() {
@@ -4659,7 +4722,10 @@ impl DurableSqliteStore {
         let mut active_logs = BTreeMap::new();
         let mut open_log: Option<(DurableDataLogRef, File)> = None;
         let mut synced_dirs = BTreeSet::new();
-        for (segment_id, storage_node, bytes) in segments {
+        for segment in segments {
+            let segment_id = segment.segment_id;
+            let storage_node = segment.storage_node;
+            let bytes = segment.bytes;
             let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 active_logs.entry(storage_node)
@@ -5055,11 +5121,11 @@ impl DurableSqliteStore {
             };
             let mut payloads = Vec::new();
             for placement in &placements {
-                payloads.push((
-                    placement.segment_id,
-                    placement.storage_node,
-                    self.read_segment_payload(placement)?,
-                ));
+                payloads.push(DurableSegmentPayload {
+                    segment_id: placement.segment_id,
+                    storage_node: placement.storage_node,
+                    bytes: self.read_segment_payload(placement)?,
+                });
             }
             let appended = self.append_segments(payloads)?;
             let mut node_conn = self.node_catalogs.lock(log.storage_node)?;
@@ -7657,8 +7723,7 @@ fn run_maintenance_tick_parts(
                 }
             }
         }
-        let image = parts.local.state_image()?;
-        *lock(&parts.persisted_segments)? = image.storage_nodes.segment_ids();
+        *lock(&parts.persisted_segments)? = parts.local.segment_ids()?;
     }
     if plan.next_cursor != cursor {
         parts.durable.persist_maintenance_cursor(plan.next_cursor)?;
@@ -7775,7 +7840,7 @@ impl DurableCoordinator {
         local
             .metadata
             .use_append_session_incarnation(append_session_incarnation)?;
-        let persisted_segments = local.state_image()?.storage_nodes.segment_ids();
+        let persisted_segments = local.segment_ids()?;
         let maintenance_cursor = Arc::new(Mutex::new(durable.load_maintenance_cursor()?));
 
         let mut store = Self {
@@ -8197,8 +8262,7 @@ impl DurableCoordinator {
     ) -> Result<DurableCompactionReport> {
         let _persist_guard = lock(&self.persist_lock)?;
         let report = self.durable.compact_data_logs(policy)?;
-        let image = self.local.state_image()?;
-        *lock(&self.persisted_segments)? = image.storage_nodes.segment_ids();
+        *lock(&self.persisted_segments)? = self.local.segment_ids()?;
         Ok(report)
     }
 
@@ -8287,11 +8351,16 @@ impl DurableCoordinator {
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
     ) -> Result<()> {
         let _persist_guard = lock(&self.persist_lock)?;
-        let image = self.local.state_image()?;
         let previous_segments = lock(&self.persisted_segments)?.clone();
-        let kept_segments =
-            self.durable
-                .persist(&image, &previous_segments, changed_catalog_segments)?;
+        let (image, image_segments, new_segments) =
+            self.local.state_image_for_persist(&previous_segments)?;
+        let kept_segments = self.durable.persist(
+            &image,
+            &previous_segments,
+            &image_segments,
+            new_segments,
+            changed_catalog_segments,
+        )?;
         *lock(&self.persisted_segments)? = kept_segments;
         Ok(())
     }
@@ -8386,16 +8455,6 @@ struct StorageNodeRegistryInner {
     next_placement_index: u64,
     node_order: Vec<StorageNodeId>,
     nodes: BTreeMap<StorageNodeId, StorageNodeInner>,
-}
-
-impl StorageNodeRegistryInner {
-    fn segment_ids(&self) -> BTreeSet<SegmentId> {
-        let mut out = BTreeSet::new();
-        for node in self.nodes.values() {
-            out.extend(node.segment_store.segments.keys().copied());
-        }
-        out
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -10995,6 +11054,13 @@ struct SegmentRecord {
     commit: SegmentReplicaCommit,
 }
 
+#[derive(Debug)]
+struct DurableSegmentPayload {
+    segment_id: SegmentId,
+    storage_node: StorageNodeId,
+    bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SegmentStoreInner {
     next_offset: u64,
@@ -11028,8 +11094,45 @@ impl InMemorySegmentStore {
         })
     }
 
+    #[cfg(test)]
     fn state_inner(&self) -> Result<SegmentStoreInner> {
         Ok(lock(&self.inner)?.clone())
+    }
+
+    fn state_inner_for_persist(
+        &self,
+        previous_segments: &BTreeSet<SegmentId>,
+        storage_node: StorageNodeId,
+    ) -> Result<(
+        SegmentStoreInner,
+        BTreeSet<SegmentId>,
+        Vec<DurableSegmentPayload>,
+    )> {
+        let inner = lock(&self.inner)?;
+        let mut image_segments = BTreeSet::new();
+        let mut new_segments = Vec::new();
+        for (segment_id, record) in &inner.segments {
+            image_segments.insert(*segment_id);
+            if !previous_segments.contains(segment_id) {
+                new_segments.push(DurableSegmentPayload {
+                    segment_id: *segment_id,
+                    storage_node,
+                    bytes: record.bytes.clone(),
+                });
+            }
+        }
+        Ok((
+            SegmentStoreInner {
+                next_offset: inner.next_offset,
+                segments: BTreeMap::new(),
+            },
+            image_segments,
+            new_segments,
+        ))
+    }
+
+    fn segment_ids(&self) -> Result<BTreeSet<SegmentId>> {
+        Ok(lock(&self.inner)?.segments.keys().copied().collect())
     }
 
     pub fn is_synced(&self, segment_id: SegmentId) -> Result<bool> {
