@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -181,6 +182,17 @@ fn normalize_storage_nodes(
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn durable_commit_high_water_from_local(local: &LocalCoordinator) -> Result<CommitSeq> {
+    let metadata = local.metadata.state_inner()?;
+    Ok(CommitSeq::from_raw(
+        metadata.next_commit_seq.saturating_sub(1),
+    ))
 }
 
 #[derive(Debug)]
@@ -4146,6 +4158,100 @@ struct DurableSqliteStore {
     conn: Arc<Mutex<Connection>>,
     node_catalogs: Arc<NodeCatalogs>,
     policy: DurableDataLogPolicy,
+    #[cfg(test)]
+    persist_delay: Arc<Mutex<Option<Duration>>>,
+    #[cfg(test)]
+    fail_next_persist: Arc<AtomicBool>,
+}
+
+/// Process-local timing for one physical durable persist.
+///
+/// Profiles are opt-in diagnostics. They are not durable state and are not part
+/// of the public block/native provider contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DurablePersistProfile {
+    pub sequence: u64,
+    pub total_nanos: u64,
+    pub lock_wait_nanos: u64,
+    pub local_snapshot_nanos: u64,
+    pub data_log_append_sync_nanos: u64,
+    pub node_catalog_publish_nanos: u64,
+    pub root_sqlite_row_sync_nanos: u64,
+    pub root_sqlite_commit_nanos: u64,
+    pub new_segment_count: u64,
+    pub new_segment_bytes: u64,
+    pub touched_node_count: u64,
+    pub durable_commit_high_water: u64,
+}
+
+#[derive(Debug)]
+struct PersistProfiler {
+    capacity: usize,
+    next_sequence: u64,
+    profiles: VecDeque<DurablePersistProfile>,
+}
+
+impl PersistProfiler {
+    fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "persist profile capacity must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            capacity,
+            next_sequence: 1,
+            profiles: VecDeque::with_capacity(capacity.min(1024)),
+        })
+    }
+
+    fn record(&mut self, mut profile: DurablePersistProfile) {
+        profile.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.profiles.len() == self.capacity {
+            self.profiles.pop_front();
+        }
+        self.profiles.push_back(profile);
+    }
+
+    fn drain(&mut self, max: usize) -> Vec<DurablePersistProfile> {
+        let count = max.min(self.profiles.len());
+        self.profiles.drain(..count).collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DurablePersistOutcome {
+    kept_segments: BTreeSet<SegmentId>,
+    profile: DurablePersistProfile,
+}
+
+#[derive(Debug)]
+struct PersistCoordinator {
+    inner: Mutex<PersistCoordinatorState>,
+    cvar: Condvar,
+}
+
+#[derive(Debug)]
+struct PersistCoordinatorState {
+    in_flight: bool,
+    generation: u64,
+    durable_through: CommitSeq,
+    last_error: Option<(u64, StorageError)>,
+}
+
+impl PersistCoordinator {
+    fn new(durable_through: CommitSeq) -> Self {
+        Self {
+            inner: Mutex::new(PersistCoordinatorState {
+                in_flight: false,
+                generation: 0,
+                durable_through,
+                last_error: None,
+            }),
+            cvar: Condvar::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4237,6 +4343,10 @@ impl DurableSqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             node_catalogs: Arc::new(node_catalogs),
             policy,
+            #[cfg(test)]
+            persist_delay: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_next_persist: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -4548,22 +4658,64 @@ impl DurableSqliteStore {
         current_segments: &BTreeSet<SegmentId>,
         new_segments: Vec<DurableSegmentPayload>,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
-    ) -> Result<BTreeSet<SegmentId>> {
+    ) -> Result<DurablePersistOutcome> {
+        let total_started = Instant::now();
+        #[cfg(test)]
+        {
+            let delay = *lock(&self.persist_delay)?;
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable persist failure",
+                ));
+            }
+        }
+        let new_segment_count = usize_to_u64(new_segments.len());
+        let new_segment_bytes = new_segments
+            .iter()
+            .map(|segment| usize_to_u64(segment.bytes.len()))
+            .fold(0_u64, u64::saturating_add);
+
+        let started = Instant::now();
         let appended = self.append_segments(new_segments)?;
-        self.persist_node_catalog_publish(
+        let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
+
+        let started = Instant::now();
+        let touched_node_count = self.persist_node_catalog_publish(
             image,
             previous_segments,
             current_segments,
             appended,
             changed_catalog_segments,
         )?;
+        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
         let mut conn = lock(&self.conn)?;
         let previous_cursor = load_export_cursor(&conn)?;
         let tx = conn.transaction().map_err(sqlite_error)?;
+        let started = Instant::now();
         persist_row_native_state(&tx, previous_cursor.as_ref(), image)?;
+        let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
         tx.commit().map_err(sqlite_error)?;
-        Ok(current_segments.clone())
+        let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
+        Ok(DurablePersistOutcome {
+            kept_segments: current_segments.clone(),
+            profile: DurablePersistProfile {
+                total_nanos: duration_nanos_u64(total_started.elapsed()),
+                data_log_append_sync_nanos,
+                node_catalog_publish_nanos,
+                root_sqlite_row_sync_nanos,
+                root_sqlite_commit_nanos,
+                new_segment_count,
+                new_segment_bytes,
+                touched_node_count,
+                durable_commit_high_water: image.metadata.next_commit_seq.saturating_sub(1),
+                ..DurablePersistProfile::default()
+            },
+        })
     }
 
     fn persist_node_catalog_publish(
@@ -4573,7 +4725,7 @@ impl DurableSqliteStore {
         current_segments: &BTreeSet<SegmentId>,
         appended: PendingDataLogAppend,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let removed_segment_ids: Vec<_> = previous_segments
             .difference(current_segments)
             .copied()
@@ -4627,6 +4779,7 @@ impl DurableSqliteStore {
             .map(|placement| placement.segment_id)
             .collect();
 
+        let mut touched_node_count = 0_u64;
         for (ordinal, node_id) in image.storage_nodes.node_order.iter().enumerate() {
             let node = image.storage_nodes.nodes.get(node_id).ok_or_else(|| {
                 StorageError::corrupt("storage node order references missing node")
@@ -4676,8 +4829,9 @@ impl DurableSqliteStore {
                 &pre_root_pending_segments,
             )?;
             tx.commit().map_err(sqlite_error)?;
+            touched_node_count = touched_node_count.saturating_add(1);
         }
-        Ok(())
+        Ok(touched_node_count)
     }
 
     fn append_segments(
@@ -7727,6 +7881,8 @@ pub struct DurableCoordinator {
     durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     persist_lock: Arc<Mutex<()>>,
+    persist_coordinator: Arc<PersistCoordinator>,
+    persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
@@ -7811,6 +7967,7 @@ impl DurableCoordinator {
             .metadata
             .use_append_session_incarnation(append_session_incarnation)?;
         let persisted_segments = local.segment_ids()?;
+        let durable_through = durable_commit_high_water_from_local(&local)?;
         let maintenance_cursor = Arc::new(Mutex::new(durable.load_maintenance_cursor()?));
 
         let mut store = Self {
@@ -7818,6 +7975,8 @@ impl DurableCoordinator {
             durable,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             persist_lock: Arc::new(Mutex::new(())),
+            persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
+            persist_profiler: Arc::new(Mutex::new(None)),
             maintenance_policy,
             maintenance_cursor,
             maintenance_worker: None,
@@ -7869,6 +8028,140 @@ impl DurableCoordinator {
             maintenance_cursor: Arc::clone(&self.maintenance_cursor),
             maintenance_policy: self.maintenance_policy,
         }
+    }
+
+    pub fn enable_persist_profiling(&self, capacity: usize) -> Result<()> {
+        *lock(&self.persist_profiler)? = Some(PersistProfiler::new(capacity)?);
+        Ok(())
+    }
+
+    pub fn drain_persist_profiles(&self, max: usize) -> Result<Vec<DurablePersistProfile>> {
+        let mut profiler = lock(&self.persist_profiler)?;
+        Ok(profiler
+            .as_mut()
+            .map(|profiler| profiler.drain(max))
+            .unwrap_or_default())
+    }
+
+    fn record_persist_profile(&self, profile: DurablePersistProfile) -> Result<()> {
+        if let Some(profiler) = lock(&self.persist_profiler)?.as_mut() {
+            profiler.record(profile);
+        }
+        Ok(())
+    }
+
+    fn persist_until(&self, required: CommitSeq) -> Result<()> {
+        let total_started = Instant::now();
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            if state.durable_through >= required {
+                return Ok(());
+            }
+            if !state.in_flight {
+                state.in_flight = true;
+                drop(state);
+                let result = self.persist_physical(total_started, None);
+                let mut state = lock(&self.persist_coordinator.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.saturating_add(1);
+                let generation = state.generation;
+                match result {
+                    Ok(durable_through) => {
+                        state.durable_through = state.durable_through.max(durable_through);
+                        state.last_error = None;
+                        self.persist_coordinator.cvar.notify_all();
+                        if state.durable_through >= required {
+                            return Ok(());
+                        }
+                        return Err(StorageError::conflict(
+                            "durable persist did not reach required commit sequence",
+                        ));
+                    }
+                    Err(error) => {
+                        state.last_error = Some((generation, error.clone()));
+                        self.persist_coordinator.cvar.notify_all();
+                        return Err(error);
+                    }
+                }
+            }
+
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+            }
+            if state.durable_through >= required {
+                return Ok(());
+            }
+            if state.generation != generation
+                && let Some((error_generation, error)) = &state.last_error
+                && *error_generation == state.generation
+            {
+                return Err(error.clone());
+            }
+        }
+    }
+
+    fn persist_now_with_catalog_changes(
+        &self,
+        changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
+    ) -> Result<()> {
+        let total_started = Instant::now();
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            if !state.in_flight {
+                state.in_flight = true;
+                drop(state);
+                let result = self.persist_physical(total_started, changed_catalog_segments);
+                let mut state = lock(&self.persist_coordinator.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.saturating_add(1);
+                let generation = state.generation;
+                match result {
+                    Ok(durable_through) => {
+                        state.durable_through = state.durable_through.max(durable_through);
+                        state.last_error = None;
+                        self.persist_coordinator.cvar.notify_all();
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        state.last_error = Some((generation, error.clone()));
+                        self.persist_coordinator.cvar.notify_all();
+                        return Err(error);
+                    }
+                }
+            }
+            state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+            drop(state);
+        }
+    }
+
+    fn persist_physical(
+        &self,
+        total_started: Instant,
+        changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
+    ) -> Result<CommitSeq> {
+        let _persist_guard = lock(&self.persist_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
+        let snapshot_started = Instant::now();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let (image, current_segments, new_segments) =
+            self.local.state_for_durable_persist(&previous_segments)?;
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+        let outcome = self.durable.persist(
+            &image,
+            &previous_segments,
+            &current_segments,
+            new_segments,
+            changed_catalog_segments,
+        )?;
+        *lock(&self.persisted_segments)? = outcome.kept_segments;
+        let mut profile = outcome.profile;
+        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+        self.record_persist_profile(profile)?;
+        Ok(durable_through)
     }
 
     /// Return the maintenance policy configured for this store.
@@ -8014,6 +8307,17 @@ impl DurableCoordinator {
         self.local.storage_node_ids_for_test()
     }
 
+    #[cfg(test)]
+    fn set_persist_delay_for_test(&self, delay: Option<Duration>) -> Result<()> {
+        *lock(&self.durable.persist_delay)? = delay;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_persist_for_test(&self) {
+        self.durable.fail_next_persist.store(true, Ordering::SeqCst);
+    }
+
     pub fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
         self.run_and_persist(|local| {
             local
@@ -8100,15 +8404,21 @@ impl DurableCoordinator {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<WriteCommit> {
+        let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
         let admission = self.admit_write(
             u64::try_from(data.len())
                 .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
-            matches!(durability, crate::api::WriteDurability::Flushed),
+            flushed,
         )?;
-        let result = self.run_and_maybe_persist(
-            matches!(durability, crate::api::WriteDurability::Flushed),
-            |local| local.write_device(device_id, offset, data, durability),
-        );
+        let result = self
+            .local
+            .write_device(device_id, offset, data, durability)
+            .and_then(|commit| {
+                if flushed {
+                    self.persist_until(commit.commit_seq)?;
+                }
+                Ok(commit)
+            });
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -8121,7 +8431,13 @@ impl DurableCoordinator {
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
         let admission = self.admit_write(len, true)?;
-        let result = self.run_and_persist(|local| local.write_zeroes(device_id, offset, len));
+        let result = self
+            .local
+            .write_zeroes(device_id, offset, len)
+            .and_then(|commit| {
+                self.persist_until(commit.commit_seq)?;
+                Ok(commit)
+            });
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -8135,7 +8451,13 @@ impl DurableCoordinator {
         len: u64,
     ) -> Result<WriteCommit> {
         let admission = self.admit_write(len, true)?;
-        let result = self.run_and_persist(|local| local.discard_device(device_id, offset, len));
+        let result = self
+            .local
+            .discard_device(device_id, offset, len)
+            .and_then(|commit| {
+                self.persist_until(commit.commit_seq)?;
+                Ok(commit)
+            });
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -8150,15 +8472,21 @@ impl DurableCoordinator {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<FileWriteCommit> {
+        let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
         let admission = self.admit_write(
             u64::try_from(data.len())
                 .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
-            matches!(durability, crate::api::WriteDurability::Flushed),
+            flushed,
         )?;
-        let result = self.run_and_maybe_persist(
-            matches!(durability, crate::api::WriteDurability::Flushed),
-            |local| local.write_file_at(keyspace_id, file_id, offset, data, durability),
-        );
+        let result = self
+            .local
+            .write_file_at(keyspace_id, file_id, offset, data, durability)
+            .and_then(|commit| {
+                if flushed {
+                    self.persist_until(commit.commit_seq)?;
+                }
+                Ok(commit)
+            });
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -8171,15 +8499,21 @@ impl DurableCoordinator {
         data: &[u8],
         durability: crate::api::WriteDurability,
     ) -> Result<AppendCommit> {
+        let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
         let admission = self.admit_write(
             u64::try_from(data.len())
                 .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?,
-            matches!(durability, crate::api::WriteDurability::Flushed),
+            flushed,
         )?;
-        let result = self.run_and_maybe_persist(
-            matches!(durability, crate::api::WriteDurability::Flushed),
-            |local| local.append_reserved(reservation, data, durability),
-        );
+        let result = self
+            .local
+            .append_reserved(reservation, data, durability)
+            .and_then(|commit| {
+                if flushed {
+                    self.persist_until(commit.commit_seq)?;
+                }
+                Ok(commit)
+            });
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -8209,8 +8543,8 @@ impl DurableCoordinator {
     }
 
     pub fn flush_device(&self, device_id: DeviceId) -> Result<FlushResult> {
-        self.persist()?;
         let info = self.local.metadata.device_info(device_id)?;
+        self.persist_until(info.latest_commit)?;
         Ok(FlushResult {
             device_id,
             durable_through: info.latest_commit,
@@ -8218,8 +8552,8 @@ impl DurableCoordinator {
     }
 
     pub fn flush_file(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FlushResult> {
-        self.persist()?;
         let head = self.local.metadata.get_file_head(keyspace_id, file_id)?;
+        self.persist_until(head.latest_commit)?;
         Ok(FlushResult {
             device_id: DeviceId::from_raw(file_id.raw()),
             durable_through: head.latest_commit,
@@ -8320,19 +8654,7 @@ impl DurableCoordinator {
         &self,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
     ) -> Result<()> {
-        let _persist_guard = lock(&self.persist_lock)?;
-        let previous_segments = lock(&self.persisted_segments)?.clone();
-        let (image, current_segments, new_segments) =
-            self.local.state_for_durable_persist(&previous_segments)?;
-        let kept_segments = self.durable.persist(
-            &image,
-            &previous_segments,
-            &current_segments,
-            new_segments,
-            changed_catalog_segments,
-        )?;
-        *lock(&self.persisted_segments)? = kept_segments;
-        Ok(())
+        self.persist_now_with_catalog_changes(changed_catalog_segments)
     }
 }
 
@@ -14048,6 +14370,11 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
 }
 
+fn wait_on_cvar<'a, T>(cvar: &Condvar, guard: MutexGuard<'a, T>) -> Result<MutexGuard<'a, T>> {
+    cvar.wait(guard)
+        .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
+}
+
 fn server_lock_stripes() -> Vec<Mutex<()>> {
     (0..SERVER_LOCK_STRIPES).map(|_| Mutex::new(())).collect()
 }
@@ -19028,6 +19355,169 @@ mod tests {
             .read_device(device_id, ByteRange::new(0, 4096), &mut after_flush)
             .unwrap();
         assert_eq!(after_flush, repeated_blocks(1, 7));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_persist_profiling_is_opt_in_and_records_physical_persists() {
+        let root = durable_temp_dir("persist-profile");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        assert!(store.drain_persist_profiles(16).unwrap().is_empty());
+
+        store.enable_persist_profiling(8).unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 8),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let flush = store.flush_device(device_id).unwrap();
+        let profiles = store.drain_persist_profiles(16).unwrap();
+
+        assert_eq!(profiles.len(), 1);
+        let profile = profiles[0];
+        assert_eq!(profile.sequence, 1);
+        assert!(profile.total_nanos >= profile.local_snapshot_nanos);
+        assert_eq!(profile.new_segment_count, 1);
+        assert_eq!(profile.new_segment_bytes, 4096);
+        assert!(profile.touched_node_count > 0);
+        assert!(profile.durable_commit_high_water >= flush.durable_through.raw());
+        assert!(store.drain_persist_profiles(16).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_concurrent_flushes_coalesce_to_one_physical_persist() {
+        let root = durable_temp_dir("persist-coalesce");
+        let cfg = config();
+        let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store.enable_persist_profiling(64).unwrap();
+        store
+            .set_persist_delay_for_test(Some(Duration::from_millis(50)))
+            .unwrap();
+        for block in 0..4 {
+            store
+                .write_device(
+                    device_id,
+                    block * 4096,
+                    &repeated_blocks(1, block as u8 + 1),
+                    WriteDurability::Acknowledged,
+                )
+                .unwrap();
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store.flush_device(device_id).unwrap().durable_through
+            }));
+        }
+        barrier.wait();
+
+        let mut durable_through = Vec::new();
+        for handle in handles {
+            durable_through.push(handle.join().unwrap());
+        }
+        assert!(durable_through.iter().all(|seq| seq.raw() >= 4));
+        let profiles = store.drain_persist_profiles(64).unwrap();
+        assert_eq!(
+            profiles.len(),
+            1,
+            "concurrent flush waiters should share one physical persist"
+        );
+        assert_eq!(profiles[0].new_segment_count, 4);
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        for block in 0..4 {
+            let mut buf = vec![0; 4096];
+            reopened
+                .read_device(device_id, ByteRange::new(block * 4096, 4096), &mut buf)
+                .unwrap();
+            assert_eq!(buf, repeated_blocks(1, block as u8 + 1));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_persist_failure_wakes_waiters_and_later_flush_retries() {
+        let root = durable_temp_dir("persist-failure-wakes");
+        let cfg = config();
+        let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store
+            .set_persist_delay_for_test(Some(Duration::from_millis(50)))
+            .unwrap();
+        store.fail_next_persist_for_test();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 9),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store.flush_device(device_id)
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            assert!(handle.join().unwrap().is_err());
+        }
+
+        store.set_persist_delay_for_test(None).unwrap();
+        let flush = store.flush_device(device_id).unwrap();
+        assert!(flush.durable_through.raw() > 0);
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut buf = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut buf)
+            .unwrap();
+        assert_eq!(buf, repeated_blocks(1, 9));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -379,6 +379,11 @@ contention workload; conflicts or errors in the other append-batch and
 append-session rows should be treated as benchmark or implementation failures,
 not as expected noise.
 
+For durable-provider tail analysis, add `--durable-profile-csv <path>` to append
+one row per physical persist. The profile breaks total persist time into lock
+wait, local state export, data-log append/sync, node-catalog publish, root
+SQLite row sync, and root SQLite commit phases.
+
 The opt-in `append-batch` workload suite compares `native-append-4k`,
 `native-append-1m`, `native-append-4m`, and `native-append-32m` against matching
 `native-write-*` controls. Use it to diagnose client-side batching effects: if

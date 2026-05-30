@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,9 +15,9 @@ use toy_cow_block_storage::provider::{
 };
 use toy_cow_block_storage::{
     AppendReservation, AppendSession, ByteRange, CreateDeviceRequest, CreateFileRequest,
-    CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableCoordinator, DurableDataLogPolicy, FileId,
-    FileSpec, FlushResult, KeyspaceId, LocalCoordinator, LocalStoreConfig, Result, StorageError,
-    StorageNodeId, WriteDurability,
+    CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableCoordinator, DurableDataLogPolicy,
+    DurablePersistProfile, FileId, FileSpec, FlushResult, KeyspaceId, LocalCoordinator,
+    LocalStoreConfig, Result, StorageError, StorageNodeId, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -26,6 +27,7 @@ const DEFAULT_DEVICE_BLOCKS: u64 = 1_048_576;
 const DEFAULT_FILE_ROOT_BLOCKS: u64 = 1_048_576;
 const DEFAULT_FILE_CAPACITY_BYTES: u64 = DEFAULT_FILE_ROOT_BLOCKS * BLOCK_SIZE as u64;
 const SESSION_APPEND_FILE_STRIDE: usize = 64;
+const DEFAULT_PROFILE_CAPACITY: usize = 1_000_000;
 
 fn main() {
     if let Err(error) = run() {
@@ -67,6 +69,7 @@ struct Args {
     storage_nodes: usize,
     device_blocks: u64,
     samples_per_worker: usize,
+    durable_profile_csv: Option<PathBuf>,
 }
 
 impl Args {
@@ -87,6 +90,7 @@ impl Args {
             storage_nodes: 1,
             device_blocks: DEFAULT_DEVICE_BLOCKS,
             samples_per_worker: 200_000,
+            durable_profile_csv: None,
         };
 
         let mut raw = env::args().skip(1);
@@ -127,6 +131,12 @@ impl Args {
                 "--device-blocks" => args.device_blocks = parse_next(&mut raw, "--device-blocks")?,
                 "--samples-per-worker" => {
                     args.samples_per_worker = parse_next(&mut raw, "--samples-per-worker")?;
+                }
+                "--durable-profile-csv" => {
+                    args.durable_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--durable-profile-csv",
+                    )?));
                 }
                 other => {
                     return Err(StorageError::invalid_argument(format!(
@@ -232,6 +242,7 @@ options:\n\
   --storage-nodes N                        local storage node count, default: 1\n\
   --device-blocks N                        logical device blocks, default: 1048576\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
+  --durable-profile-csv PATH               append durable persist profiles to CSV\n\
   --root PATH                              durable scratch root"
     );
 }
@@ -569,14 +580,20 @@ impl BenchStore {
                 args.config(),
                 args.storage_node_ids(),
             )?))),
-            ProviderKind::Durable => Ok(Self::Durable(Arc::new(
-                DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
-                    root,
-                    args.config(),
-                    args.storage_node_ids(),
-                    DurableDataLogPolicy::default(),
-                )?,
-            ))),
+            ProviderKind::Durable => {
+                let store = Arc::new(
+                    DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+                        root,
+                        args.config(),
+                        args.storage_node_ids(),
+                        DurableDataLogPolicy::default(),
+                    )?,
+                );
+                if args.durable_profile_csv.is_some() {
+                    store.enable_persist_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                Ok(Self::Durable(store))
+            }
         }
     }
 
@@ -737,6 +754,13 @@ impl BenchStore {
             Self::Durable(store) => store.flush_file(keyspace_id, file_id),
         }
     }
+
+    fn drain_persist_profiles(&self, max: usize) -> Result<Vec<DurablePersistProfile>> {
+        match self {
+            Self::Local(_) => Ok(Vec::new()),
+            Self::Durable(store) => store.drain_persist_profiles(max),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -776,10 +800,14 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
 
     let store = BenchStore::open(args, &root)?;
     let context = setup_context(args, workload, store)?;
+    let profile_store = context.store.clone();
+    let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
     if !args.warmup.is_zero() {
         let _ = execute_load(args, workload, concurrency, context.clone(), args.warmup)?;
+        let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
     }
     let mut report = execute_load(args, workload, concurrency, context, args.duration)?;
+    append_profile_csv(args, workload, concurrency, &profile_store)?;
     report.provider = args.provider;
     report.durability = args.durability;
     report.workload = workload;
@@ -793,6 +821,64 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     }
 
     Ok(report)
+}
+
+fn append_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.durable_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,lock_wait_nanos,local_snapshot_nanos,data_log_append_sync_nanos,node_catalog_publish_nanos,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,durable_commit_high_water"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.name(),
+            args.provider,
+            args.durability,
+            args.rtt.as_micros(),
+            args.serial_rtts,
+            concurrency,
+            workload.op_size(),
+            profile.sequence,
+            profile.total_nanos,
+            profile.lock_wait_nanos,
+            profile.local_snapshot_nanos,
+            profile.data_log_append_sync_nanos,
+            profile.node_catalog_publish_nanos,
+            profile.root_sqlite_row_sync_nanos,
+            profile.root_sqlite_commit_nanos,
+            profile.new_segment_count,
+            profile.new_segment_bytes,
+            profile.touched_node_count,
+            profile.durable_commit_high_water,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
 }
 
 fn setup_context(args: &Args, workload: Workload, store: BenchStore) -> Result<BenchContext> {
