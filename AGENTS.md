@@ -126,6 +126,11 @@ A module is not done until it has:
   current module before moving on.
 - Keep Criterion regression benchmarks current for public API validation and
   every implemented hot path.
+- Use `cargo run --release --bin loadbench -- ...` as the final happy-path
+  integration performance benchmark for block/native API IOPS, throughput,
+  latency, modeled RTT, concurrency, and conflict/error behavior. Criterion is
+  the mechanism-level regression suite; `loadbench` is the north-star
+  integration baseline.
 - GC tests must include adversarial interleavings with writes, forks, deletes,
   PITR retention changes, and sweep boundaries.
 - PITR tests must verify restored contents, not only restored root IDs.

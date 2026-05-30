@@ -352,3 +352,19 @@ PITR, and GC benchmarks before optimizing those paths.
 Criterion reports performance movement; it does not make `cargo bench` fail
 solely because a benchmark regressed. Treat the output as regression detection
 signal until the project adds an explicit CI comparison step.
+
+For final happy-path integration performance expectations, use the load
+benchmark runner rather than Criterion microbenchmarks:
+
+```sh
+cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,4,16,64 --files 1024 --storage-nodes 4
+cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,16,64 --files 1024 --storage-nodes 4 --rtt-us 200
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
+```
+
+`loadbench` is the north-star integration benchmark: it exercises the public
+block and native APIs through the current provider paths, reports IOPS,
+throughput, latency percentiles, and conflicts/errors, and can model a fixed
+RTT between service boundaries. Treat its output as the current implementation's
+happy-environment performance baseline, while Criterion remains the narrow
+regression suite for individual mechanisms.
