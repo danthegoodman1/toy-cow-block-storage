@@ -206,11 +206,15 @@ options:\n\
   --provider local|durable                 default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
+                                           aliases: north-star, append-batch\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-shard-lanes, block-read-4k,\n\
                                            block-write-1m, native-read-4k,\n\
-                                           native-write-4k,\n\
-                                           native-append-4k, native-hot-append-4k\n\
+                                           native-write-4k, native-write-1m,\n\
+                                           native-write-4m, native-write-32m,\n\
+                                           native-append-4k, native-append-1m,\n\
+                                           native-append-4m, native-append-32m,\n\
+                                           native-hot-append-4k\n\
   --concurrency LIST                       default: 1,4,16\n\
   --duration-ms N                          default: 1000\n\
   --warmup-ms N                            default: 200\n\
@@ -250,10 +254,15 @@ fn parse_usize_list(value: &str, flag: &str) -> Result<Vec<usize>> {
 }
 
 fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
-    if value == "north-star" || value == "all" {
-        return Ok(Workload::north_star_suite());
+    let mut workloads = Vec::new();
+    for part in value.split(',') {
+        match part {
+            "north-star" | "all" => workloads.extend(Workload::north_star_suite()),
+            "append-batch" => workloads.extend(Workload::append_batch_suite()),
+            _ => workloads.push(Workload::from_str(part)?),
+        }
     }
-    value.split(',').map(Workload::from_str).collect()
+    Ok(workloads)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,7 +377,13 @@ enum Workload {
     BlockWrite1m,
     NativeRead4k,
     NativeWrite4k,
+    NativeWrite1m,
+    NativeWrite4m,
+    NativeWrite32m,
     NativeAppend4k,
+    NativeAppend1m,
+    NativeAppend4m,
+    NativeAppend32m,
     NativeHotAppend4k,
 }
 
@@ -386,6 +401,19 @@ impl Workload {
         ]
     }
 
+    fn append_batch_suite() -> Vec<Self> {
+        vec![
+            Self::NativeAppend4k,
+            Self::NativeAppend1m,
+            Self::NativeAppend4m,
+            Self::NativeAppend32m,
+            Self::NativeWrite4k,
+            Self::NativeWrite1m,
+            Self::NativeWrite4m,
+            Self::NativeWrite32m,
+        ]
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::BlockWrite4k => "block-write-4k",
@@ -394,14 +422,22 @@ impl Workload {
             Self::BlockWrite1m => "block-write-1m",
             Self::NativeRead4k => "native-read-4k",
             Self::NativeWrite4k => "native-write-4k",
+            Self::NativeWrite1m => "native-write-1m",
+            Self::NativeWrite4m => "native-write-4m",
+            Self::NativeWrite32m => "native-write-32m",
             Self::NativeAppend4k => "native-append-4k",
+            Self::NativeAppend1m => "native-append-1m",
+            Self::NativeAppend4m => "native-append-4m",
+            Self::NativeAppend32m => "native-append-32m",
             Self::NativeHotAppend4k => "native-hot-append-4k",
         }
     }
 
     fn op_size(self) -> usize {
         match self {
-            Self::BlockWrite1m => 1024 * 1024,
+            Self::BlockWrite1m | Self::NativeWrite1m | Self::NativeAppend1m => 1024 * 1024,
+            Self::NativeWrite4m | Self::NativeAppend4m => 4 * 1024 * 1024,
+            Self::NativeWrite32m | Self::NativeAppend32m => 32 * 1024 * 1024,
             Self::BlockWrite4k
             | Self::BlockWrite4kShardLanes
             | Self::BlockRead4k
@@ -414,6 +450,23 @@ impl Workload {
 
     fn is_read(self) -> bool {
         matches!(self, Self::BlockRead4k | Self::NativeRead4k)
+    }
+
+    fn is_native_write(self) -> bool {
+        matches!(
+            self,
+            Self::NativeWrite4k | Self::NativeWrite1m | Self::NativeWrite4m | Self::NativeWrite32m
+        )
+    }
+
+    fn is_native_append(self) -> bool {
+        matches!(
+            self,
+            Self::NativeAppend4k
+                | Self::NativeAppend1m
+                | Self::NativeAppend4m
+                | Self::NativeAppend32m
+        )
     }
 
     fn is_block(self) -> bool {
@@ -438,7 +491,13 @@ impl FromStr for Workload {
             "block-write-1m" => Ok(Self::BlockWrite1m),
             "native-read-4k" => Ok(Self::NativeRead4k),
             "native-write-4k" => Ok(Self::NativeWrite4k),
+            "native-write-1m" => Ok(Self::NativeWrite1m),
+            "native-write-4m" => Ok(Self::NativeWrite4m),
+            "native-write-32m" => Ok(Self::NativeWrite32m),
             "native-append-4k" => Ok(Self::NativeAppend4k),
+            "native-append-1m" => Ok(Self::NativeAppend1m),
+            "native-append-4m" => Ok(Self::NativeAppend4m),
+            "native-append-32m" => Ok(Self::NativeAppend32m),
             "native-hot-append-4k" => Ok(Self::NativeHotAppend4k),
             _ => Err(StorageError::invalid_argument(format!(
                 "unknown workload {value}"
@@ -701,7 +760,7 @@ fn setup_context(args: &Args, workload: Workload, store: BenchStore) -> Result<B
                     spec: FileSpec { name: None },
                 },
             )?;
-            if matches!(workload, Workload::NativeWrite4k | Workload::NativeRead4k) {
+            if matches!(workload, Workload::NativeRead4k) {
                 store.write_file_at(
                     keyspace_id,
                     file_id,
@@ -800,7 +859,11 @@ struct WorkerConfig {
 fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Result<WorkerReport> {
     let mut rng = Lcg::new(0x9e37_79b9_7f4a_7c15_u64 ^ worker.wrapping_mul(0xd1b5_4a32_d192_ed03));
     let mut report = WorkerReport::new(config.samples_per_worker);
-    let mut read_buf = vec![0; context.op_size];
+    let mut read_buf = if config.workload.is_read() {
+        vec![0; context.op_size]
+    } else {
+        Vec::new()
+    };
 
     while Instant::now() < config.deadline {
         let started = Instant::now();
@@ -933,7 +996,7 @@ fn run_one_op(
                 read_buf,
             )
         }
-        (Target::Native { keyspace_id, files }, Workload::NativeWrite4k) => {
+        (Target::Native { keyspace_id, files }, workload) if workload.is_native_write() => {
             let file_id = files[rng.below(files.len() as u64) as usize];
             context
                 .store
@@ -948,7 +1011,7 @@ fn run_one_op(
                 read_buf,
             )
         }
-        (Target::Native { keyspace_id, files }, Workload::NativeAppend4k) => {
+        (Target::Native { keyspace_id, files }, workload) if workload.is_native_append() => {
             let file_id = files[rng.below(files.len() as u64) as usize];
             let lease = context.store.acquire_append_lease(*keyspace_id, file_id)?;
             context

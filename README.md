@@ -360,6 +360,7 @@ benchmark runner rather than Criterion microbenchmarks:
 cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,4,16,64 --files 1024 --storage-nodes 4
 cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,16,64 --files 1024 --storage-nodes 4 --rtt-us 200
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
 ```
 
 `loadbench` is the north-star integration benchmark: it exercises the public
@@ -368,3 +369,14 @@ throughput, latency percentiles, and conflicts/errors, and can model a fixed
 RTT between service boundaries. Treat its output as the current implementation's
 happy-environment performance baseline, while Criterion remains the narrow
 regression suite for individual mechanisms.
+
+The opt-in `append-batch` workload suite compares `native-append-4k`,
+`native-append-1m`, `native-append-4m`, and `native-append-32m` against matching
+`native-write-*` controls. Use it to diagnose client-side batching effects: if
+append throughput rises with payload size, fixed per-append overhead dominates;
+if large append remains much slower than same-size write-at, append
+lease/publish semantics dominate; if both plateau low, the durable data-log or
+catalog persistence path is the bottleneck. Large durable write controls can
+retain substantial in-flight segment bytes before an `ack-flush:N` boundary; on
+memory-constrained Docker hosts, reduce `--files`, concurrency, or workload
+size for exploratory runs.
