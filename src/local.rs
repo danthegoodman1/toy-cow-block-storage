@@ -1751,11 +1751,7 @@ impl LocalCoordinator {
         if head.version != lease.base_version {
             return Err(StorageError::conflict("stale append lease"));
         }
-        self.metadata.validate_writer_epoch(
-            lease.keyspace_id,
-            lease.file_id,
-            lease.writer_epoch,
-        )?;
+        self.metadata.validate_append_lease(&lease)?;
 
         let owner = MappingOwner::NativeKeyspace(lease.keyspace_id);
         let block_size = u64::from(self.metadata.config.block_size);
@@ -1806,6 +1802,7 @@ impl LocalCoordinator {
             WriteGrantIntent::NativeAppend {
                 keyspace_id: lease.keyspace_id,
                 file_id: lease.file_id,
+                lease_id: lease.lease_id,
                 append_offset: head.size,
                 bytes: data_len,
                 base_version: lease.base_version,
@@ -2407,11 +2404,7 @@ impl LocalCoordinator {
         if head.version != lease.base_version {
             return Err(StorageError::conflict("stale append lease"));
         }
-        self.metadata.validate_writer_epoch(
-            lease.keyspace_id,
-            lease.file_id,
-            lease.writer_epoch,
-        )?;
+        self.metadata.validate_append_lease(&lease)?;
         let candidates = self.storage_nodes.storage_node_ids()?;
         let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
         let segment_id = self.storage_nodes.allocate_segment_id()?;
@@ -2422,6 +2415,7 @@ impl LocalCoordinator {
             intent: WriteGrantIntent::NativeAppend {
                 keyspace_id: lease.keyspace_id,
                 file_id: lease.file_id,
+                lease_id: lease.lease_id,
                 append_offset: head.size,
                 bytes: logical_bytes,
                 base_version: lease.base_version,
@@ -2760,37 +2754,47 @@ impl LocalCoordinator {
             },
         );
         let verified = self.verify_receipt_matches_grant_observed(grant, &receipt)?;
-        let (keyspace_id, file_id, append_offset, logical_bytes, base_version, writer_epoch) =
-            match receipt.intent {
-                WriteGrantIntent::NativeAppend {
-                    keyspace_id,
-                    file_id,
-                    append_offset,
-                    bytes,
-                    base_version,
-                    writer_epoch,
-                }
-                | WriteGrantIntent::NativeReservedAppend {
-                    keyspace_id,
-                    file_id,
-                    append_offset,
-                    bytes,
-                    base_version,
-                    writer_epoch,
-                } => (
-                    keyspace_id,
-                    file_id,
-                    append_offset,
-                    bytes,
-                    base_version,
-                    writer_epoch,
-                ),
-                _ => {
-                    return Err(StorageError::invalid_argument(
-                        "trusted native append publish requires a native append receipt",
-                    ));
-                }
-            };
+        let (
+            keyspace_id,
+            file_id,
+            lease_id,
+            append_offset,
+            logical_bytes,
+            base_version,
+            writer_epoch,
+        ) = match receipt.intent {
+            WriteGrantIntent::NativeAppend {
+                keyspace_id,
+                file_id,
+                lease_id,
+                append_offset,
+                bytes,
+                base_version,
+                writer_epoch,
+            }
+            | WriteGrantIntent::NativeReservedAppend {
+                keyspace_id,
+                file_id,
+                lease_id,
+                append_offset,
+                bytes,
+                base_version,
+                writer_epoch,
+            } => (
+                keyspace_id,
+                file_id,
+                lease_id,
+                append_offset,
+                bytes,
+                base_version,
+                writer_epoch,
+            ),
+            _ => {
+                return Err(StorageError::invalid_argument(
+                    "trusted native append publish requires a native append receipt",
+                ));
+            }
+        };
         if receipt.owner != MappingOwner::NativeKeyspace(keyspace_id) {
             return Err(StorageError::conflict(
                 "receipt owner does not match native keyspace intent",
@@ -2800,8 +2804,13 @@ impl LocalCoordinator {
         if head.size != append_offset || head.version != base_version {
             return Err(StorageError::conflict("stale native append receipt"));
         }
-        self.metadata
-            .validate_writer_epoch(keyspace_id, file_id, writer_epoch)?;
+        self.metadata.validate_append_fence(
+            keyspace_id,
+            file_id,
+            lease_id,
+            writer_epoch,
+            base_version,
+        )?;
         let block_size = u64::from(self.metadata.config.block_size);
         let tail_bytes = head.size % block_size;
         let segment_start_block = head.size / block_size;
@@ -4192,6 +4201,10 @@ impl DurableSqliteStore {
                 (cursor_storage_node IS NOT NULL AND cursor_log_id IS NOT NULL)
               )
             );
+            CREATE TABLE IF NOT EXISTS append_lease_runtime (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              next_incarnation INTEGER NOT NULL CHECK (next_incarnation > 0)
+            );
             CREATE TABLE IF NOT EXISTS device_specs (
               device_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
@@ -4909,6 +4922,38 @@ impl DurableSqliteStore {
     fn load_maintenance_cursor(&self) -> Result<Option<DurableDataLogRef>> {
         let conn = lock(&self.conn)?;
         load_maintenance_cursor(&conn)
+    }
+
+    fn reserve_append_lease_incarnation(&self) -> Result<u64> {
+        let mut conn = lock(&self.conn)?;
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let current = tx
+            .query_row(
+                "SELECT next_incarnation
+                 FROM append_lease_runtime
+                 WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .map(i64_to_u64)
+            .transpose()
+            .map_err(sqlite_error)?
+            .unwrap_or(1);
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("append lease incarnation overflow"))?;
+        tx.execute(
+            "INSERT INTO append_lease_runtime(id, next_incarnation)
+             VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET
+               next_incarnation = excluded.next_incarnation",
+            params![u64_to_i64(next)?],
+        )
+        .map_err(sqlite_error)?;
+        tx.commit().map_err(sqlite_error)?;
+        Ok(current)
     }
 
     fn persist_maintenance_cursor(&self, cursor: Option<DurableDataLogRef>) -> Result<()> {
@@ -7701,6 +7746,10 @@ impl DurableCoordinator {
         let local = durable
             .load(config)?
             .unwrap_or(LocalCoordinator::with_storage_nodes(config, storage_nodes)?);
+        let append_lease_incarnation = durable.reserve_append_lease_incarnation()?;
+        local
+            .metadata
+            .use_append_lease_incarnation(append_lease_incarnation)?;
         let persisted_segments = local.state_image()?.storage_nodes.segment_ids();
         let maintenance_cursor = Arc::new(Mutex::new(durable.load_maintenance_cursor()?));
 
@@ -7948,7 +7997,7 @@ impl DurableCoordinator {
         keyspace_id: KeyspaceId,
         file_id: FileId,
     ) -> Result<AppendLease> {
-        self.run_and_persist(|local| local.acquire_append_lease(keyspace_id, file_id))
+        self.local.acquire_append_lease(keyspace_id, file_id)
     }
 
     pub fn checkpoint(&self, device_id: DeviceId) -> Result<CheckpointId> {
@@ -8601,11 +8650,45 @@ impl MetadataInner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveAppendLease {
+    lease_id: AppendLeaseId,
+    writer_epoch: WriterEpoch,
+    base_version: FileVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppendLeaseAllocator {
+    incarnation: u64,
+    next_counter: u64,
+}
+
+impl AppendLeaseAllocator {
+    fn new(incarnation: u64) -> Self {
+        Self {
+            incarnation,
+            next_counter: 1,
+        }
+    }
+
+    fn next_id(&mut self) -> Result<AppendLeaseId> {
+        let counter = self.next_counter;
+        self.next_counter = self
+            .next_counter
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("append lease counter overflow"))?;
+        let raw = (u128::from(self.incarnation) << 64) | u128::from(counter);
+        Ok(AppendLeaseId::from_raw(raw))
+    }
+}
+
 /// In-memory implementation of `MetadataPlane`.
 #[derive(Debug)]
 pub struct InMemoryMetadataPlane {
     config: LocalStoreConfig,
     inner: Mutex<MetadataInner>,
+    active_append_leases: Mutex<BTreeMap<(KeyspaceId, FileId), ActiveAppendLease>>,
+    append_lease_allocator: Mutex<AppendLeaseAllocator>,
 }
 
 impl InMemoryMetadataPlane {
@@ -8614,6 +8697,8 @@ impl InMemoryMetadataPlane {
         Ok(Self {
             config,
             inner: Mutex::new(MetadataInner::new()),
+            active_append_leases: Mutex::new(BTreeMap::new()),
+            append_lease_allocator: Mutex::new(AppendLeaseAllocator::new(0)),
         })
     }
 
@@ -8622,11 +8707,19 @@ impl InMemoryMetadataPlane {
         Ok(Self {
             config,
             inner: Mutex::new(inner),
+            active_append_leases: Mutex::new(BTreeMap::new()),
+            append_lease_allocator: Mutex::new(AppendLeaseAllocator::new(0)),
         })
     }
 
     fn state_inner(&self) -> Result<MetadataInner> {
         Ok(lock(&self.inner)?.clone())
+    }
+
+    fn use_append_lease_incarnation(&self, incarnation: u64) -> Result<()> {
+        *lock(&self.append_lease_allocator)? = AppendLeaseAllocator::new(incarnation);
+        lock(&self.active_append_leases)?.clear();
+        Ok(())
     }
 
     pub fn device_info(&self, device_id: DeviceId) -> Result<DeviceInfo> {
@@ -8882,42 +8975,76 @@ impl InMemoryMetadataPlane {
         keyspace_id: KeyspaceId,
         file_id: FileId,
     ) -> Result<AppendLease> {
-        let mut inner = lock(&self.inner)?;
+        let lease_id = lock(&self.append_lease_allocator)?.next_id()?;
+        let inner = lock(&self.inner)?;
         let head = Self::file_head_locked(&inner, keyspace_id, file_id)?;
         let key = (keyspace_id, file_id);
-        let current_epoch = inner
+        let persisted_epoch = inner
             .file_writer_epochs
             .get(&key)
             .copied()
             .unwrap_or_else(|| WriterEpoch::from_raw(0));
+        let mut active = lock(&self.active_append_leases)?;
+        let current_epoch = active
+            .get(&key)
+            .map(|lease| lease.writer_epoch)
+            .unwrap_or(persisted_epoch);
         let writer_epoch = current_epoch
             .raw()
             .checked_add(1)
             .map(WriterEpoch::from_raw)
             .ok_or_else(|| StorageError::conflict("writer epoch overflow"))?;
-        inner.file_writer_epochs.insert(key, writer_epoch);
-        Ok(AppendLease {
+        let lease = AppendLease {
             keyspace_id,
             file_id,
-            lease_id: AppendLeaseId::from_raw(writer_epoch.raw() as u128),
+            lease_id,
             writer_epoch,
             base_version: head.version,
-        })
+        };
+        active.insert(
+            key,
+            ActiveAppendLease {
+                lease_id,
+                writer_epoch,
+                base_version: head.version,
+            },
+        );
+        Ok(lease)
     }
 
-    pub fn validate_writer_epoch(
+    pub fn validate_append_lease(&self, lease: &AppendLease) -> Result<()> {
+        let inner = lock(&self.inner)?;
+        Self::file_head_locked(&inner, lease.keyspace_id, lease.file_id)?;
+        drop(inner);
+
+        let active = lock(&self.active_append_leases)?;
+        match active.get(&(lease.keyspace_id, lease.file_id)) {
+            Some(current)
+                if current.lease_id == lease.lease_id
+                    && current.writer_epoch == lease.writer_epoch
+                    && current.base_version == lease.base_version =>
+            {
+                Ok(())
+            }
+            Some(_) | None => Err(StorageError::conflict("stale append lease")),
+        }
+    }
+
+    pub fn validate_append_fence(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
+        lease_id: AppendLeaseId,
         writer_epoch: WriterEpoch,
+        base_version: FileVersion,
     ) -> Result<()> {
-        let inner = lock(&self.inner)?;
-        Self::file_head_locked(&inner, keyspace_id, file_id)?;
-        match inner.file_writer_epochs.get(&(keyspace_id, file_id)) {
-            Some(current) if *current == writer_epoch => Ok(()),
-            Some(_) => Err(StorageError::conflict("stale writer epoch")),
-            None => Err(StorageError::conflict("stale writer epoch")),
-        }
+        self.validate_append_lease(&AppendLease {
+            keyspace_id,
+            file_id,
+            lease_id,
+            writer_epoch,
+            base_version,
+        })
     }
 
     fn create_empty_tree(
@@ -10384,8 +10511,8 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 let current_entry =
                     Self::keyspace_file_in_root_locked(&inner, current_catalog.root_id, file_id)?;
                 let current = current_entry.head.clone();
-                match intent.fence {
-                    MetadataFence::FileVersion(version) if version == current.version => {}
+                let committed_writer_epoch = match intent.fence {
+                    MetadataFence::FileVersion(version) if version == current.version => None,
                     MetadataFence::FileVersion(_) => {
                         return Err(StorageError::conflict("stale file version fence"));
                     }
@@ -10393,8 +10520,15 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         base_version,
                         writer_epoch,
                     } if base_version == current.version
-                        && Some(&writer_epoch)
-                            == inner.file_writer_epochs.get(&(keyspace_id, file_id)) => {}
+                        && lock(&self.active_append_leases)?
+                            .get(&(keyspace_id, file_id))
+                            .is_some_and(|lease| {
+                                lease.writer_epoch == writer_epoch
+                                    && lease.base_version == base_version
+                            }) =>
+                    {
+                        Some(writer_epoch)
+                    }
                     MetadataFence::WriterEpoch { .. } => {
                         return Err(StorageError::conflict("stale writer epoch fence"));
                     }
@@ -10403,7 +10537,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                             "native file commit requires file-version or writer-epoch fence",
                         ));
                     }
-                }
+                };
                 if current.root != old_root {
                     return Err(StorageError::conflict("stale file root"));
                 }
@@ -10483,6 +10617,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 inner
                     .commit_groups
                     .insert(commit_group.commit_group, commit_group.clone());
+                if let Some(writer_epoch) = committed_writer_epoch {
+                    inner
+                        .file_writer_epochs
+                        .insert((keyspace_id, file_id), writer_epoch);
+                }
                 Ok(commit_group)
             }
         }
@@ -14858,6 +14997,7 @@ impl DurableCodec for WriteGrantIntent {
             Self::NativeAppend {
                 keyspace_id,
                 file_id,
+                lease_id,
                 append_offset,
                 bytes,
                 base_version,
@@ -14866,6 +15006,7 @@ impl DurableCodec for WriteGrantIntent {
                 3u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
+                lease_id.encode(out)?;
                 append_offset.encode(out)?;
                 bytes.encode(out)?;
                 base_version.encode(out)?;
@@ -14874,6 +15015,7 @@ impl DurableCodec for WriteGrantIntent {
             Self::NativeReservedAppend {
                 keyspace_id,
                 file_id,
+                lease_id,
                 append_offset,
                 bytes,
                 base_version,
@@ -14882,6 +15024,7 @@ impl DurableCodec for WriteGrantIntent {
                 4u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
+                lease_id.encode(out)?;
                 append_offset.encode(out)?;
                 bytes.encode(out)?;
                 base_version.encode(out)?;
@@ -14912,6 +15055,7 @@ impl DurableCodec for WriteGrantIntent {
             3 => Ok(Self::NativeAppend {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
+                lease_id: AppendLeaseId::decode(input)?,
                 append_offset: u64::decode(input)?,
                 bytes: u64::decode(input)?,
                 base_version: FileVersion::decode(input)?,
@@ -14920,6 +15064,7 @@ impl DurableCodec for WriteGrantIntent {
             4 => Ok(Self::NativeReservedAppend {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
+                lease_id: AppendLeaseId::decode(input)?,
                 append_offset: u64::decode(input)?,
                 bytes: u64::decode(input)?,
                 base_version: FileVersion::decode(input)?,
@@ -21183,8 +21328,6 @@ mod tests {
                     }
                     2 => {
                         let byte = (1 + rng.next_u64() % 254) as u8;
-                        durable_blocks = live_blocks.clone();
-                        durable_file = live_file.clone();
                         let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
                         store
                             .append_file(lease, &[byte; 4096], WriteDurability::Acknowledged)
@@ -21234,7 +21377,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_provider_reopens_native_keyspace_and_writer_epochs() {
+    fn durable_append_lease_acquire_does_not_persist_writer_epoch() {
         let root = durable_temp_dir("native-restart");
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -21253,11 +21396,62 @@ mod tests {
                 },
             )
             .unwrap();
-        let stale = store.acquire_append_lease(keyspace_id, file_id).unwrap();
-        let fresh = store.acquire_append_lease(keyspace_id, file_id).unwrap();
-
         drop(store);
+
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let before = store.metadata().state_inner().unwrap();
+        assert_eq!(
+            before.file_writer_epochs.get(&(keyspace_id, file_id)),
+            Some(&WriterEpoch::from_raw(0))
+        );
+        let lease = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+        assert_eq!(lease.writer_epoch, WriterEpoch::from_raw(1));
+        let after_acquire = store.metadata().state_inner().unwrap();
+        assert_eq!(
+            after_acquire
+                .file_writer_epochs
+                .get(&(keyspace_id, file_id)),
+            Some(&WriterEpoch::from_raw(0))
+        );
+        drop(store);
+
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let after_reopen = reopened.metadata().state_inner().unwrap();
+        assert_eq!(
+            after_reopen.file_writer_epochs.get(&(keyspace_id, file_id)),
+            Some(&WriterEpoch::from_raw(0))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_uncommitted_append_leases_fail_after_reopen_even_when_epoch_repeats() {
+        let root = durable_temp_dir("native-restart-stale-lease");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let stale = store.acquire_append_lease(keyspace_id, file_id).unwrap();
+        assert_eq!(stale.writer_epoch, WriterEpoch::from_raw(1));
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let fresh = reopened.acquire_append_lease(keyspace_id, file_id).unwrap();
+        assert_eq!(fresh.writer_epoch, stale.writer_epoch);
+        assert_ne!(fresh.lease_id, stale.lease_id);
         assert!(
             reopened
                 .append_file(stale, b"stale", WriteDurability::Acknowledged)
@@ -21289,7 +21483,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes_after_restart, b"durable");
+        assert_eq!(
+            reopened_again
+                .metadata()
+                .state_inner()
+                .unwrap()
+                .file_writer_epochs
+                .get(&(keyspace_id, file_id)),
+            Some(&WriterEpoch::from_raw(1))
+        );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_lease_stealing_is_scoped_to_one_file() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (file_a, _) = create_local_file(&client, keyspace_id);
+        let (file_b, _) = create_local_file(&client, keyspace_id);
+
+        let file_b_lease = store.acquire_append_lease(keyspace_id, file_b).unwrap();
+        let stale_file_a = store.acquire_append_lease(keyspace_id, file_a).unwrap();
+        let fresh_file_a = store.acquire_append_lease(keyspace_id, file_a).unwrap();
+
+        assert!(
+            store
+                .append_file(stale_file_a, b"stale", WriteDurability::Acknowledged)
+                .is_err()
+        );
+        store
+            .append_file(file_b_lease, b"b", WriteDurability::Acknowledged)
+            .unwrap();
+        store
+            .append_file(fresh_file_a, b"a", WriteDurability::Acknowledged)
+            .unwrap();
+
+        let mut file_a_bytes = vec![0; 1];
+        store
+            .read_file(keyspace_id, file_a, ByteRange::new(0, 1), &mut file_a_bytes)
+            .unwrap();
+        assert_eq!(file_a_bytes, b"a");
+        let mut file_b_bytes = vec![0; 1];
+        store
+            .read_file(keyspace_id, file_b, ByteRange::new(0, 1), &mut file_b_bytes)
+            .unwrap();
+        assert_eq!(file_b_bytes, b"b");
     }
 
     #[test]

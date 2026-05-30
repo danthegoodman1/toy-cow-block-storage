@@ -8,10 +8,10 @@ use crate::api::{
 use crate::error::Result;
 use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileInfo, KeyspaceInfo};
 use crate::id::{
-    CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion, GrantEpoch, GrantId,
-    GrantNonce, KeyspaceId, LogicalDeadline, MetadataNodeId, PrincipalId, SegmentId,
-    ServerIncarnation, ShardId, StorageNodeId, StorageNodeKeyId, TenantId, WriteIntentId,
-    WriterEpoch,
+    AppendLeaseId, CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion,
+    GrantEpoch, GrantId, GrantNonce, KeyspaceId, LogicalDeadline, MetadataNodeId, PrincipalId,
+    SegmentId, ServerIncarnation, ShardId, StorageNodeId, StorageNodeKeyId, TenantId,
+    WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, KeyspaceHead, MappingOwner,
@@ -83,6 +83,7 @@ pub enum WriteGrantIntent {
     NativeAppend {
         keyspace_id: KeyspaceId,
         file_id: FileId,
+        lease_id: AppendLeaseId,
         append_offset: u64,
         bytes: u64,
         base_version: FileVersion,
@@ -91,6 +92,7 @@ pub enum WriteGrantIntent {
     NativeReservedAppend {
         keyspace_id: KeyspaceId,
         file_id: FileId,
+        lease_id: AppendLeaseId,
         append_offset: u64,
         bytes: u64,
         base_version: FileVersion,
@@ -1382,6 +1384,7 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
         WriteGrantIntent::NativeAppend {
             keyspace_id,
             file_id,
+            lease_id,
             append_offset,
             bytes,
             base_version,
@@ -1390,6 +1393,7 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
             put_u8(out, 3);
             put_u128(out, keyspace_id.raw());
             put_u128(out, file_id.raw());
+            put_u128(out, lease_id.raw());
             put_u64(out, append_offset);
             put_u64(out, bytes);
             put_u64(out, base_version.raw());
@@ -1398,6 +1402,7 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
         WriteGrantIntent::NativeReservedAppend {
             keyspace_id,
             file_id,
+            lease_id,
             append_offset,
             bytes,
             base_version,
@@ -1406,6 +1411,7 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
             put_u8(out, 4);
             put_u128(out, keyspace_id.raw());
             put_u128(out, file_id.raw());
+            put_u128(out, lease_id.raw());
             put_u64(out, append_offset);
             put_u64(out, bytes);
             put_u64(out, base_version.raw());
