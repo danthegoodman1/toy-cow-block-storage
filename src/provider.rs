@@ -8,10 +8,10 @@ use crate::api::{
 use crate::error::Result;
 use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileInfo, KeyspaceInfo};
 use crate::id::{
-    AppendLeaseId, CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion,
-    GrantEpoch, GrantId, GrantNonce, KeyspaceId, LogicalDeadline, MetadataNodeId, PrincipalId,
-    SegmentId, ServerIncarnation, ShardId, StorageNodeId, StorageNodeKeyId, TenantId,
-    WriteIntentId, WriterEpoch,
+    AppendReservationId, AppendSessionId, CheckpointId, CommitSeq, DeviceGeneration, DeviceId,
+    FileId, FileVersion, GrantEpoch, GrantId, GrantNonce, KeyspaceId, LogicalDeadline,
+    MetadataNodeId, PrincipalId, SegmentId, ServerIncarnation, ShardId, StorageNodeId,
+    StorageNodeKeyId, TenantId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, KeyspaceHead, MappingOwner,
@@ -83,19 +83,19 @@ pub enum WriteGrantIntent {
     NativeAppend {
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        lease_id: AppendLeaseId,
+        session_id: AppendSessionId,
+        reservation_id: AppendReservationId,
         append_offset: u64,
         bytes: u64,
-        base_version: FileVersion,
         writer_epoch: WriterEpoch,
     },
     NativeReservedAppend {
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        lease_id: AppendLeaseId,
+        session_id: AppendSessionId,
+        reservation_id: AppendReservationId,
         append_offset: u64,
         bytes: u64,
-        base_version: FileVersion,
         writer_epoch: WriterEpoch,
     },
     Internal {
@@ -637,13 +637,16 @@ pub struct CommitGroupIntent {
 /// update's `old_root` as the write-contention fence, allowing independent
 /// shard updates to commit after another shard advances the device generation.
 /// Native commits must reject a publish when the current file state no longer
-/// matches the supplied version or writer-epoch fence.
+/// matches the supplied file version or append reservation fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetadataFence {
     DeviceGeneration(DeviceGeneration),
     FileVersion(FileVersion),
-    WriterEpoch {
-        base_version: FileVersion,
+    AppendReservation {
+        session_id: AppendSessionId,
+        reservation_id: AppendReservationId,
+        offset: u64,
+        len: u64,
         writer_epoch: WriterEpoch,
     },
 }
@@ -861,7 +864,8 @@ pub trait MetadataPlane: Send + Sync {
 
     /// Return the latest committed native file head.
     ///
-    /// Must not return a head from a stale append lease or failed append commit.
+    /// Must not return a head from a stale append session/reservation or failed
+    /// append commit.
     fn get_file_head(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileHead>;
 
     /// Return user-facing native file information derived from committed state.
@@ -1003,8 +1007,8 @@ pub trait SegmentStore: Send + Sync {
 pub struct SegmentReservationIntent {
     /// Provider-unique write attempt ID used by custodians to expire failed or
     /// abandoned segment writes. This is separate from file writer epochs or
-    /// append lease IDs so expiring one storage write cannot accidentally free
-    /// another owner that reused a higher-level fencing token.
+    /// append session/reservation IDs so expiring one storage write cannot
+    /// accidentally free another owner that reused a higher-level fencing token.
     pub write_intent: WriteIntentId,
     pub owner: MappingOwner,
     pub bytes: u64,
@@ -1384,37 +1388,37 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
         WriteGrantIntent::NativeAppend {
             keyspace_id,
             file_id,
-            lease_id,
+            session_id,
+            reservation_id,
             append_offset,
             bytes,
-            base_version,
             writer_epoch,
         } => {
             put_u8(out, 3);
             put_u128(out, keyspace_id.raw());
             put_u128(out, file_id.raw());
-            put_u128(out, lease_id.raw());
+            put_u128(out, session_id.raw());
+            put_u128(out, reservation_id.raw());
             put_u64(out, append_offset);
             put_u64(out, bytes);
-            put_u64(out, base_version.raw());
             put_u64(out, writer_epoch.raw());
         }
         WriteGrantIntent::NativeReservedAppend {
             keyspace_id,
             file_id,
-            lease_id,
+            session_id,
+            reservation_id,
             append_offset,
             bytes,
-            base_version,
             writer_epoch,
         } => {
             put_u8(out, 4);
             put_u128(out, keyspace_id.raw());
             put_u128(out, file_id.raw());
-            put_u128(out, lease_id.raw());
+            put_u128(out, session_id.raw());
+            put_u128(out, reservation_id.raw());
             put_u64(out, append_offset);
             put_u64(out, bytes);
-            put_u64(out, base_version.raw());
             put_u64(out, writer_epoch.raw());
         }
         WriteGrantIntent::Internal { owner } => {

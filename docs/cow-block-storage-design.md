@@ -9,8 +9,8 @@ This project is a toy copy-on-write storage system built around immutable data
 segments and immutable metadata roots. The first compatibility surface is a
 block device, but the block layer is only one mapping layer over a shared
 segment substrate. A native extent/file API should develop alongside it for
-workloads that need file-level append leases, writer fencing, and lower metadata
-amplification than a generic block interface can provide.
+workloads that need file-level append sessions, writer fencing, and lower
+metadata amplification than a generic block interface can provide.
 
 A block device is represented by a small device head:
 
@@ -56,8 +56,8 @@ reachability-based garbage collection.
 - Keep block storage as the compatibility mapping layer, not the whole storage
   system.
 - Develop a native extent/file API beside the block API for append-heavy custom
-  filesystems and direct users that need writer epochs, append leases, and stale
-  writer rejection.
+  filesystems and direct users that need writer epochs, append sessions, and
+  stale writer rejection.
 - Add a POSIX namespace API as a sibling mapping layer for FUSE-style use,
   without forcing POSIX directory, inode, rename, unlink, truncate, or fsync
   semantics into the lower native file API.
@@ -142,9 +142,10 @@ file_head {
 }
 ```
 
-`file_version` is the fencing identity for file extent commits. Append leases
-also carry writer epochs, so a stolen lease can reject stale writers even when
-they durably wrote segment bytes before attempting metadata commit.
+`file_version` is the fencing identity for file extent commits. Append sessions
+carry writer epochs, and append reservations fence a specific offset and length,
+so a stolen session can reject stale writers even when they durably wrote
+segment bytes before attempting metadata commit.
 
 Each shard root points to a persistent immutable tree:
 
@@ -366,11 +367,12 @@ Public native guarantees:
 - Keyspace snapshots and restores are atomic namespace-level operations.
 - File writes are ordinary byte-offset mutations fenced by the committed file
   version.
-- File appends are separately fenced by append leases with writer epochs.
+- File appends are separately fenced by append sessions and reservations with
+  writer epochs.
 - Native file reads, writes, and appends are byte-oriented; block alignment is an
   implementation-private segment detail.
-- The metadata plane rejects stale append commits whose file version or writer
-  epoch no longer matches the keyspace-scoped file.
+- The metadata plane rejects stale append commits whose session, reservation, or
+  writer epoch no longer matches the keyspace-scoped file.
 - A successful mutating write or append commit advances the file version and
   keyspace catalog root atomically.
 - Segment bytes are durable before file extent metadata references them.
@@ -467,9 +469,9 @@ Phase 15 local baseline ranges on this workstation:
 | file info | ~200 ns | ~250 ns | ~4.5 us |
 | 4 KiB file read | ~470 ns | ~520 ns | ~4.9 us |
 | 4 KiB `write_at` | ~8.4 us | ~8.4 us | ~40 us |
-| 1-byte append with lease | ~18 us | ~18 us | ~53 us |
+| 1-byte append with fresh session | ~18 us | ~18 us | ~53 us |
 | create file | ~65-80 us | ~65-80 us | ~65-80 us |
-| stale lease rejection | ~0.6 us | ~0.6 us | ~9 us |
+| stale session rejection | ~0.6 us | ~0.6 us | ~9 us |
 | checkpoint root copy | ~90 ns | ~100 ns | ~90 ns |
 | snapshot root copy | ~170 ns | ~170 ns | ~170 ns |
 | checkpoint restore root copy | ~170 ns | ~190 ns | ~200 ns |
@@ -478,8 +480,8 @@ Alignment and concurrency baselines:
 
 - aligned 4 KiB native write: ~8.3 us
 - unaligned partial-block native write: ~8.5 us
-- aligned 4 KiB append with a fresh lease: ~12 us
-- unaligned 17-byte append with a fresh lease: ~12 us
+- aligned 4 KiB append with a fresh session: ~12 us
+- unaligned 17-byte append with a fresh session: ~12 us
 - aligned 4 KiB native read: ~0.6 us
 - unaligned 17-byte native read: ~0.5 us
 - four-thread independent write batch: ~71 us
@@ -1026,9 +1028,9 @@ not become permanent shortcuts:
 - PITR retention is deterministic commit-age policy in v1. Durable providers may
   add richer per-owner policies, but expiration must still be driven by injected
   logical time or commit epochs, not hidden wall-clock reads.
-- Native append lease stealing is local metadata state in v1. Durable providers
-  need lease/session records, restart-safe writer epochs, and tests where stale
-  writers race after durable segment writes.
+- Native append session stealing is local metadata state in v1. Durable
+  providers need restart-safe session identities, writer epochs, and tests where
+  stale writers race after durable segment writes.
 - Caches are ordinary in-memory maps in v1. Durable or remote implementations
   must document cache coherence, invalidation, and fence/version checks instead
   of relying on provider-local object identity.
@@ -1045,8 +1047,8 @@ server:
 1. Selects the local storage endpoint in v1, or a replica set in a later
    replicated implementation, that will hold the new segment bytes.
 2. Creates a stable write-intent identity for the request or commit group. For
-   native appends, this write intent is tied to the append lease and writer
-   epoch.
+   native appends, this write intent is tied to the append session, reservation,
+   and writer epoch.
 3. Reserves segment space in each selected storage endpoint's
    `LocalSegmentCatalog` under that write intent.
 4. Writes bytes through each selected `SegmentStore`.
@@ -1234,28 +1236,33 @@ Invariants:
 - Failed writes leave the previous file version readable.
 - Segment/block alignment is not exposed to native callers.
 
-### Acquire Append Lease
+### Open Append Session And Reserve
 
-A native append lease grants one writer the right to attempt appends against a
-specific file version and writer epoch. The metadata plane may steal the lease by
-issuing a newer writer epoch.
+A native append session grants one writer the right to reserve append offsets
+against a specific file and writer epoch. The metadata plane may steal the
+session by issuing a newer writer epoch for the same file. A reservation assigns
+one monotonically increasing offset and length within that session.
 
 Invariants:
 
-- Append leases carry `file_id`, `base_version`, and `writer_epoch`.
-- A stale lease cannot publish file metadata.
-- Lease stealing does not delete durable data; failed old writers leave orphans
+- Append sessions carry `keyspace_id`, `file_id`, `session_id`,
+  `base_version`, and `writer_epoch`.
+- Append reservations carry `session_id`, `reservation_id`, `offset`, `len`, and
+  `writer_epoch`.
+- A stale session or reservation cannot publish file metadata.
+- Session stealing does not delete durable data; failed old writers leave orphans
   if their segment writes already became durable.
 
 ### Native Append Commit
 
 A native append commit:
 
-1. Validates the append lease against the current file version and writer epoch.
-2. Creates a write intent tied to that lease.
+1. Validates the append reservation against the active session, reserved offset,
+   current file size, and writer epoch.
+2. Creates a write intent tied to that session and reservation.
 3. Reserves and writes durable segment bytes.
 4. Builds file extent metadata for the append range.
-5. Publishes the new file root with file-version and writer-epoch fencing.
+5. Publishes the new file root with append-reservation and writer-epoch fencing.
 6. Marks local segment catalog entries as referenced.
 7. Returns the new file version.
 
@@ -1385,8 +1392,9 @@ root set.
 
 The native restore API creates a new keyspace from the reconstructed
 `KeyspaceRoot`. This is intentionally not a per-file restore: every file in the
-catalog is restored together, and a stale append lease from the source keyspace
-cannot publish into the restored keyspace because leases carry `keyspace_id`.
+catalog is restored together, and a stale append session from the source
+keyspace cannot publish into the restored keyspace because sessions and
+reservations carry `keyspace_id`.
 
 Invariants:
 
@@ -1564,8 +1572,8 @@ Provider and service boundaries:
 - `BlockServer`: actor boundary that handles block requests.
 - `BlockTransport`: typed request/response transport.
 - `NativeKeyspaceClient`: public native keyspace control handle.
-- `NativeFile`: public native file handle with byte writes, append leases, and
-  file-version commits.
+- `NativeFile`: public native file handle with byte writes, append sessions,
+  reservations, and file-version commits.
 - `NativeServer`: actor boundary that handles native keyspace/file requests.
 - `NativeTransport`: typed request/response transport for native keyspace/file
   requests.
@@ -1592,8 +1600,8 @@ Provider and service boundaries:
 - `PartitionedDataLogStore`: durable manager for rolled segment payload logs,
   manifests, checksums, and replay of data-log tails.
 - `SqliteMetadataStore`: durable metadata provider for roots, commits,
-  placement index, lifecycle state, PITR, leases, manifests, and custodian
-  evidence.
+  placement index, lifecycle state, PITR, append-session state, manifests, and
+  custodian evidence.
 - `CompactionPlanner`: deterministic maintenance policy that selects sealed
   data logs for deletion or live-payload relocation.
 - `StorageNodeRegistry`: internal provider map from `StorageNodeId` to the
@@ -1628,8 +1636,8 @@ command:
 - Public writes spanning shards are atomic at request granularity.
 - Native append commits are atomic at file-version and keyspace-catalog
   granularity.
-- Stale native append leases cannot publish file metadata across keyspace
-  lineage boundaries.
+- Stale native append sessions/reservations cannot publish file metadata across
+  keyspace lineage boundaries.
 - Forked devices initially read identically to their parent.
 - After divergence, writes to one fork do not change reads from the other fork.
 - A failed publish does not expose partially written metadata.

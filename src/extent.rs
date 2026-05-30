@@ -1,8 +1,8 @@
 use crate::api::{ByteRange, FlushResult, ReadResponse, RestorePoint, WriteDurability};
 use crate::error::{Result, StorageError};
 use crate::id::{
-    AppendLeaseId, CheckpointId, ClientEpoch, CommitSeq, ExtentId, FileId, FileVersion,
-    KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
+    AppendReservationId, AppendSessionId, CheckpointId, ClientEpoch, CommitSeq, ExtentId, FileId,
+    FileVersion, KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,12 +43,23 @@ pub struct FileInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppendLease {
+pub struct AppendSession {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
-    pub lease_id: AppendLeaseId,
+    pub session_id: AppendSessionId,
     pub writer_epoch: WriterEpoch,
     pub base_version: FileVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppendReservation {
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
+    pub session_id: AppendSessionId,
+    pub reservation_id: AppendReservationId,
+    pub writer_epoch: WriterEpoch,
+    pub offset: u64,
+    pub len: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -80,8 +91,9 @@ pub enum NativeOperation {
     FileInfo,
     Read,
     Write,
-    AcquireAppend,
-    Append,
+    OpenAppendSession,
+    ReserveAppend,
+    AppendReserved,
     Flush,
     CheckpointKeyspace,
     SnapshotKeyspace,
@@ -91,15 +103,15 @@ pub enum NativeOperation {
 /// User-facing native file handle.
 ///
 /// This API is a sibling of the block API over the shared segment substrate. It
-/// preserves file-level intent such as byte writes, append leases, and writer
+/// preserves file-level intent such as byte writes, append sessions, and writer
 /// epochs while keeping snapshots at the keyspace/filesystem boundary.
 ///
 /// Minimal implementor guarantees:
 ///
 /// - Successful writes and appends are atomic file-version transitions inside
 ///   one keyspace catalog commit.
-/// - Stale append leases and stale writer epochs fail without exposing partial
-///   file contents.
+/// - Stale append sessions, stale reservations, and stale writer epochs fail
+///   without exposing partial file contents.
 /// - Reads observe the latest committed file root/version in this file's
 ///   keyspace.
 /// - Failed writes and appends leave the previous committed file version
@@ -137,21 +149,28 @@ pub trait NativeFile: Send + Sync {
     /// write is a no-op and must not allocate segment data.
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<FileWriteCommit>;
 
-    /// Acquire an append lease for this file.
+    /// Open an append session for this file.
     ///
-    /// A lease carries the keyspace, file version, and writer epoch needed to
-    /// fence stale append commits. Acquiring a new lease may invalidate older
-    /// leases when the implementation supports lock stealing.
-    fn acquire_append(&self) -> Result<AppendLease>;
+    /// A session carries the keyspace, file version, and writer epoch needed to
+    /// fence stale append commits. Opening a new session for the same file
+    /// invalidates older sessions.
+    fn open_append_session(&self) -> Result<AppendSession>;
 
-    /// Append bytes using a previously acquired lease.
+    /// Reserve append space inside an open session.
+    ///
+    /// Reservations assign monotonically increasing file offsets from the
+    /// session's volatile reserved tail. V1 implementations may require
+    /// reservations to commit in offset order.
+    fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation>;
+
+    /// Append bytes using a previously acquired reservation.
     ///
     /// Success means the byte payload is durable and committed as one
     /// file-version transition. Payload length does not need to be block
-    /// aligned. Stale leases must fail without exposing partial file data. A
-    /// zero-length append is invalid because it creates no useful extent or
-    /// version transition.
-    fn append_with_lease(&self, lease: AppendLease, data: &[u8]) -> Result<AppendCommit>;
+    /// aligned. Stale sessions/reservations must fail without exposing partial
+    /// file data. A zero-length append is invalid because it creates no useful
+    /// extent or version transition.
+    fn append_reserved(&self, reservation: AppendReservation, data: &[u8]) -> Result<AppendCommit>;
 
     /// Flush previously acknowledged native file writes.
     ///
@@ -182,11 +201,15 @@ pub trait NativeKeyspaceClient: Send + Sync {
     /// Return committed information for a native file in a keyspace.
     fn file_info(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FileInfo>;
 
-    /// Acquire an append lease for a native file.
+    /// Open an append session for a native file.
     ///
-    /// The lease must be fenced by the committed file version observed by the
+    /// The session must be fenced by the committed file version observed by the
     /// server and a writer epoch that stale writers cannot reuse successfully.
-    fn acquire_append(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<AppendLease>;
+    fn open_append_session(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Result<AppendSession>;
 
     /// Checkpoint a native keyspace catalog root for PITR replay.
     fn checkpoint_keyspace(&self, keyspace_id: KeyspaceId) -> Result<CheckpointId>;
@@ -230,14 +253,20 @@ pub enum NativeRequest {
         bytes: Vec<u8>,
         durability: WriteDurability,
     },
-    AcquireAppend {
+    OpenAppendSession {
         keyspace_id: KeyspaceId,
         file_id: FileId,
     },
-    Append {
+    ReserveAppend {
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        lease: AppendLease,
+        session: AppendSession,
+        len: u64,
+    },
+    AppendReserved {
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        reservation: AppendReservation,
         bytes: Vec<u8>,
         durability: WriteDurability,
     },
@@ -267,8 +296,9 @@ impl NativeRequest {
             Self::FileInfo { .. } => NativeOperation::FileInfo,
             Self::Read { .. } => NativeOperation::Read,
             Self::Write { .. } => NativeOperation::Write,
-            Self::AcquireAppend { .. } => NativeOperation::AcquireAppend,
-            Self::Append { .. } => NativeOperation::Append,
+            Self::OpenAppendSession { .. } => NativeOperation::OpenAppendSession,
+            Self::ReserveAppend { .. } => NativeOperation::ReserveAppend,
+            Self::AppendReserved { .. } => NativeOperation::AppendReserved,
             Self::Flush { .. } => NativeOperation::Flush,
             Self::CheckpointKeyspace { .. } => NativeOperation::CheckpointKeyspace,
             Self::SnapshotKeyspace { .. } => NativeOperation::SnapshotKeyspace,
@@ -283,8 +313,9 @@ impl NativeRequest {
             | Self::FileInfo { keyspace_id, .. }
             | Self::Read { keyspace_id, .. }
             | Self::Write { keyspace_id, .. }
-            | Self::AcquireAppend { keyspace_id, .. }
-            | Self::Append { keyspace_id, .. }
+            | Self::OpenAppendSession { keyspace_id, .. }
+            | Self::ReserveAppend { keyspace_id, .. }
+            | Self::AppendReserved { keyspace_id, .. }
             | Self::Flush { keyspace_id, .. }
             | Self::CheckpointKeyspace { keyspace_id } => Some(*keyspace_id),
             Self::SnapshotKeyspace { source, .. } | Self::RestoreKeyspace { source, .. } => {
@@ -299,8 +330,9 @@ impl NativeRequest {
             Self::FileInfo { file_id, .. }
             | Self::Read { file_id, .. }
             | Self::Write { file_id, .. }
-            | Self::AcquireAppend { file_id, .. }
-            | Self::Append { file_id, .. }
+            | Self::OpenAppendSession { file_id, .. }
+            | Self::ReserveAppend { file_id, .. }
+            | Self::AppendReserved { file_id, .. }
             | Self::Flush { file_id, .. } => Some(*file_id),
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
@@ -320,17 +352,20 @@ impl NativeRequest {
                 })?;
                 Ok(Some(ByteRange::new(*offset, len)))
             }
-            Self::Append { bytes, .. } => {
+            Self::AppendReserved {
+                reservation, bytes, ..
+            } => {
                 let len = u64::try_from(bytes.len()).map_err(|_| {
                     StorageError::invalid_argument("append byte length overflows u64")
                 })?;
-                Ok(Some(ByteRange::new(0, len)))
+                Ok(Some(ByteRange::new(reservation.offset, len)))
             }
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
             | Self::CreateFile { .. }
             | Self::FileInfo { .. }
-            | Self::AcquireAppend { .. }
+            | Self::OpenAppendSession { .. }
+            | Self::ReserveAppend { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -355,8 +390,9 @@ impl NativeRequest {
             | Self::FileInfo { .. }
             | Self::Read { .. }
             | Self::Write { .. }
-            | Self::AcquireAppend { .. }
-            | Self::Append { .. }
+            | Self::OpenAppendSession { .. }
+            | Self::ReserveAppend { .. }
+            | Self::AppendReserved { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -378,10 +414,30 @@ impl NativeRequest {
                 ByteRange::new(*offset, len).end_exclusive()?;
                 Ok(())
             }
-            Self::Append {
+            Self::ReserveAppend {
                 keyspace_id,
                 file_id,
-                lease,
+                session,
+                len,
+            } => {
+                if *len == 0 {
+                    return Err(StorageError::invalid_argument(
+                        "append reservation length must not be zero",
+                    ));
+                }
+
+                if *keyspace_id != session.keyspace_id || *file_id != session.file_id {
+                    return Err(StorageError::invalid_argument(
+                        "append session target does not match request target",
+                    ));
+                }
+
+                Ok(())
+            }
+            Self::AppendReserved {
+                keyspace_id,
+                file_id,
+                reservation,
                 bytes,
                 ..
             } => {
@@ -390,20 +446,26 @@ impl NativeRequest {
                         "append payload must not be empty",
                     ));
                 }
-
-                if *keyspace_id != lease.keyspace_id || *file_id != lease.file_id {
+                let len = u64::try_from(bytes.len()).map_err(|_| {
+                    StorageError::invalid_argument("append byte length overflows u64")
+                })?;
+                if len != reservation.len {
                     return Err(StorageError::invalid_argument(
-                        "append lease target does not match request target",
+                        "append payload length does not match reservation",
                     ));
                 }
-
+                if *keyspace_id != reservation.keyspace_id || *file_id != reservation.file_id {
+                    return Err(StorageError::invalid_argument(
+                        "append reservation target does not match request target",
+                    ));
+                }
                 Ok(())
             }
             Self::CreateKeyspace { .. }
             | Self::KeyspaceInfo { .. }
             | Self::FileInfo { .. }
             | Self::Read { .. }
-            | Self::AcquireAppend { .. }
+            | Self::OpenAppendSession { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
             | Self::SnapshotKeyspace { .. }
@@ -421,7 +483,8 @@ pub enum NativeResponse {
     Read(ReadResponse),
     Write(FileWriteCommit),
     Append(AppendCommit),
-    AppendLease(AppendLease),
+    AppendSession(AppendSession),
+    AppendReservation(AppendReservation),
     Flush(FlushResult),
     KeyspaceCheckpointed(CheckpointId),
     KeyspaceSnapshotted(KeyspaceId),
@@ -479,8 +542,8 @@ pub struct NativeResponseEnvelope {
 ///
 /// - Preserve request identity in the response envelope.
 /// - Validate public request shape before mutating provider state.
-/// - Fence conflicting append writers with keyspace, file versions, and writer
-///   epochs.
+/// - Fence conflicting append writers with keyspace, sessions, reservations,
+///   file versions, and writer epochs.
 /// - Translate native operations into shared substrate operations without
 ///   routing them through block-device logical mappings.
 /// - Keep retries idempotent or reject them deterministically by request ID and
@@ -513,13 +576,25 @@ pub trait NativeTransport: Send + Sync {
 mod tests {
     use super::*;
 
-    fn lease(keyspace_id: KeyspaceId, file_id: FileId) -> AppendLease {
-        AppendLease {
+    fn session(keyspace_id: KeyspaceId, file_id: FileId) -> AppendSession {
+        AppendSession {
             keyspace_id,
             file_id,
-            lease_id: AppendLeaseId::from_raw(9),
+            session_id: AppendSessionId::from_raw(9),
             writer_epoch: WriterEpoch::from_raw(3),
             base_version: FileVersion::from_raw(2),
+        }
+    }
+
+    fn reservation(keyspace_id: KeyspaceId, file_id: FileId) -> AppendReservation {
+        AppendReservation {
+            keyspace_id,
+            file_id,
+            session_id: AppendSessionId::from_raw(9),
+            reservation_id: AppendReservationId::from_raw(10),
+            writer_epoch: WriterEpoch::from_raw(3),
+            offset: 11,
+            len: 3,
         }
     }
 
@@ -527,12 +602,12 @@ mod tests {
     fn native_requests_expose_operation_and_targets() {
         let keyspace_id = KeyspaceId::from_raw(5);
         let file_id = FileId::from_raw(7);
-        let request = NativeRequest::AcquireAppend {
+        let request = NativeRequest::OpenAppendSession {
             keyspace_id,
             file_id,
         };
 
-        assert_eq!(request.operation(), NativeOperation::AcquireAppend);
+        assert_eq!(request.operation(), NativeOperation::OpenAppendSession);
         assert_eq!(request.target_keyspace_id(), Some(keyspace_id));
         assert_eq!(request.target_file_id(), Some(file_id));
         let write = NativeRequest::Write {
@@ -585,35 +660,62 @@ mod tests {
     }
 
     #[test]
-    fn append_validation_requires_matching_lease_and_payload() {
+    fn append_validation_requires_matching_session_reservation_and_payload() {
         let keyspace_id = KeyspaceId::from_raw(5);
         let file_id = FileId::from_raw(7);
-        let valid = NativeRequest::Append {
+        let reserve = NativeRequest::ReserveAppend {
             keyspace_id,
             file_id,
-            lease: lease(keyspace_id, file_id),
+            session: session(keyspace_id, file_id),
+            len: 3,
+        };
+        assert!(reserve.validate_for_existing_file().is_ok());
+
+        let valid = NativeRequest::AppendReserved {
+            keyspace_id,
+            file_id,
+            reservation: reservation(keyspace_id, file_id),
             bytes: vec![1, 2, 3],
             durability: WriteDurability::Acknowledged,
         };
         assert!(valid.validate_for_existing_file().is_ok());
 
-        let empty = NativeRequest::Append {
+        let empty_reserve = NativeRequest::ReserveAppend {
             keyspace_id,
             file_id,
-            lease: lease(keyspace_id, file_id),
+            session: session(keyspace_id, file_id),
+            len: 0,
+        };
+        assert!(empty_reserve.validate_for_existing_file().is_err());
+
+        let empty = NativeRequest::AppendReserved {
+            keyspace_id,
+            file_id,
+            reservation: AppendReservation {
+                len: 0,
+                ..reservation(keyspace_id, file_id)
+            },
             bytes: Vec::new(),
             durability: WriteDurability::Acknowledged,
         };
         assert!(empty.validate_for_existing_file().is_err());
 
-        let mismatched = NativeRequest::Append {
+        let mismatched_session = NativeRequest::ReserveAppend {
             keyspace_id,
             file_id,
-            lease: lease(keyspace_id, FileId::from_raw(8)),
+            session: session(keyspace_id, FileId::from_raw(8)),
+            len: 1,
+        };
+        assert!(mismatched_session.validate_for_existing_file().is_err());
+
+        let mismatched_reservation = NativeRequest::AppendReserved {
+            keyspace_id,
+            file_id,
+            reservation: reservation(keyspace_id, FileId::from_raw(8)),
             bytes: vec![1],
             durability: WriteDurability::Acknowledged,
         };
-        assert!(mismatched.validate_for_existing_file().is_err());
+        assert!(mismatched_reservation.validate_for_existing_file().is_err());
     }
 
     #[test]

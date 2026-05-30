@@ -22,7 +22,8 @@ metadata substrate:
 - **Native keyspace/files**: `NativeKeyspaceClient` and `NativeFile`, shaped for
   custom filesystems or append-heavy users. Files live inside a keyspace so
   checkpoint, snapshot, and restore are filesystem-level operations, not
-  per-file snapshots. Appends are byte-oriented and fenced by append leases.
+  per-file snapshots. Appends are byte-oriented and fenced by append
+  sessions/reservations.
 
 The local implementation runs in one process, but the API already goes through
 server and transport boundaries so durable or remote implementations can replace
@@ -134,7 +135,7 @@ Block API guarantees to care about:
 ### Native Keyspace/File Flow
 
 Use the native API when the caller wants file/keyspace intent preserved by the
-storage layer: byte-oriented writes, append leases, stale-writer rejection, and
+storage layer: byte-oriented writes, append sessions, stale-writer rejection, and
 filesystem-level snapshots. A keyspace snapshot is the native API's fork-like
 operation: it creates a new keyspace lineage that initially shares immutable
 catalog and file roots.
@@ -215,8 +216,8 @@ Native API guarantees to care about:
 - File IDs are scoped by keyspace.
 - Writes and appends are byte-oriented and committed as file-version
   transitions.
-- Append leases carry writer epochs so stale writers fail without partial file
-  visibility.
+- Append sessions carry writer epochs, and reservations fence each append offset
+  and length so stale writers fail without partial file visibility.
 - A successful non-empty file write publishes a new immutable keyspace catalog
   root.
 - Snapshot and restore copy retained keyspace-root pointers rather than walking
@@ -361,6 +362,7 @@ cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --war
 cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,16,64 --files 1024 --storage-nodes 4 --rtt-us 200
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:16 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-session --rtt-us 200
 ```
 
 `loadbench` is the north-star integration benchmark: it exercises the public
@@ -375,8 +377,15 @@ The opt-in `append-batch` workload suite compares `native-append-4k`,
 `native-write-*` controls. Use it to diagnose client-side batching effects: if
 append throughput rises with payload size, fixed per-append overhead dominates;
 if large append remains much slower than same-size write-at, append
-lease/publish semantics dominate; if both plateau low, the durable data-log or
-catalog persistence path is the bottleneck. Large durable write controls can
-retain substantial in-flight segment bytes before an `ack-flush:N` boundary; on
-memory-constrained Docker hosts, reduce `--files`, concurrency, or workload
-size for exploratory runs.
+session/reservation publish semantics dominate; if both plateau low, the
+durable data-log or catalog persistence path is the bottleneck.
+
+The opt-in `append-session` workload suite compares
+`native-session-append-4k`, `native-session-append-1m`,
+`native-session-append-4m`, and `native-session-append-32m` against matching
+`native-write-*` controls. The session workloads keep one append session open
+per worker/file lane and reserve one append offset per operation, which
+separates session-open overhead from per-append data movement and metadata
+publish cost. Large durable write controls can retain substantial in-flight
+segment bytes before an `ack-flush:N` boundary; on memory-constrained Docker
+hosts, reduce `--files`, concurrency, or workload size for exploratory runs.

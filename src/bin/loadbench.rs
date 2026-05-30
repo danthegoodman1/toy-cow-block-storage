@@ -13,10 +13,10 @@ use toy_cow_block_storage::provider::{
     MetadataPlane,
 };
 use toy_cow_block_storage::{
-    AppendLease, ByteRange, CreateDeviceRequest, CreateFileRequest, CreateKeyspaceRequest,
-    DeviceId, DeviceSpec, DurableCoordinator, DurableDataLogPolicy, FileId, FileSpec, FlushResult,
-    KeyspaceId, LocalCoordinator, LocalStoreConfig, Result, StorageError, StorageNodeId,
-    WriteDurability,
+    AppendReservation, AppendSession, ByteRange, CreateDeviceRequest, CreateFileRequest,
+    CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableCoordinator, DurableDataLogPolicy, FileId,
+    FileSpec, FlushResult, KeyspaceId, LocalCoordinator, LocalStoreConfig, Result, StorageError,
+    StorageNodeId, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -24,6 +24,8 @@ static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);
 const BLOCK_SIZE: u32 = 4096;
 const DEFAULT_DEVICE_BLOCKS: u64 = 1_048_576;
 const DEFAULT_FILE_ROOT_BLOCKS: u64 = 1_048_576;
+const DEFAULT_FILE_CAPACITY_BYTES: u64 = DEFAULT_FILE_ROOT_BLOCKS * BLOCK_SIZE as u64;
+const SESSION_APPEND_FILE_STRIDE: usize = 64;
 
 fn main() {
     if let Err(error) = run() {
@@ -206,7 +208,7 @@ options:\n\
   --provider local|durable                 default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch\n\
+                                           aliases: north-star, append-batch, append-session\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-shard-lanes, block-read-4k,\n\
                                            block-write-1m, native-read-4k,\n\
@@ -214,6 +216,10 @@ options:\n\
                                            native-write-4m, native-write-32m,\n\
                                            native-append-4k, native-append-1m,\n\
                                            native-append-4m, native-append-32m,\n\
+                                           native-session-append-4k,\n\
+                                           native-session-append-1m,\n\
+                                           native-session-append-4m,\n\
+                                           native-session-append-32m,\n\
                                            native-hot-append-4k\n\
   --concurrency LIST                       default: 1,4,16\n\
   --duration-ms N                          default: 1000\n\
@@ -259,6 +265,7 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
         match part {
             "north-star" | "all" => workloads.extend(Workload::north_star_suite()),
             "append-batch" => workloads.extend(Workload::append_batch_suite()),
+            "append-session" => workloads.extend(Workload::append_session_suite()),
             _ => workloads.push(Workload::from_str(part)?),
         }
     }
@@ -384,6 +391,10 @@ enum Workload {
     NativeAppend1m,
     NativeAppend4m,
     NativeAppend32m,
+    NativeSessionAppend4k,
+    NativeSessionAppend1m,
+    NativeSessionAppend4m,
+    NativeSessionAppend32m,
     NativeHotAppend4k,
 }
 
@@ -414,6 +425,19 @@ impl Workload {
         ]
     }
 
+    fn append_session_suite() -> Vec<Self> {
+        vec![
+            Self::NativeSessionAppend4k,
+            Self::NativeSessionAppend1m,
+            Self::NativeSessionAppend4m,
+            Self::NativeSessionAppend32m,
+            Self::NativeWrite4k,
+            Self::NativeWrite1m,
+            Self::NativeWrite4m,
+            Self::NativeWrite32m,
+        ]
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::BlockWrite4k => "block-write-4k",
@@ -429,21 +453,33 @@ impl Workload {
             Self::NativeAppend1m => "native-append-1m",
             Self::NativeAppend4m => "native-append-4m",
             Self::NativeAppend32m => "native-append-32m",
+            Self::NativeSessionAppend4k => "native-session-append-4k",
+            Self::NativeSessionAppend1m => "native-session-append-1m",
+            Self::NativeSessionAppend4m => "native-session-append-4m",
+            Self::NativeSessionAppend32m => "native-session-append-32m",
             Self::NativeHotAppend4k => "native-hot-append-4k",
         }
     }
 
     fn op_size(self) -> usize {
         match self {
-            Self::BlockWrite1m | Self::NativeWrite1m | Self::NativeAppend1m => 1024 * 1024,
-            Self::NativeWrite4m | Self::NativeAppend4m => 4 * 1024 * 1024,
-            Self::NativeWrite32m | Self::NativeAppend32m => 32 * 1024 * 1024,
+            Self::BlockWrite1m
+            | Self::NativeWrite1m
+            | Self::NativeAppend1m
+            | Self::NativeSessionAppend1m => 1024 * 1024,
+            Self::NativeWrite4m | Self::NativeAppend4m | Self::NativeSessionAppend4m => {
+                4 * 1024 * 1024
+            }
+            Self::NativeWrite32m | Self::NativeAppend32m | Self::NativeSessionAppend32m => {
+                32 * 1024 * 1024
+            }
             Self::BlockWrite4k
             | Self::BlockWrite4kShardLanes
             | Self::BlockRead4k
             | Self::NativeWrite4k
             | Self::NativeRead4k
             | Self::NativeAppend4k
+            | Self::NativeSessionAppend4k
             | Self::NativeHotAppend4k => 4096,
         }
     }
@@ -466,6 +502,16 @@ impl Workload {
                 | Self::NativeAppend1m
                 | Self::NativeAppend4m
                 | Self::NativeAppend32m
+        )
+    }
+
+    fn is_native_session_append(self) -> bool {
+        matches!(
+            self,
+            Self::NativeSessionAppend4k
+                | Self::NativeSessionAppend1m
+                | Self::NativeSessionAppend4m
+                | Self::NativeSessionAppend32m
         )
     }
 
@@ -498,6 +544,10 @@ impl FromStr for Workload {
             "native-append-1m" => Ok(Self::NativeAppend1m),
             "native-append-4m" => Ok(Self::NativeAppend4m),
             "native-append-32m" => Ok(Self::NativeAppend32m),
+            "native-session-append-4k" => Ok(Self::NativeSessionAppend4k),
+            "native-session-append-1m" => Ok(Self::NativeSessionAppend1m),
+            "native-session-append-4m" => Ok(Self::NativeSessionAppend4m),
+            "native-session-append-32m" => Ok(Self::NativeSessionAppend32m),
             "native-hot-append-4k" => Ok(Self::NativeHotAppend4k),
             _ => Err(StorageError::invalid_argument(format!(
                 "unknown workload {value}"
@@ -616,26 +666,48 @@ impl BenchStore {
         .map(|_| ())
     }
 
-    fn acquire_append_lease(
+    fn open_append_session(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-    ) -> Result<AppendLease> {
+    ) -> Result<AppendSession> {
         match self {
-            Self::Local(store) => store.acquire_append_lease(keyspace_id, file_id),
-            Self::Durable(store) => store.acquire_append_lease(keyspace_id, file_id),
+            Self::Local(store) => store.open_append_session(keyspace_id, file_id),
+            Self::Durable(store) => store.open_append_session(keyspace_id, file_id),
         }
     }
 
-    fn append_file(
+    fn append_file_once(
         &self,
-        lease: AppendLease,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        data: &[u8],
+        durability: WriteDurability,
+    ) -> Result<()> {
+        let session = self.open_append_session(keyspace_id, file_id)?;
+        let reservation = match self {
+            Self::Local(store) => store.reserve_append(&session, data.len() as u64),
+            Self::Durable(store) => store.reserve_append(&session, data.len() as u64),
+        }?;
+        self.append_reserved(reservation, data, durability)
+    }
+
+    fn reserve_append(&self, session: &AppendSession, len: u64) -> Result<AppendReservation> {
+        match self {
+            Self::Local(store) => store.reserve_append(session, len),
+            Self::Durable(store) => store.reserve_append(session, len),
+        }
+    }
+
+    fn append_reserved(
+        &self,
+        reservation: AppendReservation,
         data: &[u8],
         durability: WriteDurability,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => store.append_file(lease, data, durability),
-            Self::Durable(store) => store.append_file(lease, data, durability),
+            Self::Local(store) => store.append_reserved(reservation, data, durability),
+            Self::Durable(store) => store.append_reserved(reservation, data, durability),
         }
         .map(|_| ())
     }
@@ -859,6 +931,7 @@ struct WorkerConfig {
 fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Result<WorkerReport> {
     let mut rng = Lcg::new(0x9e37_79b9_7f4a_7c15_u64 ^ worker.wrapping_mul(0xd1b5_4a32_d192_ed03));
     let mut report = WorkerReport::new(config.samples_per_worker);
+    let mut state = WorkerState::default();
     let mut read_buf = if config.workload.is_read() {
         vec![0; context.op_size]
     } else {
@@ -874,16 +947,23 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
             &context,
             config.workload,
             worker,
+            &mut state,
             &mut rng,
             config.durability.write_durability(),
             &mut read_buf,
         )
         .and_then(|_| {
+            let session_file_index = state
+                .session_append
+                .as_ref()
+                .map(|session| session.file_index);
             maybe_flush(
                 &context,
                 config.workload,
                 config.durability,
                 report.attempts + 1,
+                worker,
+                session_file_index,
                 &mut rng,
             )
         });
@@ -898,6 +978,18 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
     }
 
     Ok(report)
+}
+
+#[derive(Default)]
+struct WorkerState {
+    session_append: Option<SessionAppendState>,
+    next_session_file_index: Option<usize>,
+}
+
+struct SessionAppendState {
+    file_index: usize,
+    session: AppendSession,
+    next_offset: u64,
 }
 
 fn apply_modeled_delay(delay: Duration, mode: DelayMode) {
@@ -916,6 +1008,7 @@ fn run_one_op(
     context: &BenchContext,
     workload: Workload,
     worker: u64,
+    state: &mut WorkerState,
     rng: &mut Lcg,
     durability: WriteDurability,
     read_buf: &mut [u8],
@@ -1013,17 +1106,88 @@ fn run_one_op(
         }
         (Target::Native { keyspace_id, files }, workload) if workload.is_native_append() => {
             let file_id = files[rng.below(files.len() as u64) as usize];
-            let lease = context.store.acquire_append_lease(*keyspace_id, file_id)?;
             context
                 .store
-                .append_file(lease, &context.payload, durability)
+                .append_file_once(*keyspace_id, file_id, &context.payload, durability)
+        }
+        (Target::Native { keyspace_id, files }, workload)
+            if workload.is_native_session_append() =>
+        {
+            let payload_len = context.payload.len() as u64;
+            for _ in 0..files.len() {
+                if let Some(session) = state.session_append.as_ref() {
+                    let would_exceed = session
+                        .next_offset
+                        .checked_add(payload_len)
+                        .is_none_or(|end| end > DEFAULT_FILE_CAPACITY_BYTES);
+                    if would_exceed {
+                        state.next_session_file_index =
+                            Some((session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len());
+                        state.session_append = None;
+                    }
+                }
+                if state.session_append.is_none() {
+                    let file_index = state
+                        .next_session_file_index
+                        .get_or_insert_with(|| worker as usize % files.len());
+                    let file_id = files[*file_index];
+                    let session = context.store.open_append_session(*keyspace_id, file_id)?;
+                    state.session_append = Some(SessionAppendState {
+                        file_index: *file_index,
+                        session,
+                        next_offset: 0,
+                    });
+                }
+                let session = state
+                    .session_append
+                    .as_ref()
+                    .map(|session| &session.session)
+                    .ok_or_else(|| StorageError::conflict("append session state missing"))?;
+                let reservation = match context.store.reserve_append(session, payload_len) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        if let Some(session) = state.session_append.as_ref() {
+                            state.next_session_file_index = Some(
+                                (session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len(),
+                            );
+                        }
+                        state.session_append = None;
+                        return Err(error);
+                    }
+                };
+                let next_offset = reservation.offset.saturating_add(reservation.len);
+                if next_offset > DEFAULT_FILE_CAPACITY_BYTES {
+                    if let Some(session) = state.session_append.as_ref() {
+                        state.next_session_file_index =
+                            Some((session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len());
+                    }
+                    state.session_append = None;
+                    continue;
+                }
+                let result =
+                    context
+                        .store
+                        .append_reserved(reservation, &context.payload, durability);
+                if result.is_err() {
+                    if let Some(session) = state.session_append.as_ref() {
+                        state.next_session_file_index =
+                            Some((session.file_index + SESSION_APPEND_FILE_STRIDE) % files.len());
+                    }
+                    state.session_append = None;
+                } else if let Some(session) = state.session_append.as_mut() {
+                    session.next_offset = next_offset;
+                }
+                return result;
+            }
+            Err(StorageError::conflict(
+                "append-session benchmark exhausted every file lane",
+            ))
         }
         (Target::Native { keyspace_id, files }, Workload::NativeHotAppend4k) => {
             let file_id = files[0];
-            let lease = context.store.acquire_append_lease(*keyspace_id, file_id)?;
             context
                 .store
-                .append_file(lease, &context.payload, durability)
+                .append_file_once(*keyspace_id, file_id, &context.payload, durability)
         }
         _ => Err(StorageError::invalid_argument(
             "workload does not match benchmark target",
@@ -1036,6 +1200,8 @@ fn maybe_flush(
     workload: Workload,
     durability: DurabilityMode,
     attempts_after_op: u64,
+    worker: u64,
+    session_file_index: Option<usize>,
     rng: &mut Lcg,
 ) -> Result<()> {
     let DurabilityMode::AckFlushEvery(every) = durability else {
@@ -1050,6 +1216,8 @@ fn maybe_flush(
         Target::Native { keyspace_id, files } => {
             let file_id = if matches!(workload, Workload::NativeHotAppend4k) {
                 files[0]
+            } else if workload.is_native_session_append() {
+                files[session_file_index.unwrap_or(worker as usize % files.len())]
             } else {
                 files[rng.below(files.len() as u64) as usize]
             };

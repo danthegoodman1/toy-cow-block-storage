@@ -56,10 +56,10 @@ Deliverables:
 - [x] Public `BlockDevice` trait for aligned reads, writes, flush, zeroing,
   discard, fork, restore, delete, and info.
 - [x] Public `NativeKeyspaceClient` trait for native keyspace create/info,
-  file create/info/append-lease lookup, keyspace checkpoint, snapshot, and
+  file create/info/append-session open, keyspace checkpoint, snapshot, and
   restore.
 - [x] Public `NativeFile` trait for native file reads, byte writes, append
-  leases, leased appends, flush, and info.
+  sessions, append reservations, reserved appends, flush, and info.
 - [x] `BlockServer` actor boundary.
 - [x] `BlockTransport` request/response boundary.
 - [x] `NativeServer` actor boundary.
@@ -80,14 +80,16 @@ Deliverables:
   and implementation-private details.
 - [x] Opaque IDs for devices, requests, client epochs, commits, commit groups,
   checkpoints, shards, segments, metadata nodes, files, file versions, append
-  leases, writer epochs, extents, storage nodes, and write intents.
+  sessions, append reservations, writer epochs, extents, storage nodes, and write
+  intents.
 - [x] Basic API validation for device specs, aligned byte ranges, zero-length
   no-ops, and overflow cases.
 - [x] Separate validation paths for create requests and existing-device
   requests.
 - [x] Public create request/response envelope.
-- [x] Native create/info/append/lease request and response envelopes.
-- [x] Native append validation for append payloads and lease/file matching.
+- [x] Native create/info/session/reservation/append request and response
+  envelopes.
+- [x] Native append validation for append payloads and reservation/file matching.
 - [x] Public service traits require `Send + Sync` so local and remote adapters
   can share the same contract.
 
@@ -100,7 +102,8 @@ Exit gate:
 - [x] The documented public contract treats successful writes as atomic at
   request granularity.
 - [x] The documented native contract treats successful append commits as atomic
-  at file-version granularity and fenced by append lease/writer epoch.
+  at file-version granularity and fenced by append session/reservation writer
+  epoch.
 - [x] Provider contracts state the minimal guarantees an in-memory, local
   durable, or remote implementation must preserve.
 - [x] Public clients are not responsible for replica fan-out or storage-node
@@ -109,8 +112,8 @@ Exit gate:
   without changing the public block or native APIs.
 - [x] Contract tests cover device spec validation, range alignment, request
   targeting, request kind/range extraction, create-vs-existing-device
-  validation, native lease/file matching, deterministic trace replay, and the
-  starter benchmark harness.
+  validation, native reservation/file matching, deterministic trace replay, and
+  the starter benchmark harness.
 
 ## Phase 2: Core Types and Invariants
 
@@ -238,7 +241,7 @@ Deliverables:
 
 - [x] Range splitter from public byte writes to shard-local chunks.
 - [x] Stable write-intent identity for each public write or commit group.
-- [x] Stable write-intent identity tied to each native append lease.
+- [x] Stable write-intent identity tied to each native append reservation.
 - [x] Block-server selection and local segment reservation.
 - [x] Segment creation for written bytes.
 - [x] Segment sync before metadata references are created.
@@ -249,7 +252,8 @@ Deliverables:
 - [x] Leaf insertion, replacement, and splitting for overwrites.
 - [x] Root-to-leaf path copy for each affected shard.
 - [x] Commit-group prepare/publish model for multi-shard writes.
-- [x] Native append commit model with file-version and writer-epoch fencing.
+- [x] Native append commit model with append-reservation and writer-epoch
+  fencing.
 - [x] Per-shard commit records linked by commit-group identity.
 - [x] Native file extent commit records linked by commit-group identity.
 - [x] Orphan segment records when durable segment writes outlive failed metadata
@@ -269,14 +273,15 @@ Exit gate:
   new mapping, never a partial update.
 - [x] Native appends expose either the old file version or the complete new file
   version, never a partial extent update.
-- [x] Stale native append leases are rejected deterministically.
+- [x] Stale native append sessions and reservations are rejected
+  deterministically.
 - [x] Conflicting writes to the same shard resolve deterministically, while
   independent writes to different shards can merge using per-shard old-root
   fences instead of a whole-device generation fence.
 - [x] Table-driven tests cover beginning, middle, end, full-range, same-range,
   and cross-shard overwrites.
-- [x] Table-driven tests cover valid append, stale lease rejection, lease
-  stealing, and append publish failure orphan cleanup.
+- [x] Table-driven tests cover valid append, stale session/reservation rejection,
+  session stealing, and append publish failure orphan cleanup.
 - [x] Criterion has baseline write benchmarks.
 
 ## Phase 7: Metadata Tree Shape
@@ -422,7 +427,7 @@ Prove the storage model under generated operation traces.
 Deliverables:
 
 - [x] Simple reference model for logical device contents, native file contents,
-  append leases, writer epochs, and history.
+  append sessions/reservations, writer epochs, and history.
 - [x] Operation generator for create, write, read, fork, delete, restore, and GC.
 - [x] Fault injector for publish conflicts, duplicate effects, delayed effects,
   missing objects, write-intent expiry, orphan segments, missed async frees, and
@@ -450,8 +455,8 @@ Deliverables:
 - [x] Benchmarks for fork cost versus device size.
 - [x] Benchmarks for single-shard write cost versus tree depth.
 - [x] Benchmarks for multi-shard atomic write cost.
-- [x] Benchmarks for native write, native append with valid leases, and
-  stale-lease rejection.
+- [x] Benchmarks for native write, native append with valid sessions, and stale
+  session rejection.
 - [x] Benchmarks for read lookup cost and read amplification.
 - [x] Benchmarks for checkpoint restore and GC traversal.
 
@@ -475,7 +480,7 @@ remote, replayable, or concurrent boundary in the owning future phase:
   proven local catalog scaling work needed before durable formats are chosen.
 - Phase 16 owned the first local durable snapshot provider: segment sync,
   atomic metadata/storage-node snapshots, commit-group persistence,
-  write-intent recovery, native append lease/session records,
+  write-intent recovery, native append session/reservation records,
   checkpoint/timeline persistence, and cache coherence after restart. Its
   `bincode` snapshot scaffolding was replaced by crate-owned durable codecs in
   Phase 18. Phase 20 removed the snapshot production hot path and the old
@@ -549,7 +554,7 @@ Status: complete.
 
 Add point-in-time history for native keyspaces without routing native operations
 through block-device mappings. This phase proves that keyspace catalog-root
-timelines, file-root audit records, append-lease fencing, and GC retention work
+timelines, file-root audit records, append-session fencing, and GC retention work
 for the native API before durable or remote providers have to persist those
 records.
 
@@ -588,8 +593,8 @@ Exit gate:
 - [x] Native checkpoint validation rejects mismatched keyspace roots.
 - [x] Unaligned native writes, appends, and reads across a block boundary
   preserve exact file bytes and size.
-- [x] Stale append leases cannot publish across a restore or snapshot lineage
-  boundary.
+- [x] Stale append sessions/reservations cannot publish across a restore or
+  snapshot lineage boundary.
 - [x] Native PITR GC never deletes metadata or segments needed by retained
   native keyspace restore points.
 - [x] Expired native restore points fail cleanly after GC sweeps the needed
@@ -618,7 +623,7 @@ while snapshot and restore continue to copy only root IDs.
 Deliverables:
 
 - [x] Criterion benchmarks for native file create, info, write, append, read,
-  checkpoint, snapshot, restore, and stale-lease rejection at keyspace sizes
+  checkpoint, snapshot, restore, and stale-session rejection at keyspace sizes
   `1`, `1k`, and `100k`; `100k` is the current normal-run local stress size.
 - [x] Benchmarks for concurrent native writes/appends across independent files
   and, separately, conflicting write/append attempts against one file.
@@ -685,7 +690,7 @@ Deliverables:
   production hot path.
 - [x] Durable write-intent table with logical expiration, cancellation/failure
   evidence, and restart recovery scan.
-- [x] Durable native append lease/session records with restart-safe writer
+- [x] Durable native append session/reservation records with restart-safe writer
   epochs and stale-writer rejection after recovery.
 - [x] Cache coherence rules for hot heads, metadata nodes, checkpoints, and
   segment descriptors after restart.
@@ -804,8 +809,8 @@ Exit gate:
   the complete new committed state; no partial commit group, partial keyspace
   commit, or metadata reference to missing segment bytes is observable.
 - [x] Replaying after repeated crashes is idempotent and does not leak write
-  intents, append leases, temporary segment files, or durable-pending catalog
-  entries.
+  intents, append sessions/reservations, temporary segment files, or
+  durable-pending catalog entries.
 - [x] `flush` reports only commit sequences whose segment bytes, storage-node
   catalog state, segment descriptors, and metadata state survive reopen.
 - [x] Storage-node custodian and metadata custodian can resume after crashes
@@ -878,7 +883,7 @@ Deliverables:
 
 - [x] Append-only metadata journal or database-backed metadata provider for
   device heads, keyspace heads, commit groups, PITR records, checkpoints,
-  write-intent state, append leases, and GC/custodian evidence.
+  write-intent state, append sessions/reservations, and GC/custodian evidence.
 - [x] Explicit compact checkpoint path so replay time can be bounded without
   rewriting the whole metadata plane on every write; a periodic scheduler can
   call this maintenance hook later without changing the durable format.
@@ -986,7 +991,7 @@ Deliverables:
 
 - [x] SQLite metadata store split by ownership: root `metadata.sqlite` for
   device heads, native keyspace/file heads, commit groups, PITR/checkpoints,
-  write-intent state, append leases, and logical metadata; per-storage-node
+  write-intent state, append sessions/reservations, and logical metadata; per-storage-node
   `catalog.sqlite` files for segment lifecycle state, placement index, data-log
   manifests, relocation state, and local segment descriptors. Phase 21
   initially used a whole-state SQLite blob for the logical metadata image while
@@ -1080,8 +1085,9 @@ Exit gate:
   or silently zero-filled.
 - [x] Metadata leaves and native extents continue to reference logical
   `SegmentId`s, not data-log offsets.
-- [x] PITR, fork, snapshot, restore, GC, native append leases, and custodian
-  semantics remain byte-for-byte equivalent to Phase 20 under generated traces.
+- [x] PITR, fork, snapshot, restore, GC, native append sessions/reservations, and
+  custodian semantics remain byte-for-byte equivalent to Phase 20 under generated
+  traces.
 - [x] Reopen time is bounded by SQLite recovery plus the current SQLite
   placement set, not by historical metadata records. Active data-log tails that
   have no placement are ignored until a later custodian/compaction pass.

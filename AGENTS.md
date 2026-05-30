@@ -13,8 +13,8 @@ proves they are necessary.
 The block device is the first compatibility mapping layer, not the whole storage
 system. Native extent/file APIs should develop beside the block API over the
 same segment substrate whenever shared write-intent, segment lifecycle,
-metadata, or custodian behavior changes. Do not force file-level append leases,
-writer epochs, or stale-writer fencing through block writes.
+metadata, or custodian behavior changes. Do not force file-level append
+sessions, writer epochs, or stale-writer fencing through block writes.
 
 This project also follows a "no tombstones" principle. Because this is a toy
 system with no promised external compatibility yet, internal formats and APIs
