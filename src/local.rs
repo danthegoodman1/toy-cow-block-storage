@@ -1062,26 +1062,6 @@ impl StorageNodeRegistry {
         })
     }
 
-    #[cfg(test)]
-    fn state_inner(&self) -> Result<StorageNodeRegistryInner> {
-        let mut nodes = BTreeMap::new();
-        for (node_id, node) in self.nodes.iter() {
-            nodes.insert(
-                *node_id,
-                StorageNodeInner {
-                    segment_store: node.segment_store.state_inner()?,
-                    segment_catalog: node.segment_catalog.state_inner()?,
-                },
-            );
-        }
-        Ok(StorageNodeRegistryInner {
-            next_segment_id: *lock(&self.next_segment_id)?,
-            next_placement_index: *lock(&self.next_placement_index)?,
-            node_order: self.node_order.as_ref().clone(),
-            nodes,
-        })
-    }
-
     fn state_inner_for_persist(
         &self,
         previous_segments: &BTreeSet<SegmentId>,
@@ -1091,13 +1071,13 @@ impl StorageNodeRegistry {
         Vec<DurableSegmentPayload>,
     )> {
         let mut nodes = BTreeMap::new();
-        let mut image_segments = BTreeSet::new();
+        let mut current_segments = BTreeSet::new();
         let mut new_segments = Vec::new();
         for (node_id, node) in self.nodes.iter() {
             let (segment_store, node_segments, mut node_new_segments) = node
                 .segment_store
                 .state_inner_for_persist(previous_segments, *node_id)?;
-            image_segments.extend(node_segments);
+            current_segments.extend(node_segments);
             new_segments.append(&mut node_new_segments);
             nodes.insert(
                 *node_id,
@@ -1114,7 +1094,7 @@ impl StorageNodeRegistry {
                 node_order: self.node_order.as_ref().clone(),
                 nodes,
             },
-            image_segments,
+            current_segments,
             new_segments,
         ))
     }
@@ -1371,7 +1351,7 @@ impl LocalCoordinator {
         })
     }
 
-    fn from_state_image(image: DurableStoreImage) -> Result<Self> {
+    fn from_durable_state(image: DurableStoreState) -> Result<Self> {
         image.config.validate()?;
         let observability = Arc::new(Observability::new(
             image.config.observability_event_capacity,
@@ -1393,37 +1373,26 @@ impl LocalCoordinator {
         })
     }
 
-    #[cfg(test)]
-    fn state_image(&self) -> Result<DurableStoreImage> {
-        Ok(DurableStoreImage {
-            config: self.metadata.config,
-            metadata: self.metadata.state_inner()?,
-            storage_nodes: self.storage_nodes.state_inner()?,
-            next_write_intent: *lock(&self.next_write_intent)?,
-            next_extent_id: *lock(&self.next_extent_id)?,
-        })
-    }
-
-    fn state_image_for_persist(
+    fn state_for_durable_persist(
         &self,
         previous_segments: &BTreeSet<SegmentId>,
     ) -> Result<(
-        DurableStoreImage,
+        DurableStoreState,
         BTreeSet<SegmentId>,
         Vec<DurableSegmentPayload>,
     )> {
-        let (storage_nodes, image_segments, new_segments) = self
+        let (storage_nodes, current_segments, new_segments) = self
             .storage_nodes
             .state_inner_for_persist(previous_segments)?;
         Ok((
-            DurableStoreImage {
+            DurableStoreState {
                 config: self.metadata.config,
                 metadata: self.metadata.state_inner()?,
                 storage_nodes,
                 next_write_intent: *lock(&self.next_write_intent)?,
                 next_extent_id: *lock(&self.next_extent_id)?,
             },
-            image_segments,
+            current_segments,
             new_segments,
         ))
     }
@@ -4220,7 +4189,7 @@ struct DurableExportCursor {
 }
 
 impl DurableExportCursor {
-    fn from_image(image: &DurableStoreImage) -> Self {
+    fn from_state(image: &DurableStoreState) -> Self {
         Self {
             config: image.config,
             next_device_id: image.metadata.next_device_id,
@@ -4414,16 +4383,16 @@ impl DurableSqliteStore {
                 &MetadataInner::new(),
                 &mut storage_nodes,
             );
-            let image = DurableStoreImage {
+            let image = DurableStoreState {
                 config: expected_config,
                 metadata: MetadataInner::new(),
                 storage_nodes,
                 next_write_intent,
                 next_extent_id: 1,
             };
-            validate_row_native_image(&image)?;
+            validate_row_native_state(&image)?;
             self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
-            return Ok(Some(LocalCoordinator::from_state_image(image)?));
+            return Ok(Some(LocalCoordinator::from_durable_state(image)?));
         };
         if !cursor.config.storage_shape_matches(expected_config) {
             return Err(StorageError::corrupt(
@@ -4459,16 +4428,16 @@ impl DurableSqliteStore {
         metadata.next_gc_epoch = cursor.next_gc_epoch;
         let repairs = reconcile_catalog_references_from_metadata(&metadata, &mut storage_nodes);
 
-        let image = DurableStoreImage {
+        let image = DurableStoreState {
             config: runtime_config,
             metadata,
             storage_nodes,
             next_write_intent,
             next_extent_id: cursor.next_extent_id,
         };
-        validate_row_native_image(&image)?;
+        validate_row_native_state(&image)?;
         self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
-        Ok(Some(LocalCoordinator::from_state_image(image)?))
+        Ok(Some(LocalCoordinator::from_durable_state(image)?))
     }
 
     fn persist_catalog_reference_repairs(
@@ -4574,9 +4543,9 @@ impl DurableSqliteStore {
 
     fn persist(
         &self,
-        image: &DurableStoreImage,
+        image: &DurableStoreState,
         previous_segments: &BTreeSet<SegmentId>,
-        image_segments: &BTreeSet<SegmentId>,
+        current_segments: &BTreeSet<SegmentId>,
         new_segments: Vec<DurableSegmentPayload>,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
     ) -> Result<BTreeSet<SegmentId>> {
@@ -4584,7 +4553,7 @@ impl DurableSqliteStore {
         self.persist_node_catalog_publish(
             image,
             previous_segments,
-            image_segments,
+            current_segments,
             appended,
             changed_catalog_segments,
         )?;
@@ -4594,19 +4563,19 @@ impl DurableSqliteStore {
         let tx = conn.transaction().map_err(sqlite_error)?;
         persist_row_native_state(&tx, previous_cursor.as_ref(), image)?;
         tx.commit().map_err(sqlite_error)?;
-        Ok(image_segments.clone())
+        Ok(current_segments.clone())
     }
 
     fn persist_node_catalog_publish(
         &self,
-        image: &DurableStoreImage,
+        image: &DurableStoreState,
         previous_segments: &BTreeSet<SegmentId>,
-        image_segments: &BTreeSet<SegmentId>,
+        current_segments: &BTreeSet<SegmentId>,
         appended: PendingDataLogAppend,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
     ) -> Result<()> {
         let removed_segment_ids: Vec<_> = previous_segments
-            .difference(image_segments)
+            .difference(current_segments)
             .copied()
             .collect();
         let incremental_catalog_sync = changed_catalog_segments.is_some()
@@ -4639,12 +4608,13 @@ impl DurableSqliteStore {
         }
         if let Some(segment_ids) = changed_catalog_segments {
             for segment_id in segment_ids {
-                let storage_node = image_storage_node_for_catalog_segment(image, *segment_id)
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        self.placement_for_segment(*segment_id)
-                            .map(|placement| placement.storage_node)
-                    })?;
+                let storage_node =
+                    durable_state_storage_node_for_catalog_segment(image, *segment_id)
+                        .map(Ok)
+                        .unwrap_or_else(|| {
+                            self.placement_for_segment(*segment_id)
+                                .map(|placement| placement.storage_node)
+                        })?;
                 changed_segments_by_node
                     .entry(storage_node)
                     .or_default()
@@ -5447,7 +5417,7 @@ fn reject_orphan_row_native_rows_if_present(conn: &Connection) -> Result<()> {
 fn persist_row_native_state(
     tx: &rusqlite::Transaction<'_>,
     previous_cursor: Option<&DurableExportCursor>,
-    image: &DurableStoreImage,
+    image: &DurableStoreState,
 ) -> Result<()> {
     let previous_u128 = |cursor_value: fn(&DurableExportCursor) -> u128| {
         previous_cursor.map(cursor_value).unwrap_or(0)
@@ -5600,7 +5570,7 @@ fn persist_row_native_state(
             .map(|(id, epoch)| (id.raw().to_string(), *epoch))
             .collect(),
     )?;
-    persist_export_cursor(tx, &DurableExportCursor::from_image(image))
+    persist_export_cursor(tx, &DurableExportCursor::from_state(image))
 }
 
 trait DurableTimelineRow: DurableCodec {
@@ -6692,7 +6662,7 @@ fn load_catalog_inner(
     })
 }
 
-fn validate_row_native_image(image: &DurableStoreImage) -> Result<()> {
+fn validate_row_native_state(image: &DurableStoreState) -> Result<()> {
     validate_row_native_cursors(image)?;
     let descriptors = row_native_segment_descriptors(image);
     for (device_id, head) in &image.metadata.device_heads {
@@ -6900,7 +6870,7 @@ fn validate_row_native_image(image: &DurableStoreImage) -> Result<()> {
     Ok(())
 }
 
-fn validate_row_native_cursors(image: &DurableStoreImage) -> Result<()> {
+fn validate_row_native_cursors(image: &DurableStoreState) -> Result<()> {
     ensure_next_u128_above(
         "next_device_id",
         image.metadata.next_device_id,
@@ -7050,7 +7020,7 @@ fn ensure_next_u128_above(
 }
 
 fn row_native_segment_descriptors(
-    image: &DurableStoreImage,
+    image: &DurableStoreState,
 ) -> BTreeMap<SegmentId, SegmentDescriptor> {
     let mut out = BTreeMap::new();
     for node in image.storage_nodes.nodes.values() {
@@ -8352,12 +8322,12 @@ impl DurableCoordinator {
     ) -> Result<()> {
         let _persist_guard = lock(&self.persist_lock)?;
         let previous_segments = lock(&self.persisted_segments)?.clone();
-        let (image, image_segments, new_segments) =
-            self.local.state_image_for_persist(&previous_segments)?;
+        let (image, current_segments, new_segments) =
+            self.local.state_for_durable_persist(&previous_segments)?;
         let kept_segments = self.durable.persist(
             &image,
             &previous_segments,
-            &image_segments,
+            &current_segments,
             new_segments,
             changed_catalog_segments,
         )?;
@@ -8441,7 +8411,7 @@ pub struct MetadataCustodianReport {
 }
 
 #[derive(Debug, Clone)]
-struct DurableStoreImage {
+struct DurableStoreState {
     config: LocalStoreConfig,
     metadata: MetadataInner,
     storage_nodes: StorageNodeRegistryInner,
@@ -8500,8 +8470,8 @@ fn reconcile_catalog_references_from_metadata(
     repaired
 }
 
-fn image_storage_node_for_catalog_segment(
-    image: &DurableStoreImage,
+fn durable_state_storage_node_for_catalog_segment(
+    image: &DurableStoreState,
     segment_id: SegmentId,
 ) -> Option<StorageNodeId> {
     image
@@ -8516,57 +8486,10 @@ fn image_storage_node_for_catalog_segment(
         })
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone)]
-struct DurableSegmentStoreImage {
-    config: LocalStoreConfig,
-    next_offset: u64,
-    records: BTreeMap<SegmentId, DurableSegmentRecord>,
-}
-
-#[cfg(test)]
-impl DurableSegmentStoreImage {
-    fn from_inner(config: LocalStoreConfig, inner: SegmentStoreInner) -> Self {
-        Self {
-            config,
-            next_offset: inner.next_offset,
-            records: inner
-                .segments
-                .into_iter()
-                .map(|(segment_id, record)| {
-                    (
-                        segment_id,
-                        DurableSegmentRecord {
-                            synced: record.synced,
-                            commit: record.commit,
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct DurableSegmentRecord {
     synced: bool,
     commit: SegmentReplicaCommit,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-struct DurableMetadataImage {
-    config: LocalStoreConfig,
-    metadata: MetadataInner,
-    next_write_intent: u128,
-    next_extent_id: u128,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-struct DurableCatalogImage {
-    config: LocalStoreConfig,
-    catalog: CatalogInner,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -11094,11 +11017,6 @@ impl InMemorySegmentStore {
         })
     }
 
-    #[cfg(test)]
-    fn state_inner(&self) -> Result<SegmentStoreInner> {
-        Ok(lock(&self.inner)?.clone())
-    }
-
     fn state_inner_for_persist(
         &self,
         previous_segments: &BTreeSet<SegmentId>,
@@ -11109,10 +11027,10 @@ impl InMemorySegmentStore {
         Vec<DurableSegmentPayload>,
     )> {
         let inner = lock(&self.inner)?;
-        let mut image_segments = BTreeSet::new();
+        let mut current_segments = BTreeSet::new();
         let mut new_segments = Vec::new();
         for (segment_id, record) in &inner.segments {
-            image_segments.insert(*segment_id);
+            current_segments.insert(*segment_id);
             if !previous_segments.contains(segment_id) {
                 new_segments.push(DurableSegmentPayload {
                     segment_id: *segment_id,
@@ -11126,7 +11044,7 @@ impl InMemorySegmentStore {
                 next_offset: inner.next_offset,
                 segments: BTreeMap::new(),
             },
-            image_segments,
+            current_segments,
             new_segments,
         ))
     }
@@ -14175,16 +14093,6 @@ fn durable_codec_error(reason: impl Into<String>) -> StorageError {
     StorageError::corrupt(format!("durable codec failed: {}", reason.into()))
 }
 
-#[cfg(test)]
-const DURABLE_TEST_IMAGE_MAGIC: &[u8; 8] = b"TCOWIMG!";
-#[cfg(test)]
-const DURABLE_TEST_IMAGE_VERSION: u16 = 1;
-#[cfg(test)]
-const DURABLE_TEST_IMAGE_METADATA: u8 = 1;
-#[cfg(test)]
-const DURABLE_TEST_IMAGE_CATALOG: u8 = 2;
-#[cfg(test)]
-const DURABLE_TEST_IMAGE_SEGMENT_STORE: u8 = 3;
 const MAX_DURABLE_COLLECTION_LEN: u64 = 1_000_000;
 const MAX_DURABLE_STRING_LEN: u64 = 1_048_576;
 
@@ -14193,26 +14101,12 @@ trait DurableCodec: Sized {
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self>;
 }
 
-#[cfg(test)]
-trait DurableTestImageCodec: DurableCodec {
-    const IMAGE_KIND: u8;
-}
-
 #[derive(Debug, Default)]
 struct DurableEncoder {
     bytes: Vec<u8>,
 }
 
 impl DurableEncoder {
-    #[cfg(test)]
-    fn new(kind: u8) -> Self {
-        let mut encoder = Self { bytes: Vec::new() };
-        encoder.bytes.extend_from_slice(DURABLE_TEST_IMAGE_MAGIC);
-        encoder.put_u16(DURABLE_TEST_IMAGE_VERSION);
-        encoder.put_u8(kind);
-        encoder
-    }
-
     fn finish(self) -> Vec<u8> {
         self.bytes
     }
@@ -14244,24 +14138,6 @@ struct DurableDecoder<'a> {
 }
 
 impl<'a> DurableDecoder<'a> {
-    #[cfg(test)]
-    fn new(bytes: &'a [u8], expected_kind: u8) -> Result<Self> {
-        let mut decoder = Self { bytes, offset: 0 };
-        let magic = decoder.take(DURABLE_TEST_IMAGE_MAGIC.len())?;
-        if magic != DURABLE_TEST_IMAGE_MAGIC {
-            return Err(durable_codec_error("bad test image magic"));
-        }
-        let version = decoder.u16()?;
-        if version != DURABLE_TEST_IMAGE_VERSION {
-            return Err(durable_codec_error("unsupported test image version"));
-        }
-        let kind = decoder.u8()?;
-        if kind != expected_kind {
-            return Err(durable_codec_error("test image kind mismatch"));
-        }
-        Ok(decoder)
-    }
-
     fn finish(&self) -> Result<()> {
         if self.offset == self.bytes.len() {
             Ok(())
@@ -15452,164 +15328,6 @@ impl DurableCodec for CatalogEntry {
     }
 }
 
-impl DurableCodec for CatalogInner {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.next_segment_id.encode(out)?;
-        self.entries.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            next_segment_id: u128::decode(input)?,
-            entries: BTreeMap::decode(input)?,
-        })
-    }
-}
-
-impl DurableCodec for DurableSegmentRecord {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.synced.encode(out)?;
-        self.commit.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            synced: bool::decode(input)?,
-            commit: SegmentReplicaCommit::decode(input)?,
-        })
-    }
-}
-
-#[cfg(test)]
-impl DurableCodec for DurableSegmentStoreImage {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.config.encode(out)?;
-        self.next_offset.encode(out)?;
-        self.records.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            config: LocalStoreConfig::decode(input)?,
-            next_offset: u64::decode(input)?,
-            records: BTreeMap::decode(input)?,
-        })
-    }
-}
-
-#[cfg(test)]
-impl DurableTestImageCodec for DurableSegmentStoreImage {
-    const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_SEGMENT_STORE;
-}
-
-#[cfg(test)]
-impl DurableCodec for DurableCatalogImage {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.config.encode(out)?;
-        self.catalog.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            config: LocalStoreConfig::decode(input)?,
-            catalog: CatalogInner::decode(input)?,
-        })
-    }
-}
-
-#[cfg(test)]
-impl DurableTestImageCodec for DurableCatalogImage {
-    const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_CATALOG;
-}
-
-impl DurableCodec for MetadataInner {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.next_device_id.encode(out)?;
-        self.next_keyspace_id.encode(out)?;
-        self.next_file_id.encode(out)?;
-        self.next_metadata_node_id.encode(out)?;
-        self.next_keyspace_root_id.encode(out)?;
-        self.next_keyspace_catalog_shard_id.encode(out)?;
-        self.next_commit_group_id.encode(out)?;
-        self.next_commit_seq.encode(out)?;
-        self.next_checkpoint_id.encode(out)?;
-        self.next_gc_epoch.encode(out)?;
-        self.device_heads.encode(out)?;
-        self.deleted_device_heads.encode(out)?;
-        self.device_specs.encode(out)?;
-        self.keyspace_heads.encode(out)?;
-        self.keyspace_roots.encode(out)?;
-        self.keyspace_catalog_shards.encode(out)?;
-        self.file_writer_epochs.encode(out)?;
-        self.metadata_nodes.encode(out)?;
-        self.commit_groups.encode(out)?;
-        self.shard_commits.encode(out)?;
-        self.keyspace_commits.encode(out)?;
-        self.file_commits.encode(out)?;
-        self.fork_records.encode(out)?;
-        self.delete_records.encode(out)?;
-        self.checkpoints.encode(out)?;
-        self.metadata_last_mark_epoch.encode(out)?;
-        self.segment_last_mark_epoch.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            next_device_id: u128::decode(input)?,
-            next_keyspace_id: u128::decode(input)?,
-            next_file_id: u128::decode(input)?,
-            next_metadata_node_id: u128::decode(input)?,
-            next_keyspace_root_id: u128::decode(input)?,
-            next_keyspace_catalog_shard_id: u128::decode(input)?,
-            next_commit_group_id: u128::decode(input)?,
-            next_commit_seq: u64::decode(input)?,
-            next_checkpoint_id: u128::decode(input)?,
-            next_gc_epoch: u64::decode(input)?,
-            device_heads: BTreeMap::decode(input)?,
-            deleted_device_heads: BTreeMap::decode(input)?,
-            device_specs: BTreeMap::decode(input)?,
-            keyspace_heads: BTreeMap::decode(input)?,
-            keyspace_roots: BTreeMap::decode(input)?,
-            keyspace_catalog_shards: BTreeMap::decode(input)?,
-            file_writer_epochs: BTreeMap::decode(input)?,
-            metadata_nodes: BTreeMap::decode(input)?,
-            commit_groups: BTreeMap::decode(input)?,
-            shard_commits: Vec::decode(input)?,
-            keyspace_commits: Vec::decode(input)?,
-            file_commits: Vec::decode(input)?,
-            fork_records: BTreeMap::decode(input)?,
-            delete_records: BTreeMap::decode(input)?,
-            checkpoints: BTreeMap::decode(input)?,
-            metadata_last_mark_epoch: BTreeMap::decode(input)?,
-            segment_last_mark_epoch: BTreeMap::decode(input)?,
-        })
-    }
-}
-
-#[cfg(test)]
-impl DurableCodec for DurableMetadataImage {
-    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
-        self.config.encode(out)?;
-        self.metadata.encode(out)?;
-        self.next_write_intent.encode(out)?;
-        self.next_extent_id.encode(out)
-    }
-
-    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
-        Ok(Self {
-            config: LocalStoreConfig::decode(input)?,
-            metadata: MetadataInner::decode(input)?,
-            next_write_intent: u128::decode(input)?,
-            next_extent_id: u128::decode(input)?,
-        })
-    }
-}
-
-#[cfg(test)]
-impl DurableTestImageCodec for DurableMetadataImage {
-    const IMAGE_KIND: u8 = DURABLE_TEST_IMAGE_METADATA;
-}
-
 impl DurableCodec for WriteDurability {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         match self {
@@ -16479,21 +16197,6 @@ impl<T: DurableCodec> DurableCodec for RemoteWireReply<T> {
     }
 }
 
-#[cfg(test)]
-fn encode_test_image<T: DurableTestImageCodec>(value: &T) -> Result<Vec<u8>> {
-    let mut out = DurableEncoder::new(T::IMAGE_KIND);
-    value.encode(&mut out)?;
-    Ok(out.finish())
-}
-
-#[cfg(test)]
-fn decode_test_image<T: DurableTestImageCodec>(bytes: &[u8]) -> Result<T> {
-    let mut input = DurableDecoder::new(bytes, T::IMAGE_KIND)?;
-    let value = T::decode(&mut input)?;
-    input.finish()?;
-    Ok(value)
-}
-
 fn validate_durable_segment_bytes(
     segment_id: SegmentId,
     record: &DurableSegmentRecord,
@@ -16517,62 +16220,6 @@ fn validate_durable_segment_bytes(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TestImageWriteFault {
-    TempWrite,
-    TempSync,
-    Rename,
-    DirSync,
-}
-
-#[cfg(test)]
-fn maybe_test_image_write_fault(
-    fault: Option<TestImageWriteFault>,
-    point: TestImageWriteFault,
-) -> Result<()> {
-    if fault == Some(point) {
-        Err(StorageError::unavailable(format!(
-            "injected test image write fault at {point:?}"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-fn write_test_image_atomic<T: DurableTestImageCodec>(path: &Path, value: &T) -> Result<()> {
-    write_test_image_atomic_with_fault(path, value, None)
-}
-
-#[cfg(test)]
-fn write_test_image_atomic_with_fault<T: DurableTestImageCodec>(
-    path: &Path,
-    value: &T,
-    fault: Option<TestImageWriteFault>,
-) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| StorageError::invalid_argument("test image path has no parent"))?;
-    fs::create_dir_all(parent).map_err(fs_error)?;
-    let tmp = path.with_extension("tmp");
-    let bytes = encode_test_image(value)?;
-    maybe_test_image_write_fault(fault, TestImageWriteFault::TempWrite)?;
-    {
-        let mut file = File::create(&tmp).map_err(fs_error)?;
-        file.write_all(&bytes).map_err(fs_error)?;
-        maybe_test_image_write_fault(fault, TestImageWriteFault::TempSync)?;
-        file.sync_data().map_err(fs_error)?;
-    }
-    maybe_test_image_write_fault(fault, TestImageWriteFault::Rename)?;
-    fs::rename(&tmp, path).map_err(fs_error)?;
-    maybe_test_image_write_fault(fault, TestImageWriteFault::DirSync)?;
-    File::open(parent)
-        .map_err(fs_error)?
-        .sync_all()
-        .map_err(fs_error)
 }
 
 fn next_request_id(next: &Mutex<u128>) -> Result<RequestId> {
@@ -17246,35 +16893,6 @@ mod tests {
 
     fn bytes_to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    fn durable_images_from_store(
-        store: &LocalCoordinator,
-    ) -> (
-        DurableMetadataImage,
-        DurableCatalogImage,
-        DurableSegmentStoreImage,
-    ) {
-        let image = store.state_image().unwrap();
-        let metadata = DurableMetadataImage {
-            config: image.config,
-            metadata: image.metadata,
-            next_write_intent: image.next_write_intent,
-            next_extent_id: image.next_extent_id,
-        };
-        let primary = image
-            .storage_nodes
-            .nodes
-            .get(&image.config.storage_node)
-            .unwrap();
-        let primary_config = image.config.for_storage_node(image.config.storage_node);
-        let catalog = DurableCatalogImage {
-            config: primary_config,
-            catalog: primary.segment_catalog.clone(),
-        };
-        let segment_store =
-            DurableSegmentStoreImage::from_inner(primary_config, primary.segment_store.clone());
-        (metadata, catalog, segment_store)
     }
 
     trait ProviderConformanceStore {
@@ -19069,8 +18687,17 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn assert_durable_row_round_trip<T>(value: &T)
+    where
+        T: DurableCodec + Clone + PartialEq,
+    {
+        let bytes = encode_row(value).unwrap();
+        let decoded = decode_row::<T>(&bytes).unwrap();
+        assert!(decoded == value.clone());
+    }
+
     #[test]
-    fn durable_state_image_codec_round_trips_real_block_and_native_state() {
+    fn durable_row_payload_codecs_round_trip_real_block_and_native_rows() {
         let store = LocalCoordinator::with_config(tree_config()).unwrap();
         let device = create_local_device(&store, 32);
         device.write_at(7 * 4096, &repeated_blocks(3, 8)).unwrap();
@@ -19097,97 +18724,40 @@ mod tests {
         append_native_file_once(&file, b"-state").unwrap();
         native.checkpoint_keyspace(keyspace_id).unwrap();
 
-        let (metadata, catalog, segment_store) = durable_images_from_store(&store);
-        for bytes in [
-            encode_test_image(&metadata).unwrap(),
-            encode_test_image(&catalog).unwrap(),
-            encode_test_image(&segment_store).unwrap(),
-        ] {
-            assert!(bytes.starts_with(DURABLE_TEST_IMAGE_MAGIC));
-        }
+        let metadata = store.metadata.state_inner().unwrap();
+        assert_durable_row_round_trip(metadata.device_specs.get(&device.device_id()).unwrap());
+        assert_durable_row_round_trip(metadata.device_heads.get(&device.device_id()).unwrap());
+        assert_durable_row_round_trip(metadata.keyspace_heads.get(&keyspace_id).unwrap());
+        assert_durable_row_round_trip(metadata.keyspace_roots.values().next().unwrap());
+        assert_durable_row_round_trip(metadata.keyspace_catalog_shards.values().next().unwrap());
+        assert_durable_row_round_trip(metadata.file_writer_epochs.values().next().unwrap());
+        assert_durable_row_round_trip(metadata.metadata_nodes.values().next().unwrap());
+        assert_durable_row_round_trip(metadata.commit_groups.values().next().unwrap());
+        assert_durable_row_round_trip(metadata.shard_commits.last().unwrap());
+        assert_durable_row_round_trip(metadata.keyspace_commits.last().unwrap());
+        assert_durable_row_round_trip(metadata.file_commits.last().unwrap());
+        assert_durable_row_round_trip(metadata.checkpoints.values().next().unwrap());
 
-        let metadata_bytes = encode_test_image(&metadata).unwrap();
-        let catalog_bytes = encode_test_image(&catalog).unwrap();
-        let segment_store_bytes = encode_test_image(&segment_store).unwrap();
-        assert_eq!(
-            encode_test_image(&decode_test_image::<DurableMetadataImage>(&metadata_bytes).unwrap())
-                .unwrap(),
-            metadata_bytes
-        );
-        assert_eq!(
-            encode_test_image(&decode_test_image::<DurableCatalogImage>(&catalog_bytes).unwrap())
-                .unwrap(),
-            catalog_bytes
-        );
-        assert_eq!(
-            encode_test_image(
-                &decode_test_image::<DurableSegmentStoreImage>(&segment_store_bytes).unwrap()
-            )
-            .unwrap(),
-            segment_store_bytes
-        );
+        let catalog = store.segment_catalog().state_inner().unwrap();
+        assert_durable_row_round_trip(catalog.entries.values().next().unwrap());
     }
 
     #[test]
-    fn durable_state_image_codec_has_stable_catalog_golden_bytes() {
-        let image = DurableCatalogImage {
-            config: LocalStoreConfig::default(),
-            catalog: CatalogInner {
-                next_segment_id: 1,
-                entries: BTreeMap::new(),
-            },
-        };
-
-        assert_eq!(
-            bytes_to_hex(&encode_test_image(&image).unwrap()),
-            concat!(
-                "54434f57494d4721",
-                "0001",
-                "02",
-                "0000000000000001",
-                "00001000",
-                "0000000000000001",
-                "0000000000000004",
-                "0000000000000400",
-                "00000000000000000000000000000001",
-                "0000000000000400",
-                "00000000000000000000000000000001",
-                "0000000000000000",
-            )
-        );
-    }
-
-    #[test]
-    fn durable_state_image_codec_rejects_malformed_inputs() {
-        let image = DurableCatalogImage {
-            config: LocalStoreConfig::default(),
-            catalog: CatalogInner {
-                next_segment_id: 1,
-                entries: BTreeMap::new(),
-            },
-        };
-        let bytes = encode_test_image(&image).unwrap();
-
-        let mut bad_magic = bytes.clone();
-        bad_magic[0] ^= 0xff;
-        assert!(decode_test_image::<DurableCatalogImage>(&bad_magic).is_err());
-
-        let mut bad_version = bytes.clone();
-        bad_version[9] = 2;
-        assert!(decode_test_image::<DurableCatalogImage>(&bad_version).is_err());
-
-        let mut bad_kind = bytes.clone();
-        bad_kind[10] = DURABLE_TEST_IMAGE_METADATA;
-        assert!(decode_test_image::<DurableCatalogImage>(&bad_kind).is_err());
-        assert!(decode_test_image::<DurableMetadataImage>(&bytes).is_err());
+    fn durable_row_payload_codec_rejects_malformed_inputs() {
+        let store = LocalCoordinator::with_config(tree_config()).unwrap();
+        let device = create_local_device(&store, 32);
+        device.write_at(7 * 4096, &repeated_blocks(1, 8)).unwrap();
+        let catalog = store.segment_catalog().state_inner().unwrap();
+        let entry = catalog.entries.values().next().unwrap();
+        let bytes = encode_row(entry).unwrap();
 
         let mut truncated = bytes.clone();
         truncated.pop();
-        assert!(decode_test_image::<DurableCatalogImage>(&truncated).is_err());
+        assert!(decode_row::<CatalogEntry>(&truncated).is_err());
 
         let mut trailing = bytes.clone();
         trailing.push(0);
-        assert!(decode_test_image::<DurableCatalogImage>(&trailing).is_err());
+        assert!(decode_row::<CatalogEntry>(&trailing).is_err());
 
         let mut invalid_tag = DurableEncoder { bytes: Vec::new() };
         99u8.encode(&mut invalid_tag).unwrap();
@@ -19222,79 +18792,6 @@ mod tests {
             offset: usize::MAX,
         };
         assert!(offset_overflow.take(1).is_err());
-    }
-
-    #[test]
-    fn fault_injected_test_image_writer_reopens_old_or_complete_new_image() {
-        fn assert_test_image_faults<T: DurableTestImageCodec + Clone>(path: &Path, old: T, new: T) {
-            write_test_image_atomic(path, &old).unwrap();
-            let old_bytes = encode_test_image(&old).unwrap();
-            let new_bytes = encode_test_image(&new).unwrap();
-
-            for fault in [
-                TestImageWriteFault::TempWrite,
-                TestImageWriteFault::TempSync,
-                TestImageWriteFault::Rename,
-                TestImageWriteFault::DirSync,
-            ] {
-                write_test_image_atomic(path, &old).unwrap();
-                assert!(write_test_image_atomic_with_fault(path, &new, Some(fault)).is_err());
-                let visible = fs::read(path).unwrap();
-                assert!(
-                    visible == old_bytes || visible == new_bytes,
-                    "fault {fault:?} left a partial test image"
-                );
-                assert!(decode_test_image::<T>(&visible).is_ok());
-            }
-
-            write_test_image_atomic(path, &new).unwrap();
-            assert_eq!(fs::read(path).unwrap(), new_bytes);
-        }
-
-        let root = durable_temp_dir("test-image-writer-faults");
-        let old_catalog = DurableCatalogImage {
-            config: LocalStoreConfig::default(),
-            catalog: CatalogInner {
-                next_segment_id: 1,
-                entries: BTreeMap::new(),
-            },
-        };
-        let mut new_catalog = old_catalog.clone();
-        new_catalog.catalog.next_segment_id = 2;
-
-        let old_segment_store = DurableSegmentStoreImage {
-            config: LocalStoreConfig::default(),
-            next_offset: 0,
-            records: BTreeMap::new(),
-        };
-        let mut new_segment_store = old_segment_store.clone();
-        new_segment_store.next_offset = 4096;
-
-        let old_metadata = DurableMetadataImage {
-            config: LocalStoreConfig::default(),
-            metadata: MetadataInner::new(),
-            next_write_intent: 1,
-            next_extent_id: 1,
-        };
-        let mut new_metadata = old_metadata.clone();
-        new_metadata.next_write_intent = 2;
-
-        assert_test_image_faults(
-            &root.join("metadata").join("catalog.img"),
-            old_catalog,
-            new_catalog,
-        );
-        assert_test_image_faults(
-            &root.join("storage-node").join("segment-store.img"),
-            old_segment_store,
-            new_segment_store,
-        );
-        assert_test_image_faults(
-            &root.join("metadata").join("metadata.img"),
-            old_metadata,
-            new_metadata,
-        );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

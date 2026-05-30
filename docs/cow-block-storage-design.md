@@ -672,9 +672,9 @@ count, and batched flush still paid one payload sync per segment file.
 
 Phase 20 removes the snapshot production path instead of adding a second
 compatibility layer. The old file-per-segment durable backend was removed with
-it. A tiny test-image wrapper remains only to exercise the crate-owned durable
-codec and atomic-write fault fixture; it is not a readable durable format or
-runtime provider.
+it. The later row-native cleanup also removed the test-image wrapper and tests
+current durable row payload codecs directly, so there is no snapshot-image
+compatibility path in runtime or test code.
 
 ### Partitioned Durable Data Logs
 

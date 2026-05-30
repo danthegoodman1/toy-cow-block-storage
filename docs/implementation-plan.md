@@ -780,9 +780,11 @@ Deliverables:
 - [x] Reusable durable provider conformance harness that can run against the
   in-memory model, the snapshot durable provider, and any future journal or
   database-backed provider where applicable.
-- [x] Crate-owned durable state-image codec with explicit magic, schema version,
-  record kind, enum tags, fixed integer endianness, bounded collection/string
-  lengths, trailing-byte rejection, and deterministic map ordering.
+- [x] Historical atomic snapshot proof codec with explicit magic, schema
+  version, record kind, enum tags, fixed integer endianness, bounded
+  collection/string lengths, trailing-byte rejection, and deterministic map
+  ordering. The row-native durable provider replaced this fixture instead of
+  keeping it as compatibility scaffolding.
 - [x] Durable codec tests for round trips, stable golden bytes, unsupported
   versions, invalid tags, truncated payloads, trailing bytes, oversized lengths,
   and length-prefix overflow.
@@ -790,7 +792,9 @@ Deliverables:
   provider. Phase 20 removed the file-per-segment runtime backend rather than
   carrying it forward as compatibility scaffolding.
 - [x] Fault-injected state-image writer for codec/atomic-write coverage of the
-  old snapshot proof shape; it remains test-only and is not a durable provider.
+  old snapshot proof shape. This fixture was removed after the row-native
+  provider replaced snapshot images; current tests exercise durable row payload
+  codecs directly.
 - [x] Crash/reopen matrix for block writes, multi-shard commit groups, forks,
   deletes, PITR checkpoints/restores, native writes, native appends, native
   keyspace checkpoints, and native keyspace snapshots/restores.
@@ -897,8 +901,8 @@ Deliverables:
   publish, segment-log append, batch sync, replay truncation, and checkpoint
   compaction.
 - [x] Migration-free replacement of the snapshot performance path under the
-  no-tombstones rule; no file-per-segment durable backend remains in runtime
-  code. The remaining state-image codec fixture is test-only.
+  no-tombstones rule; no file-per-segment durable backend or snapshot codec
+  fixture remains in runtime or test code.
 - [x] Criterion baselines for acknowledged latency, single flushed latency,
   batched flush throughput, reopen replay time, checkpoint compaction, native
   append, and block/native reads after reopen.
