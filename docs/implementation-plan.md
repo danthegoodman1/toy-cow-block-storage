@@ -517,14 +517,21 @@ remote, replayable, or concurrent boundary in the owning future phase:
 - Phase 29 owns a real remote storage-node transport for the
   coordinator-to-storage-node boundary while preserving the one-replica
   semantics and grant/receipt ordering already proven in-process.
-- Phase 30 owns production proof and key lifecycle: real signature-backed
-  proof verification, durable key registries, key rotation, revocation, and
-  deterministic tests for trust-boundary failures.
-- Phase 31 owns a first-class POSIX namespace and FUSE adapter over the shared
+- Phase 30 owns the minimal production proof boundary: deterministic test
+  proofs are barred from production remote paths, real keyed grant/receipt
+  verification is used across trust boundaries, and forged, stale, wrong-scope,
+  and replayed evidence is rejected under a provisioned active keyset.
+- Phase 31 owns key lifecycle operations: rotation, retirement, revocation,
+  delayed proof handling across key epochs, and admin/inspect integration.
+- Phase 32 owns authorization policy integration above grant issuance:
+  tenant/principal policy, external authz hooks, delegated writer identities,
+  and audit surfaces. The storage core still enforces scoped grants and
+  receipts, not product policy.
+- Phase 33 owns a first-class POSIX namespace and FUSE adapter over the shared
   substrate: inodes, directories, rename/unlink/truncate/fsync semantics,
   open-handle behavior, and POSIX metadata transactions without stuffing those
   semantics into the native file API.
-- Phase 32 owns replica-set selection, SQLite-backed reference/release outbox
+- Phase 34 owns replica-set selection, SQLite-backed reference/release outbox
   and cursor tables, SQLite-backed repair jobs, orphan replica reconciliation,
   stale placement handling, and physical free reconciliation across replicated
   storage nodes.
@@ -1761,73 +1768,191 @@ Exit gate:
 - [ ] The transport never lets ordinary block/native clients choose storage
   nodes, compact logs, release segments, or mark segments referenced.
 - [ ] Network overhead and tail-latency benchmarks are recorded before Phase 30
-  proof/key work and before Phase 32 replication.
+  production proof work and before Phase 34 replication.
 
-## Phase 30: Production Proof and Key Lifecycle
+## Phase 30: Minimal Production Proof Boundary
 
 Status: not started.
 
 Turn the Phase 26 production-shaped proof envelope into a real trust-boundary
-implementation. Deterministic test MACs can remain for simulation, but any
-provider mode that claims remote/trusted-client security must use durable key
-registries, real signatures or MACs appropriate to the deployment, explicit key
-status, rotation, revocation, and replay protection.
+implementation. Deterministic test MACs can remain for simulation and local
+trusted test modes, but any provider mode that claims remote or trusted-client
+production security must use a real keyed proof scheme and a persisted active
+key registry. This phase is production-secure for the grant/receipt/reference
+boundary under a provisioned active keyset: forged, stale, wrong-scope, and
+replayed evidence must be rejected without relying on client honesty.
+
+Key rotation, retirement, revocation workflows, tenant policy, and external
+authorization are operational layers owned by later phases. They must not change
+the canonical grant, receipt, reference-evidence, or metadata-publish boundary
+proved here.
 
 Non-goals:
 
 - No storage replication or quorum durability.
-- No dependency on one cloud IAM product.
+- No live key rotation, retirement, or revocation workflow.
+- No tenant/principal authorization policy beyond fields already bound into the
+  grant and receipt bodies.
+- No dependency on one cloud IAM, KMS, or PKI product.
 - No change to ordinary public block/native APIs.
 - No acceptance of deterministic test proofs across a production trust
   boundary.
 
 Deliverables:
 
-- [ ] Durable grant-authority and storage-node key registries with key IDs,
-  algorithms, public verification material or local secret references,
-  storage-node incarnation binding, owner/tenant scope, validity epochs, and
-  key status (`active`, `retiring`, `retired`, `revoked`).
-- [ ] `NodeSignatureV1` implementation over the canonical receipt body using a
-  documented production signature scheme, such as Ed25519, with domain
-  separation and golden vectors.
-- [ ] Production grant proof implementation or pluggable authority boundary for
-  metadata-issued grants; local tests may keep deterministic proofs behind an
-  explicit test-only configuration.
-- [ ] Metadata verifier rules for key status, validity epoch, expiration,
-  tenant/principal/device/keyspace scope, storage-node incarnation, durability
-  requirement, grant/receipt binding, checksum, and replay/idempotency keys.
-- [ ] Key rotation flow that overlaps old and new keys for deterministic
-  logical epochs, rejects new proofs from retired keys, keeps old proofs
-  verifiable only while their grants/receipts remain valid, and treats revoked
-  keys as hard failures.
-- [ ] Reopen and admin-tool integration so key registries, key status, and
-  pending grants/receipts survive restart and can be inspected.
+- [ ] Production proof scheme choice documented with its trust model and
+  benchmark evidence. A symmetric cluster MAC is acceptable only for a single
+  controlled trust domain with non-client-held secrets; asymmetric
+  `NodeSignatureV1` remains the required shape for independently verifiable
+  storage-node receipts.
+- [ ] Minimal durable key registry for active grant-authority and storage-node
+  verification material, including key ID, algorithm, role, owner/node binding,
+  logical validity epoch, and production/test-mode eligibility.
+- [ ] Production grant proof implementation over the existing canonical grant
+  body. Local deterministic proofs remain available only behind an explicit
+  test/local-trusted configuration.
+- [ ] Production receipt proof implementation over the existing canonical
+  receipt body, with domain separation and golden vectors.
+- [ ] Production reference-evidence proof implementation over the existing
+  canonical reference-evidence body.
+- [ ] Metadata and storage-node verifier rules for proof scheme, key ID,
+  validity epoch, expiration, tenant/principal/device/keyspace scope,
+  storage-node incarnation, durability requirement, grant/receipt binding,
+  checksum, and replay/idempotency keys.
+- [ ] Production-mode configuration refuses to start remote storage-node or
+  trusted-client paths if deterministic test proofs are enabled or if required
+  active keys are missing.
+- [ ] Reopen tests prove active key registry state survives restart before any
+  pending production-mode grant, receipt, or reference evidence can be accepted.
 - [ ] Chaos tests for forged proofs, wrong key ID, wrong node identity, wrong
-  tenant, stale incarnation, expired grant, retired key, revoked key, replayed
-  receipt, and key rotation during pending writes.
-- [ ] Benchmarks for grant issue, storage-node signing, metadata verification,
-  duplicate receipt verification, large append grant windows, and batched
-  receipt verification if implemented.
+  tenant, stale incarnation, expired grant, replayed receipt, mismatched
+  reference evidence, and duplicated/delayed production proofs.
+- [ ] Benchmarks for grant issue, storage-node proof creation, metadata
+  verification, duplicate receipt verification, large append grant windows, and
+  batched receipt verification if implemented.
 
 Exit gate:
 
 - [ ] Production-mode storage nodes reject writes without valid grants signed or
-  MACed by an accepted grant authority.
+  MACed by an accepted active grant authority key.
 - [ ] Metadata rejects receipts unless the receipt proof verifies against the
-  registered storage-node key and the verified body matches the grant and
+  registered active storage-node key and the verified body matches the grant and
   logical metadata intent.
+- [ ] Storage nodes reject mark-referenced evidence unless metadata-produced
+  reference evidence verifies under an accepted active key and matches the
+  storage node, segment, and metadata commit.
 - [ ] Deterministic test proofs cannot be enabled accidentally in production
-  provider configuration.
-- [ ] Key rotation and revocation are deterministic, persisted, replay-safe, and
-  covered by generated traces with delayed, duplicated, and reordered grants and
-  receipts.
+  provider configuration or across a remote production transport.
+- [ ] Replayed, duplicated, delayed, malformed, wrong-scope, or stale grants,
+  receipts, and reference evidence fail without making data visible or freeing
+  live data.
 - [ ] Real proof verification does not regress local hot-path write benchmarks
   beyond the documented threshold without a specific optimization follow-up.
 - [ ] No second proof path remains beside the current grant/receipt verifier;
   test and production schemes share the same canonical bodies and verifier
   boundary.
 
-## Phase 31: POSIX Namespace and FUSE Adapter
+## Phase 31: Key Lifecycle Operations
+
+Status: not started.
+
+Add operational key lifecycle after the production proof boundary is secure
+with a provisioned active keyset. This phase makes production operations
+manageable when keys change, are retired, or must be revoked, without changing
+the grant/receipt/reference evidence semantics proven in Phase 30.
+
+Non-goals:
+
+- No new proof body or second verification path.
+- No tenant/principal authorization policy engine.
+- No public block/native API changes.
+- No dependency on one cloud IAM, KMS, or PKI product.
+
+Deliverables:
+
+- [ ] Durable key status model for `active`, `retiring`, `retired`, and
+  `revoked` grant-authority and storage-node keys.
+- [ ] Deterministic logical-epoch rotation flow that overlaps old and new keys
+  while preserving pending grants and receipts that were valid when issued.
+- [ ] Retired-key rules that reject new proofs while allowing already-issued
+  grants/receipts only until their deterministic expiration.
+- [ ] Revocation rules that treat a revoked key as a hard failure for new and
+  pending evidence unless an explicit safe repair or operator decision proves
+  otherwise.
+- [ ] Reopen behavior for key status, pending grants, pending receipts, and
+  delayed reference evidence across rotation and revocation.
+- [ ] Admin/inspect integration for key status, active epochs, pending evidence,
+  and proof rejection reasons.
+- [ ] Chaos tests for delayed, duplicated, and reordered grants/receipts across
+  rotation; stale incarnations; retired-key submissions; revoked-key
+  submissions; and restart during rotation.
+- [ ] Benchmarks for key lookup, active-key cache hits, rotation with pending
+  evidence, and verification overhead with multiple active/retiring keys.
+
+Exit gate:
+
+- [ ] Rotating keys cannot make already committed data unreadable or make
+  uncommitted bytes visible.
+- [ ] New production proofs from retired or revoked keys are rejected according
+  to documented deterministic epoch rules.
+- [ ] Pending grants and receipts across rotation are either accepted or rejected
+  by persisted, replay-safe rules, never by wall-clock timing or process-local
+  cache state.
+- [ ] Admin/inspect output can explain proof failures by key status, epoch,
+  scope, expiration, or malformed evidence.
+- [ ] Key lifecycle behavior is deterministic under delayed, duplicated, and
+  reordered proof delivery.
+
+## Phase 32: Authorization Policy Integration
+
+Status: not started.
+
+Integrate grant issuance with product or management-layer authorization policy.
+The storage core remains a capability verifier: it enforces scoped grants,
+receipts, reference evidence, fencing, and durability. It does not own account
+management, billing, IAM, or product-level policy decisions.
+
+Non-goals:
+
+- No change to `BlockDevice`, `NativeFile`, or POSIX caller semantics.
+- No storage-node choice or replica fan-out by ordinary clients.
+- No hard dependency on one external IAM, KMS, policy engine, or identity
+  provider.
+- No policy database inside metadata-tree logic.
+
+Deliverables:
+
+- [ ] Provider-public grant authorization hook for deciding whether a tenant,
+  principal, owner, operation intent, byte range, durability class, and
+  placement result may receive a write grant.
+- [ ] Default local policy that preserves current trusted single-tenant behavior
+  without weakening Phase 30 proof verification.
+- [ ] Optional external policy adapter boundary with deterministic request and
+  response envelopes, explicit failure behavior, and no hidden retries in
+  deterministic code.
+- [ ] Delegated writer identity model for callers that may carry grants to
+  storage nodes without being allowed to choose placement or publish metadata.
+- [ ] Audit records for grant issuance, denial, policy errors, delegated writer
+  identity, and proof-verification outcome.
+- [ ] Generated tests for policy allow/deny, stale policy epochs, delegated
+  writer misuse, cross-tenant grant attempts, and policy adapter failure.
+- [ ] Benchmarks for grant authorization overhead on small writes, large
+  appends, and batched grant issuance.
+
+Exit gate:
+
+- [ ] A caller cannot obtain a production write grant unless the configured
+  policy authorizes the exact scoped operation.
+- [ ] Policy denial or policy adapter failure cannot create storage-node bytes,
+  metadata roots, or reference evidence.
+- [ ] Storage nodes and metadata still verify grants and receipts
+  cryptographically; policy approval alone never creates logical truth.
+- [ ] Public block/native/POSIX APIs do not expose placement, replica selection,
+  or storage-node credentials.
+- [ ] Management-layer policy can be replaced without changing metadata tree,
+  segment lifecycle, PITR, GC, or replication semantics.
+
+## Phase 33: POSIX Namespace and FUSE Adapter
 
 Status: not started.
 
@@ -1898,7 +2023,7 @@ Exit gate:
 - [ ] Criterion and FUSE smoke tests show whether the POSIX layer is usable for
   internal workloads before any production claims are made.
 
-## Phase 32: Storage Replication
+## Phase 34: Storage Replication
 
 Status: not started.
 
@@ -1908,8 +2033,11 @@ nodes, after Phase 26 proves authenticated storage-node receipts and chaos
 delivery for the one-replica path, after Phase 27 makes operational debt
 observable, after Phase 28 provides verification/admin tooling, after Phase 29
 proves real remote storage-node transport semantics, and after Phase 30 proves
-production key lifecycle for proof-carrying writes. If the replicated provider
-is expected to serve POSIX mounts, Phase 31 POSIX namespace semantics
+the production proof boundary for proof-carrying writes. Phase 31 key lifecycle
+and Phase 32 authorization policy are operational hardening layers for
+deployments that need live key operations or tenant/product policy; they do not
+change the replication correctness model. If the replicated provider is
+expected to serve POSIX mounts, Phase 33 POSIX namespace semantics
 must be in the conformance suite before replication is called complete. The
 local and durable providers must pass the same conformance suite, remote
 transport behavior must be deterministic, and the real network transport must
@@ -1965,9 +2093,9 @@ Exit gate:
   logical segment or replica placement.
 - [ ] Replicated providers pass the same read/write/fork/PITR/GC conformance
   suite as single-replica providers, including POSIX namespace conformance once
-  Phase 31 is implemented.
+  Phase 33 is implemented.
 
-## Phase 33: Linux io_uring Storage Node Backend
+## Phase 35: Linux io_uring Storage Node Backend
 
 Status: not started.
 
@@ -2008,7 +2136,7 @@ Exit gate:
 - [ ] Backend-specific behavior does not leak into metadata, PITR, GC, block
   API, native file API, or deterministic core logic.
 
-## Phase 34: Optional ublk Adapter
+## Phase 36: Optional ublk Adapter
 
 Status: not started.
 

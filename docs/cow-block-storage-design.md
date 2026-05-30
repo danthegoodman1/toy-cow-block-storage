@@ -883,11 +883,22 @@ epoch/expiration, node key ID, proof scheme, and proof bytes.
 
 Receipt proofs use a canonical crate-owned binary receipt body with a domain
 separator such as `TCOW_SEGMENT_RECEIPT_V1`. The proof covers the payload
-checksum and all logical/placement fields, not the full payload bytes.
-Production adapters should prefer asymmetric storage-node signatures
-(`NodeSignatureV1`) verified through a storage-node key registry. The local
-provider may use deterministic test MACs so simulations remain replayable, but
-the verifier boundary and receipt body must stay production-shaped.
+checksum and all logical/placement fields, not the full payload bytes. Phase 30
+turns this into the minimal production proof boundary: remote or
+trusted-client production modes must reject deterministic test proofs and use a
+real keyed proof scheme verified through a persisted active key registry. A
+symmetric cluster MAC is acceptable only inside one controlled trust domain
+where clients never hold the storage-node or grant-authority secrets.
+Asymmetric storage-node signatures (`NodeSignatureV1`) remain the preferred
+shape when receipts need independent verification or stronger node
+accountability.
+
+That Phase 30 boundary is production-secure for forged, stale, wrong-scope, and
+replayed grant, receipt, and reference evidence under a provisioned active
+keyset. Later key rotation, retirement, revocation, admin inspection, and
+external authorization policy are operational layers. They must not change the
+canonical proof bodies or create a second path for making segment bytes
+logically visible.
 
 Metadata verifies grant/receipt evidence and their binding before it accepts a
 new segment reference, but must still not open storage-node catalogs or read
@@ -988,9 +999,10 @@ not become permanent shortcuts:
   reference evidence; custom durable logs or external queues need specific
   remote-deployment or benchmark evidence.
 - Storage-node write receipts now use authenticated grant and receipt bodies in
-  the local provider. Remote adapters still need a network encoding, a
-  storage-node key registry, and a production `NodeSignatureV1` verifier before
-  those receipts can cross trust boundaries.
+  the local provider. Remote adapters still need a network encoding and Phase 30
+  production proof verifier before those receipts can cross trust boundaries.
+  Key rotation/revocation and tenant authorization policy are operational
+  follow-up layers, not alternate proof paths.
 - Durable compaction is one local append log in Phase 20. The SQLite metadata
   plus partitioned-data-log phase needs placement tables, relocation
   transactions, data-log manifests, and incremental compaction tests before
