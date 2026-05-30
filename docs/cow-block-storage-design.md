@@ -121,10 +121,15 @@ DeviceHead {
 }
 ```
 
-The generation is a fencing identity for publishing device-head updates. The
-number of shards is fixed for a device lineage in v1. A later format may change
-that, but only by updating this spec and the deterministic tests in the same
-change.
+The generation is a monotonic observation identity for the committed device-head
+view. Block writes are fenced by the expected old root of each touched shard,
+not by the whole-device generation, so independent writes to different shards
+can publish without conflict. A stale write to the same shard still fails when
+its expected old root no longer matches. Storage write grants for block data
+therefore carry the target shard ID and expected old shard root alongside the
+observed device generation. The number of shards is fixed for a device lineage
+in v1. A later format may change that, but only by updating this spec and the
+deterministic tests in the same change.
 
 The logical state of a live native file is:
 

@@ -1575,6 +1575,8 @@ impl LocalCoordinator {
                     device_id,
                     range: chunk.range,
                     fence: current.generation,
+                    shard_id: chunk.shard_id,
+                    old_root: chunk.old_root,
                 },
                 write_intent,
                 chunk_bytes.to_vec(),
@@ -2193,6 +2195,24 @@ impl LocalCoordinator {
         Ok(chunks)
     }
 
+    fn single_shard_for_block_range(
+        &self,
+        head: &DeviceHead,
+        range: crate::api::BlockRange,
+    ) -> Result<(ShardId, MetadataNodeId)> {
+        for (shard, root) in head.shard_roots.iter().copied().enumerate() {
+            let node = self.metadata.get_metadata_node(root)?;
+            if node.covered_range.contains_range(range)? {
+                let shard_id = u32::try_from(shard)
+                    .map_err(|_| StorageError::invalid_argument("shard index overflows u32"))?;
+                return Ok((ShardId::from_raw(shard_id), root));
+            }
+        }
+        Err(StorageError::invalid_argument(
+            "block range is not contained by one shard",
+        ))
+    }
+
     #[cfg(test)]
     fn write_segment_for_owner(
         &self,
@@ -2303,6 +2323,7 @@ impl LocalCoordinator {
     ) -> Result<WriteGrant> {
         range.validate_non_empty()?;
         let head = self.metadata.get_head(device_id)?;
+        let (shard_id, old_root) = self.single_shard_for_block_range(&head, range)?;
         let block_size = u64::from(self.metadata.config.block_size);
         let max_bytes = range
             .blocks
@@ -2320,6 +2341,8 @@ impl LocalCoordinator {
                 device_id,
                 range,
                 fence: head.generation,
+                shard_id,
+                old_root,
             },
             write_intent,
             segment_id,
@@ -2549,6 +2572,8 @@ impl LocalCoordinator {
             device_id,
             range,
             fence,
+            shard_id,
+            old_root,
         } = receipt.intent
         else {
             return Err(StorageError::invalid_argument(
@@ -2561,19 +2586,15 @@ impl LocalCoordinator {
             ));
         }
         let current = self.metadata.get_head(device_id)?;
-        let mut selected = None;
-        for (shard_index, root_id) in current.shard_roots.iter().copied().enumerate() {
-            let node = self.metadata.get_metadata_node(root_id)?;
-            if node.covered_range.contains_range(range)? {
-                let shard_id = u32::try_from(shard_index)
-                    .map_err(|_| StorageError::invalid_argument("shard index overflows u32"))?;
-                selected = Some((ShardId::from_raw(shard_id), root_id));
-                break;
-            }
+        let shard = usize::try_from(shard_id.raw())
+            .map_err(|_| StorageError::invalid_argument("shard ID overflows usize"))?;
+        let current_root = current
+            .shard_roots
+            .get(shard)
+            .ok_or_else(|| StorageError::invalid_argument("receipt shard is outside device"))?;
+        if *current_root != old_root {
+            return Err(StorageError::conflict("stale shard root"));
         }
-        let (shard_id, old_root) = selected.ok_or_else(|| {
-            StorageError::invalid_argument("receipt block range is not contained by one shard")
-        })?;
         let new_root = self
             .replace_tree_range_with_receipts(
                 old_root,
@@ -10260,11 +10281,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     .cloned()
                     .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
                 match intent.fence {
-                    MetadataFence::DeviceGeneration(generation)
-                        if generation == current.generation => {}
-                    MetadataFence::DeviceGeneration(_) => {
-                        return Err(StorageError::conflict("stale device generation fence"));
-                    }
+                    MetadataFence::DeviceGeneration(_) => {}
                     _ => {
                         return Err(StorageError::invalid_argument(
                             "block device commit requires device-generation fence",
@@ -14816,11 +14833,15 @@ impl DurableCodec for WriteGrantIntent {
                 device_id,
                 range,
                 fence,
+                shard_id,
+                old_root,
             } => {
                 1u8.encode(out)?;
                 device_id.encode(out)?;
                 range.encode(out)?;
-                fence.encode(out)
+                fence.encode(out)?;
+                shard_id.encode(out)?;
+                old_root.encode(out)
             }
             Self::NativeWrite {
                 keyspace_id,
@@ -14879,6 +14900,8 @@ impl DurableCodec for WriteGrantIntent {
                 device_id: DeviceId::decode(input)?,
                 range: crate::api::BlockRange::decode(input)?,
                 fence: DeviceGeneration::decode(input)?,
+                shard_id: ShardId::decode(input)?,
+                old_root: MetadataNodeId::decode(input)?,
             }),
             2 => Ok(Self::NativeWrite {
                 keyspace_id: KeyspaceId::decode(input)?,
@@ -17207,12 +17230,23 @@ mod tests {
     }
 
     #[test]
-    fn metadata_publish_is_fenced_atomic_and_checks_missing_roots() {
+    fn metadata_publish_merges_independent_shards_and_checks_missing_roots() {
         let metadata = InMemoryMetadataPlane::new(config()).unwrap();
         let head = metadata.create_device(device_request()).unwrap();
         let new_node = metadata_leaf(999, 0, 8);
+        let shard_one_node = metadata_leaf(1000, 8, 8);
+        let stale_same_shard_node = metadata_leaf(1001, 0, 8);
         metadata
             .persist_metadata_node(MetadataNodeWrite::new(new_node.clone(), Vec::new()))
+            .unwrap();
+        metadata
+            .persist_metadata_node(MetadataNodeWrite::new(shard_one_node.clone(), Vec::new()))
+            .unwrap();
+        metadata
+            .persist_metadata_node(MetadataNodeWrite::new(
+                stale_same_shard_node.clone(),
+                Vec::new(),
+            ))
             .unwrap();
 
         let stale_missing = CommitGroupIntent {
@@ -17244,17 +17278,35 @@ mod tests {
         assert_eq!(updated.shard_roots[0], new_node.node_id);
         assert_eq!(updated.generation, DeviceGeneration::from_raw(1));
 
-        let stale = CommitGroupIntent {
+        let independent = metadata
+            .publish_commit_group(CommitGroupIntent {
+                owner: MappingOwner::BlockDevice(head.device_id),
+                fence: MetadataFence::DeviceGeneration(head.generation),
+                updates: vec![RootUpdate::BlockShard(ShardRootUpdate {
+                    shard_id: ShardId::from_raw(1),
+                    old_root: head.shard_roots[1],
+                    new_root: shard_one_node.node_id,
+                })],
+            })
+            .unwrap();
+        assert_eq!(independent.commit_seq, CommitSeq::from_raw(2));
+
+        let merged = metadata.get_head(head.device_id).unwrap();
+        assert_eq!(merged.shard_roots[0], new_node.node_id);
+        assert_eq!(merged.shard_roots[1], shard_one_node.node_id);
+        assert_eq!(merged.generation, DeviceGeneration::from_raw(2));
+
+        let stale_same_shard = CommitGroupIntent {
             owner: MappingOwner::BlockDevice(head.device_id),
             fence: MetadataFence::DeviceGeneration(head.generation),
             updates: vec![RootUpdate::BlockShard(ShardRootUpdate {
-                shard_id: ShardId::from_raw(1),
-                old_root: head.shard_roots[1],
-                new_root: new_node.node_id,
+                shard_id: ShardId::from_raw(0),
+                old_root: head.shard_roots[0],
+                new_root: stale_same_shard_node.node_id,
             })],
         };
-        assert!(metadata.publish_commit_group(stale).is_err());
-        assert_eq!(metadata.get_head(head.device_id).unwrap(), updated);
+        assert!(metadata.publish_commit_group(stale_same_shard).is_err());
+        assert_eq!(metadata.get_head(head.device_id).unwrap(), merged);
     }
 
     #[test]
@@ -23756,10 +23808,10 @@ mod tests {
 
         let failed = store.metadata().publish_commit_group(CommitGroupIntent {
             owner: MappingOwner::BlockDevice(head.device_id),
-            fence: MetadataFence::DeviceGeneration(DeviceGeneration::from_raw(99)),
+            fence: MetadataFence::DeviceGeneration(head.generation),
             updates: vec![RootUpdate::BlockShard(ShardRootUpdate {
                 shard_id: ShardId::from_raw(0),
-                old_root: head.shard_roots[0],
+                old_root: MetadataNodeId::from_raw(404),
                 new_root: node.node_id,
             })],
         });
@@ -25244,6 +25296,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes_after_duplicate, repeated_blocks(1, 55));
+    }
+
+    #[test]
+    fn trusted_block_grants_merge_independent_shards_from_same_generation() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let head = store.metadata().create_device(device_request()).unwrap();
+        let left_range =
+            crate::api::BlockRange::new(BlockIndex::from_raw(2), BlockCount::from_raw(1));
+        let right_range =
+            crate::api::BlockRange::new(BlockIndex::from_raw(10), BlockCount::from_raw(1));
+        let left_grant = store
+            .issue_block_write_grant(head.device_id, left_range, WriteDurability::Acknowledged)
+            .unwrap();
+        let right_grant = store
+            .issue_block_write_grant(head.device_id, right_range, WriteDurability::Acknowledged)
+            .unwrap();
+        let left_receipt = store
+            .write_granted_segment(&left_grant, repeated_blocks(1, 11))
+            .unwrap();
+        let right_receipt = store
+            .write_granted_segment(&right_grant, repeated_blocks(1, 22))
+            .unwrap();
+
+        store
+            .submit_block_write_receipt(&left_grant, left_receipt)
+            .unwrap();
+        store
+            .submit_block_write_receipt(&right_grant, right_receipt)
+            .unwrap();
+
+        let mut left = vec![0; 4096];
+        let mut right = vec![0; 4096];
+        store
+            .read_device(head.device_id, ByteRange::new(2 * 4096, 4096), &mut left)
+            .unwrap();
+        store
+            .read_device(head.device_id, ByteRange::new(10 * 4096, 4096), &mut right)
+            .unwrap();
+        assert_eq!(left, repeated_blocks(1, 11));
+        assert_eq!(right, repeated_blocks(1, 22));
+        assert_eq!(
+            store
+                .metadata()
+                .get_head(head.device_id)
+                .unwrap()
+                .generation,
+            DeviceGeneration::from_raw(2)
+        );
     }
 
     #[test]

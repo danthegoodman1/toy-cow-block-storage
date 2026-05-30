@@ -10,7 +10,8 @@ use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileInfo, Keyspace
 use crate::id::{
     CheckpointId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion, GrantEpoch, GrantId,
     GrantNonce, KeyspaceId, LogicalDeadline, MetadataNodeId, PrincipalId, SegmentId,
-    ServerIncarnation, StorageNodeId, StorageNodeKeyId, TenantId, WriteIntentId, WriterEpoch,
+    ServerIncarnation, ShardId, StorageNodeId, StorageNodeKeyId, TenantId, WriteIntentId,
+    WriterEpoch,
 };
 use crate::object::{
     Checkpoint, CommitGroup, DeleteRecord, DeviceHead, FileHead, KeyspaceHead, MappingOwner,
@@ -61,10 +62,17 @@ pub struct GrantHash(pub [u8; 32]);
 /// Logical operation a grant authorizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WriteGrantIntent {
+    /// A one-shard block write.
+    ///
+    /// `fence` identifies the observed device-head generation, while
+    /// `shard_id` and `old_root` are the write-contention fence that metadata
+    /// publish must compare before replacing the shard root.
     BlockWrite {
         device_id: DeviceId,
         range: BlockRange,
         fence: DeviceGeneration,
+        shard_id: ShardId,
+        old_root: MetadataNodeId,
     },
     NativeWrite {
         keyspace_id: KeyspaceId,
@@ -608,9 +616,11 @@ pub trait GrantReceiptAuthority: Send + Sync {
 ///
 /// Implementors must treat this as the atomic metadata transition for one owner.
 /// For block devices, all shard-root updates in the intent become visible
-/// together or none do. For native keyspaces, the catalog-root transition and
-/// enclosed file root/version transition become visible together or none does.
-/// Successful publishes must be durably replayable before success is returned.
+/// together or none do, and each update is fenced by its expected `old_root` so
+/// independent shard updates can merge without a whole-device write conflict.
+/// For native keyspaces, the catalog-root transition and enclosed file
+/// root/version transition become visible together or none does. Successful
+/// publishes must be durably replayable before success is returned.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitGroupIntent {
     pub owner: MappingOwner,
@@ -620,9 +630,12 @@ pub struct CommitGroupIntent {
 
 /// Fencing token for metadata publishes.
 ///
-/// Implementors must reject a publish when the current owner state no longer
-/// matches the supplied fence. Rejection must not partially apply any root
-/// update. A stale native writer should be rejected through `WriterEpoch`.
+/// Rejection must not partially apply any root update. Block commits use the
+/// supplied device generation as an owner/lineage token and use each shard
+/// update's `old_root` as the write-contention fence, allowing independent
+/// shard updates to commit after another shard advances the device generation.
+/// Native commits must reject a publish when the current file state no longer
+/// matches the supplied version or writer-epoch fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetadataFence {
     DeviceGeneration(DeviceGeneration),
@@ -1342,12 +1355,16 @@ fn put_write_grant_intent(out: &mut impl CanonicalSink, intent: WriteGrantIntent
             device_id,
             range,
             fence,
+            shard_id,
+            old_root,
         } => {
             put_u8(out, 1);
             put_u128(out, device_id.raw());
             put_u64(out, range.start.raw());
             put_u64(out, range.blocks.raw());
             put_u64(out, fence.raw());
+            put_u64(out, u64::from(shard_id.raw()));
+            put_u128(out, old_root.raw());
         }
         WriteGrantIntent::NativeWrite {
             keyspace_id,
@@ -1491,6 +1508,8 @@ mod tests {
                 device_id: DeviceId::from_raw(7),
                 range: BlockRange::new(BlockIndex::from_raw(8), BlockCount::from_raw(2)),
                 fence: DeviceGeneration::from_raw(9),
+                shard_id: ShardId::from_raw(10),
+                old_root: MetadataNodeId::from_raw(11),
             },
             write_intent: WriteIntentId::from_raw(10),
             segment_id: SegmentId::from_raw(12),

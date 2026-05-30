@@ -21,9 +21,12 @@ pub enum MappingOwner {
 
 /// Current committed block-device root set.
 ///
-/// A `DeviceHead` is the durable publication unit for a block device. Providers
-/// must treat `generation`, `latest_commit`, and all `shard_roots` as one
-/// committed view: readers should never observe only part of a newer root set.
+/// A `DeviceHead` is the durable read view for a block device. Providers must
+/// treat `generation`, `latest_commit`, and all `shard_roots` as one committed
+/// view: readers should never observe only part of a newer root set. Block
+/// writes are fenced by the touched shard roots' expected old IDs, so
+/// independent shard writes can publish without contending on the whole-device
+/// generation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceHead {
     pub device_id: DeviceId,

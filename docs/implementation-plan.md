@@ -270,7 +270,9 @@ Exit gate:
 - [x] Native appends expose either the old file version or the complete new file
   version, never a partial extent update.
 - [x] Stale native append leases are rejected deterministically.
-- [x] Conflicting writes to the same shard resolve deterministically.
+- [x] Conflicting writes to the same shard resolve deterministically, while
+  independent writes to different shards can merge using per-shard old-root
+  fences instead of a whole-device generation fence.
 - [x] Table-driven tests cover beginning, middle, end, full-range, same-range,
   and cross-shard overwrites.
 - [x] Table-driven tests cover valid append, stale lease rejection, lease

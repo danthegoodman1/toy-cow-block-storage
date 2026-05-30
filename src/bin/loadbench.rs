@@ -206,7 +206,8 @@ options:\n\
   --provider local|durable                 default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           names: block-write-4k, block-read-4k,\n\
+                                           names: block-write-4k,\n\
+                                           block-write-4k-shard-lanes, block-read-4k,\n\
                                            block-write-1m, native-read-4k,\n\
                                            native-write-4k,\n\
                                            native-append-4k, native-hot-append-4k\n\
@@ -362,6 +363,7 @@ impl FromStr for DelayMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Workload {
     BlockWrite4k,
+    BlockWrite4kShardLanes,
     BlockRead4k,
     BlockWrite1m,
     NativeRead4k,
@@ -374,6 +376,7 @@ impl Workload {
     fn north_star_suite() -> Vec<Self> {
         vec![
             Self::BlockWrite4k,
+            Self::BlockWrite4kShardLanes,
             Self::BlockRead4k,
             Self::BlockWrite1m,
             Self::NativeRead4k,
@@ -386,6 +389,7 @@ impl Workload {
     fn name(self) -> &'static str {
         match self {
             Self::BlockWrite4k => "block-write-4k",
+            Self::BlockWrite4kShardLanes => "block-write-4k-shard-lanes",
             Self::BlockRead4k => "block-read-4k",
             Self::BlockWrite1m => "block-write-1m",
             Self::NativeRead4k => "native-read-4k",
@@ -399,6 +403,7 @@ impl Workload {
         match self {
             Self::BlockWrite1m => 1024 * 1024,
             Self::BlockWrite4k
+            | Self::BlockWrite4kShardLanes
             | Self::BlockRead4k
             | Self::NativeWrite4k
             | Self::NativeRead4k
@@ -414,7 +419,10 @@ impl Workload {
     fn is_block(self) -> bool {
         matches!(
             self,
-            Self::BlockWrite4k | Self::BlockRead4k | Self::BlockWrite1m
+            Self::BlockWrite4k
+                | Self::BlockWrite4kShardLanes
+                | Self::BlockRead4k
+                | Self::BlockWrite1m
         )
     }
 }
@@ -425,6 +433,7 @@ impl FromStr for Workload {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "block-write-4k" => Ok(Self::BlockWrite4k),
+            "block-write-4k-shard-lanes" => Ok(Self::BlockWrite4kShardLanes),
             "block-read-4k" => Ok(Self::BlockRead4k),
             "block-write-1m" => Ok(Self::BlockWrite1m),
             "native-read-4k" => Ok(Self::NativeRead4k),
@@ -613,6 +622,7 @@ enum Target {
         device_id: DeviceId,
         logical_blocks: u64,
         hot_blocks: u64,
+        shard_count: usize,
     },
     Native {
         keyspace_id: KeyspaceId,
@@ -674,6 +684,7 @@ fn setup_context(args: &Args, workload: Workload, store: BenchStore) -> Result<B
             device_id,
             logical_blocks: args.device_blocks,
             hot_blocks,
+            shard_count: args.shards,
         }
     } else {
         let keyspace_id = store.create_keyspace(CreateKeyspaceRequest { name: None })?;
@@ -799,6 +810,7 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
         let result = run_one_op(
             &context,
             config.workload,
+            worker,
             &mut rng,
             config.durability.write_durability(),
             &mut read_buf,
@@ -840,6 +852,7 @@ fn apply_modeled_delay(delay: Duration, mode: DelayMode) {
 fn run_one_op(
     context: &BenchContext,
     workload: Workload,
+    worker: u64,
     rng: &mut Lcg,
     durability: WriteDurability,
     read_buf: &mut [u8],
@@ -854,6 +867,33 @@ fn run_one_op(
             Workload::BlockWrite4k,
         ) => {
             let block = rng.below(*logical_blocks);
+            context.store.write_device(
+                *device_id,
+                block * u64::from(BLOCK_SIZE),
+                &context.payload,
+                durability,
+            )
+        }
+        (
+            Target::Block {
+                device_id,
+                logical_blocks,
+                shard_count,
+                ..
+            },
+            Workload::BlockWrite4kShardLanes,
+        ) => {
+            let shard_count = *shard_count as u64;
+            let shard = worker % shard_count;
+            let start = logical_blocks
+                .checked_mul(shard)
+                .ok_or_else(|| StorageError::invalid_argument("shard start overflows"))?
+                / shard_count;
+            let end = logical_blocks
+                .checked_mul(shard + 1)
+                .ok_or_else(|| StorageError::invalid_argument("shard end overflows"))?
+                / shard_count;
+            let block = start + rng.below(end - start);
             context.store.write_device(
                 *device_id,
                 block * u64::from(BLOCK_SIZE),
