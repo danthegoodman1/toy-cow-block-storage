@@ -564,15 +564,17 @@ impl DurableCoordinator {
         let total_started = Instant::now();
         loop {
             let mut state = lock(&self.persist_coordinator.inner)?;
+            state.requested_through = state.requested_through.max(commit_seq);
             if state.durable_through >= commit_seq {
                 return Ok(());
             }
             if !state.in_flight {
+                let target_commit = state.requested_through;
                 state.in_flight = true;
                 drop(state);
                 let result = self.persist_append_stream_publish_delta_physical(
                     stream,
-                    commit_seq,
+                    target_commit,
                     changed_segments,
                     total_started,
                 );
@@ -587,7 +589,12 @@ impl DurableCoordinator {
                             state.requested_through.max(state.durable_through);
                         state.last_error = None;
                         self.persist_coordinator.cvar.notify_all();
-                        return Ok(());
+                        if state.durable_through >= commit_seq {
+                            return Ok(());
+                        }
+                        return Err(StorageError::conflict(
+                            "append stream publish persist did not reach required commit sequence",
+                        ));
                     }
                     Err(error) => {
                         state.last_error = Some((generation, error.clone()));
@@ -616,26 +623,33 @@ impl DurableCoordinator {
     fn persist_append_stream_publish_delta_physical(
         &self,
         stream: &AppendStream,
-        commit_seq: CommitSeq,
+        minimum_target: CommitSeq,
         changed_segments: &BTreeSet<SegmentId>,
         total_started: Instant,
     ) -> Result<CommitSeq> {
         let _persist_guard = lock(&self.persist_lock)?;
         let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
+        let target_commit = lock(&self.persist_coordinator.inner)?
+            .requested_through
+            .max(minimum_target);
 
         let snapshot_started = Instant::now();
         let Some(previous_cursor) = self.durable.export_cursor()? else {
             drop(_persist_guard);
-            return self.persist_physical(total_started, None, Some(commit_seq));
+            return self.persist_physical(total_started, None, Some(target_commit));
         };
         let pending_append = lock(&self.pending_data_log_append)?.clone();
         if !pending_append.is_empty() {
             drop(_persist_guard);
-            return self.persist_physical(total_started, None, Some(commit_seq));
+            return self.persist_physical(total_started, None, Some(target_commit));
         }
-        let delta = self
+        let Some(delta) = self
             .local
-            .native_append_publish_delta_since(stream, &previous_cursor)?;
+            .native_append_publish_delta_through(stream, target_commit, &previous_cursor)?
+        else {
+            drop(_persist_guard);
+            return self.persist_physical(total_started, None, Some(target_commit));
+        };
         let previous_segments = lock(&self.persisted_segments)?.clone();
         if delta
             .referenced_segment_ids
@@ -643,7 +657,7 @@ impl DurableCoordinator {
             .any(|segment_id| !previous_segments.contains(segment_id))
         {
             drop(_persist_guard);
-            return self.persist_physical(total_started, None, Some(commit_seq));
+            return self.persist_physical(total_started, None, Some(target_commit));
         }
         let mut changed_segments = changed_segments.clone();
         changed_segments.extend(delta.referenced_segment_ids.iter().copied());
@@ -659,7 +673,7 @@ impl DurableCoordinator {
             Vec::new(),
         )?;
         let durable_high_water = CommitSeq::from_raw(profile.durable_commit_high_water);
-        if durable_high_water < commit_seq {
+        if durable_high_water < target_commit {
             return Err(StorageError::conflict(
                 "append stream publish persist did not reach required commit sequence",
             ));

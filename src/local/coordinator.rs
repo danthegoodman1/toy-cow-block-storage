@@ -680,146 +680,28 @@ impl LocalCoordinator {
         })
     }
 
-    fn native_append_publish_delta_since(
+    fn native_append_publish_delta_through(
         &self,
         stream: &AppendStream,
+        target_commit: CommitSeq,
         previous: &DurableExportCursor,
-    ) -> Result<NativeMetadataDelta> {
-        fn next_after_u128(current: u128, raw: u128) -> Result<u128> {
-            Ok(current.max(
-                raw.checked_add(1)
-                    .ok_or_else(|| StorageError::conflict("durable cursor id overflow"))?,
-            ))
-        }
-
-        let metadata = lock(&self.metadata.inner)?;
-        let stream_state = metadata
-            .append_streams
-            .get(&stream.stream_id)
-            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
-        stream_state.validate_token(stream)?;
-        let append_stream = stream_state.durable_export_at(stream_state.durable_through)?;
-
-        let keyspace_head = metadata
-            .keyspace_heads
-            .get(&stream.keyspace_id)
-            .cloned()
-            .ok_or_else(|| StorageError::not_found("keyspace", stream.keyspace_id.to_string()))?;
-        let shard_index = InMemoryMetadataPlane::keyspace_catalog_shard_index_for_len(
-            stream.file_id,
-            keyspace_head.shard_roots.len(),
-        )?;
-        let shard_id = keyspace_head
-            .shard_roots
-            .get(shard_index)
-            .copied()
-            .ok_or_else(|| StorageError::corrupt("keyspace shard index missing from root"))?;
-        let keyspace_shard =
-            InMemoryMetadataPlane::keyspace_catalog_shard_locked(&metadata, shard_id)?;
-
-        let keyspace_roots: BTreeMap<_, _> = metadata
-            .keyspace_roots
-            .iter()
-            .filter(|(id, _)| id.raw() >= previous.next_keyspace_root_id)
-            .map(|(id, root)| (*id, root.clone()))
-            .collect();
-        let mut keyspace_catalog_shards: BTreeMap<_, _> = metadata
-            .keyspace_catalog_shards
-            .iter()
-            .filter(|(id, _)| id.raw() >= previous.next_keyspace_catalog_shard_id)
-            .map(|(id, shard)| (*id, shard.clone()))
-            .collect();
-        keyspace_catalog_shards.insert(shard_id, keyspace_shard);
-        let metadata_nodes: BTreeMap<_, _> = metadata
-            .metadata_nodes
-            .iter()
-            .filter(|(id, _)| id.raw() >= previous.next_metadata_node_id)
-            .map(|(id, node)| (*id, node.clone()))
-            .collect();
-        let mut referenced_segment_ids = BTreeSet::new();
-        for node in metadata_nodes.values() {
-            if let MetadataNodeKind::Leaf { entries, .. } = &node.kind {
-                referenced_segment_ids.extend(entries.iter().map(|entry| entry.segment_id));
-            }
-        }
-        let commit_groups: BTreeMap<_, _> = metadata
-            .commit_groups
-            .iter()
-            .filter(|(id, _)| id.raw() >= previous.next_commit_group_id)
-            .map(|(id, group)| (*id, group.clone()))
-            .collect();
-        let keyspace_commits: Vec<_> = metadata
-            .keyspace_commits
-            .iter()
-            .filter(|commit| commit.commit_seq.raw() >= previous.next_commit_seq)
-            .cloned()
-            .collect();
-        let file_commits: Vec<_> = metadata
-            .file_commits
-            .iter()
-            .filter(|commit| commit.commit_seq.raw() >= previous.next_commit_seq)
-            .cloned()
-            .collect();
-
-        let mut cursor = previous.clone();
-        cursor.config = self.metadata.config;
-        for id in keyspace_roots.keys() {
-            cursor.next_keyspace_root_id = next_after_u128(cursor.next_keyspace_root_id, id.raw())?;
-        }
-        for id in keyspace_catalog_shards.keys() {
-            cursor.next_keyspace_catalog_shard_id =
-                next_after_u128(cursor.next_keyspace_catalog_shard_id, id.raw())?;
-        }
-        for id in metadata_nodes.keys() {
-            cursor.next_metadata_node_id = next_after_u128(cursor.next_metadata_node_id, id.raw())?;
-        }
-        for id in commit_groups.keys() {
-            cursor.next_commit_group_id = next_after_u128(cursor.next_commit_group_id, id.raw())?;
-        }
-        for commit in &keyspace_commits {
-            cursor.next_commit_seq = cursor.next_commit_seq.max(
-                commit
-                    .commit_seq
-                    .raw()
-                    .checked_add(1)
-                    .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?,
-            );
-        }
-        for commit in &file_commits {
-            cursor.next_commit_seq = cursor.next_commit_seq.max(
-                commit
-                    .commit_seq
-                    .raw()
-                    .checked_add(1)
-                    .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?,
-            );
-        }
-
-        Ok(NativeMetadataDelta {
-            cursor,
-            keyspace_heads: BTreeMap::from([(stream.keyspace_id, keyspace_head)]),
-            keyspace_roots,
-            keyspace_catalog_shards,
-            file_writer_epochs: metadata
-                .file_writer_epochs
-                .get(&(stream.keyspace_id, stream.file_id))
-                .copied()
-                .map(|epoch| ((stream.keyspace_id, stream.file_id), epoch))
-                .into_iter()
-                .collect(),
-            append_streams: vec![append_stream],
-            metadata_nodes,
-            referenced_segment_ids,
-            commit_groups,
-            keyspace_commits,
-            file_commits,
-        })
+    ) -> Result<Option<NativeMetadataDelta>> {
+        self.native_metadata_delta_through_inner(target_commit, previous, Some(stream))
     }
 
     fn native_metadata_delta_through(
         &self,
         target_commit: CommitSeq,
         previous: &DurableExportCursor,
+    ) -> Result<Option<NativeMetadataDelta>> {
+        self.native_metadata_delta_through_inner(target_commit, previous, None)
+    }
+
+    fn native_metadata_delta_through_inner(
+        &self,
+        target_commit: CommitSeq,
+        previous: &DurableExportCursor,
+        append_stream: Option<&AppendStream>,
     ) -> Result<Option<NativeMetadataDelta>> {
         fn in_range(seq: CommitSeq, previous: &DurableExportCursor, target: CommitSeq) -> bool {
             seq.raw() >= previous.next_commit_seq && seq.raw() <= target.raw()
@@ -833,7 +715,20 @@ impl LocalCoordinator {
         }
 
         let metadata = lock(&self.metadata.inner)?;
-        if previous.next_gc_epoch != metadata.next_gc_epoch || !metadata.append_streams.is_empty() {
+        let append_stream_export = if let Some(stream) = append_stream {
+            let stream_state = metadata
+                .append_streams
+                .get(&stream.stream_id)
+                .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+            stream_state.validate_token(stream)?;
+            Some(stream_state.durable_export_at(stream_state.durable_through)?)
+        } else {
+            if !metadata.append_streams.is_empty() {
+                return Ok(None);
+            }
+            None
+        };
+        if previous.next_gc_epoch != metadata.next_gc_epoch {
             return Ok(None);
         }
         if metadata
@@ -894,6 +789,13 @@ impl LocalCoordinator {
             .cloned()
             .collect();
         if file_commits.is_empty() || file_commits.iter().any(|commit| commit.old_root.is_none()) {
+            return Ok(None);
+        }
+        if let Some(stream) = append_stream
+            && !file_commits.iter().any(|commit| {
+                commit.keyspace_id == stream.keyspace_id && commit.file_id == stream.file_id
+            })
+        {
             return Ok(None);
         }
 
@@ -994,7 +896,7 @@ impl LocalCoordinator {
             keyspace_roots,
             keyspace_catalog_shards,
             file_writer_epochs,
-            append_streams: Vec::new(),
+            append_streams: append_stream_export.into_iter().collect(),
             metadata_nodes,
             referenced_segment_ids,
             commit_groups,

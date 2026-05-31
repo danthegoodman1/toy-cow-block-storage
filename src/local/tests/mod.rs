@@ -3418,8 +3418,8 @@ fn durable_append_stream_publish_delta_does_not_reappend_flushed_payloads() {
 }
 
 #[test]
-fn durable_append_stream_publish_delta_coalesces_exported_high_water() {
-    let root = durable_temp_dir("stream-publish-coalesces-high-water");
+fn durable_append_stream_publish_delta_is_target_bounded() {
+    let root = durable_temp_dir("stream-publish-target-bounded");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let keyspace_id = store
@@ -3484,27 +3484,155 @@ fn durable_append_stream_publish_delta_coalesces_exported_high_water() {
     assert_eq!(
         profiles.len(),
         1,
-        "the first publish persist should export both already-local commits"
+        "the first publish persist should export the requested commit"
     );
     assert_eq!(profiles[0].new_segment_bytes, 0);
     assert!(
-        profiles[0].durable_commit_high_water >= commit_b.commit_seq.raw(),
-        "publish delta should advance the durable high-water through coalesced local publishes"
+        profiles[0].durable_commit_high_water >= commit_a.commit_seq.raw(),
+        "publish delta must advance the durable high-water through the requested commit"
+    );
+    assert!(
+        profiles[0].durable_commit_high_water < commit_b.commit_seq.raw(),
+        "publish delta should not scan forward and export unrelated later commits"
     );
 
     store
         .persist_append_stream_publish_delta(&stream_b, commit_b.commit_seq, &changed_b)
         .unwrap();
-    assert!(
-        store.drain_persist_profiles(16).unwrap().is_empty(),
-        "a publish whose commit is already durable must not run a redundant physical persist"
-    );
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].new_segment_bytes, 0);
+    assert!(profiles[0].durable_commit_high_water >= commit_b.commit_seq.raw());
 
     store.flush_file(keyspace_id, file_b).unwrap();
     assert!(
         store.drain_persist_profiles(16).unwrap().is_empty(),
         "flush_file should also observe the coalesced durable high-water"
     );
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut read_a = vec![0; payload_a.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_a,
+            ByteRange::new(0, payload_a.len() as u64),
+            &mut read_a,
+        )
+        .unwrap();
+    assert_eq!(read_a, payload_a);
+    let mut read_b = vec![0; payload_b.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_b,
+            ByteRange::new(0, payload_b.len() as u64),
+            &mut read_b,
+        )
+        .unwrap();
+    assert_eq!(read_b, payload_b);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_concurrent_append_stream_publish_persists_to_requested_high_water() {
+    let root = durable_temp_dir("stream-publish-requested-high-water");
+    let cfg = config();
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_a = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("a".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let file_b = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("b".to_string()),
+                },
+            },
+        )
+        .unwrap();
+
+    let stream_a = store.open_append_stream(keyspace_id, file_a).unwrap();
+    let payload_a = repeated_blocks(1, 63);
+    store
+        .append_stream(&stream_a, &payload_a, WriteDurability::Acknowledged)
+        .unwrap();
+    let mark_a = store.flush_append_stream(&stream_a).unwrap();
+
+    let stream_b = store.open_append_stream(keyspace_id, file_b).unwrap();
+    let payload_b = repeated_blocks(1, 64);
+    store
+        .append_stream(&stream_b, &payload_b, WriteDurability::Acknowledged)
+        .unwrap();
+    let mark_b = store.flush_append_stream(&stream_b).unwrap();
+
+    let commit_a = store
+        .local
+        .publish_append_stream(&stream_a, &mark_a, WriteDurability::Flushed)
+        .unwrap();
+    let commit_b = store
+        .local
+        .publish_append_stream(&stream_b, &mark_b, WriteDurability::Flushed)
+        .unwrap();
+    assert!(commit_b.commit_seq > commit_a.commit_seq);
+
+    store.enable_persist_profiling(16).unwrap();
+    let persist_guard = lock(&store.persist_lock).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let first = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let stream = stream_a.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            store.persist_append_stream_publish_delta(
+                &stream,
+                commit_a.commit_seq,
+                &BTreeSet::new(),
+            )
+        })
+    };
+    let second = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let stream = stream_b.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            store.persist_append_stream_publish_delta(
+                &stream,
+                commit_b.commit_seq,
+                &BTreeSet::new(),
+            )
+        })
+    };
+    barrier.wait();
+    thread::sleep(Duration::from_millis(20));
+    drop(persist_guard);
+    first.join().unwrap().unwrap();
+    second.join().unwrap().unwrap();
+
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert_eq!(
+        profiles.len(),
+        1,
+        "concurrent publish waiters should share one target-bounded physical persist"
+    );
+    assert_eq!(profiles[0].new_segment_bytes, 0);
+    assert!(profiles[0].durable_commit_high_water >= commit_b.commit_seq.raw());
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
