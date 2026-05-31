@@ -2172,11 +2172,11 @@ impl LocalCoordinator {
         })
     }
 
-    fn native_publish_delta_since(
+    fn native_append_publish_delta_since(
         &self,
         stream: &AppendStream,
         previous: &DurableExportCursor,
-    ) -> Result<NativePublishDelta> {
+    ) -> Result<NativeMetadataDelta> {
         fn next_after_u128(current: u128, raw: u128) -> Result<u128> {
             Ok(current.max(
                 raw.checked_add(1)
@@ -2287,23 +2287,264 @@ impl LocalCoordinator {
             );
         }
 
-        Ok(NativePublishDelta {
+        Ok(NativeMetadataDelta {
             cursor,
             keyspace_heads: BTreeMap::from([(stream.keyspace_id, keyspace_head)]),
             keyspace_roots,
             keyspace_catalog_shards,
-            file_writer_epoch: metadata
+            file_writer_epochs: metadata
                 .file_writer_epochs
                 .get(&(stream.keyspace_id, stream.file_id))
                 .copied()
-                .map(|epoch| ((stream.keyspace_id, stream.file_id), epoch)),
-            append_stream,
+                .map(|epoch| ((stream.keyspace_id, stream.file_id), epoch))
+                .into_iter()
+                .collect(),
+            append_streams: vec![append_stream],
             metadata_nodes,
             referenced_segment_ids,
             commit_groups,
             keyspace_commits,
             file_commits,
         })
+    }
+
+    fn native_metadata_delta_through(
+        &self,
+        target_commit: CommitSeq,
+        previous: &DurableExportCursor,
+    ) -> Result<Option<NativeMetadataDelta>> {
+        fn in_range(seq: CommitSeq, previous: &DurableExportCursor, target: CommitSeq) -> bool {
+            seq.raw() >= previous.next_commit_seq && seq.raw() <= target.raw()
+        }
+
+        fn next_after_u128(current: u128, raw: u128) -> Result<u128> {
+            Ok(current.max(
+                raw.checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("durable cursor id overflow"))?,
+            ))
+        }
+
+        let metadata = lock(&self.metadata.inner)?;
+        if previous.next_gc_epoch != metadata.next_gc_epoch || !metadata.append_streams.is_empty() {
+            return Ok(None);
+        }
+        if metadata
+            .shard_commits
+            .iter()
+            .any(|commit| in_range(commit.commit_seq, previous, target_commit))
+            || metadata
+                .fork_records
+                .keys()
+                .any(|commit| in_range(*commit, previous, target_commit))
+            || metadata
+                .delete_records
+                .keys()
+                .any(|commit| in_range(*commit, previous, target_commit))
+            || metadata
+                .checkpoints
+                .values()
+                .any(|checkpoint| in_range(checkpoint.commit_seq, previous, target_commit))
+        {
+            return Ok(None);
+        }
+
+        let commit_groups: BTreeMap<_, _> = metadata
+            .commit_groups
+            .iter()
+            .filter(|(_, group)| in_range(group.commit_seq, previous, target_commit))
+            .map(|(id, group)| (*id, group.clone()))
+            .collect();
+        if commit_groups.is_empty() {
+            return Ok(None);
+        }
+        if commit_groups.values().any(|group| {
+            !matches!(group.owner, MappingOwner::NativeKeyspace(_))
+                || group.updates.iter().any(|update| {
+                    !matches!(
+                        update,
+                        RootUpdate::FileRoot {
+                            old_root: _,
+                            new_root: _,
+                            ..
+                        }
+                    )
+                })
+        }) {
+            return Ok(None);
+        }
+
+        let keyspace_commits: Vec<_> = metadata
+            .keyspace_commits
+            .iter()
+            .filter(|commit| in_range(commit.commit_seq, previous, target_commit))
+            .cloned()
+            .collect();
+        let file_commits: Vec<_> = metadata
+            .file_commits
+            .iter()
+            .filter(|commit| in_range(commit.commit_seq, previous, target_commit))
+            .cloned()
+            .collect();
+        if file_commits.is_empty() || file_commits.iter().any(|commit| commit.old_root.is_none()) {
+            return Ok(None);
+        }
+
+        let mut keyspace_heads = BTreeMap::new();
+        let mut keyspace_roots = BTreeMap::new();
+        let mut keyspace_catalog_shards = BTreeMap::new();
+        let mut metadata_nodes = BTreeMap::new();
+        let mut referenced_segment_ids = BTreeSet::new();
+        let mut file_writer_epochs = Vec::new();
+
+        let touched_keyspaces: BTreeSet<_> = keyspace_commits
+            .iter()
+            .map(|commit| commit.keyspace_id)
+            .chain(file_commits.iter().map(|commit| commit.keyspace_id))
+            .collect();
+        for keyspace_id in touched_keyspaces {
+            let mut head = metadata
+                .keyspace_heads
+                .get(&keyspace_id)
+                .cloned()
+                .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+            if head.latest_commit.raw() > target_commit.raw() {
+                head.root = InMemoryMetadataPlane::replay_keyspace_root_locked(
+                    &metadata,
+                    keyspace_id,
+                    target_commit,
+                    None,
+                )?;
+                head.latest_commit = Self::latest_keyspace_commit_at_or_before(
+                    &metadata,
+                    keyspace_id,
+                    target_commit,
+                );
+            }
+            keyspace_heads.insert(keyspace_id, head.clone());
+            Self::collect_native_delta_keyspace_root(
+                &metadata,
+                head.root,
+                previous,
+                &mut keyspace_roots,
+                &mut keyspace_catalog_shards,
+            )?;
+        }
+
+        let touched_files: BTreeSet<_> = file_commits
+            .iter()
+            .map(|commit| (commit.keyspace_id, commit.file_id))
+            .collect();
+        for key in &touched_files {
+            if let Some(epoch) = metadata.file_writer_epochs.get(key).copied() {
+                file_writer_epochs.push((*key, epoch));
+            }
+        }
+
+        for commit in &file_commits {
+            Self::collect_native_delta_metadata_root(
+                &metadata,
+                commit.new_root,
+                previous,
+                &mut metadata_nodes,
+                &mut referenced_segment_ids,
+            )?;
+        }
+
+        let mut cursor = previous.clone();
+        cursor.config = self.metadata.config;
+        for id in keyspace_roots.keys() {
+            cursor.next_keyspace_root_id = next_after_u128(cursor.next_keyspace_root_id, id.raw())?;
+        }
+        for id in keyspace_catalog_shards.keys() {
+            cursor.next_keyspace_catalog_shard_id =
+                next_after_u128(cursor.next_keyspace_catalog_shard_id, id.raw())?;
+        }
+        for id in metadata_nodes.keys() {
+            cursor.next_metadata_node_id = next_after_u128(cursor.next_metadata_node_id, id.raw())?;
+        }
+        for id in commit_groups.keys() {
+            cursor.next_commit_group_id = next_after_u128(cursor.next_commit_group_id, id.raw())?;
+        }
+        cursor.next_commit_seq = target_commit
+            .raw()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?
+            .max(cursor.next_commit_seq);
+        drop(metadata);
+        cursor.next_write_intent = *lock(&self.next_write_intent)?;
+        cursor.next_extent_id = *lock(&self.next_extent_id)?;
+        cursor.next_segment_id = *lock(&self.storage_nodes.next_segment_id)?;
+        cursor.next_placement_index = *lock(&self.storage_nodes.next_placement_index)?;
+
+        Ok(Some(NativeMetadataDelta {
+            cursor,
+            keyspace_heads,
+            keyspace_roots,
+            keyspace_catalog_shards,
+            file_writer_epochs,
+            append_streams: Vec::new(),
+            metadata_nodes,
+            referenced_segment_ids,
+            commit_groups,
+            keyspace_commits,
+            file_commits,
+        }))
+    }
+
+    fn collect_native_delta_keyspace_root(
+        metadata: &MetadataInner,
+        root_id: KeyspaceRootId,
+        previous: &DurableExportCursor,
+        keyspace_roots: &mut BTreeMap<KeyspaceRootId, KeyspaceRoot>,
+        keyspace_catalog_shards: &mut BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>,
+    ) -> Result<()> {
+        let root = InMemoryMetadataPlane::keyspace_root_locked(metadata, root_id)?;
+        if root_id.raw() >= previous.next_keyspace_root_id {
+            keyspace_roots.insert(root_id, root.clone());
+        }
+        for shard_id in root.shard_roots.iter().copied() {
+            if shard_id.raw() < previous.next_keyspace_catalog_shard_id {
+                continue;
+            }
+            let shard = InMemoryMetadataPlane::keyspace_catalog_shard_locked(metadata, shard_id)?;
+            keyspace_catalog_shards.insert(shard_id, shard);
+        }
+        Ok(())
+    }
+
+    fn collect_native_delta_metadata_root(
+        metadata: &MetadataInner,
+        root: MetadataNodeId,
+        previous: &DurableExportCursor,
+        metadata_nodes: &mut BTreeMap<MetadataNodeId, MetadataNode>,
+        referenced_segment_ids: &mut BTreeSet<SegmentId>,
+    ) -> Result<()> {
+        if root.raw() < previous.next_metadata_node_id || metadata_nodes.contains_key(&root) {
+            return Ok(());
+        }
+        let node = metadata
+            .metadata_nodes
+            .get(&root)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("metadata_node", root.to_string()))?;
+        match &node.kind {
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    Self::collect_native_delta_metadata_root(
+                        metadata,
+                        child.node_id,
+                        previous,
+                        metadata_nodes,
+                        referenced_segment_ids,
+                    )?;
+                }
+            }
+            MetadataNodeKind::Leaf { entries } => {
+                referenced_segment_ids.extend(entries.iter().map(|entry| entry.segment_id));
+            }
+        }
+        metadata_nodes.insert(root, node);
+        Ok(())
     }
 
     fn verify_segment_payloads_for_read(
@@ -5348,13 +5589,13 @@ struct DurableExportCursor {
 }
 
 #[derive(Debug, Clone)]
-struct NativePublishDelta {
+struct NativeMetadataDelta {
     cursor: DurableExportCursor,
     keyspace_heads: BTreeMap<KeyspaceId, KeyspaceHead>,
     keyspace_roots: BTreeMap<KeyspaceRootId, KeyspaceRoot>,
     keyspace_catalog_shards: BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>,
-    file_writer_epoch: Option<((KeyspaceId, FileId), WriterEpoch)>,
-    append_stream: AppendStreamState,
+    file_writer_epochs: Vec<((KeyspaceId, FileId), WriterEpoch)>,
+    append_streams: Vec<AppendStreamState>,
     metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
     referenced_segment_ids: BTreeSet<SegmentId>,
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
@@ -6010,9 +6251,17 @@ impl DurableSqliteStore {
             .fold(0_u64, u64::saturating_add);
 
         let started = Instant::now();
-        let (appended, data_log_profile) =
-            self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?;
-        let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
+        let (appended, data_log_profile, data_log_append_sync_nanos) = if segments.is_empty() {
+            (
+                PendingDataLogAppend::default(),
+                DataLogAppendProfile::default(),
+                0,
+            )
+        } else {
+            let (appended, profile) =
+                self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?;
+            (appended, profile, duration_nanos_u64(started.elapsed()))
+        };
 
         let started = Instant::now();
         let touched_node_count =
@@ -6052,11 +6301,12 @@ impl DurableSqliteStore {
         })
     }
 
-    fn persist_append_stream_publish_delta(
+    fn persist_native_metadata_delta(
         &self,
-        delta: &NativePublishDelta,
+        delta: &NativeMetadataDelta,
         nodes: &SelectedStorageNodeState,
         changed_segments: &BTreeSet<SegmentId>,
+        segments: Vec<DurableSegmentPayload>,
     ) -> Result<DurablePersistProfile> {
         let total_started = Instant::now();
         #[cfg(test)]
@@ -6072,12 +6322,32 @@ impl DurableSqliteStore {
             }
         }
 
+        let new_segment_count = usize_to_u64(segments.len());
+        let new_segment_bytes = segments
+            .iter()
+            .map(|segment| usize_to_u64(segment.bytes.len()))
+            .fold(0_u64, u64::saturating_add);
+
+        let started = Instant::now();
+        let (appended, data_log_profile, data_log_append_sync_nanos) = if segments.is_empty() {
+            (
+                PendingDataLogAppend::default(),
+                DataLogAppendProfile::default(),
+                0,
+            )
+        } else {
+            let (appended, profile) =
+                self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?;
+            (appended, profile, duration_nanos_u64(started.elapsed()))
+        };
+        let pre_root_pending_segments = appended.segment_ids();
+
         let started = Instant::now();
         let touched_node_count = self.persist_selected_node_catalog_publish(
             nodes,
             changed_segments,
-            PendingDataLogAppend::default(),
-            &BTreeSet::new(),
+            appended,
+            &pre_root_pending_segments,
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
@@ -6085,7 +6355,7 @@ impl DurableSqliteStore {
         let previous_cursor = load_export_cursor(&conn)?;
         let tx = conn.transaction().map_err(sqlite_error)?;
         let started = Instant::now();
-        persist_row_native_append_stream_publish_delta(&tx, previous_cursor.as_ref(), delta)?;
+        persist_row_native_metadata_delta(&tx, previous_cursor.as_ref(), delta)?;
         let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
         let started = Instant::now();
         tx.commit().map_err(sqlite_error)?;
@@ -6093,9 +6363,16 @@ impl DurableSqliteStore {
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
+            data_log_append_sync_nanos,
+            data_log_encode_nanos: data_log_profile.encode_nanos,
+            data_log_write_nanos: data_log_profile.write_nanos,
+            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
             node_catalog_publish_nanos,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
+            new_segment_count,
+            new_segment_bytes,
             touched_node_count,
             durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()
@@ -7176,10 +7453,10 @@ fn stream_flush_cursor(
     cursor
 }
 
-fn persist_row_native_append_stream_publish_delta(
+fn persist_row_native_metadata_delta(
     tx: &rusqlite::Transaction<'_>,
     previous_cursor: Option<&DurableExportCursor>,
-    delta: &NativePublishDelta,
+    delta: &NativeMetadataDelta,
 ) -> Result<()> {
     let previous_u128 = |cursor_value: fn(&DurableExportCursor) -> u128| {
         previous_cursor.map(cursor_value).unwrap_or(0)
@@ -7216,10 +7493,12 @@ fn persist_row_native_append_stream_publish_delta(
         previous_u128(|cursor| cursor.next_keyspace_catalog_shard_id),
         false,
     )?;
-    if let Some(((keyspace_id, file_id), epoch)) = delta.file_writer_epoch {
-        upsert_file_writer_epoch(tx, keyspace_id, file_id, epoch)?;
+    for ((keyspace_id, file_id), epoch) in &delta.file_writer_epochs {
+        upsert_file_writer_epoch(tx, *keyspace_id, *file_id, *epoch)?;
     }
-    upsert_append_stream(tx, &delta.append_stream)?;
+    for append_stream in &delta.append_streams {
+        upsert_append_stream(tx, append_stream)?;
+    }
     sync_u128_payload_map_since(
         tx,
         "metadata_nodes",
@@ -9899,6 +10178,34 @@ impl DurableCoordinator {
         } else {
             None
         };
+        if pending_append.is_empty()
+            && let (Some(target_commit), Some(previous_cursor)) =
+                (target_commit, previous_cursor.as_ref())
+            && let Some(delta) = self
+                .local
+                .native_metadata_delta_through(target_commit, previous_cursor)?
+        {
+            let segment_ids = delta.referenced_segment_ids.clone();
+            let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+            let new_segments: Vec<_> = payloads
+                .into_iter()
+                .filter(|payload| !previous_segments.contains(&payload.segment_id))
+                .collect();
+            let mut profile = self.durable.persist_native_metadata_delta(
+                &delta,
+                &nodes,
+                &segment_ids,
+                new_segments,
+            )?;
+            lock(&self.persisted_segments)?.extend(segment_ids);
+            *lock(&self.pending_data_log_append)? = PendingDataLogAppend::default();
+            profile.lock_wait_nanos = lock_wait_nanos;
+            profile.local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+            profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+            let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+            self.record_persist_profile(profile)?;
+            return Ok(durable_through);
+        }
         let (image, current_segments, new_segments) = if let Some(target_commit) = target_commit {
             self.local.state_for_durable_persist_through(
                 &exported_segments,
@@ -10094,7 +10401,7 @@ impl DurableCoordinator {
         }
         let delta = self
             .local
-            .native_publish_delta_since(stream, &previous_cursor)?;
+            .native_append_publish_delta_since(stream, &previous_cursor)?;
         let previous_segments = lock(&self.persisted_segments)?.clone();
         if delta
             .referenced_segment_ids
@@ -10111,9 +10418,12 @@ impl DurableCoordinator {
             .selected_state_for_segment_ids(&changed_segments)?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
-        let mut profile =
-            self.durable
-                .persist_append_stream_publish_delta(&delta, &nodes, &changed_segments)?;
+        let mut profile = self.durable.persist_native_metadata_delta(
+            &delta,
+            &nodes,
+            &changed_segments,
+            Vec::new(),
+        )?;
         let durable_high_water = CommitSeq::from_raw(profile.durable_commit_high_water);
         if durable_high_water < commit_seq {
             return Err(StorageError::conflict(
