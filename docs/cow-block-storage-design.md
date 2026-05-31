@@ -144,6 +144,15 @@ observed device generation. The number of shards is fixed for a device lineage
 in v1. A later format may change that, but only by updating this spec and the
 deterministic tests in the same change.
 
+Durable providers store this logical device head as a stable device manifest
+plus one mutable row per shard head. The manifest records device identity and
+fixed shard shape; per-shard rows record the current root, generation, and
+latest commit for that shard. Reopen reconstructs the logical `DeviceHead` by
+combining the manifest with all shard rows. This keeps the physical metadata
+convergence point aligned with the logical fence: same-shard writes still
+contend on the same shard row, while same-device different-shard writes no
+longer rewrite one whole-device head payload.
+
 The logical state of a live native file is:
 
 ```text

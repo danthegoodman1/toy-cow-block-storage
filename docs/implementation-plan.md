@@ -1466,6 +1466,40 @@ the 32-write debt fixture about 5.1 ms, and an explicitly throttled write
 decision about 74 us. Treat these as regression smoke baselines; durable write
 latency on this host is dominated by the fsync path.
 
+## Phase 24B: Block Per-Shard Durable Heads and Contention Profiling
+
+Status: complete.
+
+Align the durable block-device metadata layout with the logical shard-fenced
+CoW model, and make `loadbench` identify whether contention is logical,
+pre-SQLite convergence, or the shared SQLite/persist path.
+
+Deliverables:
+
+- [x] Durable block heads are stored as `device_manifests` plus
+  `device_shard_heads`, with matching deleted-device tables.
+- [x] Reopen reconstructs the logical `DeviceHead` from per-shard rows.
+- [x] Single-shard writes update one shard-head row while leaving the device
+  manifest unchanged.
+- [x] `loadbench` has a `block-metadata` alias covering same-shard contended,
+  same-shard serialized, same-device/different-shard, and different-device
+  block writes.
+- [x] Durable profile CSV includes persist-lock wait, SQLite lock wait,
+  row-sync/commit time, metadata publish lock wait, commit sequence allocation
+  time, touched shard-head rows, touched manifest rows, commit rows, and
+  logical conflict counts.
+
+Exit gate:
+
+- [x] Same-shard stale writes still conflict, and same-device different-shard
+  writes still merge.
+- [x] Reopen, fork, PITR, delete, and GC tests pass with the per-shard durable
+  row layout.
+- [x] The old whole-device durable head tables are removed rather than kept as
+  compatibility shims.
+- [x] Benchmark output can distinguish reduced logical/pre-SQLite convergence
+  from remaining SQLite single-writer or global persist-lock contention.
+
 ## Phase 25: Coordinator / Metadata / Storage-Node Boundary Refactor
 
 Status: complete.

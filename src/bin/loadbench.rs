@@ -4,8 +4,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -243,10 +243,14 @@ options:\n\
   --provider local|durable                 default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch, append-stream\n\
+                                           aliases: north-star, append-batch, append-stream, block-metadata\n\
                                            names: block-write-4k,\n\
-                                           block-write-4k-shard-lanes, block-read-4k,\n\
+                                           block-write-4k-same-shard-contended,\n\
+                                           block-write-4k-same-shard-serialized,\n\
+                                           block-write-4k-shard-lanes,\n\
+                                           block-write-4k-device-lanes, block-read-4k,\n\
                                            block-write-1m, block-write-1m-shard-lanes,\n\
+                                           block-write-1m-device-lanes,\n\
                                            native-read-4k,\n\
                                            native-write-4k, native-write-1m,\n\
                                            native-write-4m, native-write-32m,\n\
@@ -339,6 +343,7 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
             "north-star" | "all" => workloads.extend(Workload::north_star_suite()),
             "append-batch" => workloads.extend(Workload::append_batch_suite()),
             "append-stream" => workloads.extend(Workload::append_stream_suite()),
+            "block-metadata" => workloads.extend(Workload::block_metadata_suite()),
             _ => workloads.push(Workload::from_str(part)?),
         }
     }
@@ -452,10 +457,14 @@ impl FromStr for DelayMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Workload {
     BlockWrite4k,
+    BlockWrite4kSameShardContended,
+    BlockWrite4kSameShardSerialized,
     BlockWrite4kShardLanes,
+    BlockWrite4kDeviceLanes,
     BlockRead4k,
     BlockWrite1m,
     BlockWrite1mShardLanes,
+    BlockWrite1mDeviceLanes,
     NativeRead4k,
     NativeWrite4k,
     NativeWrite1m,
@@ -520,13 +529,28 @@ impl Workload {
         ]
     }
 
+    fn block_metadata_suite() -> Vec<Self> {
+        vec![
+            Self::BlockWrite4kSameShardContended,
+            Self::BlockWrite4kSameShardSerialized,
+            Self::BlockWrite4kShardLanes,
+            Self::BlockWrite4kDeviceLanes,
+            Self::BlockWrite1mShardLanes,
+            Self::BlockWrite1mDeviceLanes,
+        ]
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::BlockWrite4k => "block-write-4k",
+            Self::BlockWrite4kSameShardContended => "block-write-4k-same-shard-contended",
+            Self::BlockWrite4kSameShardSerialized => "block-write-4k-same-shard-serialized",
             Self::BlockWrite4kShardLanes => "block-write-4k-shard-lanes",
+            Self::BlockWrite4kDeviceLanes => "block-write-4k-device-lanes",
             Self::BlockRead4k => "block-read-4k",
             Self::BlockWrite1m => "block-write-1m",
             Self::BlockWrite1mShardLanes => "block-write-1m-shard-lanes",
+            Self::BlockWrite1mDeviceLanes => "block-write-1m-device-lanes",
             Self::NativeRead4k => "native-read-4k",
             Self::NativeWrite4k => "native-write-4k",
             Self::NativeWrite1m => "native-write-1m",
@@ -552,6 +576,7 @@ impl Workload {
         match self {
             Self::BlockWrite1m
             | Self::BlockWrite1mShardLanes
+            | Self::BlockWrite1mDeviceLanes
             | Self::NativeWrite1m
             | Self::NativeAppend1m
             | Self::NativeStreamIngest1m
@@ -567,7 +592,10 @@ impl Workload {
             | Self::NativeStreamIngest32m
             | Self::NativeStreamAppendFlush32m => 32 * 1024 * 1024,
             Self::BlockWrite4k
+            | Self::BlockWrite4kSameShardContended
+            | Self::BlockWrite4kSameShardSerialized
             | Self::BlockWrite4kShardLanes
+            | Self::BlockWrite4kDeviceLanes
             | Self::BlockRead4k
             | Self::NativeWrite4k
             | Self::NativeRead4k
@@ -639,10 +667,21 @@ impl Workload {
         matches!(
             self,
             Self::BlockWrite4k
+                | Self::BlockWrite4kSameShardContended
+                | Self::BlockWrite4kSameShardSerialized
                 | Self::BlockWrite4kShardLanes
+                | Self::BlockWrite4kDeviceLanes
                 | Self::BlockRead4k
                 | Self::BlockWrite1m
                 | Self::BlockWrite1mShardLanes
+                | Self::BlockWrite1mDeviceLanes
+        )
+    }
+
+    fn is_block_device_lanes(self) -> bool {
+        matches!(
+            self,
+            Self::BlockWrite4kDeviceLanes | Self::BlockWrite1mDeviceLanes
         )
     }
 }
@@ -653,10 +692,14 @@ impl FromStr for Workload {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "block-write-4k" => Ok(Self::BlockWrite4k),
+            "block-write-4k-same-shard-contended" => Ok(Self::BlockWrite4kSameShardContended),
+            "block-write-4k-same-shard-serialized" => Ok(Self::BlockWrite4kSameShardSerialized),
             "block-write-4k-shard-lanes" => Ok(Self::BlockWrite4kShardLanes),
+            "block-write-4k-device-lanes" => Ok(Self::BlockWrite4kDeviceLanes),
             "block-read-4k" => Ok(Self::BlockRead4k),
             "block-write-1m" => Ok(Self::BlockWrite1m),
             "block-write-1m-shard-lanes" => Ok(Self::BlockWrite1mShardLanes),
+            "block-write-1m-device-lanes" => Ok(Self::BlockWrite1mDeviceLanes),
             "native-read-4k" => Ok(Self::NativeRead4k),
             "native-write-4k" => Ok(Self::NativeWrite4k),
             "native-write-1m" => Ok(Self::NativeWrite1m),
@@ -938,9 +981,11 @@ struct BenchContext {
 enum Target {
     Block {
         device_id: DeviceId,
+        devices: Arc<Vec<DeviceId>>,
         logical_blocks: u64,
         hot_blocks: u64,
         shard_count: usize,
+        serialized_lock: Arc<Mutex<()>>,
     },
     Native {
         keyspace_id: KeyspaceId,
@@ -962,7 +1007,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     }
 
     let store = BenchStore::open(args, &root)?;
-    let context = setup_context(args, workload, store)?;
+    let context = setup_context(args, workload, concurrency, store)?;
     let profile_store = context.store.clone();
     let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
     if !args.warmup.is_zero() {
@@ -1011,14 +1056,14 @@ fn append_profile_csv(
     if write_header {
         writeln!(
             file,
-            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,lock_wait_nanos,local_snapshot_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_dir_sync_nanos,node_catalog_publish_nanos,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,durable_commit_high_water"
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_dir_sync_nanos,node_catalog_publish_nanos,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water"
         )
         .map_err(fs_error)?;
     }
     for profile in profiles {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             workload.name(),
             args.provider,
             args.durability,
@@ -1029,7 +1074,10 @@ fn append_profile_csv(
             profile.sequence,
             profile.total_nanos,
             profile.lock_wait_nanos,
+            profile.sqlite_lock_wait_nanos,
             profile.local_snapshot_nanos,
+            profile.metadata_publish_lock_wait_nanos,
+            profile.commit_sequence_alloc_nanos,
             profile.data_log_append_sync_nanos,
             profile.data_log_encode_nanos,
             profile.data_log_write_nanos,
@@ -1041,6 +1089,10 @@ fn append_profile_csv(
             profile.new_segment_count,
             profile.new_segment_bytes,
             profile.touched_node_count,
+            profile.logical_conflict_count,
+            profile.touched_shard_head_rows,
+            profile.touched_manifest_rows,
+            profile.commit_rows_written,
             profile.durable_commit_high_water,
         )
         .map_err(fs_error)?;
@@ -1048,17 +1100,31 @@ fn append_profile_csv(
     Ok(())
 }
 
-fn setup_context(args: &Args, workload: Workload, store: BenchStore) -> Result<BenchContext> {
+fn setup_context(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: BenchStore,
+) -> Result<BenchContext> {
     let op_size = workload.op_size();
     let payload = Arc::new(make_payload(op_size));
     let target = if workload.is_block() {
-        let device_id = store.create_device(CreateDeviceRequest {
-            spec: DeviceSpec {
-                logical_blocks: args.device_blocks,
-                block_size: BLOCK_SIZE,
-            },
-            name: None,
-        })?;
+        let device_count = if workload.is_block_device_lanes() {
+            concurrency.max(1)
+        } else {
+            1
+        };
+        let mut devices = Vec::with_capacity(device_count);
+        for _ in 0..device_count {
+            devices.push(store.create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: args.device_blocks,
+                    block_size: BLOCK_SIZE,
+                },
+                name: None,
+            })?);
+        }
+        let device_id = devices[0];
         let hot_blocks = if workload.is_read() {
             seed_block_read_workload(&store, device_id, args, &payload)?
         } else {
@@ -1066,9 +1132,11 @@ fn setup_context(args: &Args, workload: Workload, store: BenchStore) -> Result<B
         };
         Target::Block {
             device_id,
+            devices: Arc::new(devices),
             logical_blocks: args.device_blocks,
             hot_blocks,
             shard_count: args.shards,
+            serialized_lock: Arc::new(Mutex::new(())),
         }
     } else {
         let keyspace_id = store.create_keyspace(CreateKeyspaceRequest { name: None })?;
@@ -1427,6 +1495,60 @@ fn run_one_op(
                 shard_count,
                 ..
             },
+            Workload::BlockWrite4kSameShardContended,
+        ) => {
+            let end = logical_blocks
+                .checked_div(*shard_count as u64)
+                .ok_or_else(|| StorageError::invalid_argument("shard count is zero"))?
+                .max(1);
+            let block = rng.below(end);
+            context
+                .store
+                .write_device(
+                    *device_id,
+                    block * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
+        }
+        (
+            Target::Block {
+                device_id,
+                logical_blocks,
+                shard_count,
+                serialized_lock,
+                ..
+            },
+            Workload::BlockWrite4kSameShardSerialized,
+        ) => {
+            let _guard = serialized_lock
+                .lock()
+                .map_err(|_| StorageError::unavailable("serialized block lane lock poisoned"))?;
+            let end = logical_blocks
+                .checked_div(*shard_count as u64)
+                .ok_or_else(|| StorageError::invalid_argument("shard count is zero"))?
+                .max(1);
+            let block = rng.below(end);
+            context
+                .store
+                .write_device(
+                    *device_id,
+                    block * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
+        }
+        (
+            Target::Block {
+                device_id,
+                logical_blocks,
+                shard_count,
+                ..
+            },
             Workload::BlockWrite4kShardLanes,
         ) => {
             let shard_count = *shard_count as u64;
@@ -1444,6 +1566,27 @@ fn run_one_op(
                 .store
                 .write_device(
                     *device_id,
+                    block * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
+        }
+        (
+            Target::Block {
+                devices,
+                logical_blocks,
+                ..
+            },
+            Workload::BlockWrite4kDeviceLanes,
+        ) => {
+            let device_id = devices[worker as usize % devices.len()];
+            let block = rng.below(*logical_blocks);
+            context
+                .store
+                .write_device(
+                    device_id,
                     block * u64::from(BLOCK_SIZE),
                     &context.payload,
                     durability,
@@ -1499,6 +1642,28 @@ fn run_one_op(
                 .write_device(
                     *device_id,
                     block * u64::from(BLOCK_SIZE),
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
+        }
+        (
+            Target::Block {
+                devices,
+                logical_blocks,
+                ..
+            },
+            Workload::BlockWrite1mDeviceLanes,
+        ) => {
+            let device_id = devices[worker as usize % devices.len()];
+            let blocks = (context.op_size as u64) / u64::from(BLOCK_SIZE);
+            let start = rng.below(logical_blocks.saturating_sub(blocks).saturating_add(1));
+            context
+                .store
+                .write_device(
+                    device_id,
+                    start * u64::from(BLOCK_SIZE),
                     &context.payload,
                     durability,
                     config.payload_integrity,
@@ -1741,10 +1906,19 @@ fn maybe_flush(
     }
 
     match &context.target {
-        Target::Block { device_id, .. } => context
-            .store
-            .flush_device(*device_id)
-            .map(|_| OpProgress::default()),
+        Target::Block {
+            device_id, devices, ..
+        } => {
+            let flush_device = if workload.is_block_device_lanes() {
+                devices[worker as usize % devices.len()]
+            } else {
+                *device_id
+            };
+            context
+                .store
+                .flush_device(flush_device)
+                .map(|_| OpProgress::default())
+        }
         Target::Native { .. } if workload.is_native_stream_ingest() => {
             if let Some(stream_state) = state.stream_append.as_mut() {
                 let previous_durable = stream_state.durable_offset;

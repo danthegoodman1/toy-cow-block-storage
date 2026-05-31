@@ -5655,7 +5655,10 @@ pub struct DurablePersistProfile {
     pub sequence: u64,
     pub total_nanos: u64,
     pub lock_wait_nanos: u64,
+    pub sqlite_lock_wait_nanos: u64,
     pub local_snapshot_nanos: u64,
+    pub metadata_publish_lock_wait_nanos: u64,
+    pub commit_sequence_alloc_nanos: u64,
     pub data_log_append_sync_nanos: u64,
     pub data_log_encode_nanos: u64,
     pub data_log_write_nanos: u64,
@@ -5667,7 +5670,78 @@ pub struct DurablePersistProfile {
     pub new_segment_count: u64,
     pub new_segment_bytes: u64,
     pub touched_node_count: u64,
+    pub logical_conflict_count: u64,
+    pub touched_shard_head_rows: u64,
+    pub touched_manifest_rows: u64,
+    pub commit_rows_written: u64,
     pub durable_commit_high_water: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MetadataPublishProfile {
+    lock_wait_nanos: u64,
+    commit_sequence_alloc_nanos: u64,
+    logical_conflict_count: u64,
+    touched_shard_head_rows: u64,
+    touched_manifest_rows: u64,
+    commit_rows_written: u64,
+}
+
+#[derive(Debug)]
+struct MetadataPublishProfiler {
+    capacity: usize,
+    profiles: VecDeque<MetadataPublishProfile>,
+}
+
+impl MetadataPublishProfiler {
+    fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "metadata publish profile capacity must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            capacity,
+            profiles: VecDeque::with_capacity(capacity.min(1024)),
+        })
+    }
+
+    fn record(&mut self, profile: MetadataPublishProfile) {
+        if self.profiles.len() == self.capacity {
+            self.profiles.pop_front();
+        }
+        self.profiles.push_back(profile);
+    }
+
+    fn drain(&mut self, max: usize) -> Vec<MetadataPublishProfile> {
+        let count = max.min(self.profiles.len());
+        self.profiles.drain(..count).collect()
+    }
+}
+
+fn summarize_metadata_publish_profiles(
+    profiles: impl IntoIterator<Item = MetadataPublishProfile>,
+) -> MetadataPublishProfile {
+    let mut out = MetadataPublishProfile::default();
+    for profile in profiles {
+        out.lock_wait_nanos = out.lock_wait_nanos.saturating_add(profile.lock_wait_nanos);
+        out.commit_sequence_alloc_nanos = out
+            .commit_sequence_alloc_nanos
+            .saturating_add(profile.commit_sequence_alloc_nanos);
+        out.logical_conflict_count = out
+            .logical_conflict_count
+            .saturating_add(profile.logical_conflict_count);
+        out.touched_shard_head_rows = out
+            .touched_shard_head_rows
+            .saturating_add(profile.touched_shard_head_rows);
+        out.touched_manifest_rows = out
+            .touched_manifest_rows
+            .saturating_add(profile.touched_manifest_rows);
+        out.commit_rows_written = out
+            .commit_rows_written
+            .saturating_add(profile.commit_rows_written);
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -5887,6 +5961,52 @@ struct NativeMetadataDelta {
     file_commits: Vec<FileCommit>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableDeviceManifest {
+    device_id: DeviceId,
+    shard_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableDeviceShardHead {
+    device_id: DeviceId,
+    shard_id: ShardId,
+    root: MetadataNodeId,
+    generation: DeviceGeneration,
+    latest_commit: CommitSeq,
+}
+
+impl DurableDeviceManifest {
+    fn from_head(head: &DeviceHead) -> Result<Self> {
+        Ok(Self {
+            device_id: head.device_id,
+            shard_count: u64::try_from(head.shard_roots.len())
+                .map_err(|_| StorageError::invalid_argument("device shard count overflows u64"))?,
+        })
+    }
+}
+
+impl DurableDeviceShardHead {
+    fn from_head(
+        head: &DeviceHead,
+        shard_index: usize,
+        root: MetadataNodeId,
+        latest_commit: CommitSeq,
+    ) -> Result<Self> {
+        Ok(Self {
+            device_id: head.device_id,
+            shard_id: ShardId::from_raw(
+                u32::try_from(shard_index).map_err(|_| {
+                    StorageError::invalid_argument("device shard index overflows u32")
+                })?,
+            ),
+            root,
+            generation: DeviceGeneration::from_raw(latest_commit.raw()),
+            latest_commit,
+        })
+    }
+}
+
 impl DurableExportCursor {
     fn from_state(image: &DurableStoreState) -> Self {
         Self {
@@ -5944,6 +6064,7 @@ impl DurableSqliteStore {
         configure_sqlite_connection(&conn)?;
         Self::initialize_schema(&conn)?;
         reject_root_storage_catalog_tables_if_present(&conn)?;
+        reject_legacy_device_head_tables_if_present(&conn)?;
         let node_catalogs = NodeCatalogs::open(&paths, configured_storage_nodes)?;
         if !metadata_existed {
             sync_parent_dir(&paths.metadata)?;
@@ -5999,14 +6120,30 @@ impl DurableSqliteStore {
               device_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS device_heads (
+            CREATE TABLE IF NOT EXISTS device_manifests (
               device_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS deleted_device_heads (
+            CREATE TABLE IF NOT EXISTS deleted_device_manifests (
               device_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS device_shard_heads (
+              row_key TEXT PRIMARY KEY,
+              device_id TEXT NOT NULL,
+              shard_id INTEGER NOT NULL CHECK (shard_id >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_device_shard_heads_device
+              ON device_shard_heads(device_id, shard_id);
+            CREATE TABLE IF NOT EXISTS deleted_device_shard_heads (
+              row_key TEXT PRIMARY KEY,
+              device_id TEXT NOT NULL,
+              shard_id INTEGER NOT NULL CHECK (shard_id >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_deleted_device_shard_heads_device
+              ON deleted_device_shard_heads(device_id, shard_id);
             CREATE TABLE IF NOT EXISTS keyspace_heads (
               keyspace_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
@@ -6324,7 +6461,9 @@ impl DurableSqliteStore {
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
+        let sqlite_lock_started = Instant::now();
         let mut conn = lock(&self.conn)?;
+        let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
         let previous_cursor = load_export_cursor(&conn)?;
         let tx = conn.transaction().map_err(sqlite_error)?;
         let started = Instant::now();
@@ -6338,6 +6477,7 @@ impl DurableSqliteStore {
             profile: DurablePersistProfile {
                 total_nanos: duration_nanos_u64(total_started.elapsed()),
                 data_log_append_sync_nanos,
+                sqlite_lock_wait_nanos,
                 data_log_encode_nanos: data_log_profile.encode_nanos,
                 data_log_write_nanos: data_log_profile.write_nanos,
                 data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
@@ -6599,7 +6739,9 @@ impl DurableSqliteStore {
         let touched_node_count = manifest_touched.max(catalog_touched);
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
+        let sqlite_lock_started = Instant::now();
         let mut conn = lock(&self.conn)?;
+        let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
         let previous_cursor = load_export_cursor(&conn)?;
         let stream_cursor = stream_flush_cursor(previous_cursor.as_ref(), cursor);
         let tx = conn.transaction().map_err(sqlite_error)?;
@@ -6617,6 +6759,7 @@ impl DurableSqliteStore {
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
             data_log_append_sync_nanos,
+            sqlite_lock_wait_nanos,
             data_log_encode_nanos: data_log_profile.encode_nanos,
             data_log_write_nanos: data_log_profile.write_nanos,
             data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
@@ -6682,7 +6825,9 @@ impl DurableSqliteStore {
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
+        let sqlite_lock_started = Instant::now();
         let mut conn = lock(&self.conn)?;
+        let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
         let previous_cursor = load_export_cursor(&conn)?;
         let tx = conn.transaction().map_err(sqlite_error)?;
         let started = Instant::now();
@@ -6695,6 +6840,7 @@ impl DurableSqliteStore {
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
             data_log_append_sync_nanos,
+            sqlite_lock_wait_nanos,
             data_log_encode_nanos: data_log_profile.encode_nanos,
             data_log_write_nanos: data_log_profile.write_nanos,
             data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
@@ -7844,11 +7990,41 @@ fn reject_root_storage_catalog_tables_if_present(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn reject_legacy_device_head_tables_if_present(conn: &Connection) -> Result<()> {
+    for table in ["device_heads", "deleted_device_heads"] {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = ?1
+                 LIMIT 1",
+                params![table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if exists.is_none() {
+            continue;
+        }
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = conn
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(sqlite_error)?;
+        if count > 0 {
+            return Err(StorageError::unsupported(
+                "legacy whole-device head tables are not supported by the per-shard provider",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn reject_orphan_row_native_rows_if_present(conn: &Connection) -> Result<()> {
     for table in [
         "device_specs",
-        "device_heads",
-        "deleted_device_heads",
+        "device_manifests",
+        "deleted_device_manifests",
+        "device_shard_heads",
+        "deleted_device_shard_heads",
         "keyspace_heads",
         "keyspace_roots",
         "keyspace_catalog_shards",
@@ -7903,27 +8079,19 @@ fn persist_row_native_state(
             .map(|(id, spec)| Ok((id.raw().to_string(), encode_row(spec)?)))
             .collect::<Result<Vec<_>>>()?,
     )?;
-    sync_payload_table(
+    sync_device_head_tables(
         tx,
-        "device_heads",
-        "device_id",
-        image
-            .metadata
-            .device_heads
-            .iter()
-            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
-            .collect::<Result<Vec<_>>>()?,
+        "device_manifests",
+        "device_shard_heads",
+        &image.metadata.device_heads,
+        &image.metadata.shard_commits,
     )?;
-    sync_payload_table(
+    sync_device_head_tables(
         tx,
-        "deleted_device_heads",
-        "device_id",
-        image
-            .metadata
-            .deleted_device_heads
-            .iter()
-            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
-            .collect::<Result<Vec<_>>>()?,
+        "deleted_device_manifests",
+        "deleted_device_shard_heads",
+        &image.metadata.deleted_device_heads,
+        &image.metadata.shard_commits,
     )?;
     sync_payload_table(
         tx,
@@ -8533,6 +8701,105 @@ fn sync_payload_table(
     Ok(())
 }
 
+fn device_shard_row_key(device_id: DeviceId, shard_id: ShardId) -> String {
+    format!("{}:{:020}", device_id.raw(), shard_id.raw())
+}
+
+fn sync_device_head_tables(
+    tx: &rusqlite::Transaction<'_>,
+    manifest_table: &str,
+    shard_table: &str,
+    heads: &BTreeMap<DeviceId, DeviceHead>,
+    shard_commits: &[ShardCommit],
+) -> Result<()> {
+    let mut shard_latest_commits: BTreeMap<(DeviceId, ShardId), CommitSeq> = BTreeMap::new();
+    let mut devices_with_shard_commits = BTreeSet::new();
+    for commit in shard_commits {
+        devices_with_shard_commits.insert(commit.device_id);
+        let entry = shard_latest_commits
+            .entry((commit.device_id, commit.shard_id))
+            .or_insert(CommitSeq::from_raw(0));
+        if commit.commit_seq.raw() > entry.raw() {
+            *entry = commit.commit_seq;
+        }
+    }
+
+    let manifests: BTreeMap<String, Vec<u8>> = heads
+        .iter()
+        .map(|(device_id, head)| {
+            let manifest = DurableDeviceManifest::from_head(head)?;
+            Ok((device_id.raw().to_string(), encode_row(&manifest)?))
+        })
+        .collect::<Result<_>>()?;
+    delete_missing_text_keys(tx, manifest_table, "device_id", manifests.keys())?;
+    let manifest_sql = format!(
+        "INSERT INTO {manifest_table}(device_id, payload) VALUES (?1, ?2)
+         ON CONFLICT(device_id) DO UPDATE SET payload = excluded.payload
+         WHERE payload != excluded.payload"
+    );
+    let mut manifest_stmt = tx.prepare(&manifest_sql).map_err(sqlite_error)?;
+    for (device_id, payload) in manifests {
+        manifest_stmt
+            .execute(params![device_id, payload])
+            .map_err(sqlite_error)?;
+    }
+
+    let mut shard_rows: BTreeMap<String, (String, i64, Vec<u8>)> = BTreeMap::new();
+    for head in heads.values() {
+        for (shard_index, root) in head.shard_roots.iter().copied().enumerate() {
+            let shard_id =
+                ShardId::from_raw(u32::try_from(shard_index).map_err(|_| {
+                    StorageError::invalid_argument("device shard index overflows u32")
+                })?);
+            let latest_commit = shard_latest_commits
+                .get(&(head.device_id, shard_id))
+                .copied()
+                .unwrap_or_else(|| {
+                    if devices_with_shard_commits.contains(&head.device_id) {
+                        CommitSeq::from_raw(0)
+                    } else {
+                        head.latest_commit
+                    }
+                });
+            let shard_head =
+                DurableDeviceShardHead::from_head(head, shard_index, root, latest_commit)?;
+            let row_key = device_shard_row_key(head.device_id, shard_head.shard_id);
+            if shard_rows
+                .insert(
+                    row_key,
+                    (
+                        head.device_id.raw().to_string(),
+                        u64_to_i64(u64::from(shard_head.shard_id.raw()))?,
+                        encode_row(&shard_head)?,
+                    ),
+                )
+                .is_some()
+            {
+                return Err(StorageError::corrupt("duplicate device shard head row"));
+            }
+        }
+    }
+    delete_missing_text_keys(tx, shard_table, "row_key", shard_rows.keys())?;
+    let shard_sql = format!(
+        "INSERT INTO {shard_table}(row_key, device_id, shard_id, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(row_key) DO UPDATE SET
+           device_id = excluded.device_id,
+           shard_id = excluded.shard_id,
+           payload = excluded.payload
+         WHERE device_id != excluded.device_id
+            OR shard_id != excluded.shard_id
+            OR payload != excluded.payload"
+    );
+    let mut shard_stmt = tx.prepare(&shard_sql).map_err(sqlite_error)?;
+    for (row_key, (device_id, shard_id, payload)) in shard_rows {
+        shard_stmt
+            .execute(params![row_key, device_id, shard_id, payload])
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
 fn upsert_payload_table_rows(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -8999,8 +9266,18 @@ fn load_metadata_inner(conn: &Connection, cursor: &DurableExportCursor) -> Resul
     metadata.next_checkpoint_id = cursor.next_checkpoint_id;
     metadata.next_gc_epoch = cursor.next_gc_epoch;
     metadata.device_specs = load_device_specs(conn)?;
-    metadata.device_heads = load_device_heads(conn, "device_heads")?;
-    metadata.deleted_device_heads = load_device_heads(conn, "deleted_device_heads")?;
+    metadata.device_heads = load_device_heads(
+        conn,
+        "device_manifests",
+        "device_shard_heads",
+        cursor.config,
+    )?;
+    metadata.deleted_device_heads = load_device_heads(
+        conn,
+        "deleted_device_manifests",
+        "deleted_device_shard_heads",
+        cursor.config,
+    )?;
     metadata.keyspace_heads = load_keyspace_heads(conn)?;
     metadata.keyspace_roots = load_keyspace_roots(conn)?;
     metadata.keyspace_catalog_shards = load_keyspace_catalog_shards(conn)?;
@@ -9050,19 +9327,96 @@ fn load_device_specs(conn: &Connection) -> Result<BTreeMap<DeviceId, crate::api:
     Ok(out)
 }
 
-fn load_device_heads(conn: &Connection, table: &str) -> Result<BTreeMap<DeviceId, DeviceHead>> {
-    let mut out = BTreeMap::new();
-    for (key, payload) in load_payload_rows(conn, table, "device_id", "device_id")? {
+fn load_device_heads(
+    conn: &Connection,
+    manifest_table: &str,
+    shard_table: &str,
+    config: LocalStoreConfig,
+) -> Result<BTreeMap<DeviceId, DeviceHead>> {
+    let mut manifests = BTreeMap::new();
+    for (key, payload) in load_payload_rows(conn, manifest_table, "device_id", "device_id")? {
         let id = DeviceId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
-        let head: DeviceHead = decode_row(&payload)?;
-        if head.device_id != id {
+        let manifest: DurableDeviceManifest = decode_row(&payload)?;
+        if manifest.device_id != id {
             return Err(StorageError::corrupt(
-                "device head row key disagrees with payload",
+                "device manifest row key disagrees with payload",
             ));
         }
-        if out.insert(id, head).is_some() {
-            return Err(StorageError::corrupt("duplicate device head row"));
+        if usize::try_from(manifest.shard_count).ok() != Some(config.shard_count) {
+            return Err(StorageError::corrupt(
+                "device manifest shard count disagrees with durable config",
+            ));
         }
+        if manifests.insert(id, manifest).is_some() {
+            return Err(StorageError::corrupt("duplicate device manifest row"));
+        }
+    }
+
+    let mut shards: BTreeMap<DeviceId, BTreeMap<usize, DurableDeviceShardHead>> = BTreeMap::new();
+    for (row_key, payload) in load_payload_rows(conn, shard_table, "row_key", "row_key")? {
+        let shard: DurableDeviceShardHead = decode_row(&payload)?;
+        if row_key != device_shard_row_key(shard.device_id, shard.shard_id) {
+            return Err(StorageError::corrupt(
+                "device shard head row key disagrees with payload",
+            ));
+        }
+        let shard_index = usize::try_from(shard.shard_id.raw())
+            .map_err(|_| StorageError::corrupt("device shard id overflows usize"))?;
+        if shard_index >= config.shard_count {
+            return Err(StorageError::corrupt("device shard row is outside config"));
+        }
+        if !manifests.contains_key(&shard.device_id) {
+            return Err(StorageError::corrupt(
+                "device shard row exists without manifest",
+            ));
+        }
+        if shards
+            .entry(shard.device_id)
+            .or_default()
+            .insert(shard_index, shard)
+            .is_some()
+        {
+            return Err(StorageError::corrupt("duplicate device shard row"));
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    for (device_id, manifest) in manifests {
+        let shard_count = usize::try_from(manifest.shard_count)
+            .map_err(|_| StorageError::corrupt("device manifest shard count overflows usize"))?;
+        let mut shard_roots = Vec::with_capacity(shard_count);
+        let mut generation = DeviceGeneration::from_raw(0);
+        let mut latest_commit = CommitSeq::from_raw(0);
+        let Some(device_shards) = shards.remove(&device_id) else {
+            return Err(StorageError::corrupt("device manifest has no shard rows"));
+        };
+        for shard_index in 0..shard_count {
+            let Some(shard) = device_shards.get(&shard_index) else {
+                return Err(StorageError::corrupt(
+                    "device manifest is missing shard row",
+                ));
+            };
+            shard_roots.push(shard.root);
+            if shard.generation.raw() > generation.raw() {
+                generation = shard.generation;
+            }
+            if shard.latest_commit.raw() > latest_commit.raw() {
+                latest_commit = shard.latest_commit;
+            }
+        }
+        let head = DeviceHead {
+            device_id,
+            generation,
+            shard_roots,
+            latest_commit,
+        };
+        head.validate(config.shard_count)?;
+        if out.insert(device_id, head).is_some() {
+            return Err(StorageError::corrupt("duplicate device head"));
+        }
+    }
+    if !shards.is_empty() {
+        return Err(StorageError::corrupt("unconsumed device shard rows"));
     }
     Ok(out)
 }
@@ -10745,6 +11099,7 @@ impl DurableCoordinator {
 
     pub fn enable_persist_profiling(&self, capacity: usize) -> Result<()> {
         *lock(&self.persist_profiler)? = Some(PersistProfiler::new(capacity)?);
+        self.local.metadata.enable_publish_profiling(capacity)?;
         Ok(())
     }
 
@@ -10760,6 +11115,19 @@ impl DurableCoordinator {
         if let Some(profiler) = lock(&self.persist_profiler)?.as_mut() {
             profiler.record(profile);
         }
+        Ok(())
+    }
+
+    fn attach_metadata_publish_profile(&self, profile: &mut DurablePersistProfile) -> Result<()> {
+        let summary = summarize_metadata_publish_profiles(
+            self.local.metadata.drain_publish_profiles(usize::MAX)?,
+        );
+        profile.metadata_publish_lock_wait_nanos = summary.lock_wait_nanos;
+        profile.commit_sequence_alloc_nanos = summary.commit_sequence_alloc_nanos;
+        profile.logical_conflict_count = summary.logical_conflict_count;
+        profile.touched_shard_head_rows = summary.touched_shard_head_rows;
+        profile.touched_manifest_rows = summary.touched_manifest_rows;
+        profile.commit_rows_written = summary.commit_rows_written;
         Ok(())
     }
 
@@ -10901,6 +11269,7 @@ impl DurableCoordinator {
             profile.local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
             profile.total_nanos = duration_nanos_u64(total_started.elapsed());
             let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+            self.attach_metadata_publish_profile(&mut profile)?;
             self.record_persist_profile(profile)?;
             return Ok(durable_through);
         }
@@ -10929,6 +11298,7 @@ impl DurableCoordinator {
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+        self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_through)
     }
@@ -11116,6 +11486,7 @@ impl DurableCoordinator {
         profile.new_segment_count = profile.new_segment_count.saturating_add(new_run_count);
         profile.new_segment_bytes = profile.new_segment_bytes.saturating_add(new_run_bytes);
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(true)
     }
@@ -11233,6 +11604,7 @@ impl DurableCoordinator {
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_high_water)
     }
@@ -12550,6 +12922,7 @@ pub struct InMemoryMetadataPlane {
     config: LocalStoreConfig,
     inner: Mutex<MetadataInner>,
     append_stream_allocator: Mutex<AppendStreamAllocator>,
+    publish_profiler: Mutex<Option<MetadataPublishProfiler>>,
 }
 
 impl InMemoryMetadataPlane {
@@ -12559,6 +12932,7 @@ impl InMemoryMetadataPlane {
             config,
             inner: Mutex::new(MetadataInner::new()),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
+            publish_profiler: Mutex::new(None),
         })
     }
 
@@ -12568,11 +12942,32 @@ impl InMemoryMetadataPlane {
             config,
             inner: Mutex::new(inner),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
+            publish_profiler: Mutex::new(None),
         })
     }
 
     fn state_inner(&self) -> Result<MetadataInner> {
         Ok(lock(&self.inner)?.clone())
+    }
+
+    fn enable_publish_profiling(&self, capacity: usize) -> Result<()> {
+        *lock(&self.publish_profiler)? = Some(MetadataPublishProfiler::new(capacity)?);
+        Ok(())
+    }
+
+    fn record_publish_profile(&self, profile: MetadataPublishProfile) -> Result<()> {
+        if let Some(profiler) = lock(&self.publish_profiler)?.as_mut() {
+            profiler.record(profile);
+        }
+        Ok(())
+    }
+
+    fn drain_publish_profiles(&self, max: usize) -> Result<Vec<MetadataPublishProfile>> {
+        let mut profiler = lock(&self.publish_profiler)?;
+        Ok(profiler
+            .as_mut()
+            .map(|profiler| profiler.drain(max))
+            .unwrap_or_default())
     }
 
     fn use_append_stream_incarnation(&self, incarnation: u64) -> Result<()> {
@@ -14546,7 +14941,9 @@ impl MetadataPlane for InMemoryMetadataPlane {
     }
 
     fn publish_commit_group(&self, intent: CommitGroupIntent) -> Result<CommitGroup> {
+        let publish_started = Instant::now();
         let mut inner = lock(&self.inner)?;
+        let publish_lock_wait_nanos = duration_nanos_u64(publish_started.elapsed());
 
         match intent.owner {
             MappingOwner::BlockDevice(device_id) => {
@@ -14586,6 +14983,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         ));
                     }
                     if next_roots[shard] != update.old_root {
+                        self.record_publish_profile(MetadataPublishProfile {
+                            lock_wait_nanos: publish_lock_wait_nanos,
+                            logical_conflict_count: 1,
+                            ..MetadataPublishProfile::default()
+                        })?;
                         return Err(StorageError::conflict("stale shard root"));
                     }
                     if !inner.metadata_nodes.contains_key(&update.new_root) {
@@ -14598,7 +15000,9 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     next_roots[shard] = update.new_root;
                 }
 
+                let commit_seq_started = Instant::now();
                 let commit_seq = inner.alloc_commit_seq()?;
+                let commit_sequence_alloc_nanos = duration_nanos_u64(commit_seq_started.elapsed());
                 let commit_group_id = inner.alloc_commit_group_id();
                 let commit_group = CommitGroup {
                     commit_group: commit_group_id,
@@ -14625,6 +15029,13 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 inner
                     .commit_groups
                     .insert(commit_group.commit_group, commit_group.clone());
+                self.record_publish_profile(MetadataPublishProfile {
+                    lock_wait_nanos: publish_lock_wait_nanos,
+                    commit_sequence_alloc_nanos,
+                    touched_shard_head_rows: usize_to_u64(commit_group.updates.len()),
+                    commit_rows_written: 1,
+                    ..MetadataPublishProfile::default()
+                })?;
                 Ok(commit_group)
             }
             MappingOwner::NativeKeyspace(keyspace_id) => {
@@ -18854,6 +19265,40 @@ impl DurableCodec for DeviceHead {
             device_id: DeviceId::decode(input)?,
             generation: DeviceGeneration::decode(input)?,
             shard_roots: Vec::decode(input)?,
+            latest_commit: CommitSeq::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableDeviceManifest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.shard_count.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            shard_count: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableDeviceShardHead {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.shard_id.encode(out)?;
+        self.root.encode(out)?;
+        self.generation.encode(out)?;
+        self.latest_commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            shard_id: ShardId::decode(input)?,
+            root: MetadataNodeId::decode(input)?,
+            generation: DeviceGeneration::decode(input)?,
             latest_commit: CommitSeq::decode(input)?,
         })
     }
@@ -23421,7 +23866,17 @@ mod tests {
 
         let metadata = store.metadata.state_inner().unwrap();
         assert_durable_row_round_trip(metadata.device_specs.get(&device.device_id()).unwrap());
-        assert_durable_row_round_trip(metadata.device_heads.get(&device.device_id()).unwrap());
+        let device_head = metadata.device_heads.get(&device.device_id()).unwrap();
+        assert_durable_row_round_trip(&DurableDeviceManifest::from_head(device_head).unwrap());
+        assert_durable_row_round_trip(
+            &DurableDeviceShardHead::from_head(
+                device_head,
+                0,
+                device_head.shard_roots[0],
+                device_head.latest_commit,
+            )
+            .unwrap(),
+        );
         assert_durable_row_round_trip(metadata.keyspace_heads.get(&keyspace_id).unwrap());
         assert_durable_row_round_trip(metadata.keyspace_roots.values().next().unwrap());
         assert_durable_row_round_trip(metadata.keyspace_catalog_shards.values().next().unwrap());
@@ -24862,7 +25317,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(current_state_tables, 0);
-        for table in ["store_meta", "device_heads", "metadata_nodes"] {
+        for table in [
+            "store_meta",
+            "device_manifests",
+            "device_shard_heads",
+            "metadata_nodes",
+        ] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                     row.get(0)
@@ -24903,6 +25363,140 @@ mod tests {
                 .unwrap();
             assert!(count > 0, "{table} should have node-local catalog rows");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_stores_block_heads_as_per_shard_rows() {
+        let root = durable_temp_dir("per-shard-device-heads");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let old_head_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('device_heads', 'deleted_device_heads')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_head_tables, 0);
+        let manifest_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM device_manifests", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(manifest_count, 1);
+        let initial_manifest: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM device_manifests WHERE device_id = ?1",
+                params![device_id.raw().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let initial_shards = device_shard_payloads_for_test(&conn);
+        assert_eq!(initial_shards.len(), cfg.shard_count);
+        drop(conn);
+
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 1),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let after_first_manifest: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM device_manifests WHERE device_id = ?1",
+                params![device_id.raw().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_first_manifest, initial_manifest);
+        let after_first = device_shard_payloads_for_test(&conn);
+        assert_eq!(
+            changed_payload_count(&initial_shards, &after_first),
+            1,
+            "a single-shard write should update one shard-head row"
+        );
+        drop(conn);
+
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        store
+            .write_device(
+                device_id,
+                8 * 4096,
+                &repeated_blocks(1, 2),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let after_second = device_shard_payloads_for_test(&conn);
+        assert_eq!(
+            changed_payload_count(&after_first, &after_second),
+            1,
+            "an independent shard write should update only its shard-head row"
+        );
+        drop(conn);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut buf = vec![0; 16 * 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 16 * 4096), &mut buf)
+            .unwrap();
+        assert_eq!(&buf[0..4096], repeated_blocks(1, 1).as_slice());
+        assert_eq!(&buf[8 * 4096..9 * 4096], repeated_blocks(1, 2).as_slice());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_persist_profile_reports_block_metadata_contention_fields() {
+        let root = durable_temp_dir("block-metadata-profile-fields");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        store.enable_persist_profiling(16).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        let _ = store.drain_persist_profiles(16).unwrap();
+
+        store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 3),
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        let profiles = store.drain_persist_profiles(16).unwrap();
+        let profile = profiles.last().expect("flushed write should persist");
+        assert_eq!(profile.logical_conflict_count, 0);
+        assert_eq!(profile.touched_shard_head_rows, 1);
+        assert_eq!(profile.commit_rows_written, 1);
+        assert!(profile.total_nanos >= profile.lock_wait_nanos);
+        assert!(profile.root_sqlite_row_sync_nanos > 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -32312,6 +32906,32 @@ mod tests {
 
     fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {
         vec![byte; blocks as usize * 4096]
+    }
+
+    fn device_shard_payloads_for_test(conn: &Connection) -> BTreeMap<String, Vec<u8>> {
+        let mut stmt = conn
+            .prepare("SELECT row_key, payload FROM device_shard_heads ORDER BY row_key")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut out = BTreeMap::new();
+        while let Some(row) = rows.next().unwrap() {
+            out.insert(row.get(0).unwrap(), row.get(1).unwrap());
+        }
+        out
+    }
+
+    fn changed_payload_count(
+        before: &BTreeMap<String, Vec<u8>>,
+        after: &BTreeMap<String, Vec<u8>>,
+    ) -> usize {
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+        before
+            .iter()
+            .filter(|(key, payload)| after.get(*key) != Some(*payload))
+            .count()
     }
 
     fn first_device_segment(store: &DurableCoordinator, device_id: DeviceId) -> SegmentId {

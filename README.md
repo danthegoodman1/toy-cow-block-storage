@@ -371,6 +371,7 @@ cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --war
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
 cargo run --release --bin loadbench -- --provider durable --durability ack --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-stream --rtt-us 200 --stream-flush-mib 2 --stream-publish-mib 128
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16,64 --workloads block-metadata --rtt-us 200 --durable-profile-csv target/loadbench/block-metadata/profile.csv
 ```
 
 `loadbench` is the north-star integration benchmark: it exercises the public
@@ -388,6 +389,14 @@ with intentional flush queueing.
 Use the `*-shard-lanes` block write workloads when the goal is happy-path
 throughput. The plain random block write workloads are intentionally allowed to
 collide at high concurrency and are better read as conflict behavior controls.
+Use the `block-metadata` alias when diagnosing block metadata convergence. It
+separates same-shard contention, same-device/different-shard writes, and
+different-device writes. With `--durable-profile-csv`, the profile rows also
+split persist-lock wait, SQLite lock wait, row-sync/commit time, metadata
+publish lock wait, commit sequence allocation time, touched shard-head rows,
+and logical conflict counts. Use a flushing durability mode such as
+`ack-flush:1` when you need SQLite phase profiles; pure `ack` runs measure the
+acknowledged in-memory path and may not emit persist profile rows.
 
 For append-stream workloads, the normal `mbps` column is accepted ingest
 throughput. The `durable_mbps` and `published_mbps` columns separately report
