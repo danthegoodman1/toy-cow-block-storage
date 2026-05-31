@@ -1164,6 +1164,49 @@ impl StorageNodeRegistry {
         Ok((nodes, payloads))
     }
 
+    fn selected_state_for_segment_ids(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<SelectedStorageNodeState> {
+        let mut nodes = BTreeMap::new();
+        if segment_ids.is_empty() {
+            return Ok(nodes);
+        }
+        let mut found = BTreeSet::new();
+        for (ordinal, node_id) in self.node_order.iter().enumerate() {
+            let node = self.node(*node_id)?;
+            let catalog = node.segment_catalog.state_inner()?;
+            let selected: BTreeSet<_> = segment_ids
+                .iter()
+                .copied()
+                .filter(|segment_id| catalog.entries.contains_key(segment_id))
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            found.extend(selected);
+            nodes.insert(
+                *node_id,
+                (
+                    ordinal,
+                    StorageNodeInner {
+                        segment_store: SegmentStoreInner {
+                            next_offset: node.segment_store.next_offset()?,
+                            segments: BTreeMap::new(),
+                        },
+                        segment_catalog: catalog,
+                    },
+                ),
+            );
+        }
+        if &found != segment_ids {
+            return Err(StorageError::corrupt(
+                "publish delta references segments missing from storage-node catalogs",
+            ));
+        }
+        Ok(nodes)
+    }
+
     fn verify_segment_payload_for_read(
         &self,
         segment_id: SegmentId,
@@ -1493,6 +1536,14 @@ impl LocalCoordinator {
         self.storage_nodes.state_for_segment_ids(segment_ids)
     }
 
+    fn selected_state_for_segment_ids(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<SelectedStorageNodeState> {
+        self.storage_nodes
+            .selected_state_for_segment_ids(segment_ids)
+    }
+
     fn durable_export_cursor(&self) -> Result<DurableExportCursor> {
         let metadata = lock(&self.metadata.inner)?;
         Ok(DurableExportCursor {
@@ -1514,8 +1565,138 @@ impl LocalCoordinator {
         })
     }
 
-    fn metadata_state_inner(&self) -> Result<MetadataInner> {
-        self.metadata.state_inner()
+    fn native_publish_delta_since(
+        &self,
+        stream: &AppendStream,
+        previous: &DurableExportCursor,
+    ) -> Result<NativePublishDelta> {
+        fn next_after_u128(current: u128, raw: u128) -> Result<u128> {
+            Ok(current.max(
+                raw.checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("durable cursor id overflow"))?,
+            ))
+        }
+
+        let metadata = lock(&self.metadata.inner)?;
+        let stream_state = metadata
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        stream_state.validate_token(stream)?;
+        let append_stream = stream_state.durable_export_at(stream_state.durable_through)?;
+
+        let keyspace_head = metadata
+            .keyspace_heads
+            .get(&stream.keyspace_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", stream.keyspace_id.to_string()))?;
+        let keyspace_root =
+            InMemoryMetadataPlane::keyspace_root_locked(&metadata, keyspace_head.root)?;
+        let shard_index =
+            InMemoryMetadataPlane::keyspace_catalog_shard_index(stream.file_id, &keyspace_root)?;
+        let shard_id = keyspace_root
+            .shard_roots
+            .get(shard_index)
+            .copied()
+            .ok_or_else(|| StorageError::corrupt("keyspace shard index missing from root"))?;
+        let keyspace_shard =
+            InMemoryMetadataPlane::keyspace_catalog_shard_locked(&metadata, shard_id)?;
+
+        let keyspace_roots: BTreeMap<_, _> = metadata
+            .keyspace_roots
+            .iter()
+            .filter(|(id, _)| id.raw() >= previous.next_keyspace_root_id)
+            .map(|(id, root)| (*id, root.clone()))
+            .collect();
+        let mut keyspace_catalog_shards: BTreeMap<_, _> = metadata
+            .keyspace_catalog_shards
+            .iter()
+            .filter(|(id, _)| id.raw() >= previous.next_keyspace_catalog_shard_id)
+            .map(|(id, shard)| (*id, shard.clone()))
+            .collect();
+        keyspace_catalog_shards.insert(shard_id, keyspace_shard);
+        let metadata_nodes: BTreeMap<_, _> = metadata
+            .metadata_nodes
+            .iter()
+            .filter(|(id, _)| id.raw() >= previous.next_metadata_node_id)
+            .map(|(id, node)| (*id, node.clone()))
+            .collect();
+        let mut referenced_segment_ids = BTreeSet::new();
+        for node in metadata_nodes.values() {
+            if let MetadataNodeKind::Leaf { entries } = &node.kind {
+                referenced_segment_ids.extend(entries.iter().map(|entry| entry.segment_id));
+            }
+        }
+        let commit_groups: BTreeMap<_, _> = metadata
+            .commit_groups
+            .iter()
+            .filter(|(id, _)| id.raw() >= previous.next_commit_group_id)
+            .map(|(id, group)| (*id, group.clone()))
+            .collect();
+        let keyspace_commits: Vec<_> = metadata
+            .keyspace_commits
+            .iter()
+            .filter(|commit| commit.commit_seq.raw() >= previous.next_commit_seq)
+            .cloned()
+            .collect();
+        let file_commits: Vec<_> = metadata
+            .file_commits
+            .iter()
+            .filter(|commit| commit.commit_seq.raw() >= previous.next_commit_seq)
+            .cloned()
+            .collect();
+
+        let mut cursor = previous.clone();
+        cursor.config = self.metadata.config;
+        for id in keyspace_roots.keys() {
+            cursor.next_keyspace_root_id = next_after_u128(cursor.next_keyspace_root_id, id.raw())?;
+        }
+        for id in keyspace_catalog_shards.keys() {
+            cursor.next_keyspace_catalog_shard_id =
+                next_after_u128(cursor.next_keyspace_catalog_shard_id, id.raw())?;
+        }
+        for id in metadata_nodes.keys() {
+            cursor.next_metadata_node_id = next_after_u128(cursor.next_metadata_node_id, id.raw())?;
+        }
+        for id in commit_groups.keys() {
+            cursor.next_commit_group_id = next_after_u128(cursor.next_commit_group_id, id.raw())?;
+        }
+        for commit in &keyspace_commits {
+            cursor.next_commit_seq = cursor.next_commit_seq.max(
+                commit
+                    .commit_seq
+                    .raw()
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?,
+            );
+        }
+        for commit in &file_commits {
+            cursor.next_commit_seq = cursor.next_commit_seq.max(
+                commit
+                    .commit_seq
+                    .raw()
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?,
+            );
+        }
+
+        Ok(NativePublishDelta {
+            cursor,
+            keyspace_heads: BTreeMap::from([(stream.keyspace_id, keyspace_head)]),
+            keyspace_roots,
+            keyspace_catalog_shards,
+            file_writer_epoch: metadata
+                .file_writer_epochs
+                .get(&(stream.keyspace_id, stream.file_id))
+                .copied()
+                .map(|epoch| ((stream.keyspace_id, stream.file_id), epoch)),
+            append_stream,
+            metadata_nodes,
+            referenced_segment_ids,
+            commit_groups,
+            keyspace_commits,
+            file_commits,
+        })
     }
 
     fn verify_segment_payloads_for_read(
@@ -4412,6 +4593,10 @@ pub struct DurablePersistProfile {
     pub lock_wait_nanos: u64,
     pub local_snapshot_nanos: u64,
     pub data_log_append_sync_nanos: u64,
+    pub data_log_encode_nanos: u64,
+    pub data_log_write_nanos: u64,
+    pub data_log_file_sync_nanos: u64,
+    pub data_log_dir_sync_nanos: u64,
     pub node_catalog_publish_nanos: u64,
     pub root_sqlite_row_sync_nanos: u64,
     pub root_sqlite_commit_nanos: u64,
@@ -4461,6 +4646,23 @@ impl PersistProfiler {
 struct DurablePersistOutcome {
     kept_segments: BTreeSet<SegmentId>,
     profile: DurablePersistProfile,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DataLogAppendProfile {
+    encode_nanos: u64,
+    write_nanos: u64,
+    file_sync_nanos: u64,
+    dir_sync_nanos: u64,
+}
+
+impl DataLogAppendProfile {
+    fn merge(&mut self, other: Self) {
+        self.encode_nanos = self.encode_nanos.saturating_add(other.encode_nanos);
+        self.write_nanos = self.write_nanos.saturating_add(other.write_nanos);
+        self.file_sync_nanos = self.file_sync_nanos.saturating_add(other.file_sync_nanos);
+        self.dir_sync_nanos = self.dir_sync_nanos.saturating_add(other.dir_sync_nanos);
+    }
 }
 
 #[derive(Debug)]
@@ -4534,6 +4736,21 @@ struct DurableExportCursor {
     next_extent_id: u128,
     next_segment_id: u128,
     next_placement_index: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NativePublishDelta {
+    cursor: DurableExportCursor,
+    keyspace_heads: BTreeMap<KeyspaceId, KeyspaceHead>,
+    keyspace_roots: BTreeMap<KeyspaceRootId, KeyspaceRoot>,
+    keyspace_catalog_shards: BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>,
+    file_writer_epoch: Option<((KeyspaceId, FileId), WriterEpoch)>,
+    append_stream: AppendStreamState,
+    metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
+    referenced_segment_ids: BTreeSet<SegmentId>,
+    commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
+    keyspace_commits: Vec<KeyspaceCommit>,
+    file_commits: Vec<FileCommit>,
 }
 
 impl DurableExportCursor {
@@ -4799,6 +5016,11 @@ impl DurableSqliteStore {
         Ok(Some(LocalCoordinator::from_durable_state(image)?))
     }
 
+    fn export_cursor(&self) -> Result<Option<DurableExportCursor>> {
+        let conn = lock(&self.conn)?;
+        load_export_cursor(&conn)
+    }
+
     fn persist_catalog_reference_repairs(
         &self,
         storage_nodes: &StorageNodeRegistryInner,
@@ -4930,8 +5152,12 @@ impl DurableSqliteStore {
 
         pending_append.retain_current_placements(current_segments);
         let started = Instant::now();
-        let new_append = self.append_segments_bounded(new_segments, &pending_append)?;
-        sync_pending_data_logs(&self.paths.data_dir, &pending_append)?;
+        let (new_append, mut data_log_profile) =
+            self.append_segments_bounded(new_segments, &pending_append)?;
+        data_log_profile.merge(sync_pending_data_logs(
+            &self.paths.data_dir,
+            &pending_append,
+        )?);
         pending_append.merge(new_append);
         let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
 
@@ -4959,6 +5185,10 @@ impl DurableSqliteStore {
             profile: DurablePersistProfile {
                 total_nanos: duration_nanos_u64(total_started.elapsed()),
                 data_log_append_sync_nanos,
+                data_log_encode_nanos: data_log_profile.encode_nanos,
+                data_log_write_nanos: data_log_profile.write_nanos,
+                data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+                data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
                 node_catalog_publish_nanos,
                 root_sqlite_row_sync_nanos,
                 root_sqlite_commit_nanos,
@@ -5171,7 +5401,8 @@ impl DurableSqliteStore {
             .fold(0_u64, u64::saturating_add);
 
         let started = Instant::now();
-        let appended = self.append_segments(segments, DataLogSyncMode::Sync, None)?;
+        let (appended, data_log_profile) =
+            self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?;
         let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
 
         let started = Instant::now();
@@ -5197,6 +5428,10 @@ impl DurableSqliteStore {
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
             data_log_append_sync_nanos,
+            data_log_encode_nanos: data_log_profile.encode_nanos,
+            data_log_write_nanos: data_log_profile.write_nanos,
+            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
             node_catalog_publish_nanos,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
@@ -5210,8 +5445,7 @@ impl DurableSqliteStore {
 
     fn persist_append_stream_publish_delta(
         &self,
-        cursor: &DurableExportCursor,
-        metadata: &MetadataInner,
+        delta: &NativePublishDelta,
         nodes: &SelectedStorageNodeState,
         changed_segments: &BTreeSet<SegmentId>,
     ) -> Result<DurablePersistProfile> {
@@ -5242,12 +5476,7 @@ impl DurableSqliteStore {
         let previous_cursor = load_export_cursor(&conn)?;
         let tx = conn.transaction().map_err(sqlite_error)?;
         let started = Instant::now();
-        persist_row_native_append_stream_publish_delta(
-            &tx,
-            previous_cursor.as_ref(),
-            metadata,
-            cursor,
-        )?;
+        persist_row_native_append_stream_publish_delta(&tx, previous_cursor.as_ref(), delta)?;
         let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
         let started = Instant::now();
         tx.commit().map_err(sqlite_error)?;
@@ -5259,7 +5488,7 @@ impl DurableSqliteStore {
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
             touched_node_count,
-            durable_commit_high_water: cursor.next_commit_seq.saturating_sub(1),
+            durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()
         })
     }
@@ -5270,14 +5499,25 @@ impl DurableSqliteStore {
         sync_mode: DataLogSyncMode,
         pending_base: Option<&PendingDataLogAppend>,
     ) -> Result<PendingDataLogAppend> {
+        self.append_segments_profiled(segments, sync_mode, pending_base)
+            .map(|(append, _)| append)
+    }
+
+    fn append_segments_profiled(
+        &self,
+        segments: Vec<DurableSegmentPayload>,
+        sync_mode: DataLogSyncMode,
+        pending_base: Option<&PendingDataLogAppend>,
+    ) -> Result<(PendingDataLogAppend, DataLogAppendProfile)> {
         let mut append = PendingDataLogAppend::default();
         if segments.is_empty() {
-            return Ok(append);
+            return Ok((append, DataLogAppendProfile::default()));
         }
 
         let mut active_logs = BTreeMap::new();
         let mut open_log: Option<(DurableDataLogRef, File)> = None;
         let mut synced_dirs = BTreeSet::new();
+        let mut profile = DataLogAppendProfile::default();
         for segment in segments {
             let segment_id = segment.segment_id;
             let storage_node = segment.storage_node;
@@ -5307,10 +5547,13 @@ impl DurableSqliteStore {
             let active = active_logs
                 .get_mut(&storage_node)
                 .ok_or_else(|| StorageError::corrupt("active data-log row missing"))?;
-            let record = encode_data_log_record(segment_id, integrity, &bytes)?;
-            let record_len = u64::try_from(record.len()).map_err(|_| {
-                StorageError::invalid_argument("data-log record length overflows u64")
-            })?;
+            let payload_bytes = u64::try_from(bytes.len())
+                .map_err(|_| StorageError::invalid_argument("payload length overflows u64"))?;
+            let record_len = (DATA_LOG_HEADER_LEN as u64)
+                .checked_add(payload_bytes)
+                .ok_or_else(|| {
+                    StorageError::invalid_argument("data-log record length overflows")
+                })?;
             if active.total_bytes != 0
                 && active
                     .total_bytes
@@ -5336,11 +5579,17 @@ impl DurableSqliteStore {
                 log_id: active.log_id,
             };
             if open_log.as_ref().map(|(log_ref, _)| *log_ref) != Some(log_ref) {
-                finish_open_data_log(&mut open_log, sync_mode)?;
+                profile.file_sync_nanos = profile
+                    .file_sync_nanos
+                    .saturating_add(finish_open_data_log(&mut open_log, sync_mode)?);
                 let data_dir_existed = data_dir.exists();
                 fs::create_dir_all(&data_dir).map_err(fs_error)?;
                 if sync_mode == DataLogSyncMode::Sync && !data_dir_existed {
+                    let started = Instant::now();
                     sync_dir(&self.paths.data_dir)?;
+                    profile.dir_sync_nanos = profile
+                        .dir_sync_nanos
+                        .saturating_add(duration_nanos_u64(started.elapsed()));
                 }
                 let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
                 let existed = path.exists();
@@ -5362,12 +5611,19 @@ impl DurableSqliteStore {
             let Some((_, file)) = open_log.as_mut() else {
                 return Err(StorageError::conflict("data-log writer was not opened"));
             };
+            let started = Instant::now();
+            let record = encode_data_log_record(segment_id, integrity, &bytes)?;
+            profile.encode_nanos = profile
+                .encode_nanos
+                .saturating_add(duration_nanos_u64(started.elapsed()));
+            let started = Instant::now();
             file.write_all(&record).map_err(fs_error)?;
+            profile.write_nanos = profile
+                .write_nanos
+                .saturating_add(duration_nanos_u64(started.elapsed()));
             let payload_offset = offset
                 .checked_add(DATA_LOG_HEADER_LEN as u64)
                 .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
-            let payload_bytes = u64::try_from(bytes.len())
-                .map_err(|_| StorageError::invalid_argument("payload length overflows u64"))?;
             let new_total = offset
                 .checked_add(record_len)
                 .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
@@ -5392,22 +5648,29 @@ impl DurableSqliteStore {
                 integrity,
             });
         }
-        finish_open_data_log(&mut open_log, sync_mode)?;
+        profile.file_sync_nanos = profile
+            .file_sync_nanos
+            .saturating_add(finish_open_data_log(&mut open_log, sync_mode)?);
         if sync_mode == DataLogSyncMode::Sync {
             for storage_node in synced_dirs {
                 let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+                let started = Instant::now();
                 sync_dir(&data_dir)?;
+                profile.dir_sync_nanos = profile
+                    .dir_sync_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
             }
         }
-        Ok(append)
+        Ok((append, profile))
     }
 
     fn append_segments_bounded(
         &self,
         segments: Vec<DurableSegmentPayload>,
         pending_base: &PendingDataLogAppend,
-    ) -> Result<PendingDataLogAppend> {
+    ) -> Result<(PendingDataLogAppend, DataLogAppendProfile)> {
         let mut appended = PendingDataLogAppend::default();
+        let mut profile = DataLogAppendProfile::default();
         let mut base = pending_base.clone();
         let mut chunk = Vec::new();
         let mut chunk_bytes = 0_u64;
@@ -5417,11 +5680,12 @@ impl DurableSqliteStore {
             if !chunk.is_empty()
                 && chunk_bytes.saturating_add(segment_bytes) > MAX_DATA_LOG_SYNC_GROUP_BYTES
             {
-                let new_append = self.append_segments(
+                let (new_append, chunk_profile) = self.append_segments_profiled(
                     std::mem::take(&mut chunk),
                     DataLogSyncMode::Sync,
                     Some(&base),
                 )?;
+                profile.merge(chunk_profile);
                 base.merge(new_append.clone());
                 appended.merge(new_append);
                 chunk_bytes = 0;
@@ -5431,10 +5695,12 @@ impl DurableSqliteStore {
         }
 
         if !chunk.is_empty() {
-            let new_append = self.append_segments(chunk, DataLogSyncMode::Sync, Some(&base))?;
+            let (new_append, chunk_profile) =
+                self.append_segments_profiled(chunk, DataLogSyncMode::Sync, Some(&base))?;
+            profile.merge(chunk_profile);
             appended.merge(new_append);
         }
-        Ok(appended)
+        Ok((appended, profile))
     }
 
     fn read_segment_payload(&self, placement: &SegmentPlacementRow) -> Result<Vec<u8>> {
@@ -6304,8 +6570,7 @@ fn stream_flush_cursor(
 fn persist_row_native_append_stream_publish_delta(
     tx: &rusqlite::Transaction<'_>,
     previous_cursor: Option<&DurableExportCursor>,
-    metadata: &MetadataInner,
-    cursor: &DurableExportCursor,
+    delta: &NativePublishDelta,
 ) -> Result<()> {
     let previous_u128 = |cursor_value: fn(&DurableExportCursor) -> u128| {
         previous_cursor.map(cursor_value).unwrap_or(0)
@@ -6318,7 +6583,7 @@ fn persist_row_native_append_stream_publish_delta(
         tx,
         "keyspace_heads",
         "keyspace_id",
-        metadata
+        delta
             .keyspace_heads
             .iter()
             .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
@@ -6328,7 +6593,7 @@ fn persist_row_native_append_stream_publish_delta(
         tx,
         "keyspace_roots",
         "root_id",
-        &metadata.keyspace_roots,
+        &delta.keyspace_roots,
         |id| id.raw(),
         previous_u128(|cursor| cursor.next_keyspace_root_id),
         false,
@@ -6337,54 +6602,45 @@ fn persist_row_native_append_stream_publish_delta(
         tx,
         "keyspace_catalog_shards",
         "shard_id",
-        &metadata.keyspace_catalog_shards,
+        &delta.keyspace_catalog_shards,
         |id| id.raw(),
         previous_u128(|cursor| cursor.next_keyspace_catalog_shard_id),
         false,
     )?;
-    for ((keyspace_id, file_id), epoch) in &metadata.file_writer_epochs {
-        upsert_file_writer_epoch(tx, *keyspace_id, *file_id, *epoch)?;
+    if let Some(((keyspace_id, file_id), epoch)) = delta.file_writer_epoch {
+        upsert_file_writer_epoch(tx, keyspace_id, file_id, epoch)?;
     }
-    for stream in metadata.append_streams.values() {
-        upsert_append_stream(tx, stream)?;
-    }
+    upsert_append_stream(tx, &delta.append_stream)?;
     sync_u128_payload_map_since(
         tx,
         "metadata_nodes",
         "node_id",
-        &metadata.metadata_nodes,
+        &delta.metadata_nodes,
         |id| id.raw(),
         previous_u128(|cursor| cursor.next_metadata_node_id),
         false,
     )?;
     sync_commit_groups_since(
         tx,
-        &metadata.commit_groups,
+        &delta.commit_groups,
         previous_u128(|cursor| cursor.next_commit_group_id),
         false,
     )?;
     sync_timeline_table_since(
         tx,
-        "shard_commits",
-        &metadata.shard_commits,
-        previous_u64(|cursor| cursor.next_commit_seq),
-        false,
-    )?;
-    sync_timeline_table_since(
-        tx,
         "keyspace_commits",
-        &metadata.keyspace_commits,
+        &delta.keyspace_commits,
         previous_u64(|cursor| cursor.next_commit_seq),
         false,
     )?;
     sync_timeline_table_since(
         tx,
         "file_commits",
-        &metadata.file_commits,
+        &delta.file_commits,
         previous_u64(|cursor| cursor.next_commit_seq),
         false,
     )?;
-    persist_export_cursor(tx, cursor)
+    persist_export_cursor(tx, &delta.cursor)
 }
 
 trait DurableTimelineRow: DurableCodec {
@@ -8023,19 +8279,25 @@ fn delete_data_log(data_dir: &Path, log_ref: DurableDataLogRef) -> Result<()> {
 fn finish_open_data_log(
     open_log: &mut Option<(DurableDataLogRef, File)>,
     sync_mode: DataLogSyncMode,
-) -> Result<()> {
+) -> Result<u64> {
     if let Some((_, file)) = open_log.take()
         && sync_mode == DataLogSyncMode::Sync
     {
+        let started = Instant::now();
         file.sync_data().map_err(fs_error)?;
+        return Ok(duration_nanos_u64(started.elapsed()));
     }
-    Ok(())
+    Ok(0)
 }
 
-fn sync_pending_data_logs(data_dir: &Path, pending: &PendingDataLogAppend) -> Result<()> {
+fn sync_pending_data_logs(
+    data_dir: &Path,
+    pending: &PendingDataLogAppend,
+) -> Result<DataLogAppendProfile> {
     if pending.is_empty() {
-        return Ok(());
+        return Ok(DataLogAppendProfile::default());
     }
+    let mut profile = DataLogAppendProfile::default();
     let mut storage_nodes = BTreeSet::new();
     let mut logs = BTreeSet::new();
     for log_ref in pending.logs.keys() {
@@ -8044,15 +8306,26 @@ fn sync_pending_data_logs(data_dir: &Path, pending: &PendingDataLogAppend) -> Re
     }
     for log_ref in logs {
         let path = data_log_path(data_dir, log_ref.storage_node, log_ref.log_id);
-        File::open(&path)
-            .map_err(fs_error)?
-            .sync_data()
-            .map_err(fs_error)?;
+        let file = File::open(&path).map_err(fs_error)?;
+        let started = Instant::now();
+        file.sync_data().map_err(fs_error)?;
+        profile.file_sync_nanos = profile
+            .file_sync_nanos
+            .saturating_add(duration_nanos_u64(started.elapsed()));
     }
     for storage_node in storage_nodes {
+        let started = Instant::now();
         sync_dir(&node_data_log_dir(data_dir, storage_node))?;
+        profile.dir_sync_nanos = profile
+            .dir_sync_nanos
+            .saturating_add(duration_nanos_u64(started.elapsed()));
     }
-    sync_dir(data_dir)
+    let started = Instant::now();
+    sync_dir(data_dir)?;
+    profile.dir_sync_nanos = profile
+        .dir_sync_nanos
+        .saturating_add(duration_nanos_u64(started.elapsed()));
+    Ok(profile)
 }
 
 fn sync_parent_dir(path: &Path) -> Result<()> {
@@ -8090,7 +8363,6 @@ fn encode_data_log_record(
 ) -> Result<Vec<u8>> {
     let payload_len = u64::try_from(bytes.len())
         .map_err(|_| StorageError::invalid_argument("data-log payload length overflows u64"))?;
-    verify_segment_payload_integrity(integrity, bytes)?;
     let mut out = Vec::with_capacity(DATA_LOG_HEADER_LEN + bytes.len());
     out.extend_from_slice(DATA_LOG_MAGIC);
     out.extend_from_slice(&DATA_LOG_VERSION.to_be_bytes());
@@ -9028,14 +9300,6 @@ impl DurableCoordinator {
         Ok(durable_through)
     }
 
-    fn note_durable_commit(&self, durable_through: CommitSeq) -> Result<()> {
-        let mut state = lock(&self.persist_coordinator.inner)?;
-        state.durable_through = state.durable_through.max(durable_through);
-        state.last_error = None;
-        self.persist_coordinator.cvar.notify_all();
-        Ok(())
-    }
-
     fn persist_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
         loop {
             let batch = self
@@ -9124,43 +9388,114 @@ impl DurableCoordinator {
 
     fn persist_append_stream_publish_delta(
         &self,
+        stream: &AppendStream,
         commit_seq: CommitSeq,
         changed_segments: &BTreeSet<SegmentId>,
     ) -> Result<()> {
         let total_started = Instant::now();
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            if state.durable_through >= commit_seq {
+                return Ok(());
+            }
+            if !state.in_flight {
+                state.in_flight = true;
+                drop(state);
+                let result = self.persist_append_stream_publish_delta_physical(
+                    stream,
+                    commit_seq,
+                    changed_segments,
+                    total_started,
+                );
+                let mut state = lock(&self.persist_coordinator.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.saturating_add(1);
+                let generation = state.generation;
+                match result {
+                    Ok(durable_high_water) => {
+                        state.durable_through = state.durable_through.max(durable_high_water);
+                        state.last_error = None;
+                        self.persist_coordinator.cvar.notify_all();
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        state.last_error = Some((generation, error.clone()));
+                        self.persist_coordinator.cvar.notify_all();
+                        return Err(error);
+                    }
+                }
+            }
+
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+            }
+            if state.durable_through >= commit_seq {
+                return Ok(());
+            }
+            if state.generation != generation
+                && let Some((error_generation, error)) = &state.last_error
+                && *error_generation == state.generation
+            {
+                return Err(error.clone());
+            }
+        }
+    }
+
+    fn persist_append_stream_publish_delta_physical(
+        &self,
+        stream: &AppendStream,
+        commit_seq: CommitSeq,
+        changed_segments: &BTreeSet<SegmentId>,
+        total_started: Instant,
+    ) -> Result<CommitSeq> {
         let _persist_guard = lock(&self.persist_lock)?;
         let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
 
         let snapshot_started = Instant::now();
-        let previous_segments = lock(&self.persisted_segments)?.clone();
-        let pending_append = lock(&self.pending_data_log_append)?.clone();
-        let mut exported_segments = previous_segments.clone();
-        exported_segments.extend(pending_append.segment_ids());
-        let (_, current_segments, new_segments) =
-            self.local.state_for_durable_persist(&exported_segments)?;
-        if !new_segments.is_empty() || !pending_append.is_empty() {
+        let Some(previous_cursor) = self.durable.export_cursor()? else {
             drop(_persist_guard);
-            return self.persist_until(commit_seq);
+            return self.persist_physical(total_started, None);
+        };
+        let pending_append = lock(&self.pending_data_log_append)?.clone();
+        if !pending_append.is_empty() {
+            drop(_persist_guard);
+            return self.persist_physical(total_started, None);
         }
-        let (nodes, _) = self.local.state_for_segment_ids(changed_segments)?;
-        let cursor = self.local.durable_export_cursor()?;
-        let mut metadata = self.local.metadata_state_inner()?;
-        metadata.prune_append_streams_for_durable_export();
+        let delta = self
+            .local
+            .native_publish_delta_since(stream, &previous_cursor)?;
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        if delta
+            .referenced_segment_ids
+            .iter()
+            .any(|segment_id| !previous_segments.contains(segment_id))
+        {
+            drop(_persist_guard);
+            return self.persist_physical(total_started, None);
+        }
+        let mut changed_segments = changed_segments.clone();
+        changed_segments.extend(delta.referenced_segment_ids.iter().copied());
+        let nodes = self
+            .local
+            .selected_state_for_segment_ids(&changed_segments)?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
-        let mut profile = self.durable.persist_append_stream_publish_delta(
-            &cursor,
-            &metadata,
-            &nodes,
-            changed_segments,
-        )?;
-        *lock(&self.persisted_segments)? = current_segments;
-        self.note_durable_commit(commit_seq)?;
+        let mut profile =
+            self.durable
+                .persist_append_stream_publish_delta(&delta, &nodes, &changed_segments)?;
+        let durable_high_water = CommitSeq::from_raw(profile.durable_commit_high_water);
+        if durable_high_water < commit_seq {
+            return Err(StorageError::conflict(
+                "append stream publish persist did not reach required commit sequence",
+            ));
+        }
 
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
-        self.record_persist_profile(profile)
+        self.record_persist_profile(profile)?;
+        Ok(durable_high_water)
     }
 
     /// Return the maintenance policy configured for this store.
@@ -9610,7 +9945,7 @@ impl DurableCoordinator {
         let commit = self
             .local
             .publish_append_stream(stream, mark, WriteDurability::Flushed)?;
-        self.persist_append_stream_publish_delta(commit.commit_seq, &changed_segments)?;
+        self.persist_append_stream_publish_delta(stream, commit.commit_seq, &changed_segments)?;
         Ok(commit)
     }
 
@@ -21296,18 +21631,20 @@ mod tests {
         store.enable_persist_profiling(16).unwrap();
         let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
         let one_mib = vec![41; 1024 * 1024];
-        for _ in 0..40 {
+        let total_bytes = MAX_DATA_LOG_SYNC_GROUP_BYTES + 8 * 1024 * 1024;
+        let chunks = total_bytes / (1024 * 1024);
+        for _ in 0..chunks {
             store
                 .append_stream(&stream, &one_mib, WriteDurability::Acknowledged)
                 .unwrap();
         }
 
         let mark = store.flush_append_stream(&stream).unwrap();
-        assert_eq!(mark.durable_through, 40 * 1024 * 1024);
+        assert_eq!(mark.durable_through, total_bytes);
         let profiles = store.drain_persist_profiles(16).unwrap();
         assert!(
             profiles.len() >= 2,
-            "40MiB stream flush should require multiple bounded physical persists"
+            "cap-plus stream flush should require multiple bounded physical persists"
         );
         assert!(
             profiles
@@ -21319,7 +21656,7 @@ mod tests {
                 .iter()
                 .map(|profile| profile.new_segment_bytes)
                 .sum::<u64>(),
-            40 * 1024 * 1024
+            total_bytes
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -21399,10 +21736,12 @@ mod tests {
         drop(store);
 
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
-        let private_mark = reopened.flush_append_stream(&private_stream).unwrap();
-        assert_eq!(
-            private_mark.durable_through, private_stream.visible_base_size,
-            "unflushed private stream bytes must not become resumable through unrelated publish"
+        assert!(
+            matches!(
+                reopened.flush_append_stream(&private_stream),
+                Err(StorageError::Conflict { reason }) if reason == "stale append stream"
+            ),
+            "unflushed private stream tokens must not become resumable through unrelated publish"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -21444,6 +21783,10 @@ mod tests {
         assert_eq!(publish_profiles[0].new_segment_count, 0);
         assert_eq!(publish_profiles[0].new_segment_bytes, 0);
         assert_eq!(publish_profiles[0].data_log_append_sync_nanos, 0);
+        assert_eq!(publish_profiles[0].data_log_encode_nanos, 0);
+        assert_eq!(publish_profiles[0].data_log_write_nanos, 0);
+        assert_eq!(publish_profiles[0].data_log_file_sync_nanos, 0);
+        assert_eq!(publish_profiles[0].data_log_dir_sync_nanos, 0);
 
         drop(store);
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -21457,6 +21800,140 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes, payload);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_append_stream_publish_delta_coalesces_exported_high_water() {
+        let root = durable_temp_dir("stream-publish-coalesces-high-water");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_a = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("a".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let file_b = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("b".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store.enable_persist_profiling(16).unwrap();
+
+        let stream_a = store.open_append_stream(keyspace_id, file_a).unwrap();
+        let payload_a = repeated_blocks(1, 61);
+        store
+            .append_stream(&stream_a, &payload_a, WriteDurability::Acknowledged)
+            .unwrap();
+        let mark_a = store.flush_append_stream(&stream_a).unwrap();
+
+        let stream_b = store.open_append_stream(keyspace_id, file_b).unwrap();
+        let payload_b = repeated_blocks(1, 62);
+        store
+            .append_stream(&stream_b, &payload_b, WriteDurability::Acknowledged)
+            .unwrap();
+        let mark_b = store.flush_append_stream(&stream_b).unwrap();
+        let _ = store.drain_persist_profiles(16).unwrap();
+
+        let changed_segments = |stream: &AppendStream, mark: &DurableAppendMark| {
+            let state = store
+                .local
+                .metadata
+                .validate_append_stream_mark(stream, mark)
+                .unwrap();
+            state
+                .records
+                .iter()
+                .filter(|record| {
+                    record.offset >= state.published_through
+                        && record.offset < mark.durable_through
+                        && record
+                            .offset
+                            .checked_add(record.len)
+                            .is_some_and(|end| end <= mark.durable_through)
+                })
+                .map(|record| record.segment_id)
+                .collect::<BTreeSet<_>>()
+        };
+        let changed_a = changed_segments(&stream_a, &mark_a);
+        let changed_b = changed_segments(&stream_b, &mark_b);
+
+        let commit_a = store
+            .local
+            .publish_append_stream(&stream_a, &mark_a, WriteDurability::Flushed)
+            .unwrap();
+        let commit_b = store
+            .local
+            .publish_append_stream(&stream_b, &mark_b, WriteDurability::Flushed)
+            .unwrap();
+        assert!(commit_b.commit_seq > commit_a.commit_seq);
+
+        store
+            .persist_append_stream_publish_delta(&stream_a, commit_a.commit_seq, &changed_a)
+            .unwrap();
+        let profiles = store.drain_persist_profiles(16).unwrap();
+        assert_eq!(
+            profiles.len(),
+            1,
+            "the first publish persist should export both already-local commits"
+        );
+        assert_eq!(profiles[0].new_segment_bytes, 0);
+        assert!(
+            profiles[0].durable_commit_high_water >= commit_b.commit_seq.raw(),
+            "publish delta should advance the durable high-water through coalesced local publishes"
+        );
+
+        store
+            .persist_append_stream_publish_delta(&stream_b, commit_b.commit_seq, &changed_b)
+            .unwrap();
+        assert!(
+            store.drain_persist_profiles(16).unwrap().is_empty(),
+            "a publish whose commit is already durable must not run a redundant physical persist"
+        );
+
+        store.flush_file(keyspace_id, file_b).unwrap();
+        assert!(
+            store.drain_persist_profiles(16).unwrap().is_empty(),
+            "flush_file should also observe the coalesced durable high-water"
+        );
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut read_a = vec![0; payload_a.len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_a,
+                ByteRange::new(0, payload_a.len() as u64),
+                &mut read_a,
+            )
+            .unwrap();
+        assert_eq!(read_a, payload_a);
+        let mut read_b = vec![0; payload_b.len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_b,
+                ByteRange::new(0, payload_b.len() as u64),
+                &mut read_b,
+            )
+            .unwrap();
+        assert_eq!(read_b, payload_b);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21536,6 +22013,10 @@ mod tests {
         let profile = profiles[0];
         assert_eq!(profile.sequence, 1);
         assert!(profile.total_nanos >= profile.local_snapshot_nanos);
+        assert!(profile.data_log_append_sync_nanos >= profile.data_log_file_sync_nanos);
+        assert!(profile.data_log_encode_nanos > 0);
+        assert!(profile.data_log_write_nanos > 0);
+        assert!(profile.data_log_file_sync_nanos > 0);
         assert_eq!(profile.new_segment_count, 1);
         assert_eq!(profile.new_segment_bytes, 4096);
         assert!(profile.touched_node_count > 0);

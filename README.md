@@ -368,9 +368,9 @@ benchmark runner rather than Criterion microbenchmarks:
 ```sh
 cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,4,16,64 --files 1024 --storage-nodes 4
 cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,16,64 --files 1024 --storage-nodes 4 --rtt-us 200
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:64 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
-cargo run --release --bin loadbench -- --provider durable --durability ack --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-stream --rtt-us 200 --stream-flush-mib 16 --stream-publish-mib 128
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
+cargo run --release --bin loadbench -- --provider durable --durability ack --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-stream --rtt-us 200 --stream-flush-mib 2 --stream-publish-mib 128
 ```
 
 `loadbench` is the north-star integration benchmark: it exercises the public
@@ -379,6 +379,11 @@ throughput, latency percentiles, and conflicts/errors, and can model a fixed
 RTT between service boundaries. Treat its output as the current implementation's
 happy-environment performance baseline, while Criterion remains the narrow
 regression suite for individual mechanisms.
+
+For large durable writes, prefer small `ack-flush:N` values when comparing
+latency. `ack-flush:64` is useful as a coarse-throughput stress case, but with
+1MiB writes it creates 64MiB per-lane durability intervals and can dominate p99
+with intentional flush queueing.
 
 Use the `*-shard-lanes` block write workloads when the goal is happy-path
 throughput. The plain random block write workloads are intentionally allowed to
@@ -400,8 +405,9 @@ not as expected noise.
 
 For durable-provider tail analysis, add `--durable-profile-csv <path>` to append
 one row per physical persist. The profile breaks total persist time into lock
-wait, local state export, data-log append/sync, node-catalog publish, root
-SQLite row sync, and root SQLite commit phases.
+wait, local state export, data-log append/sync, data-log encode/write/file-sync
+subphases, node-catalog publish, root SQLite row sync, and root SQLite commit
+phases.
 
 Payload integrity is explicit in the benchmark harness. The default
 `--payload-integrity verified` stores CRC32C integrity metadata and default
@@ -422,12 +428,13 @@ The opt-in `append-stream` workload suite compares `native-stream-ingest-*`,
 `native-stream-append-flush-*`, `native-stream-publish-preflushed-1m`, and
 `native-stream-flush-publish-1m` against `native-write-*` controls. Ingest rows
 keep one stream open per worker/file lane and measure private accepted bytes.
-Use `--stream-flush-mib 16` or `--stream-flush-mib 32` with ingest rows to model
-coarse durable ingest intervals, and `--stream-publish-mib 128` to model
-batched reader visibility. `native-stream-append-flush-*` measures append plus
-durable mark per operation. `native-stream-publish-preflushed-1m` times the
-visibility boundary for already-flushed private data.
-`native-stream-flush-publish-1m` measures the full append, durable, and visible path. Large durable
-write controls can retain substantial in-flight segment bytes before an
-`ack-flush:N` boundary; on memory-constrained Docker hosts, reduce `--files`,
-concurrency, or workload size for exploratory runs.
+Use `--stream-flush-mib 2` or `--stream-flush-mib 4` for latency-first durable
+intervals; use `16` or `32` only when explicitly exploring coarser resumability
+points. `--stream-publish-mib 128` models batched reader visibility.
+`native-stream-append-flush-*` measures append plus durable mark per operation.
+`native-stream-publish-preflushed-1m` times the visibility boundary for
+already-flushed private data. `native-stream-flush-publish-1m` measures the
+full append, durable, and visible path. Large durable write controls can retain
+substantial in-flight segment bytes before an `ack-flush:N` boundary; on
+memory-constrained Docker hosts, reduce `--files`, concurrency, or workload
+size for exploratory runs.

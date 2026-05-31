@@ -273,7 +273,7 @@ options:\n\
   --device-blocks N                        logical device blocks, default: 1048576\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
   --durable-profile-csv PATH               append durable persist profiles to CSV\n\
-  --stream-flush-mib N                     flush append streams after N MiB per stream\n\
+  --stream-flush-mib N                     flush append streams after N MiB per stream; 2-4 is latency-first\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --payload-integrity verified|unchecked   write payload integrity, default: verified\n\
   --read-verification default|require-verified|skip\n\
@@ -1011,14 +1011,14 @@ fn append_profile_csv(
     if write_header {
         writeln!(
             file,
-            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,lock_wait_nanos,local_snapshot_nanos,data_log_append_sync_nanos,node_catalog_publish_nanos,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,durable_commit_high_water"
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,lock_wait_nanos,local_snapshot_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_dir_sync_nanos,node_catalog_publish_nanos,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,durable_commit_high_water"
         )
         .map_err(fs_error)?;
     }
     for profile in profiles {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             workload.name(),
             args.provider,
             args.durability,
@@ -1031,6 +1031,10 @@ fn append_profile_csv(
             profile.lock_wait_nanos,
             profile.local_snapshot_nanos,
             profile.data_log_append_sync_nanos,
+            profile.data_log_encode_nanos,
+            profile.data_log_write_nanos,
+            profile.data_log_file_sync_nanos,
+            profile.data_log_dir_sync_nanos,
             profile.node_catalog_publish_nanos,
             profile.root_sqlite_row_sync_nanos,
             profile.root_sqlite_commit_nanos,
