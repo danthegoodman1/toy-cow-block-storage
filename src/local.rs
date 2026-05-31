@@ -5337,7 +5337,7 @@ fn initialize_node_catalog_schema(conn: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS data_logs (
           log_id INTEGER PRIMARY KEY CHECK (log_id >= 0),
-          state TEXT NOT NULL CHECK (state IN ('active', 'stream-active', 'sealed', 'deleted')),
+          state TEXT NOT NULL,
           total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
           live_bytes INTEGER NOT NULL CHECK (live_bytes >= 0),
           dead_bytes INTEGER NOT NULL CHECK (dead_bytes >= 0)
@@ -5850,6 +5850,7 @@ struct DurableSqliteStore {
     conn: Arc<Mutex<Connection>>,
     node_catalogs: Arc<NodeCatalogs>,
     policy: DurableDataLogPolicy,
+    data_log_allocation_lock: Arc<Mutex<()>>,
     #[cfg(test)]
     persist_delay: Arc<Mutex<Option<Duration>>>,
     #[cfg(test)]
@@ -6089,6 +6090,17 @@ const MAX_STREAM_FLUSH_GROUPS_PER_RUN: usize = 64;
 const GENERIC_DATA_LOG_STATE_ACTIVE: &str = "active";
 const STREAM_DATA_LOG_STATE_ACTIVE: &str = "stream-active";
 
+fn stream_data_log_state(stream_id: AppendStreamId) -> String {
+    format!("{STREAM_DATA_LOG_STATE_ACTIVE}:{}", stream_id.raw())
+}
+
+fn is_stream_data_log_state(state: &str) -> bool {
+    state == STREAM_DATA_LOG_STATE_ACTIVE
+        || state
+            .strip_prefix(STREAM_DATA_LOG_STATE_ACTIVE)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
 impl DurableSqliteStore {
     fn open(
         paths: DurableStorePaths,
@@ -6110,6 +6122,7 @@ impl DurableSqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             node_catalogs: Arc::new(node_catalogs),
             policy,
+            data_log_allocation_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             persist_delay: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -6910,84 +6923,91 @@ impl DurableSqliteStore {
         let mut profile = DataLogAppendProfile::default();
         let storage_node = payload.storage_node;
         let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+        let active_state = stream_data_log_state(payload.stream_id);
 
-        let mut active = match pending_base {
-            Some(pending) => pending.active_log_for_node(
-                storage_node,
-                &self.paths.data_dir,
-                STREAM_DATA_LOG_STATE_ACTIVE,
-            )?,
-            None => None,
-        };
-        let mut active = match active.take() {
-            Some(active) => active,
-            None => {
+        let (mut file, log_id, record_offset, new_total) = {
+            let _allocation_guard = lock(&self.data_log_allocation_lock)?;
+            let mut active = match pending_base {
+                Some(pending) => pending.active_log_for_node(
+                    storage_node,
+                    &self.paths.data_dir,
+                    &active_state,
+                )?,
+                None => None,
+            };
+            let mut active = match active.take() {
+                Some(active) => active,
+                None => {
+                    let node_conn = self.node_catalogs.lock(storage_node)?;
+                    active_data_log_with_state(
+                        &node_conn,
+                        &self.paths.data_dir,
+                        storage_node,
+                        &active_state,
+                    )?
+                }
+            };
+            if active.total_bytes != 0
+                && active
+                    .total_bytes
+                    .checked_add(record_len)
+                    .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
+                    > self.policy.target_data_log_bytes
+            {
+                append.sealed_logs.push(DurableDataLogRef {
+                    storage_node,
+                    log_id: active.log_id,
+                });
                 let node_conn = self.node_catalogs.lock(storage_node)?;
-                active_data_log_with_state(
+                active = next_data_log(
                     &node_conn,
                     &self.paths.data_dir,
                     storage_node,
-                    STREAM_DATA_LOG_STATE_ACTIVE,
-                )?
+                    active.log_id,
+                )?;
             }
-        };
-        if active.total_bytes != 0
-            && active
-                .total_bytes
+
+            fs::create_dir_all(&data_dir).map_err(fs_error)?;
+            let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(fs_error)?;
+            let file_len = file.metadata().map_err(fs_error)?.len();
+            active.total_bytes = active.total_bytes.max(file_len);
+            let record_offset = active.total_bytes;
+            let new_total = record_offset
                 .checked_add(record_len)
-                .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
-                > self.policy.target_data_log_bytes
-        {
-            append.sealed_logs.push(DurableDataLogRef {
-                storage_node,
-                log_id: active.log_id,
-            });
-            let node_conn = self.node_catalogs.lock(storage_node)?;
-            active = next_data_log(
-                &node_conn,
-                &self.paths.data_dir,
-                storage_node,
-                active.log_id,
-            )?;
-        }
+                .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
+            (file, active.log_id, record_offset, new_total)
+        };
 
-        fs::create_dir_all(&data_dir).map_err(fs_error)?;
-        let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
-            .map_err(fs_error)?;
-        let file_len = file.metadata().map_err(fs_error)?.len();
-        active.total_bytes = active.total_bytes.max(file_len);
-
-        let record_offset = active.total_bytes;
         let started = Instant::now();
         let integrity =
             segment_payload_integrity_chunks(payload.payload_integrity, &payload.chunks);
         profile.encode_nanos = duration_nanos_u64(started.elapsed());
         let started = Instant::now();
+        file.seek(SeekFrom::Start(record_offset))
+            .map_err(fs_error)?;
         for chunk in &payload.chunks {
             file.write_all(chunk).map_err(fs_error)?;
         }
         profile.write_nanos = duration_nanos_u64(started.elapsed());
 
         let payload_offset = record_offset;
-        let new_total = record_offset
-            .checked_add(record_len)
-            .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
-        active.total_bytes = new_total;
         let log_ref = DurableDataLogRef {
             storage_node,
-            log_id: active.log_id,
+            log_id,
         };
         append.logs.insert(
             log_ref,
             PendingDataLogManifest {
                 storage_node,
-                log_id: active.log_id,
-                state: STREAM_DATA_LOG_STATE_ACTIVE,
+                log_id,
+                state: active_state,
                 total_bytes: new_total,
             },
         );
@@ -7001,7 +7021,7 @@ impl DurableSqliteStore {
             file_id: payload.file_id,
             file_offset_start: payload.file_offset_start,
             payload_len: payload_bytes,
-            log_id: active.log_id,
+            log_id,
             log_payload_offset: payload_offset,
             log_record_bytes: record_len,
             integrity,
@@ -7046,7 +7066,7 @@ impl DurableSqliteStore {
         segments: Vec<DurableSegmentPayload>,
         sync_mode: DataLogSyncMode,
         pending_base: Option<&PendingDataLogAppend>,
-        active_state: &'static str,
+        active_state: &str,
     ) -> Result<(PendingDataLogAppend, DataLogAppendProfile)> {
         let mut append = PendingDataLogAppend::default();
         if segments.is_empty() {
@@ -7178,7 +7198,7 @@ impl DurableSqliteStore {
                 PendingDataLogManifest {
                     storage_node,
                     log_id: active.log_id,
-                    state: active_state,
+                    state: active_state.to_string(),
                     total_bytes: new_total,
                 },
             );
@@ -7774,7 +7794,7 @@ impl PendingDataLogAppend {
         &self,
         storage_node: StorageNodeId,
         data_dir: &Path,
-        active_state: &'static str,
+        active_state: &str,
     ) -> Result<Option<DataLogRow>> {
         let sealed: BTreeSet<_> = self
             .sealed_logs
@@ -7820,7 +7840,7 @@ impl PendingDataLogAppend {
                 .entry(log_ref)
                 .and_modify(|existing| {
                     existing.total_bytes = existing.total_bytes.max(manifest.total_bytes);
-                    existing.state = manifest.state;
+                    existing.state = manifest.state.clone();
                 })
                 .or_insert(manifest);
         }
@@ -7836,7 +7856,7 @@ impl PendingDataLogAppend {
 struct PendingDataLogManifest {
     storage_node: StorageNodeId,
     log_id: u64,
-    state: &'static str,
+    state: String,
     total_bytes: u64,
 }
 
@@ -8507,7 +8527,7 @@ fn persist_data_log_manifest(
     log: &PendingDataLogManifest,
 ) -> Result<()> {
     let data_logs = node_catalog_table(log.storage_node, "data_logs")?;
-    let live_bytes = if log.state == STREAM_DATA_LOG_STATE_ACTIVE {
+    let live_bytes = if is_stream_data_log_state(&log.state) {
         log.total_bytes
     } else {
         0
@@ -8523,7 +8543,7 @@ fn persist_data_log_manifest(
         ),
         params![
             u64_to_i64(log.log_id)?,
-            log.state,
+            &log.state,
             u64_to_i64(log.total_bytes)?,
             u64_to_i64(live_bytes)?
         ],
@@ -10790,6 +10810,7 @@ pub struct DurableCoordinator {
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     pending_stream_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
+    stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<Mutex<()>>>>>,
     persist_lock: Arc<Mutex<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
     stream_flush_coordinator: Arc<StreamFlushCoordinator>,
@@ -10887,6 +10908,7 @@ impl DurableCoordinator {
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             pending_stream_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
+            stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_lock: Arc::new(Mutex::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_flush_coordinator: Arc::new(StreamFlushCoordinator::new()),
@@ -11531,7 +11553,7 @@ impl DurableCoordinator {
                 PendingDataLogManifest {
                     storage_node: log_ref.storage_node,
                     log_id: log_ref.log_id,
-                    state: STREAM_DATA_LOG_STATE_ACTIVE,
+                    state: STREAM_DATA_LOG_STATE_ACTIVE.to_string(),
                     total_bytes,
                 },
             );
@@ -12092,6 +12114,15 @@ impl DurableCoordinator {
         self.append_stream_with_integrity(stream, data, durability, PayloadIntegrity::Verified)
     }
 
+    fn stream_append_lane(&self, stream_id: AppendStreamId) -> Result<Arc<Mutex<()>>> {
+        let mut lanes = lock(&self.stream_append_lanes)?;
+        Ok(Arc::clone(
+            lanes
+                .entry(stream_id)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+
     pub fn append_stream_with_integrity(
         &self,
         stream: &AppendStream,
@@ -12105,6 +12136,8 @@ impl DurableCoordinator {
                 .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?,
             flushed,
         )?;
+        let lane = self.stream_append_lane(stream.stream_id)?;
+        let _lane_guard = lock(&lane)?;
         let result = self
             .local
             .prepare_append_stream_run(
@@ -24804,6 +24837,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes, one_mib);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_append_stream_lanes_keep_interleaved_files_coalescible() {
+        let root = durable_temp_dir("stream-lanes-keep-files-coalescible");
+        let cfg = LocalStoreConfig {
+            file_root_blocks: 16 * 1024,
+            metadata_leaf_blocks: 16 * 1024,
+            ..config()
+        };
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_a = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("a".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let file_b = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("b".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let stream_a = store.open_append_stream(keyspace_id, file_a).unwrap();
+        let stream_b = store.open_append_stream(keyspace_id, file_b).unwrap();
+        let one_mib_a = vec![11; 1024 * 1024];
+        let one_mib_b = vec![29; 1024 * 1024];
+        for _ in 0..8 {
+            store
+                .append_stream(&stream_a, &one_mib_a, WriteDurability::Acknowledged)
+                .unwrap();
+            store
+                .append_stream(&stream_b, &one_mib_b, WriteDurability::Acknowledged)
+                .unwrap();
+        }
+
+        let mark_a = store.flush_append_stream(&stream_a).unwrap();
+        let mark_b = store.flush_append_stream(&stream_b).unwrap();
+        store.publish_append_stream(&stream_a, &mark_a).unwrap();
+        store.publish_append_stream(&stream_b, &mark_b).unwrap();
+
+        let extents_a = file_run_extents(&store.metadata(), keyspace_id, file_a);
+        let extents_b = file_run_extents(&store.metadata(), keyspace_id, file_b);
+        assert_eq!(extents_a.len(), 1);
+        assert_eq!(extents_b.len(), 1);
+        assert_eq!(extents_a[0].payload_len, 8 * 1024 * 1024);
+        assert_eq!(extents_b[0].payload_len, 8 * 1024 * 1024);
+        assert_ne!(extents_a[0].run.log_id, extents_b[0].run.log_id);
+
         let _ = fs::remove_dir_all(root);
     }
 
