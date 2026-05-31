@@ -1304,6 +1304,58 @@ native flush after 32 acknowledged writes about 10 ms with high host variance.
 Treat these as regression smoke baselines; the sync-heavy floor remains
 host/filesystem dependent.
 
+## Phase 23A: Durable Append-Run Native Streams
+
+Status: planned.
+
+Replace the native append-stream storage shape with durable append runs and
+compact run-backed visible file extents. The public stream API keeps the
+durable/visible split, but the implementation must stop translating stream
+ingest into ordinary segment placement fanout. The detailed implementation plan
+lives in `docs/durable-append-run-architecture-plan.md`.
+
+Non-goals:
+
+- No block write rewrite.
+- No compatibility reader for the old internal stream-segment representation.
+- No replication, quorum, `io_uring`, compression, encryption, or POSIX fsync
+  semantics in this phase.
+- No weakening of SQLite durability settings to hide metadata cost.
+
+Deliverables:
+
+- [ ] Core append-run, run-range, checksum-range, durable-mark, and
+  run-backed-file-extent types with deterministic validation.
+- [ ] Stream ingest writes payloads once into storage-node append lanes, not
+  into both append logs and ordinary segments.
+- [ ] Bounded durable stream flush persists log runs and stream high-water
+  without generic full-state or generic segment publish paths.
+- [ ] Visible publish converts durable stream runs into coalesced file extents
+  in one metadata transition.
+- [ ] Reopen restores visible heads and resumable private stream state while
+  ignoring unflushed bytes.
+- [ ] GC roots include active/resumable private stream ranges and stop
+  protecting fenced, aborted, expired, superseded, or fully published private
+  ranges.
+- [ ] Read paths support verified reads from run-backed extents and explicit
+  no-verify policy when callers choose it.
+- [ ] `loadbench` reports the append-run matrix at 200 us modeled RTT with
+  phase-level durable profiles.
+
+Exit gate:
+
+- [ ] `append_stream` does not create ordinary segment placements or durable
+  stream rows with one record per client append.
+- [ ] Publishing 128 one-MiB appends produces one or a small deterministic
+  number of visible extents when the physical run is contiguous.
+- [ ] Stream flush p99 is dominated by bounded physical sync groups, not global
+  lock wait or metadata fanout.
+- [ ] Publish profile has no payload append/sync and scales with run count.
+- [ ] Fencing, restart, corruption, PITR, fork, and GC tests pass for
+  durable-but-invisible private data.
+- [ ] The no-tombstones rule is upheld: once the run-backed path is complete,
+  the old stream-segment path is deleted rather than kept as a wrapper.
+
 ## Phase 24: Background Compaction Scheduling and Backpressure Policy
 
 Status: complete.

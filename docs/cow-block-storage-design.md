@@ -30,11 +30,24 @@ logical_start, length -> segment_id, segment_offset
 ```
 
 The native extent/file API uses the same segment substrate and commit/fencing
-rules, but publishes file extents instead of logical block ranges:
+rules for ordinary writes, but publishes file extents instead of logical block
+ranges:
 
 ```text
 file_id, file_version, file_extent -> segment_id, segment_offset
 ```
+
+Append-stream publishes are a native file fast path, not a block-compatibility
+mapping. Their final storage shape is run-backed file extents over
+stream-private append logs:
+
+```text
+file_id, file_version, file_extent -> append_log_run_id, run_offset
+```
+
+That keeps large appends from fragmenting visible metadata into one ordinary
+segment per client append call. Block writes and ordinary file writes can still
+use immutable segments.
 
 Data is never overwritten in place. Writes append data to fresh immutable
 segments, copy only the metadata path inside the affected shard, and publish a
@@ -1267,9 +1280,9 @@ A native append publish:
 
 1. Validates the append stream and durable mark against the active stream state.
 2. Verifies the visible file head still matches the stream's published boundary.
-3. Builds file extent metadata for the durable private range being made visible.
+3. Coalesces the durable private range into compact run-backed file extents.
 4. Publishes the new file root with append-stream and writer-epoch fencing.
-5. Marks referenced segment catalog entries after metadata publish succeeds.
+5. Marks the stream range published after metadata publish succeeds.
 6. Returns the new file version.
 
 Invariants:
@@ -1277,6 +1290,10 @@ Invariants:
 - A successful publish advances the file version atomically.
 - Stale writers are rejected by metadata fencing.
 - Flush without publish never becomes readable file data.
+- Publish of already-flushed append-stream data is metadata-only; it must not
+  append or sync payload bytes again.
+- Publish metadata scales with durable run count, not with client append call
+  count.
 - Durable private data from fenced, aborted, or abandoned streams is reclaimable
   once it stops acting as an active stream GC root.
 
