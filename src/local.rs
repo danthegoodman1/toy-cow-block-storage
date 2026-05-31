@@ -10023,19 +10023,18 @@ fn sync_pending_data_logs(
     let mut profile = DataLogAppendProfile::default();
     let mut storage_nodes = BTreeSet::new();
     let mut logs = BTreeSet::new();
+    let mut files = Vec::new();
     for log_ref in pending.logs.keys() {
         storage_nodes.insert(log_ref.storage_node);
         logs.insert(*log_ref);
     }
     for log_ref in logs {
         let path = data_log_path(data_dir, log_ref.storage_node, log_ref.log_id);
-        let file = File::open(&path).map_err(fs_error)?;
-        let started = Instant::now();
-        file.sync_data().map_err(fs_error)?;
-        profile.file_sync_nanos = profile
-            .file_sync_nanos
-            .saturating_add(duration_nanos_u64(started.elapsed()));
+        files.push(File::open(&path).map_err(fs_error)?);
     }
+    let started = Instant::now();
+    sync_data_log_files(files)?;
+    profile.file_sync_nanos = duration_nanos_u64(started.elapsed());
     for storage_node in storage_nodes {
         let started = Instant::now();
         sync_dir(&node_data_log_dir(data_dir, storage_node))?;
