@@ -471,8 +471,8 @@ following local shortcuts are intentional, but each must become a durable,
 remote, replayable, or concurrent boundary in the owning future phase:
 
 - Phase 14 owns native keyspace PITR and snapshot semantics over the shared
-  segment substrate, including keyspace catalog-root records, file-root audit
-  records, and restore/snapshot API shape.
+  segment substrate, including keyspace catalog-shard commit records,
+  file-root audit records, and restore/snapshot API shape.
 - Phase 15 owns native keyspace performance characterization and any benchmark-
   proven local catalog scaling work needed before durable formats are chosen.
 - Phase 16 owned the first local durable snapshot provider: segment sync,
@@ -550,7 +550,7 @@ delay, duplication, reorder, failure, and restart tests.
 Status: complete.
 
 Add point-in-time history for native keyspaces without routing native operations
-through block-device mappings. This phase proves that keyspace catalog-root
+through block-device mappings. This phase proves that keyspace catalog-shard
 timelines, file-root audit records, append-stream fencing, and GC retention work
 for the native API before durable or remote providers have to persist those
 records.
@@ -564,14 +564,14 @@ Deliverables:
 - [x] Public native keyspace restore/snapshot API shape documented in the spec.
 - [x] Native file read/write/append semantics are byte-oriented while local
   segment storage remains block-aligned internally.
-- [x] Append-only `KeyspaceCommit` records with old/new keyspace catalog roots,
-  commit sequence, commit group, and logical time.
+- [x] Append-only `KeyspaceCommit` records with old/new keyspace catalog shard
+  roots, file-count transition, commit sequence, commit group, and logical time.
 - [x] Append-only `FileCommit` records with old/new file roots, old/new file
   versions, size, commit sequence, commit group, and logical time.
 - [x] Native keyspace checkpoint records that can reconstruct a `KeyspaceHead`.
 - [x] Immutable keyspace catalog entries include file creation metadata, so
   snapshots and restores preserve namespace metadata by root-pointer copy.
-- [x] Restore algorithm from checkpoint plus keyspace commits.
+- [x] Restore algorithm from checkpoint plus per-shard keyspace commits.
 - [x] Native snapshot or restore operation that creates a new keyspace lineage
   without mutating the source keyspace.
 - [x] PITR retention and replay-anchor materialization for native keyspace
@@ -585,8 +585,8 @@ Exit gate:
 
 - [x] Native keyspace restore to selected commits, checkpoints, and times returns
   expected file bytes, size, and file version for every restored file.
-- [x] Snapshot and restore reuse the retained `KeyspaceRoot` pointer and do not
-  allocate file metadata-tree nodes.
+- [x] Snapshot and restore reuse retained keyspace catalog shard roots and do
+  not allocate file metadata-tree nodes.
 - [x] Native checkpoint validation rejects mismatched keyspace roots.
 - [x] Unaligned native writes, appends, and reads across a block boundary
   preserve exact file bytes and size.
@@ -613,9 +613,9 @@ API and deterministic core leave room for high-performance implementations.
 Before this phase, each immutable `KeyspaceRoot` contained one deterministic
 map of file catalog entries. That was a good correctness model, but the Phase
 15 benchmarks showed whole-catalog publish cost would freeze the wrong shape
-into durable providers. The local catalog now uses sharded immutable keyspace
-catalog roots: file create/write/append copies one catalog shard plus one root,
-while snapshot and restore continue to copy only root IDs.
+into durable providers. The local catalog now uses live sharded catalog heads:
+file create/write/append copies one catalog shard, while `KeyspaceRoot` objects
+are materialized only for checkpoint, snapshot, and PITR replay anchors.
 
 Deliverables:
 
@@ -634,7 +634,7 @@ Deliverables:
   correctness model, or implement a sharded keyspace catalog before durable
   providers.
 - [x] If benchmarks show `O(file_count)` publish cost is material, replace the
-  local `BTreeMap` catalog root body with sharded immutable catalog roots or an
+  local `BTreeMap` catalog root body with live sharded catalog heads or an
   equally simple measured alternative.
 - [x] If catalog sharding is added, deterministic generated tests compare
   native keyspace behavior against the existing simple historical model.
@@ -642,7 +642,7 @@ Deliverables:
   publishes contend at catalog-shard granularity rather than whole-keyspace
   granularity.
 - [x] Documentation of the intended high-performance implementation shape:
-  cached hot file heads, sharded catalog-root publishes, append-only timeline
+  cached hot file heads, sharded catalog-shard publishes, append-only timeline
   records, and provider-private indexes that do not leak into public APIs.
 
 Exit gate:

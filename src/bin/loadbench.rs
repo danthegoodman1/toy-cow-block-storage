@@ -261,7 +261,7 @@ options:\n\
                                            default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch, append-stream, block-metadata\n\
+                                           aliases: north-star, append-batch, append-stream, block-metadata, native-metadata\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-same-shard-contended,\n\
                                            block-write-4k-same-shard-serialized,\n\
@@ -270,9 +270,11 @@ options:\n\
                                            block-write-1m, block-write-1m-shard-lanes,\n\
                                            block-write-1m-device-lanes,\n\
                                            native-read-4k,\n\
-                                           native-write-4k, native-write-1m,\n\
+                                           native-write-4k, native-write-4k-same-file,\n\
+                                           native-write-4k-file-lanes, native-write-1m,\n\
                                            native-write-4m, native-write-32m,\n\
-                                           native-append-4k, native-append-1m,\n\
+                                           native-append-4k, native-append-4k-same-file,\n\
+                                           native-append-4k-file-lanes, native-append-1m,\n\
                                            native-append-4m, native-append-32m,\n\
                                            native-stream-ingest-1m,\n\
                                            native-stream-ingest-4m,\n\
@@ -371,6 +373,7 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
             "append-batch" => workloads.extend(Workload::append_batch_suite()),
             "append-stream" => workloads.extend(Workload::append_stream_suite()),
             "block-metadata" => workloads.extend(Workload::block_metadata_suite()),
+            "native-metadata" => workloads.extend(Workload::native_metadata_suite()),
             _ => workloads.push(Workload::from_str(part)?),
         }
     }
@@ -500,10 +503,14 @@ enum Workload {
     BlockWrite1mDeviceLanes,
     NativeRead4k,
     NativeWrite4k,
+    NativeWrite4kSameFile,
+    NativeWrite4kFileLanes,
     NativeWrite1m,
     NativeWrite4m,
     NativeWrite32m,
     NativeAppend4k,
+    NativeAppend4kSameFile,
+    NativeAppend4kFileLanes,
     NativeAppend1m,
     NativeAppend4m,
     NativeAppend32m,
@@ -573,6 +580,16 @@ impl Workload {
         ]
     }
 
+    fn native_metadata_suite() -> Vec<Self> {
+        vec![
+            Self::NativeWrite4kSameFile,
+            Self::NativeWrite4kFileLanes,
+            Self::NativeAppend4kSameFile,
+            Self::NativeAppend4kFileLanes,
+            Self::NativeStreamFlushPublish1m,
+        ]
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::BlockWrite4k => "block-write-4k",
@@ -586,10 +603,14 @@ impl Workload {
             Self::BlockWrite1mDeviceLanes => "block-write-1m-device-lanes",
             Self::NativeRead4k => "native-read-4k",
             Self::NativeWrite4k => "native-write-4k",
+            Self::NativeWrite4kSameFile => "native-write-4k-same-file",
+            Self::NativeWrite4kFileLanes => "native-write-4k-file-lanes",
             Self::NativeWrite1m => "native-write-1m",
             Self::NativeWrite4m => "native-write-4m",
             Self::NativeWrite32m => "native-write-32m",
             Self::NativeAppend4k => "native-append-4k",
+            Self::NativeAppend4kSameFile => "native-append-4k-same-file",
+            Self::NativeAppend4kFileLanes => "native-append-4k-file-lanes",
             Self::NativeAppend1m => "native-append-1m",
             Self::NativeAppend4m => "native-append-4m",
             Self::NativeAppend32m => "native-append-32m",
@@ -631,8 +652,12 @@ impl Workload {
             | Self::BlockWrite4kDeviceLanes
             | Self::BlockRead4k
             | Self::NativeWrite4k
+            | Self::NativeWrite4kSameFile
+            | Self::NativeWrite4kFileLanes
             | Self::NativeRead4k
             | Self::NativeAppend4k
+            | Self::NativeAppend4kSameFile
+            | Self::NativeAppend4kFileLanes
             | Self::NativeHotAppend4k => 4096,
         }
     }
@@ -644,7 +669,12 @@ impl Workload {
     fn is_native_write(self) -> bool {
         matches!(
             self,
-            Self::NativeWrite4k | Self::NativeWrite1m | Self::NativeWrite4m | Self::NativeWrite32m
+            Self::NativeWrite4k
+                | Self::NativeWrite4kSameFile
+                | Self::NativeWrite4kFileLanes
+                | Self::NativeWrite1m
+                | Self::NativeWrite4m
+                | Self::NativeWrite32m
         )
     }
 
@@ -652,6 +682,8 @@ impl Workload {
         matches!(
             self,
             Self::NativeAppend4k
+                | Self::NativeAppend4kSameFile
+                | Self::NativeAppend4kFileLanes
                 | Self::NativeAppend1m
                 | Self::NativeAppend4m
                 | Self::NativeAppend32m
@@ -735,10 +767,14 @@ impl FromStr for Workload {
             "block-write-1m-device-lanes" => Ok(Self::BlockWrite1mDeviceLanes),
             "native-read-4k" => Ok(Self::NativeRead4k),
             "native-write-4k" => Ok(Self::NativeWrite4k),
+            "native-write-4k-same-file" => Ok(Self::NativeWrite4kSameFile),
+            "native-write-4k-file-lanes" => Ok(Self::NativeWrite4kFileLanes),
             "native-write-1m" => Ok(Self::NativeWrite1m),
             "native-write-4m" => Ok(Self::NativeWrite4m),
             "native-write-32m" => Ok(Self::NativeWrite32m),
             "native-append-4k" => Ok(Self::NativeAppend4k),
+            "native-append-4k-same-file" => Ok(Self::NativeAppend4kSameFile),
+            "native-append-4k-file-lanes" => Ok(Self::NativeAppend4kFileLanes),
             "native-append-1m" => Ok(Self::NativeAppend1m),
             "native-append-4m" => Ok(Self::NativeAppend4m),
             "native-append-32m" => Ok(Self::NativeAppend32m),
@@ -1958,6 +1994,20 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
+        (Target::Native { keyspace_id, files }, Workload::NativeWrite4kSameFile) => {
+            let file_id = files[0];
+            context
+                .store
+                .write_file_at(
+                    *keyspace_id,
+                    file_id,
+                    0,
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
+        }
         (Target::Native { keyspace_id, files }, workload) if workload.is_native_write() => {
             let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());
             let file_id = files[file_index];
@@ -1983,6 +2033,19 @@ fn run_one_op(
                     ByteRange::new(0, context.op_size as u64),
                     read_buf,
                     config.read_verification,
+                )
+                .map(|_| OpProgress::default())
+        }
+        (Target::Native { keyspace_id, files }, Workload::NativeAppend4kSameFile) => {
+            let file_id = files[0];
+            context
+                .store
+                .append_file_once(
+                    *keyspace_id,
+                    file_id,
+                    &context.payload,
+                    durability,
+                    config.payload_integrity,
                 )
                 .map(|_| OpProgress::default())
         }
@@ -2529,6 +2592,15 @@ mod tests {
         assert!(suite.contains(&Workload::NativeStreamFlushPublish1m));
         assert!(Workload::from_str("native-stream-append-1m").is_err());
         assert!(Workload::from_str("native-stream-publish-1m").is_err());
+    }
+
+    #[test]
+    fn native_metadata_suite_names_contention_shapes() {
+        let suite = parse_workloads("native-metadata").unwrap();
+        assert!(suite.contains(&Workload::NativeWrite4kSameFile));
+        assert!(suite.contains(&Workload::NativeWrite4kFileLanes));
+        assert!(suite.contains(&Workload::NativeAppend4kSameFile));
+        assert!(suite.contains(&Workload::NativeAppend4kFileLanes));
     }
 
     #[test]

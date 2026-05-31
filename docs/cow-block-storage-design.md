@@ -342,14 +342,15 @@ snapshots, byte writes, append ownership, file versions, and stale-writer
 fencing instead of encoding those semantics into ordinary block writes.
 
 The snapshot and restore boundary is the native keyspace, not an individual
-file. A keyspace is a filesystem-like namespace whose committed head points to
-an immutable catalog root:
+file. A keyspace is a filesystem-like namespace whose live committed head holds
+one root per catalog shard:
 
 ```text
 KeyspaceHead {
   keyspace_id
   generation
-  root -> KeyspaceRoot
+  file_count
+  catalog_shards[0..K-1] -> KeyspaceCatalogShard
 }
 
 KeyspaceRoot {
@@ -366,17 +367,19 @@ KeyspaceCatalogShard {
 ```
 
 File IDs are scoped by `keyspace_id`. A snapshot or restore creates a new
-keyspace lineage by copying the retained `KeyspaceRoot` pointer, so all files in
-the namespace and their catalog metadata are restored to one coherent point in
-time. File creation metadata belongs inside the immutable catalog root; it must
-not live in a mutable side table that snapshots have to rediscover.
+keyspace lineage by copying a retained keyspace catalog root/checkpoint, so all
+files in the namespace and their catalog metadata are restored to one coherent
+point in time. File creation metadata belongs inside immutable catalog shards;
+it must not live in a mutable side table that snapshots have to rediscover.
 
 The local Phase 15 provider uses a fixed provider-private catalog shard count.
-Creating or mutating one file copies exactly one catalog shard plus one
-`KeyspaceRoot`, while untouched catalog shards and all file metadata trees stay
-shared. The shard count is not part of the public API; durable or remote
-providers may choose a different sharding or indexing policy while preserving
-the same root-pointer snapshot and restore semantics.
+Creating or mutating one file copies exactly one catalog shard and updates that
+shard in the live `KeyspaceHead`; ordinary file publishes do not allocate a new
+whole-keyspace root. `KeyspaceRoot` objects are materialized for checkpoints,
+snapshots, and PITR replay anchors. The shard count is not part of the public
+API; durable or remote providers may choose a different sharding or indexing
+policy while preserving the same coherent keyspace snapshot and restore
+semantics.
 
 The native API publishes mappings shaped like:
 
@@ -395,7 +398,7 @@ Public native guarantees:
 - The metadata plane rejects stale append stream operations whose stream token
   or writer epoch no longer matches the keyspace-scoped file.
 - A successful mutating write or append commit advances the file version and
-  keyspace catalog root atomically.
+  owning keyspace catalog shard atomically.
 - Segment bytes are durable before file extent metadata references them.
 - Failed or stale append commits leave only orphan segment data that custodians
   can reclaim.
@@ -448,8 +451,8 @@ decisions.
 
 ### Native Keyspace Scaling Decision
 
-Phase 15 replaces the original local whole-catalog `BTreeMap` body with sharded
-immutable keyspace catalog roots before durable formats exist. The benchmarked
+Phase 15 replaces the original local whole-catalog `BTreeMap` body with live
+sharded keyspace catalog heads before durable formats exist. The benchmarked
 whole-map approach made native file create/write/append cost proportional to the
 number of files in the keyspace because every publish cloned the full catalog.
 The local provider now models the intended durable shape:
@@ -605,7 +608,7 @@ semantics.
 - current device heads
 - current keyspace heads, file heads, and file versions
 - shard-root publish and compare-and-swap
-- native keyspace catalog-root publish with file-version and writer-epoch
+- native keyspace catalog-shard publish with file-version and writer-epoch
   fencing
 - commit groups for multi-shard atomic public writes
 - commit groups for native file write/append extent commits
@@ -1143,7 +1146,7 @@ Invariants:
 
 Native files do not get a public per-file fork API in v1. The native API
 snapshots and restores whole keyspaces so a filesystem namespace remains
-coherent; those operations copy keyspace catalog-root pointers rather than
+coherent; those operations copy catalog shard-root sets rather than
 piggybacking on block-device forks.
 
 ### Read Range
@@ -1231,9 +1234,9 @@ Invariants:
 ### Native File Create
 
 Creating a native file initializes an empty file metadata root and a file
-version of zero, then publishes a new immutable keyspace catalog root containing
-that file head. File metadata roots are GC roots while their keyspace catalog
-root is live or retained by PITR policy.
+version of zero, then publishes a new immutable keyspace catalog shard
+containing that file head. File metadata roots are GC roots while their
+catalog shard is live or retained by PITR policy.
 
 Invariants:
 
@@ -1253,7 +1256,7 @@ root.
 Invariants:
 
 - A successful write advances the file version atomically with the containing
-  keyspace catalog root.
+  keyspace catalog shard.
 - Writes are fenced by the committed file version observed by the metadata
   plane.
 - Failed writes leave the previous file version readable.
@@ -1370,7 +1373,7 @@ ShardCommit {
 }
 ```
 
-Native operations append keyspace catalog-root commit records. File-root
+Native operations append keyspace catalog-shard commit records. File-root
 changes are also recorded as audit/replay evidence inside the keyspace commit:
 
 ```text
@@ -1379,8 +1382,11 @@ KeyspaceCommit {
   commit_group
   time
   keyspace_id
-  old_root
-  new_root
+  shard_index
+  old_shard
+  new_shard
+  old_file_count
+  new_file_count
 }
 ```
 
@@ -1423,8 +1429,8 @@ mutate the source device or historical roots. Device creation and fork creation
 also write baseline checkpoints so replay always has a deterministic starting
 root set.
 
-The native restore API creates a new keyspace from the reconstructed
-`KeyspaceRoot`. This is intentionally not a per-file restore: every file in the
+The native restore API creates a new keyspace from the reconstructed catalog
+shard-root set. This is intentionally not a per-file restore: every file in the
 catalog is restored together, and a stale append stream from the source
 keyspace cannot publish into the restored keyspace because append streams carry
 `keyspace_id`.
@@ -1456,7 +1462,7 @@ being O(1), and every snapshot would require walking metadata.
 
 Use tracing GC:
 
-1. Start from all live device shard roots, live native keyspace catalog roots,
+1. Start from all live device shard roots, live native keyspace catalog shards,
    and retained PITR checkpoint/timeline roots.
 2. Mark reachable metadata nodes.
 3. Mark segment IDs referenced by reachable leaf entries.
@@ -1655,7 +1661,7 @@ The simulator and tests should check these invariants after every delivered
 command:
 
 - Every live device has exactly `N` shard roots.
-- Every live native keyspace has one current catalog root.
+- Every live native keyspace has exactly `K` catalog shard roots.
 - Every file in a live native keyspace has one current file root and monotonic
   file version.
 - Every committed shard root points to an existing metadata node.

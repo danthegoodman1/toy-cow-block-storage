@@ -1925,7 +1925,8 @@ impl LocalCoordinator {
                     None,
                 ) {
                     Ok(root) => {
-                        head.root = root;
+                        head.shard_roots = root.shard_roots.to_vec();
+                        head.file_count = root.file_count;
                         head.latest_commit = Self::latest_keyspace_commit_at_or_before(
                             &metadata,
                             keyspace_id,
@@ -1997,24 +1998,26 @@ impl LocalCoordinator {
             Self::collect_metadata_root_for_export(&metadata, commit.new_root, &mut retained)?;
         }
         for head in metadata.keyspace_heads.values() {
-            Self::collect_keyspace_root_for_export(
-                &metadata,
-                head.keyspace_id,
-                head.root,
-                &mut retained,
-            )?;
+            for shard_id in head.shard_roots.iter().copied() {
+                Self::collect_keyspace_shard_for_export(
+                    &metadata,
+                    head.keyspace_id,
+                    shard_id,
+                    &mut retained,
+                )?;
+            }
         }
         for commit in &metadata.keyspace_commits {
-            Self::collect_keyspace_root_for_export(
+            Self::collect_keyspace_shard_for_export(
                 &metadata,
                 commit.keyspace_id,
-                commit.old_root,
+                commit.old_shard,
                 &mut retained,
             )?;
-            Self::collect_keyspace_root_for_export(
+            Self::collect_keyspace_shard_for_export(
                 &metadata,
                 commit.keyspace_id,
-                commit.new_root,
+                commit.new_shard,
                 &mut retained,
             )?;
         }
@@ -2288,20 +2291,30 @@ impl LocalCoordinator {
             .get(&root_id)
             .ok_or_else(|| StorageError::not_found("keyspace_root", root_id.to_string()))?;
         for shard_id in root.shard_roots.iter().copied() {
-            if !retained.should_collect_keyspace_shard(shard_id) {
-                continue;
-            }
-            retained.keyspace_shards.insert(shard_id);
-            let shard = metadata
-                .keyspace_catalog_shards
-                .get(&shard_id)
-                .ok_or_else(|| {
-                    StorageError::not_found("keyspace_catalog_shard", shard_id.to_string())
-                })?;
-            for (file_id, entry) in &shard.files {
-                retained.files.insert((keyspace_id, *file_id));
-                Self::collect_metadata_root_for_export(metadata, entry.head.root, retained)?;
-            }
+            Self::collect_keyspace_shard_for_export(metadata, keyspace_id, shard_id, retained)?;
+        }
+        Ok(())
+    }
+
+    fn collect_keyspace_shard_for_export(
+        metadata: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        shard_id: KeyspaceCatalogShardId,
+        retained: &mut DurableExportRetention,
+    ) -> Result<()> {
+        if !retained.should_collect_keyspace_shard(shard_id) {
+            return Ok(());
+        }
+        retained.keyspace_shards.insert(shard_id);
+        let shard = metadata
+            .keyspace_catalog_shards
+            .get(&shard_id)
+            .ok_or_else(|| {
+                StorageError::not_found("keyspace_catalog_shard", shard_id.to_string())
+            })?;
+        for (file_id, entry) in &shard.files {
+            retained.files.insert((keyspace_id, *file_id));
+            Self::collect_metadata_root_for_export(metadata, entry.head.root, retained)?;
         }
         Ok(())
     }
@@ -2381,11 +2394,11 @@ impl LocalCoordinator {
             .get(&stream.keyspace_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("keyspace", stream.keyspace_id.to_string()))?;
-        let keyspace_root =
-            InMemoryMetadataPlane::keyspace_root_locked(&metadata, keyspace_head.root)?;
-        let shard_index =
-            InMemoryMetadataPlane::keyspace_catalog_shard_index(stream.file_id, &keyspace_root)?;
-        let shard_id = keyspace_root
+        let shard_index = InMemoryMetadataPlane::keyspace_catalog_shard_index_for_len(
+            stream.file_id,
+            keyspace_head.shard_roots.len(),
+        )?;
+        let shard_id = keyspace_head
             .shard_roots
             .get(shard_index)
             .copied()
@@ -2574,7 +2587,7 @@ impl LocalCoordinator {
         }
 
         let mut keyspace_heads = BTreeMap::new();
-        let mut keyspace_roots = BTreeMap::new();
+        let keyspace_roots: BTreeMap<KeyspaceRootId, KeyspaceRoot> = BTreeMap::new();
         let mut keyspace_catalog_shards = BTreeMap::new();
         let mut metadata_nodes = BTreeMap::new();
         let mut referenced_segment_ids = BTreeSet::new();
@@ -2592,12 +2605,14 @@ impl LocalCoordinator {
                 .cloned()
                 .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
             if head.latest_commit.raw() > target_commit.raw() {
-                head.root = InMemoryMetadataPlane::replay_keyspace_root_locked(
+                let root = InMemoryMetadataPlane::replay_keyspace_root_locked(
                     &metadata,
                     keyspace_id,
                     target_commit,
                     None,
                 )?;
+                head.shard_roots = root.shard_roots.to_vec();
+                head.file_count = root.file_count;
                 head.latest_commit = Self::latest_keyspace_commit_at_or_before(
                     &metadata,
                     keyspace_id,
@@ -2605,13 +2620,14 @@ impl LocalCoordinator {
                 );
             }
             keyspace_heads.insert(keyspace_id, head.clone());
-            Self::collect_native_delta_keyspace_root(
-                &metadata,
-                head.root,
-                previous,
-                &mut keyspace_roots,
-                &mut keyspace_catalog_shards,
-            )?;
+            for shard_id in head.shard_roots.iter().copied() {
+                Self::collect_native_delta_keyspace_shard(
+                    &metadata,
+                    shard_id,
+                    previous,
+                    &mut keyspace_catalog_shards,
+                )?;
+            }
         }
 
         let touched_files: BTreeSet<_> = file_commits
@@ -2676,24 +2692,17 @@ impl LocalCoordinator {
         }))
     }
 
-    fn collect_native_delta_keyspace_root(
+    fn collect_native_delta_keyspace_shard(
         metadata: &MetadataInner,
-        root_id: KeyspaceRootId,
+        shard_id: KeyspaceCatalogShardId,
         previous: &DurableExportCursor,
-        keyspace_roots: &mut BTreeMap<KeyspaceRootId, KeyspaceRoot>,
         keyspace_catalog_shards: &mut BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>,
     ) -> Result<()> {
-        let root = InMemoryMetadataPlane::keyspace_root_locked(metadata, root_id)?;
-        if root_id.raw() >= previous.next_keyspace_root_id {
-            keyspace_roots.insert(root_id, root.clone());
+        if shard_id.raw() < previous.next_keyspace_catalog_shard_id {
+            return Ok(());
         }
-        for shard_id in root.shard_roots.iter().copied() {
-            if shard_id.raw() < previous.next_keyspace_catalog_shard_id {
-                continue;
-            }
-            let shard = InMemoryMetadataPlane::keyspace_catalog_shard_locked(metadata, shard_id)?;
-            keyspace_catalog_shards.insert(shard_id, shard);
-        }
+        let shard = InMemoryMetadataPlane::keyspace_catalog_shard_locked(metadata, shard_id)?;
+        keyspace_catalog_shards.insert(shard_id, shard);
         Ok(())
     }
 
@@ -6249,6 +6258,22 @@ struct DurableDeviceShardHead {
     latest_commit: CommitSeq,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableKeyspaceManifest {
+    keyspace_id: KeyspaceId,
+    shard_count: u64,
+    file_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableKeyspaceShardHead {
+    keyspace_id: KeyspaceId,
+    shard_index: u32,
+    root: KeyspaceCatalogShardId,
+    generation: KeyspaceGeneration,
+    latest_commit: CommitSeq,
+}
+
 impl DurableDeviceManifest {
     fn from_head(head: &DeviceHead) -> Result<Self> {
         Ok(Self {
@@ -6275,6 +6300,38 @@ impl DurableDeviceShardHead {
             ),
             root,
             generation: DeviceGeneration::from_raw(latest_commit.raw()),
+            latest_commit,
+        })
+    }
+}
+
+impl DurableKeyspaceManifest {
+    fn from_head(head: &KeyspaceHead) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: head.keyspace_id,
+            shard_count: u64::try_from(head.shard_roots.len()).map_err(|_| {
+                StorageError::invalid_argument("keyspace shard count overflows u64")
+            })?,
+            file_count: u64::try_from(head.file_count)
+                .map_err(|_| StorageError::invalid_argument("keyspace file count overflows u64"))?,
+        })
+    }
+}
+
+impl DurableKeyspaceShardHead {
+    fn from_head(
+        head: &KeyspaceHead,
+        shard_index: usize,
+        root: KeyspaceCatalogShardId,
+        latest_commit: CommitSeq,
+    ) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: head.keyspace_id,
+            shard_index: u32::try_from(shard_index).map_err(|_| {
+                StorageError::invalid_argument("keyspace shard index overflows u32")
+            })?,
+            root,
+            generation: KeyspaceGeneration::from_raw(latest_commit.raw()),
             latest_commit,
         })
     }
@@ -6338,6 +6395,7 @@ impl DurableSqliteStore {
         Self::initialize_schema(&conn)?;
         reject_root_storage_catalog_tables_if_present(&conn)?;
         reject_legacy_device_head_tables_if_present(&conn)?;
+        reject_legacy_keyspace_head_tables_if_present(&conn)?;
         let node_catalogs = NodeCatalogs::open(&paths, configured_storage_nodes)?;
         if !metadata_existed {
             sync_parent_dir(&paths.metadata)?;
@@ -6417,10 +6475,18 @@ impl DurableSqliteStore {
             );
             CREATE INDEX IF NOT EXISTS idx_deleted_device_shard_heads_device
               ON deleted_device_shard_heads(device_id, shard_id);
-            CREATE TABLE IF NOT EXISTS keyspace_heads (
+            CREATE TABLE IF NOT EXISTS keyspace_manifests (
               keyspace_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS keyspace_shard_heads (
+              row_key TEXT PRIMARY KEY,
+              keyspace_id TEXT NOT NULL,
+              shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_keyspace_shard_heads_keyspace
+              ON keyspace_shard_heads(keyspace_id, shard_index);
             CREATE TABLE IF NOT EXISTS keyspace_roots (
               root_id TEXT PRIMARY KEY,
               payload BLOB NOT NULL
@@ -8291,6 +8357,31 @@ fn reject_legacy_device_head_tables_if_present(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+fn reject_legacy_keyspace_head_tables_if_present(conn: &Connection) -> Result<()> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'keyspace_heads'
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if exists.is_none() {
+        return Ok(());
+    }
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM keyspace_heads", [], |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if count > 0 {
+        return Err(StorageError::unsupported(
+            "legacy whole-keyspace head tables are not supported by the per-shard provider",
+        ));
+    }
+    Ok(())
+}
+
 fn reject_orphan_row_native_rows_if_present(conn: &Connection) -> Result<()> {
     for table in [
         "device_specs",
@@ -8298,7 +8389,8 @@ fn reject_orphan_row_native_rows_if_present(conn: &Connection) -> Result<()> {
         "deleted_device_manifests",
         "device_shard_heads",
         "deleted_device_shard_heads",
-        "keyspace_heads",
+        "keyspace_manifests",
+        "keyspace_shard_heads",
         "keyspace_roots",
         "keyspace_catalog_shards",
         "file_writer_epochs",
@@ -8366,16 +8458,13 @@ fn persist_row_native_state(
         &image.metadata.deleted_device_heads,
         &image.metadata.shard_commits,
     )?;
-    sync_payload_table(
+    sync_keyspace_head_tables(
         tx,
-        "keyspace_heads",
-        "keyspace_id",
-        image
-            .metadata
-            .keyspace_heads
-            .iter()
-            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
-            .collect::<Result<Vec<_>>>()?,
+        "keyspace_manifests",
+        "keyspace_shard_heads",
+        &image.metadata.keyspace_heads,
+        &image.metadata.keyspace_commits,
+        true,
     )?;
     sync_u128_payload_map_since(
         tx,
@@ -8508,15 +8597,13 @@ fn persist_row_native_metadata_delta(
         previous_cursor.map(cursor_value).unwrap_or(0)
     };
 
-    upsert_payload_table_rows(
+    sync_keyspace_head_tables(
         tx,
-        "keyspace_heads",
-        "keyspace_id",
-        delta
-            .keyspace_heads
-            .iter()
-            .map(|(id, head)| Ok((id.raw().to_string(), encode_row(head)?)))
-            .collect::<Result<Vec<_>>>()?,
+        "keyspace_manifests",
+        "keyspace_shard_heads",
+        &delta.keyspace_heads,
+        &delta.keyspace_commits,
+        false,
     )?;
     sync_u128_payload_map_since(
         tx,
@@ -8978,6 +9065,10 @@ fn device_shard_row_key(device_id: DeviceId, shard_id: ShardId) -> String {
     format!("{}:{:020}", device_id.raw(), shard_id.raw())
 }
 
+fn keyspace_shard_row_key(keyspace_id: KeyspaceId, shard_index: u32) -> String {
+    format!("{}:{:020}", keyspace_id.raw(), shard_index)
+}
+
 fn sync_device_head_tables(
     tx: &rusqlite::Transaction<'_>,
     manifest_table: &str,
@@ -9073,20 +9164,107 @@ fn sync_device_head_tables(
     Ok(())
 }
 
-fn upsert_payload_table_rows(
+fn sync_keyspace_head_tables(
     tx: &rusqlite::Transaction<'_>,
-    table: &str,
-    key_col: &str,
-    rows: Vec<(String, Vec<u8>)>,
+    manifest_table: &str,
+    shard_table: &str,
+    heads: &BTreeMap<KeyspaceId, KeyspaceHead>,
+    keyspace_commits: &[KeyspaceCommit],
+    prune_missing: bool,
 ) -> Result<()> {
-    let sql = format!(
-        "INSERT INTO {table}({key_col}, payload) VALUES (?1, ?2)
-         ON CONFLICT({key_col}) DO UPDATE SET payload = excluded.payload
+    let mut shard_latest_commits: BTreeMap<(KeyspaceId, u32), CommitSeq> = BTreeMap::new();
+    let mut keyspaces_with_shard_commits = BTreeSet::new();
+    for commit in keyspace_commits {
+        keyspaces_with_shard_commits.insert(commit.keyspace_id);
+        let entry = shard_latest_commits
+            .entry((commit.keyspace_id, commit.shard_index))
+            .or_insert(CommitSeq::from_raw(0));
+        if commit.commit_seq.raw() > entry.raw() {
+            *entry = commit.commit_seq;
+        }
+    }
+
+    let manifests: BTreeMap<String, Vec<u8>> = heads
+        .iter()
+        .map(|(keyspace_id, head)| {
+            let manifest = DurableKeyspaceManifest::from_head(head)?;
+            Ok((keyspace_id.raw().to_string(), encode_row(&manifest)?))
+        })
+        .collect::<Result<_>>()?;
+    if prune_missing {
+        delete_missing_text_keys(tx, manifest_table, "keyspace_id", manifests.keys())?;
+    }
+    let manifest_sql = format!(
+        "INSERT INTO {manifest_table}(keyspace_id, payload) VALUES (?1, ?2)
+         ON CONFLICT(keyspace_id) DO UPDATE SET payload = excluded.payload
          WHERE payload != excluded.payload"
     );
-    let mut stmt = tx.prepare(&sql).map_err(sqlite_error)?;
-    for (key, payload) in rows {
-        stmt.execute(params![key, payload]).map_err(sqlite_error)?;
+    let mut manifest_stmt = tx.prepare(&manifest_sql).map_err(sqlite_error)?;
+    for (keyspace_id, payload) in manifests {
+        manifest_stmt
+            .execute(params![keyspace_id, payload])
+            .map_err(sqlite_error)?;
+    }
+
+    let mut shard_rows: BTreeMap<String, (String, i64, Vec<u8>)> = BTreeMap::new();
+    for head in heads.values() {
+        for (shard_index, root) in head.shard_roots.iter().copied().enumerate() {
+            let shard_index_u32 = u32::try_from(shard_index).map_err(|_| {
+                StorageError::invalid_argument("keyspace shard index overflows u32")
+            })?;
+            if !prune_missing
+                && keyspaces_with_shard_commits.contains(&head.keyspace_id)
+                && !shard_latest_commits.contains_key(&(head.keyspace_id, shard_index_u32))
+            {
+                continue;
+            }
+            let latest_commit = shard_latest_commits
+                .get(&(head.keyspace_id, shard_index_u32))
+                .copied()
+                .unwrap_or_else(|| {
+                    if keyspaces_with_shard_commits.contains(&head.keyspace_id) {
+                        CommitSeq::from_raw(0)
+                    } else {
+                        head.latest_commit
+                    }
+                });
+            let shard_head =
+                DurableKeyspaceShardHead::from_head(head, shard_index, root, latest_commit)?;
+            let row_key = keyspace_shard_row_key(head.keyspace_id, shard_head.shard_index);
+            if shard_rows
+                .insert(
+                    row_key,
+                    (
+                        head.keyspace_id.raw().to_string(),
+                        u64_to_i64(u64::from(shard_head.shard_index))?,
+                        encode_row(&shard_head)?,
+                    ),
+                )
+                .is_some()
+            {
+                return Err(StorageError::corrupt("duplicate keyspace shard head row"));
+            }
+        }
+    }
+    if prune_missing {
+        delete_missing_text_keys(tx, shard_table, "row_key", shard_rows.keys())?;
+    }
+    let shard_sql = format!(
+        "INSERT INTO {shard_table}(row_key, keyspace_id, shard_index, payload)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(row_key) DO UPDATE SET
+           keyspace_id = excluded.keyspace_id,
+           shard_index = excluded.shard_index,
+           payload = excluded.payload
+         WHERE keyspace_id != excluded.keyspace_id
+            OR shard_index != excluded.shard_index
+            OR payload != excluded.payload"
+    );
+    let mut shard_stmt = tx.prepare(&shard_sql).map_err(sqlite_error)?;
+    for (row_key, (keyspace_id, shard_index, payload)) in shard_rows {
+        shard_stmt
+            .execute(params![row_key, keyspace_id, shard_index, payload])
+            .map_err(sqlite_error)?;
     }
     Ok(())
 }
@@ -9695,18 +9873,97 @@ fn load_device_heads(
 }
 
 fn load_keyspace_heads(conn: &Connection) -> Result<BTreeMap<KeyspaceId, KeyspaceHead>> {
-    let mut out = BTreeMap::new();
-    for (key, payload) in load_payload_rows(conn, "keyspace_heads", "keyspace_id", "keyspace_id")? {
+    let mut manifests = BTreeMap::new();
+    for (key, payload) in
+        load_payload_rows(conn, "keyspace_manifests", "keyspace_id", "keyspace_id")?
+    {
         let id = KeyspaceId::from_raw(parse_u128_key(&key).map_err(sqlite_error)?);
-        let head: KeyspaceHead = decode_row(&payload)?;
-        if head.keyspace_id != id {
+        let manifest: DurableKeyspaceManifest = decode_row(&payload)?;
+        if manifest.keyspace_id != id {
             return Err(StorageError::corrupt(
-                "keyspace head row key disagrees with payload",
+                "keyspace manifest row key disagrees with payload",
             ));
         }
-        if out.insert(id, head).is_some() {
-            return Err(StorageError::corrupt("duplicate keyspace head row"));
+        if usize::try_from(manifest.shard_count).ok() != Some(KEYSPACE_CATALOG_SHARD_COUNT) {
+            return Err(StorageError::corrupt(
+                "keyspace manifest shard count disagrees with config",
+            ));
         }
+        if manifests.insert(id, manifest).is_some() {
+            return Err(StorageError::corrupt("duplicate keyspace manifest row"));
+        }
+    }
+
+    let mut shards: BTreeMap<KeyspaceId, BTreeMap<usize, DurableKeyspaceShardHead>> =
+        BTreeMap::new();
+    for (row_key, payload) in load_payload_rows(conn, "keyspace_shard_heads", "row_key", "row_key")?
+    {
+        let shard: DurableKeyspaceShardHead = decode_row(&payload)?;
+        if row_key != keyspace_shard_row_key(shard.keyspace_id, shard.shard_index) {
+            return Err(StorageError::corrupt(
+                "keyspace shard head row key disagrees with payload",
+            ));
+        }
+        let shard_index = usize::try_from(shard.shard_index)
+            .map_err(|_| StorageError::corrupt("keyspace shard index overflows usize"))?;
+        if shard_index >= KEYSPACE_CATALOG_SHARD_COUNT {
+            return Err(StorageError::corrupt(
+                "keyspace shard row is outside config",
+            ));
+        }
+        if !manifests.contains_key(&shard.keyspace_id) {
+            return Err(StorageError::corrupt(
+                "keyspace shard row exists without manifest",
+            ));
+        }
+        if shards
+            .entry(shard.keyspace_id)
+            .or_default()
+            .insert(shard_index, shard)
+            .is_some()
+        {
+            return Err(StorageError::corrupt("duplicate keyspace shard row"));
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    for (keyspace_id, manifest) in manifests {
+        let shard_count = usize::try_from(manifest.shard_count)
+            .map_err(|_| StorageError::corrupt("keyspace manifest shard count overflows usize"))?;
+        let mut shard_roots = Vec::with_capacity(shard_count);
+        let mut generation = KeyspaceGeneration::from_raw(0);
+        let mut latest_commit = CommitSeq::from_raw(0);
+        let Some(keyspace_shards) = shards.remove(&keyspace_id) else {
+            return Err(StorageError::corrupt("keyspace manifest has no shard rows"));
+        };
+        for shard_index in 0..shard_count {
+            let Some(shard) = keyspace_shards.get(&shard_index) else {
+                return Err(StorageError::corrupt(
+                    "keyspace manifest is missing shard row",
+                ));
+            };
+            shard_roots.push(shard.root);
+            if shard.generation.raw() > generation.raw() {
+                generation = shard.generation;
+            }
+            if shard.latest_commit.raw() > latest_commit.raw() {
+                latest_commit = shard.latest_commit;
+            }
+        }
+        let head = KeyspaceHead {
+            keyspace_id,
+            generation,
+            shard_roots,
+            file_count: usize::try_from(manifest.file_count)
+                .map_err(|_| StorageError::corrupt("keyspace file count overflows usize"))?,
+            latest_commit,
+        };
+        if out.insert(keyspace_id, head).is_some() {
+            return Err(StorageError::corrupt("duplicate keyspace head"));
+        }
+    }
+    if !shards.is_empty() {
+        return Err(StorageError::corrupt("unconsumed keyspace shard rows"));
     }
     Ok(out)
 }
@@ -10032,8 +10289,33 @@ fn validate_row_native_state(image: &DurableStoreState) -> Result<()> {
         if *keyspace_id != head.keyspace_id {
             return Err(StorageError::corrupt("keyspace head key mismatch"));
         }
-        if !image.metadata.keyspace_roots.contains_key(&head.root) {
-            return Err(StorageError::corrupt("keyspace head root missing"));
+        if head.shard_roots.len() != KEYSPACE_CATALOG_SHARD_COUNT {
+            return Err(StorageError::corrupt("keyspace head shard count mismatch"));
+        }
+        let mut actual_file_count = 0usize;
+        for shard_id in &head.shard_roots {
+            if !image
+                .metadata
+                .keyspace_catalog_shards
+                .contains_key(shard_id)
+            {
+                return Err(StorageError::corrupt("keyspace head shard missing"));
+            }
+            actual_file_count = actual_file_count
+                .checked_add(
+                    image
+                        .metadata
+                        .keyspace_catalog_shards
+                        .get(shard_id)
+                        .map(|shard| shard.files.len())
+                        .unwrap_or_default(),
+                )
+                .ok_or_else(|| StorageError::corrupt("keyspace file count overflows"))?;
+        }
+        if actual_file_count != head.file_count {
+            return Err(StorageError::corrupt(
+                "keyspace head file count disagrees with shards",
+            ));
         }
     }
     for root in image.metadata.keyspace_roots.values() {
@@ -10099,11 +10381,17 @@ fn validate_row_native_state(image: &DurableStoreState) -> Result<()> {
         }
     }
     for commit in &image.metadata.keyspace_commits {
-        if !image.metadata.keyspace_roots.contains_key(&commit.old_root)
-            || !image.metadata.keyspace_roots.contains_key(&commit.new_root)
+        if !image
+            .metadata
+            .keyspace_catalog_shards
+            .contains_key(&commit.old_shard)
+            || !image
+                .metadata
+                .keyspace_catalog_shards
+                .contains_key(&commit.new_shard)
         {
             return Err(StorageError::corrupt(
-                "keyspace commit references missing catalog root",
+                "keyspace commit references missing catalog shard",
             ));
         }
     }
@@ -13373,7 +13661,7 @@ impl InMemoryMetadataPlane {
         &self,
         keyspace_id: KeyspaceId,
         commit_seq: CommitSeq,
-    ) -> Result<KeyspaceRootId> {
+    ) -> Result<KeyspaceRoot> {
         let inner = lock(&self.inner)?;
         Self::replay_keyspace_root_locked(&inner, keyspace_id, commit_seq, None)
     }
@@ -13427,7 +13715,10 @@ impl InMemoryMetadataPlane {
                     }
                     Err(error) => return Err(error),
                 };
-                if replayed != checkpoint_root {
+                let checkpoint_root = Self::keyspace_root_locked(&inner, checkpoint_root)?;
+                if replayed.shard_roots != checkpoint_root.shard_roots
+                    || replayed.file_count != checkpoint_root.file_count
+                {
                     return Err(StorageError::corrupt(
                         "keyspace checkpoint root does not match replayed timeline",
                     ));
@@ -13460,6 +13751,11 @@ impl InMemoryMetadataPlane {
     #[cfg(test)]
     fn keyspace_catalog_shard_count_for_test(&self) -> Result<usize> {
         Ok(lock(&self.inner)?.keyspace_catalog_shards.len())
+    }
+
+    #[cfg(test)]
+    fn keyspace_root_count_for_test(&self) -> Result<usize> {
+        Ok(lock(&self.inner)?.keyspace_roots.len())
     }
 
     #[cfg(test)]
@@ -13992,6 +14288,7 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::not_found("keyspace_catalog_shard", shard_id.to_string()))
     }
 
+    #[cfg(test)]
     fn current_keyspace_root_locked(
         inner: &MetadataInner,
         keyspace_id: KeyspaceId,
@@ -14000,24 +14297,32 @@ impl InMemoryMetadataPlane {
             .keyspace_heads
             .get(&keyspace_id)
             .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
-        Self::keyspace_root_locked(inner, head.root)
+        Ok(KeyspaceRoot {
+            root_id: KeyspaceRootId::from_raw(0),
+            shard_roots: head.shard_roots.clone().into(),
+            file_count: head.file_count,
+        })
     }
 
+    #[cfg(test)]
     fn keyspace_catalog_shard_index(file_id: FileId, root: &KeyspaceRoot) -> Result<usize> {
-        if root.shard_roots.is_empty() {
+        Self::keyspace_catalog_shard_index_for_len(file_id, root.shard_roots.len())
+    }
+
+    fn keyspace_catalog_shard_index_for_len(file_id: FileId, shard_count: usize) -> Result<usize> {
+        if shard_count == 0 {
             return Err(StorageError::corrupt("keyspace root has no catalog shards"));
         }
-        Ok((file_id.raw() % root.shard_roots.len() as u128) as usize)
+        Ok((file_id.raw() % shard_count as u128) as usize)
     }
 
-    fn keyspace_file_in_root_locked(
+    fn keyspace_file_in_shards_locked(
         inner: &MetadataInner,
-        root_id: KeyspaceRootId,
+        shard_roots: &[KeyspaceCatalogShardId],
         file_id: FileId,
     ) -> Result<KeyspaceFile> {
-        let root = Self::keyspace_root_locked(inner, root_id)?;
-        let shard_index = Self::keyspace_catalog_shard_index(file_id, &root)?;
-        let shard = Self::keyspace_catalog_shard_locked(inner, root.shard_roots[shard_index])?;
+        let shard_index = Self::keyspace_catalog_shard_index_for_len(file_id, shard_roots.len())?;
+        let shard = Self::keyspace_catalog_shard_locked(inner, shard_roots[shard_index])?;
         shard
             .files
             .get(&file_id)
@@ -14030,8 +14335,12 @@ impl InMemoryMetadataPlane {
         keyspace_id: KeyspaceId,
         file_id: FileId,
     ) -> Result<FileHead> {
-        let root = Self::current_keyspace_root_locked(inner, keyspace_id)?;
-        Self::keyspace_file_in_root_locked(inner, root.root_id, file_id).map(|entry| entry.head)
+        let head = inner
+            .keyspace_heads
+            .get(&keyspace_id)
+            .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+        Self::keyspace_file_in_shards_locked(inner, &head.shard_roots, file_id)
+            .map(|entry| entry.head)
     }
 
     #[cfg(test)]
@@ -14040,8 +14349,12 @@ impl InMemoryMetadataPlane {
         keyspace_id: KeyspaceId,
         file_id: FileId,
     ) -> Result<Option<String>> {
-        let root = Self::current_keyspace_root_locked(inner, keyspace_id)?;
-        Self::keyspace_file_in_root_locked(inner, root.root_id, file_id).map(|entry| entry.name)
+        let head = inner
+            .keyspace_heads
+            .get(&keyspace_id)
+            .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+        Self::keyspace_file_in_shards_locked(inner, &head.shard_roots, file_id)
+            .map(|entry| entry.name)
     }
 
     fn insert_keyspace_catalog_shard_locked(
@@ -14127,26 +14440,25 @@ impl InMemoryMetadataPlane {
 
     fn update_keyspace_file_locked(
         inner: &mut MetadataInner,
-        root: &KeyspaceRoot,
+        shard_roots: &[KeyspaceCatalogShardId],
+        file_count: usize,
         file_id: FileId,
         entry: KeyspaceFile,
-    ) -> Result<KeyspaceRoot> {
-        let shard_index = Self::keyspace_catalog_shard_index(file_id, root)?;
-        let shard_id = root.shard_roots[shard_index];
+    ) -> Result<(usize, KeyspaceCatalogShardId, KeyspaceCatalogShard, usize)> {
+        let shard_index = Self::keyspace_catalog_shard_index_for_len(file_id, shard_roots.len())?;
+        let shard_id = shard_roots[shard_index];
         let shard = Self::keyspace_catalog_shard_locked(inner, shard_id)?;
         let mut files = shard.files.clone();
         let replaced = files.insert(file_id, entry).is_some();
         let new_shard = Self::insert_keyspace_catalog_shard_locked(inner, files)?;
-        let mut shard_roots = root.shard_roots.to_vec();
-        shard_roots[shard_index] = new_shard.shard_id;
         let file_count = if replaced {
-            root.file_count
+            file_count
         } else {
-            root.file_count
+            file_count
                 .checked_add(1)
                 .ok_or_else(|| StorageError::conflict("keyspace file count overflow"))?
         };
-        Self::insert_keyspace_root_locked(inner, shard_roots, file_count)
+        Ok((shard_index, shard_id, new_shard, file_count))
     }
 
     fn collect_keyspace_metadata_roots_locked(
@@ -14156,9 +14468,18 @@ impl InMemoryMetadataPlane {
     ) -> Result<()> {
         let root = Self::keyspace_root_locked(inner, root_id)?;
         for shard_id in root.shard_roots.iter().copied() {
-            let shard = Self::keyspace_catalog_shard_locked(inner, shard_id)?;
-            out.extend(shard.files.values().map(|entry| entry.head.root));
+            Self::collect_keyspace_shard_metadata_roots_locked(inner, shard_id, out)?;
         }
+        Ok(())
+    }
+
+    fn collect_keyspace_shard_metadata_roots_locked(
+        inner: &MetadataInner,
+        shard_id: KeyspaceCatalogShardId,
+        out: &mut Vec<MetadataNodeId>,
+    ) -> Result<()> {
+        let shard = Self::keyspace_catalog_shard_locked(inner, shard_id)?;
+        out.extend(shard.files.values().map(|entry| entry.head.root));
         Ok(())
     }
 
@@ -14271,7 +14592,7 @@ impl InMemoryMetadataPlane {
         keyspace_id: KeyspaceId,
         commit_seq: CommitSeq,
         excluded_checkpoint: Option<CheckpointId>,
-    ) -> Result<KeyspaceRootId> {
+    ) -> Result<KeyspaceRoot> {
         let checkpoint = Self::latest_keyspace_checkpoint_at_or_before_locked(
             inner,
             keyspace_id,
@@ -14279,7 +14600,10 @@ impl InMemoryMetadataPlane {
             excluded_checkpoint,
         )
         .ok_or_else(|| StorageError::not_found("checkpoint", keyspace_id.to_string()))?;
-        let mut root = Self::checkpoint_keyspace_root(&checkpoint)?;
+        let checkpoint_root_id = Self::checkpoint_keyspace_root(&checkpoint)?;
+        let checkpoint_root = Self::keyspace_root_locked(inner, checkpoint_root_id)?;
+        let mut shard_roots = checkpoint_root.shard_roots.to_vec();
+        let mut file_count = checkpoint_root.file_count;
 
         for commit in Self::keyspace_commits_for_keyspace_locked(inner, keyspace_id)
             .into_iter()
@@ -14288,15 +14612,28 @@ impl InMemoryMetadataPlane {
                     && commit.commit_seq.raw() <= commit_seq.raw()
             })
         {
-            if root != commit.old_root {
+            let shard_index = usize::try_from(commit.shard_index).map_err(|_| {
+                StorageError::invalid_argument("keyspace shard index overflows usize")
+            })?;
+            if shard_index >= shard_roots.len() {
                 return Err(StorageError::corrupt(
-                    "keyspace commit old_root does not match replay state",
+                    "keyspace commit references shard outside root set",
                 ));
             }
-            root = commit.new_root;
+            if shard_roots[shard_index] != commit.old_shard || file_count != commit.old_file_count {
+                return Err(StorageError::corrupt(
+                    "keyspace commit old state does not match replay state",
+                ));
+            }
+            shard_roots[shard_index] = commit.new_shard;
+            file_count = commit.new_file_count;
         }
 
-        Ok(root)
+        Ok(KeyspaceRoot {
+            root_id: checkpoint_root_id,
+            shard_roots: shard_roots.into(),
+            file_count,
+        })
     }
 
     fn validate_checkpoint_root_shape_locked(
@@ -14461,7 +14798,9 @@ impl InMemoryMetadataPlane {
             roots.extend(head.shard_roots.iter().copied());
         }
         for head in inner.keyspace_heads.values() {
-            Self::collect_keyspace_metadata_roots_locked(inner, head.root, &mut roots)?;
+            for shard_id in head.shard_roots.iter().copied() {
+                Self::collect_keyspace_shard_metadata_roots_locked(inner, shard_id, &mut roots)?;
+            }
         }
         for checkpoint in inner.checkpoints.values() {
             match checkpoint.owner {
@@ -14492,7 +14831,11 @@ impl InMemoryMetadataPlane {
         }
         for commit in &inner.keyspace_commits {
             if Self::retain_keyspace_commit_for_pitr_locked(inner, &policy, commit) {
-                Self::collect_keyspace_metadata_roots_locked(inner, commit.new_root, &mut roots)?;
+                Self::collect_keyspace_shard_metadata_roots_locked(
+                    inner,
+                    commit.new_shard,
+                    &mut roots,
+                )?;
             }
         }
         for (device_id, head) in &inner.deleted_device_heads {
@@ -14627,7 +14970,16 @@ impl InMemoryMetadataPlane {
                 continue;
             }
             let root = Self::replay_keyspace_root_locked(inner, keyspace_id, anchor_seq, None)?;
-            inner.insert_checkpoint(owner, anchor_seq, CheckpointRoots::NativeKeyspace(root));
+            let root = Self::insert_keyspace_root_locked(
+                inner,
+                root.shard_roots.to_vec(),
+                root.file_count,
+            )?;
+            inner.insert_checkpoint(
+                owner,
+                anchor_seq,
+                CheckpointRoots::NativeKeyspace(root.root_id),
+            );
         }
         Ok(())
     }
@@ -15031,14 +15383,15 @@ impl MetadataPlane for InMemoryMetadataPlane {
         let head = KeyspaceHead {
             keyspace_id,
             generation: KeyspaceGeneration::from_raw(0),
-            root: root.root_id,
+            shard_roots: root.shard_roots.to_vec(),
+            file_count: root.file_count,
             latest_commit: CommitSeq::from_raw(0),
         };
         inner.keyspace_heads.insert(keyspace_id, head.clone());
         inner.insert_checkpoint(
             MappingOwner::NativeKeyspace(keyspace_id),
             head.latest_commit,
-            CheckpointRoots::NativeKeyspace(head.root),
+            CheckpointRoots::NativeKeyspace(root.root_id),
         );
         Ok(head)
     }
@@ -15059,12 +15412,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .get(&keyspace_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
-        let root = Self::keyspace_root_locked(&inner, head.root)?;
         Ok(KeyspaceInfo {
             keyspace_id,
             generation: head.generation,
             latest_commit: head.latest_commit,
-            file_count: root.file_count,
+            file_count: head.file_count,
         })
     }
 
@@ -15076,7 +15428,6 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .get(&request.keyspace_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("keyspace", request.keyspace_id.to_string()))?;
-        let keyspace_root = Self::keyspace_root_locked(&inner, keyspace_head.root)?;
         let file_id = inner.alloc_file_id();
         let root = Self::create_empty_tree(
             &mut inner,
@@ -15097,15 +15448,17 @@ impl MetadataPlane for InMemoryMetadataPlane {
         };
         file_head.validate_current(root.covered_range, self.config.block_size)?;
 
-        let new_keyspace_root = Self::update_keyspace_file_locked(
-            &mut inner,
-            &keyspace_root,
-            file_id,
-            KeyspaceFile {
-                name: request.request.spec.name.clone(),
-                head: file_head.clone(),
-            },
-        )?;
+        let (shard_index, old_shard, new_shard, new_file_count) =
+            Self::update_keyspace_file_locked(
+                &mut inner,
+                &keyspace_head.shard_roots,
+                keyspace_head.file_count,
+                file_id,
+                KeyspaceFile {
+                    name: request.request.spec.name.clone(),
+                    head: file_head.clone(),
+                },
+            )?;
 
         let commit_group = CommitGroup {
             commit_group: commit_group_id,
@@ -15121,7 +15474,8 @@ impl MetadataPlane for InMemoryMetadataPlane {
         next_keyspace_head.generation =
             Self::next_keyspace_generation(next_keyspace_head.generation)?;
         next_keyspace_head.latest_commit = commit_seq;
-        next_keyspace_head.root = new_keyspace_root.root_id;
+        next_keyspace_head.shard_roots[shard_index] = new_shard.shard_id;
+        next_keyspace_head.file_count = new_file_count;
 
         inner
             .file_writer_epochs
@@ -15134,8 +15488,13 @@ impl MetadataPlane for InMemoryMetadataPlane {
             commit_group: commit_group_id,
             time: LogicalTime::from_raw(commit_seq.raw()),
             keyspace_id: request.keyspace_id,
-            old_root: keyspace_root.root_id,
-            new_root: new_keyspace_root.root_id,
+            shard_index: u32::try_from(shard_index).map_err(|_| {
+                StorageError::invalid_argument("keyspace shard index overflows u32")
+            })?,
+            old_shard,
+            new_shard: new_shard.shard_id,
+            old_file_count: keyspace_head.file_count,
+            new_file_count,
         });
         inner.file_commits.push(FileCommit {
             commit_seq,
@@ -15317,7 +15676,6 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     .get(&keyspace_id)
                     .cloned()
                     .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
-                let current_catalog = Self::keyspace_root_locked(&inner, current_keyspace.root)?;
                 if intent.updates.len() != 1 {
                     return Err(StorageError::invalid_argument(
                         "native keyspace commit must include exactly one file-root update",
@@ -15340,12 +15698,20 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     }
                     _ => unreachable!("length checked above"),
                 };
-                let current_entry =
-                    Self::keyspace_file_in_root_locked(&inner, current_catalog.root_id, file_id)?;
+                let current_entry = Self::keyspace_file_in_shards_locked(
+                    &inner,
+                    &current_keyspace.shard_roots,
+                    file_id,
+                )?;
                 let current = current_entry.head.clone();
                 let append_stream_commit = match intent.fence {
                     MetadataFence::FileVersion(version) if version == current.version => None,
                     MetadataFence::FileVersion(_) => {
+                        self.record_publish_profile(MetadataPublishProfile {
+                            lock_wait_nanos: publish_lock_wait_nanos,
+                            logical_conflict_count: 1,
+                            ..MetadataPublishProfile::default()
+                        })?;
                         return Err(StorageError::conflict("stale file version fence"));
                     }
                     MetadataFence::AppendStream {
@@ -15361,6 +15727,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
                             || stream.published_through != current.size
                             || stream.status != AppendStreamStatus::Active
                         {
+                            self.record_publish_profile(MetadataPublishProfile {
+                                lock_wait_nanos: publish_lock_wait_nanos,
+                                logical_conflict_count: 1,
+                                ..MetadataPublishProfile::default()
+                            })?;
                             return Err(StorageError::conflict("stale append stream"));
                         }
                         Some((stream_id, writer_epoch))
@@ -15372,6 +15743,11 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     }
                 };
                 if current.root != old_root {
+                    self.record_publish_profile(MetadataPublishProfile {
+                        lock_wait_nanos: publish_lock_wait_nanos,
+                        logical_conflict_count: 1,
+                        ..MetadataPublishProfile::default()
+                    })?;
                     return Err(StorageError::conflict("stale file root"));
                 }
                 if !inner.metadata_nodes.contains_key(&new_root) {
@@ -15389,7 +15765,9 @@ impl MetadataPlane for InMemoryMetadataPlane {
                             StorageError::not_found("metadata_node", new_root.to_string())
                         })?;
 
+                let commit_seq_started = Instant::now();
                 let commit_seq = inner.alloc_commit_seq()?;
+                let commit_sequence_alloc_nanos = duration_nanos_u64(commit_seq_started.elapsed());
                 let commit_group = CommitGroup {
                     commit_group: inner.alloc_commit_group_id(),
                     commit_seq,
@@ -15411,28 +15789,36 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     new_root_node.covered_range,
                     self.config.block_size,
                 )?;
-                let new_catalog = Self::update_keyspace_file_locked(
-                    &mut inner,
-                    &current_catalog,
-                    file_id,
-                    KeyspaceFile {
-                        head: next_head.clone(),
-                        ..current_entry
-                    },
-                )?;
+                let (shard_index, old_shard, new_shard, new_file_count) =
+                    Self::update_keyspace_file_locked(
+                        &mut inner,
+                        &current_keyspace.shard_roots,
+                        current_keyspace.file_count,
+                        file_id,
+                        KeyspaceFile {
+                            head: next_head.clone(),
+                            ..current_entry
+                        },
+                    )?;
                 let mut next_keyspace = current_keyspace.clone();
                 next_keyspace.generation =
                     Self::next_keyspace_generation(next_keyspace.generation)?;
                 next_keyspace.latest_commit = commit_seq;
-                next_keyspace.root = new_catalog.root_id;
+                next_keyspace.shard_roots[shard_index] = new_shard.shard_id;
+                next_keyspace.file_count = new_file_count;
                 inner.keyspace_heads.insert(keyspace_id, next_keyspace);
                 inner.keyspace_commits.push(KeyspaceCommit {
                     commit_seq,
                     commit_group: commit_group.commit_group,
                     time: LogicalTime::from_raw(commit_seq.raw()),
                     keyspace_id,
-                    old_root: current_catalog.root_id,
-                    new_root: new_catalog.root_id,
+                    shard_index: u32::try_from(shard_index).map_err(|_| {
+                        StorageError::invalid_argument("keyspace shard index overflows u32")
+                    })?,
+                    old_shard,
+                    new_shard: new_shard.shard_id,
+                    old_file_count: current_keyspace.file_count,
+                    new_file_count,
                 });
                 inner.file_commits.push(FileCommit {
                     commit_seq,
@@ -15460,6 +15846,13 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         stream.published_through = new_size;
                     }
                 }
+                self.record_publish_profile(MetadataPublishProfile {
+                    lock_wait_nanos: publish_lock_wait_nanos,
+                    commit_sequence_alloc_nanos,
+                    touched_shard_head_rows: 1,
+                    commit_rows_written: 1,
+                    ..MetadataPublishProfile::default()
+                })?;
                 Ok(commit_group)
             }
         }
@@ -15573,14 +15966,20 @@ impl MetadataPlane for InMemoryMetadataPlane {
         let head = KeyspaceHead {
             keyspace_id: target,
             generation: KeyspaceGeneration::from_raw(0),
-            root: source_head.root,
+            shard_roots: source_head.shard_roots.clone(),
+            file_count: source_head.file_count,
             latest_commit,
         };
+        let checkpoint_root = Self::insert_keyspace_root_locked(
+            &mut inner,
+            head.shard_roots.clone(),
+            head.file_count,
+        )?;
         inner.keyspace_heads.insert(target, head.clone());
         inner.insert_checkpoint(
             MappingOwner::NativeKeyspace(target),
             latest_commit,
-            CheckpointRoots::NativeKeyspace(head.root),
+            CheckpointRoots::NativeKeyspace(checkpoint_root.root_id),
         );
         Ok(head)
     }
@@ -15594,7 +15993,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
         if !inner.keyspace_heads.contains_key(&source) {
             return Err(StorageError::not_found("keyspace", source.to_string()));
         }
-        let root = match point {
+        let (shard_roots, file_count) = match point {
             RestorePoint::Checkpoint(checkpoint_id) => {
                 let checkpoint =
                     inner
@@ -15609,30 +16008,38 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         "checkpoint does not belong to source keyspace",
                     ));
                 }
-                Self::checkpoint_keyspace_root(&checkpoint)?
+                let root = Self::keyspace_root_locked(
+                    &inner,
+                    Self::checkpoint_keyspace_root(&checkpoint)?,
+                )?;
+                (root.shard_roots.to_vec(), root.file_count)
             }
             RestorePoint::Commit(_) | RestorePoint::Time(_) => {
                 let target_commit =
                     Self::target_commit_for_keyspace_restore_locked(&inner, source, point)?;
-                Self::replay_keyspace_root_locked(&inner, source, target_commit, None)?
+                let root = Self::replay_keyspace_root_locked(&inner, source, target_commit, None)?;
+                (root.shard_roots.to_vec(), root.file_count)
             }
         };
-        if !inner.keyspace_roots.contains_key(&root) {
-            return Err(StorageError::not_found("keyspace_root", root.to_string()));
-        }
         let target = inner.alloc_keyspace_id();
         let latest_commit = inner.alloc_commit_seq()?;
         let head = KeyspaceHead {
             keyspace_id: target,
             generation: KeyspaceGeneration::from_raw(0),
-            root,
+            shard_roots,
+            file_count,
             latest_commit,
         };
+        let checkpoint_root = Self::insert_keyspace_root_locked(
+            &mut inner,
+            head.shard_roots.clone(),
+            head.file_count,
+        )?;
         inner.keyspace_heads.insert(target, head.clone());
         inner.insert_checkpoint(
             MappingOwner::NativeKeyspace(target),
             latest_commit,
-            CheckpointRoots::NativeKeyspace(head.root),
+            CheckpointRoots::NativeKeyspace(checkpoint_root.root_id),
         );
         Ok(head)
     }
@@ -15686,10 +16093,15 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .get(&keyspace_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("keyspace", keyspace_id.to_string()))?;
+        let checkpoint_root = Self::insert_keyspace_root_locked(
+            &mut inner,
+            head.shard_roots.clone(),
+            head.file_count,
+        )?;
         Ok(inner.insert_checkpoint(
             MappingOwner::NativeKeyspace(keyspace_id),
             head.latest_commit,
-            CheckpointRoots::NativeKeyspace(head.root),
+            CheckpointRoots::NativeKeyspace(checkpoint_root.root_id),
         ))
     }
 
@@ -19696,11 +20108,48 @@ impl DurableCodec for DurableDeviceShardHead {
     }
 }
 
+impl DurableCodec for DurableKeyspaceManifest {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.shard_count.encode(out)?;
+        self.file_count.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            shard_count: u64::decode(input)?,
+            file_count: u64::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for DurableKeyspaceShardHead {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.keyspace_id.encode(out)?;
+        self.shard_index.encode(out)?;
+        self.root.encode(out)?;
+        self.generation.encode(out)?;
+        self.latest_commit.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            keyspace_id: KeyspaceId::decode(input)?,
+            shard_index: u32::decode(input)?,
+            root: KeyspaceCatalogShardId::decode(input)?,
+            generation: KeyspaceGeneration::decode(input)?,
+            latest_commit: CommitSeq::decode(input)?,
+        })
+    }
+}
+
 impl DurableCodec for KeyspaceHead {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.keyspace_id.encode(out)?;
         self.generation.encode(out)?;
-        self.root.encode(out)?;
+        self.shard_roots.encode(out)?;
+        self.file_count.encode(out)?;
         self.latest_commit.encode(out)
     }
 
@@ -19708,7 +20157,8 @@ impl DurableCodec for KeyspaceHead {
         Ok(Self {
             keyspace_id: KeyspaceId::decode(input)?,
             generation: KeyspaceGeneration::decode(input)?,
-            root: KeyspaceRootId::decode(input)?,
+            shard_roots: Vec::<KeyspaceCatalogShardId>::decode(input)?,
+            file_count: usize::decode(input)?,
             latest_commit: CommitSeq::decode(input)?,
         })
     }
@@ -20111,8 +20561,11 @@ impl DurableCodec for KeyspaceCommit {
         self.commit_group.encode(out)?;
         self.time.encode(out)?;
         self.keyspace_id.encode(out)?;
-        self.old_root.encode(out)?;
-        self.new_root.encode(out)
+        self.shard_index.encode(out)?;
+        self.old_shard.encode(out)?;
+        self.new_shard.encode(out)?;
+        self.old_file_count.encode(out)?;
+        self.new_file_count.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -20121,8 +20574,11 @@ impl DurableCodec for KeyspaceCommit {
             commit_group: CommitGroupId::decode(input)?,
             time: LogicalTime::decode(input)?,
             keyspace_id: KeyspaceId::decode(input)?,
-            old_root: KeyspaceRootId::decode(input)?,
-            new_root: KeyspaceRootId::decode(input)?,
+            shard_index: u32::decode(input)?,
+            old_shard: KeyspaceCatalogShardId::decode(input)?,
+            new_shard: KeyspaceCatalogShardId::decode(input)?,
+            old_file_count: usize::decode(input)?,
+            new_file_count: usize::decode(input)?,
         })
     }
 }
@@ -24278,7 +24734,17 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_durable_row_round_trip(metadata.keyspace_heads.get(&keyspace_id).unwrap());
+        let keyspace_head = metadata.keyspace_heads.get(&keyspace_id).unwrap();
+        assert_durable_row_round_trip(&DurableKeyspaceManifest::from_head(keyspace_head).unwrap());
+        assert_durable_row_round_trip(
+            &DurableKeyspaceShardHead::from_head(
+                keyspace_head,
+                0,
+                keyspace_head.shard_roots[0],
+                keyspace_head.latest_commit,
+            )
+            .unwrap(),
+        );
         assert_durable_row_round_trip(metadata.keyspace_roots.values().next().unwrap());
         assert_durable_row_round_trip(metadata.keyspace_catalog_shards.values().next().unwrap());
         assert_durable_row_round_trip(metadata.file_writer_epochs.values().next().unwrap());
@@ -25863,6 +26329,113 @@ mod tests {
             .unwrap();
         assert_eq!(&buf[0..4096], repeated_blocks(1, 1).as_slice());
         assert_eq!(&buf[8 * 4096..9 * 4096], repeated_blocks(1, 2).as_slice());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_sqlite_stores_native_keyspace_heads_as_per_shard_rows() {
+        let root = durable_temp_dir("per-shard-keyspace-heads");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest { name: None })
+            .unwrap();
+        let file_a_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("a".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let file_b_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("b".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let old_head_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'keyspace_heads'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_head_tables, 0);
+        let manifest_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyspace_manifests", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(manifest_count, 1);
+        let initial_manifest: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM keyspace_manifests WHERE keyspace_id = ?1",
+                params![keyspace_id.raw().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let initial_shards = keyspace_shard_payloads_for_test(&conn);
+        assert_eq!(initial_shards.len(), KEYSPACE_CATALOG_SHARD_COUNT);
+        drop(conn);
+
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        store
+            .write_file_at(keyspace_id, file_a_id, 0, b"aaaa", WriteDurability::Flushed)
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let after_first_manifest: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM keyspace_manifests WHERE keyspace_id = ?1",
+                params![keyspace_id.raw().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_first_manifest, initial_manifest);
+        let after_first = keyspace_shard_payloads_for_test(&conn);
+        assert_eq!(
+            changed_payload_count(&initial_shards, &after_first),
+            1,
+            "a single-file write should update one keyspace shard-head row"
+        );
+        drop(conn);
+
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        store
+            .write_file_at(keyspace_id, file_b_id, 0, b"bbbb", WriteDurability::Flushed)
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let after_second = keyspace_shard_payloads_for_test(&conn);
+        assert_eq!(
+            changed_payload_count(&after_first, &after_second),
+            1,
+            "an independent file write should update only its keyspace shard-head row"
+        );
+        drop(conn);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut a = vec![0; 4];
+        reopened
+            .read_file(keyspace_id, file_a_id, ByteRange::new(0, 4), &mut a)
+            .unwrap();
+        let mut b = vec![0; 4];
+        reopened
+            .read_file(keyspace_id, file_b_id, ByteRange::new(0, 4), &mut b)
+            .unwrap();
+        assert_eq!(a, b"aaaa");
+        assert_eq!(b, b"bbbb");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -31558,7 +32131,7 @@ mod tests {
     }
 
     #[test]
-    fn native_keyspace_catalog_publish_copies_only_one_catalog_shard() {
+    fn native_keyspace_catalog_publish_updates_one_shard_without_allocating_keyspace_root() {
         let store = LocalCoordinator::with_config(config()).unwrap();
         let client = create_native_client(&store);
         let keyspace_id = create_local_keyspace(&client);
@@ -31599,6 +32172,7 @@ mod tests {
             .metadata()
             .keyspace_catalog_shard_count_for_test()
             .unwrap();
+        let root_count_before_write = store.metadata().keyspace_root_count_for_test().unwrap();
         let file = client
             .open_file(keyspace_id, file_ids[KEYSPACE_CATALOG_SHARD_COUNT])
             .unwrap();
@@ -31623,12 +32197,17 @@ mod tests {
                 .unwrap(),
             shard_count_before_write + 1
         );
+        assert_eq!(
+            store.metadata().keyspace_root_count_for_test().unwrap(),
+            root_count_before_write
+        );
 
         let before_create = after_write;
         let shard_count_before_create = store
             .metadata()
             .keyspace_catalog_shard_count_for_test()
             .unwrap();
+        let root_count_before_create = store.metadata().keyspace_root_count_for_test().unwrap();
         client
             .create_file(
                 keyspace_id,
@@ -31655,6 +32234,10 @@ mod tests {
                 .keyspace_catalog_shard_count_for_test()
                 .unwrap(),
             shard_count_before_create + 1
+        );
+        assert_eq!(
+            store.metadata().keyspace_root_count_for_test().unwrap(),
+            root_count_before_create
         );
     }
 
@@ -31689,11 +32272,7 @@ mod tests {
         append_native_file_once(&file_a, &repeated_blocks(1, 1)).unwrap();
         append_native_file_once(&file_b, &repeated_blocks(1, 2)).unwrap();
         let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
-        let checkpoint_root = store
-            .metadata()
-            .get_keyspace_head(keyspace_id)
-            .unwrap()
-            .root;
+        let checkpoint_head = store.metadata().get_keyspace_head(keyspace_id).unwrap();
         let stale_source_stream = file_a.open_append_stream().unwrap();
 
         append_native_file_with_stream(&file_a, &stale_source_stream, &repeated_blocks(1, 3))
@@ -31707,14 +32286,12 @@ mod tests {
         let restored_keyspace = client
             .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(checkpoint))
             .unwrap();
-        assert_eq!(
-            store
-                .metadata()
-                .get_keyspace_head(restored_keyspace)
-                .unwrap()
-                .root,
-            checkpoint_root
-        );
+        let restored_head = store
+            .metadata()
+            .get_keyspace_head(restored_keyspace)
+            .unwrap();
+        assert_eq!(restored_head.shard_roots, checkpoint_head.shard_roots);
+        assert_eq!(restored_head.file_count, checkpoint_head.file_count);
         assert_eq!(
             store.metadata().metadata_node_count().unwrap(),
             nodes_before_restore
@@ -31784,11 +32361,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let snapshot_source_root = store
-            .metadata()
-            .get_keyspace_head(keyspace_id)
-            .unwrap()
-            .root;
+        let snapshot_source_head = store.metadata().get_keyspace_head(keyspace_id).unwrap();
         let nodes_before_snapshot = store.metadata().metadata_node_count().unwrap();
         let catalog_shards_before_snapshot = store
             .metadata()
@@ -31803,14 +32376,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            store
-                .metadata()
-                .get_keyspace_head(snapshot_keyspace)
-                .unwrap()
-                .root,
-            snapshot_source_root
-        );
+        let snapshot_head = store
+            .metadata()
+            .get_keyspace_head(snapshot_keyspace)
+            .unwrap();
+        assert_eq!(snapshot_head.shard_roots, snapshot_source_head.shard_roots);
+        assert_eq!(snapshot_head.file_count, snapshot_source_head.file_count);
         assert_eq!(
             store.metadata().metadata_node_count().unwrap(),
             nodes_before_snapshot
@@ -31905,11 +32476,7 @@ mod tests {
 
         file.write_at(0, b"stable").unwrap();
         let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
-        let checkpoint_root = store
-            .metadata()
-            .get_keyspace_head(keyspace_id)
-            .unwrap()
-            .root;
+        let checkpoint_head = store.metadata().get_keyspace_head(keyspace_id).unwrap();
         let changed = file.write_at(0, b"change").unwrap();
 
         store
@@ -31920,10 +32487,9 @@ mod tests {
         let restored = client
             .restore_keyspace(keyspace_id, RestorePoint::Checkpoint(checkpoint))
             .unwrap();
-        assert_eq!(
-            store.metadata().get_keyspace_head(restored).unwrap().root,
-            checkpoint_root
-        );
+        let restored_head = store.metadata().get_keyspace_head(restored).unwrap();
+        assert_eq!(restored_head.shard_roots, checkpoint_head.shard_roots);
+        assert_eq!(restored_head.file_count, checkpoint_head.file_count);
         let restored_file = client.open_file(restored, file_id).unwrap();
         let mut actual = vec![0; b"stable".len()];
         restored_file.read_at(0, &mut actual).unwrap();
@@ -33312,6 +33878,18 @@ mod tests {
     fn device_shard_payloads_for_test(conn: &Connection) -> BTreeMap<String, Vec<u8>> {
         let mut stmt = conn
             .prepare("SELECT row_key, payload FROM device_shard_heads ORDER BY row_key")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut out = BTreeMap::new();
+        while let Some(row) = rows.next().unwrap() {
+            out.insert(row.get(0).unwrap(), row.get(1).unwrap());
+        }
+        out
+    }
+
+    fn keyspace_shard_payloads_for_test(conn: &Connection) -> BTreeMap<String, Vec<u8>> {
+        let mut stmt = conn
+            .prepare("SELECT row_key, payload FROM keyspace_shard_heads ORDER BY row_key")
             .unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut out = BTreeMap::new();

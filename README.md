@@ -412,6 +412,14 @@ contention workload; conflicts or errors in the other append-batch and
 append-stream rows should be treated as benchmark or implementation failures,
 not as expected noise.
 
+Use the `native-metadata` alias when diagnosing native keyspace convergence. It
+contrasts same-file write/append pressure with same-keyspace different-file
+lanes, then includes the stream flush+publish path. With
+`--durable-profile-csv`, profile rows show whether successful native publishes
+touch one catalog shard row, how much time is spent waiting on metadata publish
+locks, and whether the remaining ceiling is SQLite/persist work rather than
+logical keyspace convergence.
+
 For durable-provider tail analysis, add `--durable-profile-csv <path>` to append
 one row per physical persist. The profile breaks total persist time into lock
 wait, local state export, data-log append/sync, data-log encode/write/file-sync

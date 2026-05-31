@@ -44,16 +44,19 @@ pub struct DeviceHead {
     pub latest_commit: CommitSeq,
 }
 
-/// Current committed native keyspace catalog root.
+/// Current committed native keyspace catalog shard set.
 ///
-/// A `KeyspaceHead` is the durable publication unit for the native
-/// filesystem-like API. Snapshots and restores copy its immutable catalog root
-/// pointer, not individual file metadata roots.
+/// A `KeyspaceHead` is the reconstructed read view for the native
+/// filesystem-like API. File creates/writes/appends are fenced by the owning
+/// file head and publish by replacing exactly one catalog shard root, so
+/// independent files in different catalog shards do not converge on one live
+/// keyspace-root object.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceHead {
     pub keyspace_id: KeyspaceId,
     pub generation: KeyspaceGeneration,
-    pub root: KeyspaceRootId,
+    pub shard_roots: Vec<KeyspaceCatalogShardId>,
+    pub file_count: usize,
     pub latest_commit: CommitSeq,
 }
 
@@ -184,13 +187,12 @@ impl KeyspaceCatalogShard {
     }
 }
 
-/// Immutable native keyspace catalog root.
+/// Immutable native keyspace catalog checkpoint root.
 ///
-/// The local catalog is sharded so native file publish cost is bounded by one
-/// deterministic catalog shard instead of the whole keyspace. The public API
-/// still depends only on the immutable catalog root boundary: snapshots and
-/// restores copy one `KeyspaceRootId`, while file creates/writes/appends publish
-/// one new root plus one changed shard.
+/// Live native file publishes replace one shard in `KeyspaceHead`. A
+/// `KeyspaceRoot` materializes a point-in-time shard vector for checkpoints,
+/// snapshots, and restore replay anchors; ordinary file writes do not allocate
+/// one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceRoot {
     pub root_id: KeyspaceRootId,
@@ -650,19 +652,22 @@ pub struct ShardCommit {
     pub new_root: MetadataNodeId,
 }
 
-/// Append-only native keyspace catalog-root timeline record.
+/// Append-only native keyspace catalog-shard timeline record.
 ///
-/// A native file create or append publishes a new immutable keyspace catalog
-/// root. PITR replay starts from a native keyspace checkpoint and applies these
-/// records in commit order.
+/// A native file create/write/append publishes one new catalog shard root.
+/// PITR replay starts from a native keyspace checkpoint and applies these
+/// records in commit order, replacing only the touched shard.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceCommit {
     pub commit_seq: CommitSeq,
     pub commit_group: CommitGroupId,
     pub time: LogicalTime,
     pub keyspace_id: KeyspaceId,
-    pub old_root: KeyspaceRootId,
-    pub new_root: KeyspaceRootId,
+    pub shard_index: u32,
+    pub old_shard: KeyspaceCatalogShardId,
+    pub new_shard: KeyspaceCatalogShardId,
+    pub old_file_count: usize,
+    pub new_file_count: usize,
 }
 
 /// Append-only native file-root audit record inside a keyspace commit.
