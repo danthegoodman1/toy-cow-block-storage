@@ -3076,6 +3076,50 @@ impl LocalCoordinator {
         })
     }
 
+    fn prepare_append_stream_run(
+        &self,
+        stream: &AppendStream,
+        data_len: usize,
+        durability: crate::api::WriteDurability,
+    ) -> Result<PreparedAppendStreamRun> {
+        if data_len == 0 {
+            return Err(StorageError::invalid_argument(
+                "append payload must not be empty",
+            ));
+        }
+        if matches!(durability, crate::api::WriteDurability::Flushed) {
+            return Err(StorageError::invalid_argument(
+                "append stream flushed durability is handled by DurableCoordinator",
+            ));
+        }
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
+        let data_len_u64 = u64::try_from(data_len)
+            .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
+        let ticket_id = self.metadata.next_append_ticket_id()?;
+        let ticket_range = self
+            .metadata
+            .reserve_append_stream_range(stream, data_len_u64)?;
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        Ok(PreparedAppendStreamRun {
+            stream: stream.clone(),
+            ticket_id,
+            range: ticket_range,
+            storage_node,
+            run_id: AppendRunId::from_raw(ticket_id.raw()),
+        })
+    }
+
     fn commit_prepared_append_stream_segment(
         &self,
         prepared: PreparedAppendStreamSegment,
@@ -3115,6 +3159,32 @@ impl LocalCoordinator {
                 bytes: payload_for_durable,
             },
         ))
+    }
+
+    fn commit_prepared_append_stream_run(
+        &self,
+        prepared: PreparedAppendStreamRun,
+        run: AppendLogRun,
+    ) -> Result<AppendTicket> {
+        if run.run_id != prepared.run_id
+            || run.storage_node != prepared.storage_node
+            || run.stream_id != prepared.stream.stream_id
+            || run.writer_epoch != prepared.stream.writer_epoch
+            || run.keyspace_id != prepared.stream.keyspace_id
+            || run.file_id != prepared.stream.file_id
+            || run.file_offset_start != prepared.range.offset
+            || run.payload_len != prepared.range.len
+        {
+            return Err(StorageError::corrupt(
+                "append run manifest disagrees with prepared stream range",
+            ));
+        }
+        self.metadata.append_stream_run_record(
+            &prepared.stream,
+            prepared.ticket_id,
+            prepared.range,
+            run,
+        )
     }
 
     fn materialize_append_stream_records(
@@ -3170,6 +3240,11 @@ impl LocalCoordinator {
                         ByteRange::new(0, record.len),
                         &mut bytes[start_len..],
                     )?;
+                }
+                AppendStreamSegmentBacking::AppendRun { .. } => {
+                    return Err(StorageError::unsupported(
+                        "append-run materialization requires durable append-run storage",
+                    ));
                 }
             }
         }
@@ -5806,7 +5881,6 @@ struct DataLogRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataLogSyncMode {
-    NoSync,
     Sync,
 }
 
@@ -5867,8 +5941,11 @@ impl DurableExportCursor {
 }
 
 const DATA_LOG_MAGIC: &[u8; 8] = b"TCOWDAT!";
-const DATA_LOG_VERSION: u16 = 2;
-const DATA_LOG_HEADER_LEN: usize = 8 + 2 + 16 + 8 + 1 + 8;
+const DATA_LOG_VERSION: u16 = 3;
+const DATA_LOG_HEADER_LEN: usize = 8 + 2 + 1 + 16 + 8 + 1 + 8;
+const DATA_LOG_CHECKSUM_OFFSET: usize = 8 + 2 + 1 + 16 + 8 + 1;
+const DATA_LOG_KIND_SEGMENT: u8 = 1;
+const DATA_LOG_KIND_APPEND_RUN: u8 = 2;
 const MAX_DATA_LOG_SYNC_GROUP_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STREAM_FLUSH_GROUPS_PER_RUN: usize = 64;
@@ -6467,6 +6544,36 @@ impl DurableSqliteStore {
         Ok(touched_node_count)
     }
 
+    fn persist_data_log_manifests_only(&self, appended: &PendingDataLogAppend) -> Result<u64> {
+        let mut touched = BTreeSet::new();
+        for log in appended.logs.values() {
+            touched.insert(log.storage_node);
+        }
+        for log_ref in &appended.sealed_logs {
+            touched.insert(log_ref.storage_node);
+        }
+        for storage_node in touched.iter().copied() {
+            let mut conn = self.node_catalogs.lock(storage_node)?;
+            let tx = conn.transaction().map_err(sqlite_error)?;
+            for log in appended
+                .logs
+                .values()
+                .filter(|log| log.storage_node == storage_node)
+            {
+                persist_data_log_manifest(&tx, log)?;
+            }
+            for log_ref in appended
+                .sealed_logs
+                .iter()
+                .filter(|log_ref| log_ref.storage_node == storage_node)
+            {
+                seal_data_log_manifest(&tx, *log_ref)?;
+            }
+            tx.commit().map_err(sqlite_error)?;
+        }
+        Ok(usize_to_u64(touched.len()))
+    }
+
     fn persist_preingested_append_stream_flush(
         &self,
         cursor: &DurableExportCursor,
@@ -6501,8 +6608,14 @@ impl DurableSqliteStore {
         let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
 
         let started = Instant::now();
-        let touched_node_count =
-            self.persist_selected_node_catalog_publish(nodes, segment_ids, appended, segment_ids)?;
+        let manifest_touched = self.persist_data_log_manifests_only(&appended)?;
+        let catalog_touched = self.persist_selected_node_catalog_publish(
+            nodes,
+            segment_ids,
+            appended.clone(),
+            segment_ids,
+        )?;
+        let touched_node_count = manifest_touched.max(catalog_touched);
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
         let mut conn = lock(&self.conn)?;
@@ -6640,17 +6753,149 @@ impl DurableSqliteStore {
         )
     }
 
-    fn append_stream_segments_unsynced(
+    fn append_run_payload_unsynced(
         &self,
-        segments: Vec<DurableSegmentPayload>,
+        payload: DurableAppendRunPayload,
         pending_base: Option<&PendingDataLogAppend>,
-    ) -> Result<(PendingDataLogAppend, DataLogAppendProfile)> {
-        self.append_segments_profiled_with_state(
-            segments,
-            DataLogSyncMode::NoSync,
-            pending_base,
-            STREAM_DATA_LOG_STATE_ACTIVE,
-        )
+    ) -> Result<(AppendLogRun, PendingDataLogAppend, DataLogAppendProfile)> {
+        let payload_bytes = u64::try_from(payload.bytes.len())
+            .map_err(|_| StorageError::invalid_argument("payload length overflows u64"))?;
+        if payload_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "append run payload must not be empty",
+            ));
+        }
+        let record_len = (DATA_LOG_HEADER_LEN as u64)
+            .checked_add(payload_bytes)
+            .ok_or_else(|| StorageError::invalid_argument("data-log record length overflows"))?;
+        let mut append = PendingDataLogAppend::default();
+        let mut profile = DataLogAppendProfile::default();
+        let storage_node = payload.storage_node;
+        let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+
+        let mut active = match pending_base {
+            Some(pending) => pending.active_log_for_node(
+                storage_node,
+                &self.paths.data_dir,
+                STREAM_DATA_LOG_STATE_ACTIVE,
+            )?,
+            None => None,
+        };
+        let mut active = match active.take() {
+            Some(active) => active,
+            None => {
+                let node_conn = self.node_catalogs.lock(storage_node)?;
+                active_data_log_with_state(
+                    &node_conn,
+                    &self.paths.data_dir,
+                    storage_node,
+                    STREAM_DATA_LOG_STATE_ACTIVE,
+                )?
+            }
+        };
+        if active.total_bytes != 0
+            && active
+                .total_bytes
+                .checked_add(record_len)
+                .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
+                > self.policy.target_data_log_bytes
+        {
+            append.sealed_logs.push(DurableDataLogRef {
+                storage_node,
+                log_id: active.log_id,
+            });
+            let node_conn = self.node_catalogs.lock(storage_node)?;
+            active = next_data_log(
+                &node_conn,
+                &self.paths.data_dir,
+                storage_node,
+                active.log_id,
+            )?;
+        }
+
+        fs::create_dir_all(&data_dir).map_err(fs_error)?;
+        let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .map_err(fs_error)?;
+        let file_len = file.metadata().map_err(fs_error)?.len();
+        active.total_bytes = active.total_bytes.max(file_len);
+
+        let record_offset = active.total_bytes;
+        let started = Instant::now();
+        let record =
+            encode_append_run_data_log_record(payload.run_id, payload.integrity, &payload.bytes)?;
+        profile.encode_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
+        file.write_all(&record).map_err(fs_error)?;
+        profile.write_nanos = duration_nanos_u64(started.elapsed());
+
+        let payload_offset = record_offset
+            .checked_add(DATA_LOG_HEADER_LEN as u64)
+            .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
+        let new_total = record_offset
+            .checked_add(record_len)
+            .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
+        active.total_bytes = new_total;
+        let log_ref = DurableDataLogRef {
+            storage_node,
+            log_id: active.log_id,
+        };
+        append.logs.insert(
+            log_ref,
+            PendingDataLogManifest {
+                storage_node,
+                log_id: active.log_id,
+                state: STREAM_DATA_LOG_STATE_ACTIVE,
+                total_bytes: new_total,
+            },
+        );
+
+        let run = AppendLogRun {
+            run_id: payload.run_id,
+            storage_node,
+            stream_id: payload.stream_id,
+            writer_epoch: payload.writer_epoch,
+            keyspace_id: payload.keyspace_id,
+            file_id: payload.file_id,
+            file_offset_start: payload.file_offset_start,
+            payload_len: payload_bytes,
+            log_id: active.log_id,
+            log_payload_offset: payload_offset,
+            log_record_bytes: record_len,
+            integrity: payload.integrity,
+        };
+        run.validate()?;
+        Ok((run, append, profile))
+    }
+
+    fn read_append_run_payload(&self, run: &AppendLogRun) -> Result<Vec<u8>> {
+        run.validate()?;
+        let record_offset = run
+            .log_payload_offset
+            .checked_sub(DATA_LOG_HEADER_LEN as u64)
+            .ok_or_else(|| StorageError::corrupt("append run payload offset precedes record"))?;
+        let path = data_log_path(&self.paths.data_dir, run.storage_node, run.log_id);
+        let mut file = File::open(&path).map_err(fs_error)?;
+        file.seek(SeekFrom::Start(record_offset))
+            .map_err(fs_error)?;
+        let record_len = usize::try_from(run.log_record_bytes)
+            .map_err(|_| StorageError::corrupt("append run record length overflows usize"))?;
+        let mut record = vec![0; record_len];
+        file.read_exact(&mut record).map_err(fs_error)?;
+        let data = decode_append_run_data_log_record(&record)?;
+        if data.run_id != run.run_id
+            || data.bytes.len() as u64 != run.payload_len
+            || data.integrity != run.integrity
+        {
+            return Err(StorageError::corrupt(
+                "append-run data-log record disagrees with manifest",
+            ));
+        }
+        Ok(data.bytes)
     }
 
     fn append_segments_profiled_with_state(
@@ -6909,7 +7154,7 @@ impl DurableSqliteStore {
             .map_err(|_| StorageError::corrupt("data-log record length overflows usize"))?;
         let mut record = vec![0; record_len];
         file.read_exact(&mut record).map_err(fs_error)?;
-        let data = decode_data_log_record(&record)?;
+        let data = decode_segment_data_log_record(&record)?;
         if data.segment_id != placement.segment_id
             || data.bytes.len() as u64 != placement.payload_bytes
             || data.integrity != placement.integrity
@@ -7327,6 +7572,26 @@ impl PendingDataLogAppend {
         }
     }
 
+    fn selected_log_refs(&self, selected: &BTreeSet<DurableDataLogRef>) -> Self {
+        let logs = self
+            .logs
+            .iter()
+            .filter(|(log_ref, _)| selected.contains(log_ref))
+            .map(|(log_ref, manifest)| (*log_ref, manifest.clone()))
+            .collect();
+        let sealed_logs = self
+            .sealed_logs
+            .iter()
+            .copied()
+            .filter(|log_ref| selected.contains(log_ref))
+            .collect();
+        Self {
+            placements: Vec::new(),
+            logs,
+            sealed_logs,
+        }
+    }
+
     fn remove_segments(&mut self, segment_ids: &BTreeSet<SegmentId>) {
         self.placements
             .retain(|placement| !segment_ids.contains(&placement.segment_id));
@@ -7342,6 +7607,12 @@ impl PendingDataLogAppend {
             .retain(|log_ref, _| touched_logs.contains(log_ref));
         self.sealed_logs
             .retain(|log_ref| touched_logs.contains(log_ref));
+    }
+
+    fn remove_log_refs(&mut self, log_refs: &BTreeSet<DurableDataLogRef>) {
+        self.logs.retain(|log_ref, _| !log_refs.contains(log_ref));
+        self.sealed_logs
+            .retain(|log_ref| !log_refs.contains(log_ref));
     }
 
     fn log_refs(&self) -> BTreeSet<DurableDataLogRef> {
@@ -7439,6 +7710,19 @@ struct DataLogSegmentData {
     segment_id: SegmentId,
     integrity: SegmentPayloadIntegrity,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct DataLogAppendRunData {
+    run_id: AppendRunId,
+    integrity: SegmentPayloadIntegrity,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+enum DataLogRecordData {
+    Segment(DataLogSegmentData),
+    AppendRun(DataLogAppendRunData),
 }
 
 fn encode_row<T: DurableCodec>(value: &T) -> Result<Vec<u8>> {
@@ -9626,12 +9910,35 @@ fn encode_data_log_record(
     integrity: SegmentPayloadIntegrity,
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
+    encode_typed_data_log_record(DATA_LOG_KIND_SEGMENT, segment_id.raw(), integrity, bytes)
+}
+
+fn encode_append_run_data_log_record(
+    run_id: AppendRunId,
+    integrity: SegmentPayloadIntegrity,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    encode_typed_data_log_record(DATA_LOG_KIND_APPEND_RUN, run_id.raw(), integrity, bytes)
+}
+
+fn encode_typed_data_log_record(
+    kind: u8,
+    identity: u128,
+    integrity: SegmentPayloadIntegrity,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    if !matches!(kind, DATA_LOG_KIND_SEGMENT | DATA_LOG_KIND_APPEND_RUN) {
+        return Err(StorageError::invalid_argument(
+            "unknown data-log record kind",
+        ));
+    }
     let payload_len = u64::try_from(bytes.len())
         .map_err(|_| StorageError::invalid_argument("data-log payload length overflows u64"))?;
     let mut out = Vec::with_capacity(DATA_LOG_HEADER_LEN + bytes.len());
     out.extend_from_slice(DATA_LOG_MAGIC);
     out.extend_from_slice(&DATA_LOG_VERSION.to_be_bytes());
-    out.extend_from_slice(&segment_id.raw().to_be_bytes());
+    out.push(kind);
+    out.extend_from_slice(&identity.to_be_bytes());
     out.extend_from_slice(&payload_len.to_be_bytes());
     match integrity {
         SegmentPayloadIntegrity::Crc32c(checksum) => {
@@ -9647,7 +9954,7 @@ fn encode_data_log_record(
     Ok(out)
 }
 
-fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
+fn decode_data_log_record(record: &[u8]) -> Result<DataLogRecordData> {
     if record.len() < DATA_LOG_HEADER_LEN {
         return Err(StorageError::corrupt("data-log record is truncated"));
     }
@@ -9663,13 +9970,15 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
     if version != DATA_LOG_VERSION {
         return Err(StorageError::corrupt("unsupported data-log version"));
     }
-    let segment_start = version_offset + 2;
-    let segment_id = SegmentId::from_raw(u128::from_be_bytes(
-        record[segment_start..segment_start + 16]
+    let kind_offset = version_offset + 2;
+    let kind = record[kind_offset];
+    let identity_start = kind_offset + 1;
+    let identity = u128::from_be_bytes(
+        record[identity_start..identity_start + 16]
             .try_into()
-            .map_err(|_| StorageError::corrupt("bad data-log segment id"))?,
-    ));
-    let payload_len_start = segment_start + 16;
+            .map_err(|_| StorageError::corrupt("bad data-log identity"))?,
+    );
+    let payload_len_start = identity_start + 16;
     let payload_len = u64::from_be_bytes(
         record[payload_len_start..payload_len_start + 8]
             .try_into()
@@ -9677,7 +9986,7 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
     );
     let integrity_start = payload_len_start + 8;
     let integrity_tag = record[integrity_start];
-    let checksum_start = integrity_start + 1;
+    let checksum_start = DATA_LOG_CHECKSUM_OFFSET;
     let expected_checksum = u64::from_be_bytes(
         record[checksum_start..checksum_start + 8]
             .try_into()
@@ -9703,11 +10012,37 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
         _ => return Err(StorageError::corrupt("invalid data-log integrity tag")),
     };
     verify_segment_payload_integrity(integrity, &bytes)?;
-    Ok(DataLogSegmentData {
-        segment_id,
-        integrity,
-        bytes,
-    })
+    match kind {
+        DATA_LOG_KIND_SEGMENT => Ok(DataLogRecordData::Segment(DataLogSegmentData {
+            segment_id: SegmentId::from_raw(identity),
+            integrity,
+            bytes,
+        })),
+        DATA_LOG_KIND_APPEND_RUN => Ok(DataLogRecordData::AppendRun(DataLogAppendRunData {
+            run_id: AppendRunId::from_raw(identity),
+            integrity,
+            bytes,
+        })),
+        _ => Err(StorageError::corrupt("invalid data-log record kind")),
+    }
+}
+
+fn decode_segment_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
+    match decode_data_log_record(record)? {
+        DataLogRecordData::Segment(data) => Ok(data),
+        DataLogRecordData::AppendRun(_) => Err(StorageError::corrupt(
+            "expected segment data-log record, found append-run record",
+        )),
+    }
+}
+
+fn decode_append_run_data_log_record(record: &[u8]) -> Result<DataLogAppendRunData> {
+    match decode_data_log_record(record)? {
+        DataLogRecordData::AppendRun(data) => Ok(data),
+        DataLogRecordData::Segment(_) => Err(StorageError::corrupt(
+            "expected append-run data-log record, found segment record",
+        )),
+    }
 }
 
 fn current_placements_for_log(
@@ -10704,8 +11039,19 @@ impl DurableCoordinator {
             .copied()
             .filter(|segment_id| !persisted_segments.contains(segment_id))
             .collect();
-        let pending_stream_append =
-            lock(&self.pending_stream_data_log_append)?.selected_segments(&missing_pending);
+        let run_log_refs: BTreeSet<_> = plans
+            .iter()
+            .flat_map(|plan| {
+                plan.batch
+                    .records
+                    .iter()
+                    .filter_map(AppendStreamSegment::log_ref)
+            })
+            .collect();
+        let pending_stream = lock(&self.pending_stream_data_log_append)?;
+        let mut pending_stream_append = pending_stream.selected_segments(&missing_pending);
+        pending_stream_append.merge(pending_stream.selected_log_refs(&run_log_refs));
+        drop(pending_stream);
         let pending_segment_ids = pending_stream_append.segment_ids();
         if pending_segment_ids != missing_pending {
             return Err(StorageError::corrupt(
@@ -10732,7 +11078,9 @@ impl DurableCoordinator {
             pending_stream_append,
         )?;
         lock(&self.persisted_segments)?.extend(segment_ids);
-        lock(&self.pending_stream_data_log_append)?.remove_segments(&missing_pending);
+        let mut pending_stream = lock(&self.pending_stream_data_log_append)?;
+        pending_stream.remove_segments(&missing_pending);
+        pending_stream.remove_log_refs(&run_log_refs);
         for plan in &plans {
             self.local
                 .metadata
@@ -11268,37 +11616,36 @@ impl DurableCoordinator {
         )?;
         let result = self
             .local
-            .prepare_append_stream_segment(
+            .prepare_append_stream_run(
                 stream,
                 data.len(),
                 crate::api::WriteDurability::Acknowledged,
-                payload_integrity,
             )
             .and_then(|prepared| {
-                let prepared_segment_id = prepared.grant.segment_id;
-                let segment_bytes = self.local.padded_append_segment_bytes(data)?;
-                let payload = DurableSegmentPayload {
-                    segment_id: prepared_segment_id,
-                    storage_node: prepared.grant.storage_node,
-                    integrity: segment_payload_integrity(payload_integrity, &segment_bytes),
-                    bytes: Arc::from(segment_bytes.clone()),
+                let payload_bytes: Arc<[u8]> = Arc::from(data.to_vec());
+                let payload = DurableAppendRunPayload {
+                    run_id: prepared.run_id,
+                    storage_node: prepared.storage_node,
+                    stream_id: prepared.stream.stream_id,
+                    writer_epoch: prepared.stream.writer_epoch,
+                    keyspace_id: prepared.stream.keyspace_id,
+                    file_id: prepared.stream.file_id,
+                    file_offset_start: prepared.range.offset,
+                    integrity: segment_payload_integrity(payload_integrity, &payload_bytes),
+                    bytes: payload_bytes,
                 };
                 let pending_base = lock(&self.pending_stream_data_log_append)?.clone();
-                let (append, _) = self
+                let (run, append, _) = self
                     .durable
-                    .append_stream_segments_unsynced(vec![payload], Some(&pending_base))?;
+                    .append_run_payload_unsynced(payload, Some(&pending_base))?;
+                let appended_log_refs = append.log_refs();
                 lock(&self.pending_stream_data_log_append)?.merge(append);
-                let commit = self.local.commit_prepared_append_stream_segment(
-                    prepared,
-                    segment_bytes,
-                    payload_integrity,
-                );
-                let (ticket, _) = match commit {
-                    Ok(commit) => commit,
+                let commit = self.local.commit_prepared_append_stream_run(prepared, run);
+                let ticket = match commit {
+                    Ok(ticket) => ticket,
                     Err(error) => {
-                        let mut orphaned = BTreeSet::new();
-                        orphaned.insert(prepared_segment_id);
-                        lock(&self.pending_stream_data_log_append)?.remove_segments(&orphaned);
+                        lock(&self.pending_stream_data_log_append)?
+                            .remove_log_refs(&appended_log_refs);
                         return Err(error);
                     }
                 };
@@ -11317,16 +11664,85 @@ impl DurableCoordinator {
         self.persist_append_stream(stream)
     }
 
+    fn materialize_append_runs_for_publish(
+        &self,
+        stream: &AppendStream,
+        mark: &DurableAppendMark,
+    ) -> Result<BTreeSet<SegmentId>> {
+        let state = self
+            .local
+            .metadata
+            .validate_append_stream_mark(stream, mark)?;
+        let records: Vec<_> = state
+            .records
+            .iter()
+            .filter(|record| {
+                record.offset >= state.published_through
+                    && record.offset < mark.durable_through
+                    && record
+                        .offset
+                        .checked_add(record.len)
+                        .is_some_and(|end| end <= mark.durable_through)
+                    && record.append_run().is_some()
+            })
+            .cloned()
+            .collect();
+        let mut materialized = BTreeSet::new();
+        for record in records {
+            let run = record
+                .append_run()
+                .ok_or_else(|| StorageError::corrupt("append run record missing run"))?
+                .clone();
+            let bytes = self.durable.read_append_run_payload(&run)?;
+            let segment_bytes = self.local.padded_append_segment_bytes(&bytes)?;
+            let payload_integrity = payload_integrity_from_segment(run.integrity);
+            let verified = self.local.write_segment_for_intent_with_id_owned_verified(
+                WriteGrantIntent::NativeAppendStream {
+                    keyspace_id: stream.keyspace_id,
+                    file_id: stream.file_id,
+                    stream_id: stream.stream_id,
+                    ticket_id: record.ticket_id,
+                    append_offset: record.offset,
+                    bytes: record.len,
+                    writer_epoch: stream.writer_epoch,
+                },
+                self.local.next_write_intent()?,
+                segment_bytes,
+                WriteDurability::Acknowledged,
+                payload_integrity,
+            )?;
+            let replacement = AppendStreamSegment {
+                ticket_id: record.ticket_id,
+                offset: record.offset,
+                len: record.len,
+                backing: AppendStreamSegmentBacking::Segment {
+                    segment_id: verified.descriptor.segment_id,
+                    segment_bytes: verified.descriptor.bytes,
+                    payload_integrity,
+                },
+            };
+            self.local.metadata.replace_append_stream_records(
+                stream,
+                record.offset,
+                record.end_exclusive()?,
+                replacement,
+            )?;
+            materialized.insert(verified.descriptor.segment_id);
+        }
+        Ok(materialized)
+    }
+
     pub fn publish_append_stream(
         &self,
         stream: &AppendStream,
         mark: &DurableAppendMark,
     ) -> Result<AppendPublishCommit> {
+        let materialized_segments = self.materialize_append_runs_for_publish(stream, mark)?;
         let state = self
             .local
             .metadata
             .validate_append_stream_mark(stream, mark)?;
-        let changed_segments: BTreeSet<_> = state
+        let mut changed_segments: BTreeSet<_> = state
             .records
             .iter()
             .filter(|record| {
@@ -11339,6 +11755,7 @@ impl DurableCoordinator {
             })
             .filter_map(AppendStreamSegment::segment_id)
             .collect();
+        changed_segments.extend(materialized_segments);
         let commit = self
             .local
             .publish_append_stream(stream, mark, WriteDurability::Flushed)?;
@@ -11774,7 +12191,7 @@ impl MetadataInner {
     fn prune_append_streams_for_durable_export(&mut self) {
         for stream in self.append_streams.values_mut() {
             stream.records.retain(|record| {
-                record.is_materialized()
+                record.is_durable_backing()
                     && record
                         .offset
                         .checked_add(record.len)
@@ -11925,6 +12342,9 @@ enum AppendStreamSegmentBacking {
         segment_bytes: u64,
         payload_integrity: PayloadIntegrity,
     },
+    AppendRun {
+        run: AppendLogRun,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -11956,6 +12376,15 @@ struct PreparedAppendStreamSegment {
     grant: WriteGrant,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedAppendStreamRun {
+    stream: AppendStream,
+    ticket_id: AppendTicketId,
+    range: ByteRange,
+    storage_node: StorageNodeId,
+    run_id: AppendRunId,
+}
+
 impl AppendStreamSegment {
     fn end_exclusive(&self) -> Result<u64> {
         self.offset
@@ -11964,32 +12393,60 @@ impl AppendStreamSegment {
     }
 
     fn segment_id(&self) -> Option<SegmentId> {
-        match self.backing {
-            AppendStreamSegmentBacking::Pending { .. } => None,
-            AppendStreamSegmentBacking::Segment { segment_id, .. } => Some(segment_id),
+        match &self.backing {
+            AppendStreamSegmentBacking::Pending { .. }
+            | AppendStreamSegmentBacking::AppendRun { .. } => None,
+            AppendStreamSegmentBacking::Segment { segment_id, .. } => Some(*segment_id),
         }
+    }
+
+    fn append_run(&self) -> Option<&AppendLogRun> {
+        match &self.backing {
+            AppendStreamSegmentBacking::AppendRun { run } => Some(run),
+            AppendStreamSegmentBacking::Pending { .. }
+            | AppendStreamSegmentBacking::Segment { .. } => None,
+        }
+    }
+
+    fn log_ref(&self) -> Option<DurableDataLogRef> {
+        self.append_run().map(|run| DurableDataLogRef {
+            storage_node: run.storage_node,
+            log_id: run.log_id,
+        })
     }
 
     fn segment_bytes(&self) -> u64 {
         match &self.backing {
             AppendStreamSegmentBacking::Pending { bytes, .. } => usize_to_u64(bytes.len()),
             AppendStreamSegmentBacking::Segment { segment_bytes, .. } => *segment_bytes,
+            AppendStreamSegmentBacking::AppendRun { run } => run.payload_len,
         }
     }
 
     fn payload_integrity(&self) -> PayloadIntegrity {
-        match self.backing {
+        match &self.backing {
             AppendStreamSegmentBacking::Pending {
                 payload_integrity, ..
             }
             | AppendStreamSegmentBacking::Segment {
                 payload_integrity, ..
-            } => payload_integrity,
+            } => *payload_integrity,
+            AppendStreamSegmentBacking::AppendRun { run } => {
+                payload_integrity_from_segment(run.integrity)
+            }
         }
     }
 
     fn is_materialized(&self) -> bool {
         matches!(self.backing, AppendStreamSegmentBacking::Segment { .. })
+    }
+
+    fn is_durable_backing(&self) -> bool {
+        matches!(
+            self.backing,
+            AppendStreamSegmentBacking::Segment { .. }
+                | AppendStreamSegmentBacking::AppendRun { .. }
+        )
     }
 }
 
@@ -12107,7 +12564,7 @@ impl AppendStreamState {
         exported.durable_through = durable_through;
         exported.reserved_tail = durable_through;
         exported.records.retain(|record| {
-            record.is_materialized()
+            record.is_durable_backing()
                 && record
                     .offset
                     .checked_add(record.len)
@@ -12613,6 +13070,58 @@ impl InMemoryMetadataPlane {
                 segment_bytes,
                 payload_integrity,
             },
+        });
+        Ok(AppendTicket {
+            keyspace_id: stream.keyspace_id,
+            file_id: stream.file_id,
+            stream_id: stream.stream_id,
+            ticket_id,
+            writer_epoch: stream.writer_epoch,
+            range,
+        })
+    }
+
+    pub fn append_stream_run_record(
+        &self,
+        stream: &AppendStream,
+        ticket_id: AppendTicketId,
+        range: ByteRange,
+        run: AppendLogRun,
+    ) -> Result<AppendTicket> {
+        if range.len == 0 {
+            return Err(StorageError::invalid_argument(
+                "append payload must not be empty",
+            ));
+        }
+        run.validate()?;
+        if run.stream_id != stream.stream_id
+            || run.writer_epoch != stream.writer_epoch
+            || run.keyspace_id != stream.keyspace_id
+            || run.file_id != stream.file_id
+            || run.file_offset_start != range.offset
+            || run.payload_len != range.len
+        {
+            return Err(StorageError::invalid_argument(
+                "append run does not match stream record range",
+            ));
+        }
+        let mut inner = lock(&self.inner)?;
+        Self::file_head_locked(&inner, stream.keyspace_id, stream.file_id)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        if range.end_exclusive()? > state.reserved_tail {
+            return Err(StorageError::conflict(
+                "append stream record exceeds reserved tail",
+            ));
+        }
+        state.records.push(AppendStreamSegment {
+            ticket_id,
+            offset: range.offset,
+            len: range.len,
+            backing: AppendStreamSegmentBacking::AppendRun { run },
         });
         Ok(AppendTicket {
             keyspace_id: stream.keyspace_id,
@@ -14771,6 +15280,19 @@ struct SegmentRecord {
 struct DurableSegmentPayload {
     segment_id: SegmentId,
     storage_node: StorageNodeId,
+    integrity: SegmentPayloadIntegrity,
+    bytes: Arc<[u8]>,
+}
+
+#[derive(Debug)]
+struct DurableAppendRunPayload {
+    run_id: AppendRunId,
+    storage_node: StorageNodeId,
+    stream_id: AppendStreamId,
+    writer_epoch: WriterEpoch,
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    file_offset_start: u64,
     integrity: SegmentPayloadIntegrity,
     bytes: Arc<[u8]>,
 }
@@ -20040,6 +20562,10 @@ impl DurableCodec for AppendStreamSegment {
                 segment_bytes.encode(out)?;
                 payload_integrity.encode(out)
             }
+            AppendStreamSegmentBacking::AppendRun { run } => {
+                2u8.encode(out)?;
+                run.encode(out)
+            }
         }
     }
 
@@ -20052,6 +20578,9 @@ impl DurableCodec for AppendStreamSegment {
                 segment_id: SegmentId::decode(input)?,
                 segment_bytes: u64::decode(input)?,
                 payload_integrity: PayloadIntegrity::decode(input)?,
+            },
+            2 => AppendStreamSegmentBacking::AppendRun {
+                run: AppendLogRun::decode(input)?,
             },
             _ => {
                 return Err(durable_codec_error(
@@ -20517,6 +21046,13 @@ fn segment_payload_integrity(mode: PayloadIntegrity, bytes: &[u8]) -> SegmentPay
     match mode {
         PayloadIntegrity::Verified => SegmentPayloadIntegrity::Crc32c(data_log_checksum(bytes)),
         PayloadIntegrity::Unchecked => SegmentPayloadIntegrity::Unchecked,
+    }
+}
+
+fn payload_integrity_from_segment(integrity: SegmentPayloadIntegrity) -> PayloadIntegrity {
+    match integrity {
+        SegmentPayloadIntegrity::Crc32c(_) => PayloadIntegrity::Verified,
+        SegmentPayloadIntegrity::Unchecked => PayloadIntegrity::Unchecked,
     }
 }
 
@@ -24883,6 +25419,72 @@ mod tests {
     }
 
     #[test]
+    fn data_log_records_distinguish_segments_from_append_runs() {
+        let segment_bytes = repeated_blocks(1, 31);
+        let segment_record = encode_data_log_record(
+            SegmentId::from_raw(10),
+            segment_payload_integrity(PayloadIntegrity::Verified, &segment_bytes),
+            &segment_bytes,
+        )
+        .unwrap();
+        let segment = decode_segment_data_log_record(&segment_record).unwrap();
+        assert_eq!(segment.segment_id, SegmentId::from_raw(10));
+        assert_eq!(segment.bytes, segment_bytes);
+        assert!(decode_append_run_data_log_record(&segment_record).is_err());
+
+        let run_bytes = repeated_blocks(1, 32);
+        let run_record = encode_append_run_data_log_record(
+            AppendRunId::from_raw(11),
+            segment_payload_integrity(PayloadIntegrity::Verified, &run_bytes),
+            &run_bytes,
+        )
+        .unwrap();
+        let run = decode_append_run_data_log_record(&run_record).unwrap();
+        assert_eq!(run.run_id, AppendRunId::from_raw(11));
+        assert_eq!(
+            run.integrity,
+            segment_payload_integrity(PayloadIntegrity::Verified, &run_bytes)
+        );
+        assert_eq!(run.bytes, run_bytes);
+        assert!(decode_segment_data_log_record(&run_record).is_err());
+    }
+
+    #[test]
+    fn durable_append_run_payload_writes_without_segment_placement() {
+        let root = durable_temp_dir("append-run-payload");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let bytes = repeated_blocks(1, 33);
+        let integrity = segment_payload_integrity(PayloadIntegrity::Verified, &bytes);
+        let payload = DurableAppendRunPayload {
+            run_id: AppendRunId::from_raw(77),
+            storage_node: cfg.storage_node,
+            stream_id: AppendStreamId::from_raw(88),
+            writer_epoch: WriterEpoch::from_raw(3),
+            keyspace_id: KeyspaceId::from_raw(4),
+            file_id: FileId::from_raw(5),
+            file_offset_start: 4096,
+            integrity,
+            bytes: Arc::from(bytes.clone()),
+        };
+
+        let (run, pending, profile) = store
+            .durable
+            .append_run_payload_unsynced(payload, None)
+            .unwrap();
+        assert_eq!(run.run_id, AppendRunId::from_raw(77));
+        assert_eq!(run.file_offset_start, 4096);
+        assert_eq!(run.payload_len, 4096);
+        assert_eq!(pending.placements.len(), 0);
+        assert_eq!(pending.logs.len(), 1);
+        assert!(profile.write_nanos > 0);
+        assert_eq!(store.durable.read_append_run_payload(&run).unwrap(), bytes);
+        assert!(store.local.segment_ids().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn durable_batched_flush_persists_many_segments_in_one_data_log() {
         let root = durable_temp_dir("batched-flush-one-log");
         let cfg = config();
@@ -25156,7 +25758,7 @@ mod tests {
             .open(path)
             .unwrap();
         let checksum_offset =
-            placement.record_offset + u64::try_from(DATA_LOG_MAGIC.len() + 2 + 16 + 8 + 1).unwrap();
+            placement.record_offset + u64::try_from(DATA_LOG_CHECKSUM_OFFSET).unwrap();
         file.seek(SeekFrom::Start(checksum_offset)).unwrap();
         let mut byte = [0; 1];
         file.read_exact(&mut byte).unwrap();
