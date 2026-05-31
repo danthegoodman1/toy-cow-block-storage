@@ -1135,12 +1135,17 @@ impl StorageNodeRegistry {
             if selected.is_empty() {
                 continue;
             }
-            for segment_id in selected {
+            let selected: BTreeSet<_> = selected.into_iter().collect();
+            for segment_id in &selected {
                 payloads.push(
                     node.segment_store
-                        .payload_for_segment(*node_id, segment_id)?,
+                        .payload_for_segment(*node_id, *segment_id)?,
                 );
             }
+            let mut catalog = catalog;
+            catalog
+                .entries
+                .retain(|segment_id, _| selected.contains(segment_id));
             nodes.insert(
                 *node_id,
                 (
@@ -1184,7 +1189,11 @@ impl StorageNodeRegistry {
             if selected.is_empty() {
                 continue;
             }
-            found.extend(selected);
+            found.extend(selected.iter().copied());
+            let mut catalog = catalog;
+            catalog
+                .entries
+                .retain(|segment_id, _| selected.contains(segment_id));
             nodes.insert(
                 *node_id,
                 (
