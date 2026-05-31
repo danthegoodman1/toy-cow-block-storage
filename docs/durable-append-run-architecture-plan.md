@@ -222,19 +222,19 @@ native append publish should not be forced through the block segment shape.
 ### Checksums
 
 Checksums remain a storage-node integrity concern, not a reason to fragment file
-metadata. A large visible extent may point to a run that has a checksum sidecar:
+metadata. The current append-run implementation stores one integrity policy on
+each run or run range:
 
 ```text
-ChecksumRange {
-  run_id
-  chunk_size
-  checksums[]
-}
+SegmentPayloadIntegrity::Crc32c(checksum) | SegmentPayloadIntegrity::Unchecked
 ```
 
-Reads verify the relevant checksum chunks unless the caller explicitly chooses a
-no-verify mode. A checksum failure rejects the read. Checksum chunking must not
-force one visible extent per checksum chunk.
+Reads verify run-backed extents by default when the run is verified. Callers may
+choose unchecked writes and skip-verify reads explicitly; requiring verification
+against an unchecked run fails cleanly. A checksum failure rejects the read.
+Chunked checksum sidecars are not part of v1 because the corrected CRC32C path
+is not a measured bottleneck and the sidecar would add metadata shape without a
+clear win.
 
 ### Recovery
 
@@ -313,8 +313,8 @@ Exit gate:
 
 ### Stage 1: Append Run Types In The Deterministic Core
 
-- Add core types for append log runs, run ranges, checksum ranges, durable marks,
-  and run-backed file extents.
+- Add core types for append log runs, run ranges, payload-integrity policy,
+  durable marks, and run-backed file extents.
 - Update metadata validation to accept run-backed extents beside existing
   segment-backed extents where native files need them.
 - Add deterministic coalescing rules for adjacent compatible run ranges.
@@ -379,7 +379,7 @@ Exit gate:
 ### Stage 5: Read Path And Verification
 
 - Read run-backed file extents directly from append log ranges.
-- Verify checksum chunks on read by default.
+- Verify run-backed payload integrity on read by default.
 - Support explicit no-verify reads and writes as a policy bit, without allowing
   silent mismatch between verified and unverified payloads.
 - Keep corruption failures local and deterministic.

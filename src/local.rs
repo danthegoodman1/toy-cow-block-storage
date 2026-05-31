@@ -12299,7 +12299,7 @@ struct AppendStreamRunRecord {
 struct AppendStreamFlushBatch {
     records: Vec<AppendStreamRunRecord>,
     durable_through: u64,
-    segment_bytes: u64,
+    payload_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12331,7 +12331,7 @@ impl AppendStreamRunRecord {
         }
     }
 
-    fn segment_bytes(&self) -> u64 {
+    fn payload_bytes(&self) -> u64 {
         self.run.payload_len
     }
 
@@ -12447,14 +12447,14 @@ impl AppendStreamState {
         Ok(expected)
     }
 
-    fn flush_batch(&self, max_segment_bytes: u64) -> Result<AppendStreamFlushBatch> {
-        if max_segment_bytes == 0 {
+    fn flush_batch(&self, max_batch_bytes: u64) -> Result<AppendStreamFlushBatch> {
+        if max_batch_bytes == 0 {
             return Err(StorageError::invalid_argument(
                 "append stream flush batch byte cap must be greater than zero",
             ));
         }
         let mut expected = self.durable_through;
-        let mut segment_bytes = 0_u64;
+        let mut payload_bytes = 0_u64;
         let mut selected = Vec::new();
         let mut records = self.records.clone();
         records.sort_by_key(|record| record.offset);
@@ -12466,17 +12466,17 @@ impl AppendStreamState {
             if record.offset != expected {
                 break;
             }
-            let record_segment_bytes = record.segment_bytes();
+            let record_payload_bytes = record.payload_bytes();
             let would_exceed = !selected.is_empty()
-                && segment_bytes
-                    .checked_add(record_segment_bytes)
+                && payload_bytes
+                    .checked_add(record_payload_bytes)
                     .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?
-                    > max_segment_bytes;
+                    > max_batch_bytes;
             if would_exceed {
                 break;
             }
-            segment_bytes = segment_bytes
-                .checked_add(record_segment_bytes)
+            payload_bytes = payload_bytes
+                .checked_add(record_payload_bytes)
                 .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
             expected = end;
             selected.push(record);
@@ -12484,7 +12484,7 @@ impl AppendStreamState {
         Ok(AppendStreamFlushBatch {
             records: selected,
             durable_through: expected,
-            segment_bytes,
+            payload_bytes,
         })
     }
 
@@ -13038,7 +13038,7 @@ impl InMemoryMetadataPlane {
     fn append_stream_flush_plans_for(
         &self,
         requests: &[(AppendStream, u64)],
-        max_segment_bytes: u64,
+        max_batch_bytes: u64,
     ) -> Result<Vec<AppendStreamFlushPlan>> {
         let inner = lock(&self.inner)?;
         let mut total_bytes = 0_u64;
@@ -13054,20 +13054,20 @@ impl InMemoryMetadataPlane {
             {
                 continue;
             }
-            let batch = state.flush_batch(max_segment_bytes)?;
+            let batch = state.flush_batch(max_batch_bytes)?;
             if batch.records.is_empty() {
                 continue;
             }
             let would_exceed = !plans.is_empty()
                 && total_bytes
-                    .checked_add(batch.segment_bytes)
+                    .checked_add(batch.payload_bytes)
                     .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?
-                    > max_segment_bytes;
+                    > max_batch_bytes;
             if would_exceed {
                 continue;
             }
             total_bytes = total_bytes
-                .checked_add(batch.segment_bytes)
+                .checked_add(batch.payload_bytes)
                 .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
             plans.push(AppendStreamFlushPlan {
                 stream: state.public_stream(),

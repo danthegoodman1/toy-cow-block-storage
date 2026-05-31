@@ -1324,7 +1324,7 @@ Non-goals:
 
 Deliverables:
 
-- [x] Core append-run, run-range, checksum-range, durable-mark, and
+- [x] Core append-run, run-range, payload-integrity, durable-mark, and
   run-backed-file-extent types with deterministic validation.
 - [x] Stream ingest writes payloads once into storage-node append lanes, not
   into both append logs and ordinary segments.
