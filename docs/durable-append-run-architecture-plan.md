@@ -47,9 +47,20 @@ the 200 us RTT durable matrix for the append-run implementation. At c16,
 70 ms; `native-stream-ingest-32m` reached about 4.9 GiB/s with p50 111 ms and
 p99 159 ms; preflushed publish reached about 923 MiB/s with p50 5.2 ms and p99
 17 ms; flush+publish reached about 1.1 GiB/s with p50 14 ms and p99 42 ms.
-Profile rows show metadata work is generally sub-ms to low-single-digit ms; the
-remaining tail is bounded data-log sync groups plus occasional c16 wait time
-while other sync groups finish.
+Profile rows show metadata work is generally sub-ms to low-single-digit ms.
+When split by profile `new_segment_bytes`, payload flush rows are dominated by
+bounded data-log sync groups: c16 `native-stream-ingest-1m` 32 MiB flush rows
+had total p50/p99 about 9.9/15.6 ms, lock wait p99 about 0 ms, and file-sync
+p99 about 14.9 ms; c16 `native-stream-ingest-32m` 32 MiB flush rows had total
+p50/p99 about 5.6/15.7 ms, lock wait p99 below 1 ms, and file-sync p99 about
+13.1 ms. The higher zero-byte profile tail is publish metadata waiting behind
+an in-flight bounded data-log sync, not stream flush metadata fanout.
+
+Read verification was measured separately in
+`target/loadbench/append-run-read-verification/`. At c16 and 200 us RTT,
+verified native 4 KiB reads reached about 72.8k IOPS with p99 468 us, while
+skip-verify reads reached about 71.1k IOPS with p99 628 us. The checksum path is
+therefore not a meaningful bottleneck in the current measured read path.
 
 ## Mental Model
 

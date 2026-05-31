@@ -1348,7 +1348,7 @@ Exit gate:
   stream rows with one record per client append.
 - [x] Publishing 128 one-MiB appends produces one or a small deterministic
   number of visible extents when the physical run is contiguous.
-- [ ] Stream flush p99 is dominated by bounded physical sync groups, not global
+- [x] Stream flush p99 is dominated by bounded physical sync groups, not global
   lock wait or metadata fanout.
 - [x] Publish profile has no payload append/sync and scales with run count.
 - [x] Fencing, restart, corruption, PITR, fork, and GC tests pass for
@@ -1358,11 +1358,16 @@ Exit gate:
 
 Measured checkpoint: `target/loadbench/append-run-waiter-batch-final/` has the
 200 us RTT matrix and phase profiles for the run-backed implementation. c16
-stream ingest now reaches multi-GiB/s throughput, and metadata phases are no
-longer the dominant cost. The remaining unchecked exit item is conservative:
-large c16 stream flushes still show occasional wait tails behind bounded data-log
-sync groups, so the next performance pass should focus on whether that queueing
-is acceptable or should be split across more independent storage-node lanes.
+stream ingest now reaches multi-GiB/s throughput. Splitting profile rows by
+`new_segment_bytes` shows payload flush rows are dominated by bounded data-log
+sync groups: c16 `native-stream-ingest-1m` 32 MiB flush rows had lock-wait p99
+about 0 ms and file-sync p99 about 14.9 ms; c16 `native-stream-ingest-32m`
+32 MiB flush rows had lock-wait p99 below 1 ms and file-sync p99 about 13.1 ms.
+The remaining zero-byte profile tail is publish metadata queueing behind an
+in-flight data-log sync, not stream flush metadata fanout. Verified and
+skip-verify read measurements live under
+`target/loadbench/append-run-read-verification/` and show checksum verification
+is not a meaningful read bottleneck at 200 us RTT.
 
 ## Phase 24: Background Compaction Scheduling and Backpressure Policy
 
