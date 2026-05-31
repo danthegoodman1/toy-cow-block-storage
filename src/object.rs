@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::api::BlockRange;
 use crate::error::{Result, StorageError};
@@ -192,7 +193,7 @@ impl KeyspaceCatalogShard {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyspaceRoot {
     pub root_id: KeyspaceRootId,
-    pub shard_roots: Vec<KeyspaceCatalogShardId>,
+    pub shard_roots: Arc<[KeyspaceCatalogShardId]>,
     pub file_count: usize,
 }
 

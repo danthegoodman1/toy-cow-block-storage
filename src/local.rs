@@ -1169,6 +1169,62 @@ impl StorageNodeRegistry {
         Ok((nodes, payloads))
     }
 
+    fn state_inner_for_segment_ids(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+        previous_segments: &BTreeSet<SegmentId>,
+    ) -> Result<(
+        StorageNodeRegistryInner,
+        BTreeSet<SegmentId>,
+        Vec<DurableSegmentPayload>,
+    )> {
+        let mut nodes = BTreeMap::new();
+        let mut found = BTreeSet::new();
+        let mut new_segments = Vec::new();
+        for node_id in self.node_order.iter() {
+            let node = self.node(*node_id)?;
+            let mut catalog = node.segment_catalog.state_inner()?;
+            let selected: BTreeSet<_> = segment_ids
+                .iter()
+                .copied()
+                .filter(|segment_id| catalog.entries.contains_key(segment_id))
+                .collect();
+            found.extend(selected.iter().copied());
+            let (next_offset, mut node_new_segments) =
+                node.segment_store
+                    .payloads_for_segments(*node_id, &selected, previous_segments)?;
+            new_segments.append(&mut node_new_segments);
+            catalog
+                .entries
+                .retain(|segment_id, _| selected.contains(segment_id));
+            nodes.insert(
+                *node_id,
+                StorageNodeInner {
+                    segment_store: SegmentStoreInner {
+                        next_offset,
+                        segments: BTreeMap::new(),
+                    },
+                    segment_catalog: catalog,
+                },
+            );
+        }
+        if &found != segment_ids {
+            return Err(StorageError::corrupt(
+                "durable export references segments missing from storage-node catalogs",
+            ));
+        }
+        Ok((
+            StorageNodeRegistryInner {
+                next_segment_id: *lock(&self.next_segment_id)?,
+                next_placement_index: *lock(&self.next_placement_index)?,
+                node_order: self.node_order.as_ref().clone(),
+                nodes,
+            },
+            found,
+            new_segments,
+        ))
+    }
+
     fn selected_state_for_segment_ids(
         &self,
         segment_ids: &BTreeSet<SegmentId>,
@@ -1536,6 +1592,548 @@ impl LocalCoordinator {
             current_segments,
             new_segments,
         ))
+    }
+
+    fn state_for_durable_persist_through(
+        &self,
+        previous_segments: &BTreeSet<SegmentId>,
+        target_commit: CommitSeq,
+        previous_cursor: Option<&DurableExportCursor>,
+    ) -> Result<(
+        DurableStoreState,
+        BTreeSet<SegmentId>,
+        Vec<DurableSegmentPayload>,
+    )> {
+        let mut metadata = self.metadata.state_inner()?;
+        let current_commit = CommitSeq::from_raw(metadata.next_commit_seq.saturating_sub(1));
+        if target_commit.raw() >= current_commit.raw() {
+            return self.state_for_durable_persist(previous_segments);
+        }
+
+        metadata.prune_append_streams_for_durable_export();
+        let previous_cursor =
+            previous_cursor.filter(|cursor| cursor.next_gc_epoch == metadata.next_gc_epoch);
+        let incremental_rows = previous_cursor.is_some();
+        let metadata = Self::metadata_through_commit(metadata, target_commit, previous_cursor)?;
+        let mut segment_ids = Self::durable_export_segment_ids(&metadata);
+        if incremental_rows {
+            segment_ids.extend(previous_segments.iter().copied());
+        }
+        let (storage_nodes, current_segments, new_segments) = self
+            .storage_nodes
+            .state_inner_for_segment_ids(&segment_ids, previous_segments)?;
+
+        Ok((
+            DurableStoreState {
+                config: self.metadata.config,
+                metadata,
+                storage_nodes,
+                next_write_intent: *lock(&self.next_write_intent)?,
+                next_extent_id: *lock(&self.next_extent_id)?,
+            },
+            current_segments,
+            new_segments,
+        ))
+    }
+
+    fn metadata_through_commit(
+        mut metadata: MetadataInner,
+        target_commit: CommitSeq,
+        previous_cursor: Option<&DurableExportCursor>,
+    ) -> Result<MetadataInner> {
+        let target_raw = target_commit.raw();
+        let incremental_rows = previous_cursor.is_some();
+
+        let original_live_heads = metadata.device_heads.clone();
+        let original_deleted_heads = metadata.deleted_device_heads.clone();
+        let original_keyspace_heads = metadata.keyspace_heads.clone();
+
+        metadata
+            .commit_groups
+            .retain(|_, group| group.commit_seq.raw() <= target_raw);
+        metadata
+            .shard_commits
+            .retain(|commit| commit.commit_seq.raw() <= target_raw);
+        metadata
+            .keyspace_commits
+            .retain(|commit| commit.commit_seq.raw() <= target_raw);
+        metadata
+            .file_commits
+            .retain(|commit| commit.commit_seq.raw() <= target_raw);
+        metadata
+            .fork_records
+            .retain(|seq, _| seq.raw() <= target_raw);
+        metadata
+            .delete_records
+            .retain(|seq, _| seq.raw() <= target_raw);
+        metadata
+            .checkpoints
+            .retain(|_, checkpoint| checkpoint.commit_seq.raw() <= target_raw);
+
+        let mut live_heads = BTreeMap::new();
+        for (device_id, mut head) in original_live_heads {
+            if head.latest_commit.raw() > target_raw {
+                match InMemoryMetadataPlane::replay_device_roots_locked(
+                    &metadata,
+                    device_id,
+                    target_commit,
+                    None,
+                ) {
+                    Ok(roots) => {
+                        head.shard_roots = roots;
+                        head.latest_commit = Self::latest_device_commit_at_or_before(
+                            &metadata,
+                            device_id,
+                            target_commit,
+                        );
+                    }
+                    Err(StorageError::NotFound { .. }) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            live_heads.insert(device_id, head);
+        }
+
+        let mut deleted_heads = BTreeMap::new();
+        for (device_id, mut head) in original_deleted_heads {
+            if head.latest_commit.raw() <= target_raw {
+                deleted_heads.insert(device_id, head);
+                continue;
+            }
+            match InMemoryMetadataPlane::replay_device_roots_locked(
+                &metadata,
+                device_id,
+                target_commit,
+                None,
+            ) {
+                Ok(roots) => {
+                    head.shard_roots = roots;
+                    head.latest_commit = Self::latest_device_commit_at_or_before(
+                        &metadata,
+                        device_id,
+                        target_commit,
+                    );
+                    live_heads.insert(device_id, head);
+                }
+                Err(StorageError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        metadata.device_heads = live_heads;
+        metadata.deleted_device_heads = deleted_heads;
+
+        let mut keyspace_heads = BTreeMap::new();
+        for (keyspace_id, mut head) in original_keyspace_heads {
+            if head.latest_commit.raw() > target_raw {
+                match InMemoryMetadataPlane::replay_keyspace_root_locked(
+                    &metadata,
+                    keyspace_id,
+                    target_commit,
+                    None,
+                ) {
+                    Ok(root) => {
+                        head.root = root;
+                        head.latest_commit = Self::latest_keyspace_commit_at_or_before(
+                            &metadata,
+                            keyspace_id,
+                            target_commit,
+                        );
+                    }
+                    Err(StorageError::NotFound { .. }) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            keyspace_heads.insert(keyspace_id, head);
+        }
+        metadata.keyspace_heads = keyspace_heads;
+
+        if let Some(previous) = previous_cursor {
+            metadata
+                .commit_groups
+                .retain(|id, _| id.raw() >= previous.next_commit_group_id);
+            metadata
+                .shard_commits
+                .retain(|commit| commit.commit_seq.raw() >= previous.next_commit_seq);
+            metadata
+                .keyspace_commits
+                .retain(|commit| commit.commit_seq.raw() >= previous.next_commit_seq);
+            metadata
+                .file_commits
+                .retain(|commit| commit.commit_seq.raw() >= previous.next_commit_seq);
+            metadata
+                .fork_records
+                .retain(|seq, _| seq.raw() >= previous.next_commit_seq);
+            metadata
+                .delete_records
+                .retain(|seq, _| seq.raw() >= previous.next_commit_seq);
+            metadata
+                .checkpoints
+                .retain(|id, _| id.raw() >= previous.next_checkpoint_id);
+        }
+
+        let mut retained = DurableExportRetention::from_previous_cursor(previous_cursor);
+
+        for (device_id, head) in &metadata.device_heads {
+            retained.devices.insert(*device_id);
+            for root in &head.shard_roots {
+                Self::collect_metadata_root_for_export(&metadata, *root, &mut retained)?;
+            }
+        }
+        for (device_id, head) in &metadata.deleted_device_heads {
+            retained.devices.insert(*device_id);
+            for root in &head.shard_roots {
+                Self::collect_metadata_root_for_export(&metadata, *root, &mut retained)?;
+            }
+        }
+        for record in metadata.fork_records.values() {
+            retained.devices.insert(record.source);
+            retained.devices.insert(record.target);
+            for root in &record.shard_roots {
+                Self::collect_metadata_root_for_export(&metadata, *root, &mut retained)?;
+            }
+        }
+        for record in metadata.delete_records.values() {
+            retained.devices.insert(record.device_id);
+            for root in &record.shard_roots {
+                Self::collect_metadata_root_for_export(&metadata, *root, &mut retained)?;
+            }
+        }
+        for commit in &metadata.shard_commits {
+            retained.devices.insert(commit.device_id);
+            Self::collect_metadata_root_for_export(&metadata, commit.old_root, &mut retained)?;
+            Self::collect_metadata_root_for_export(&metadata, commit.new_root, &mut retained)?;
+        }
+        for head in metadata.keyspace_heads.values() {
+            Self::collect_keyspace_root_for_export(
+                &metadata,
+                head.keyspace_id,
+                head.root,
+                &mut retained,
+            )?;
+        }
+        for commit in &metadata.keyspace_commits {
+            Self::collect_keyspace_root_for_export(
+                &metadata,
+                commit.keyspace_id,
+                commit.old_root,
+                &mut retained,
+            )?;
+            Self::collect_keyspace_root_for_export(
+                &metadata,
+                commit.keyspace_id,
+                commit.new_root,
+                &mut retained,
+            )?;
+        }
+        for commit in &metadata.file_commits {
+            retained.files.insert((commit.keyspace_id, commit.file_id));
+            if let Some(old_root) = commit.old_root {
+                Self::collect_metadata_root_for_export(&metadata, old_root, &mut retained)?;
+            }
+            Self::collect_metadata_root_for_export(&metadata, commit.new_root, &mut retained)?;
+        }
+        for group in metadata.commit_groups.values() {
+            if let MappingOwner::BlockDevice(device_id) = group.owner {
+                retained.devices.insert(device_id);
+            }
+            for update in &group.updates {
+                match update {
+                    RootUpdate::BlockShard(update) => {
+                        Self::collect_metadata_root_for_export(
+                            &metadata,
+                            update.old_root,
+                            &mut retained,
+                        )?;
+                        Self::collect_metadata_root_for_export(
+                            &metadata,
+                            update.new_root,
+                            &mut retained,
+                        )?;
+                    }
+                    RootUpdate::FileCreated {
+                        file_id, new_root, ..
+                    } => {
+                        retained
+                            .files
+                            .insert((Self::keyspace_for_group(group.owner)?, *file_id));
+                        Self::collect_metadata_root_for_export(
+                            &metadata,
+                            *new_root,
+                            &mut retained,
+                        )?;
+                    }
+                    RootUpdate::FileRoot {
+                        file_id,
+                        old_root,
+                        new_root,
+                        ..
+                    } => {
+                        retained
+                            .files
+                            .insert((Self::keyspace_for_group(group.owner)?, *file_id));
+                        Self::collect_metadata_root_for_export(
+                            &metadata,
+                            *old_root,
+                            &mut retained,
+                        )?;
+                        Self::collect_metadata_root_for_export(
+                            &metadata,
+                            *new_root,
+                            &mut retained,
+                        )?;
+                    }
+                }
+            }
+        }
+        for checkpoint in metadata.checkpoints.values() {
+            match &checkpoint.roots {
+                CheckpointRoots::BlockShard(roots) => {
+                    if let MappingOwner::BlockDevice(device_id) = checkpoint.owner {
+                        retained.devices.insert(device_id);
+                    }
+                    for root in roots {
+                        Self::collect_metadata_root_for_export(&metadata, *root, &mut retained)?;
+                    }
+                }
+                CheckpointRoots::NativeKeyspace(root) => {
+                    let MappingOwner::NativeKeyspace(keyspace_id) = checkpoint.owner else {
+                        return Err(StorageError::corrupt(
+                            "native keyspace checkpoint has non-keyspace owner",
+                        ));
+                    };
+                    Self::collect_keyspace_root_for_export(
+                        &metadata,
+                        keyspace_id,
+                        *root,
+                        &mut retained,
+                    )?;
+                }
+            }
+        }
+        for stream in metadata.append_streams.values() {
+            retained.files.insert((stream.keyspace_id, stream.file_id));
+            for record in &stream.records {
+                retained.segments.insert(record.segment_id);
+            }
+        }
+
+        metadata
+            .device_specs
+            .retain(|device_id, _| retained.devices.contains(device_id));
+        metadata
+            .keyspace_roots
+            .retain(|root_id, _| retained.keyspace_roots.contains(root_id));
+        metadata
+            .keyspace_catalog_shards
+            .retain(|shard_id, _| retained.keyspace_shards.contains(shard_id));
+        metadata
+            .metadata_nodes
+            .retain(|node_id, _| retained.nodes.contains(node_id));
+        if !incremental_rows {
+            metadata
+                .file_writer_epochs
+                .retain(|key, _| retained.files.contains(key));
+            metadata
+                .metadata_last_mark_epoch
+                .retain(|node_id, _| retained.nodes.contains(node_id));
+            metadata
+                .segment_last_mark_epoch
+                .retain(|segment_id, _| retained.segments.contains(segment_id));
+        }
+
+        metadata.next_device_id = Self::next_u128_after_max(
+            metadata
+                .device_specs
+                .keys()
+                .chain(metadata.device_heads.keys())
+                .chain(metadata.deleted_device_heads.keys())
+                .map(|id| id.raw()),
+        )?
+        .max(previous_cursor.map_or(1, |cursor| cursor.next_device_id));
+        metadata.next_keyspace_id =
+            Self::next_u128_after_max(metadata.keyspace_heads.keys().map(|id| id.raw()))?
+                .max(previous_cursor.map_or(1, |cursor| cursor.next_keyspace_id));
+        metadata.next_file_id = Self::next_u128_after_max(
+            metadata
+                .file_writer_epochs
+                .keys()
+                .map(|(_, file_id)| file_id.raw()),
+        )?
+        .max(previous_cursor.map_or(1, |cursor| cursor.next_file_id));
+        metadata.next_metadata_node_id =
+            Self::next_u128_after_max(metadata.metadata_nodes.keys().map(|id| id.raw()))?
+                .max(previous_cursor.map_or(1, |cursor| cursor.next_metadata_node_id));
+        metadata.next_keyspace_root_id =
+            Self::next_u128_after_max(metadata.keyspace_roots.keys().map(|id| id.raw()))?
+                .max(previous_cursor.map_or(1, |cursor| cursor.next_keyspace_root_id));
+        metadata.next_keyspace_catalog_shard_id =
+            Self::next_u128_after_max(metadata.keyspace_catalog_shards.keys().map(|id| id.raw()))?
+                .max(previous_cursor.map_or(1, |cursor| cursor.next_keyspace_catalog_shard_id));
+        metadata.next_commit_group_id =
+            Self::next_u128_after_max(metadata.commit_groups.keys().map(|id| id.raw()))?
+                .max(previous_cursor.map_or(1, |cursor| cursor.next_commit_group_id));
+        metadata.next_commit_seq = target_raw
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("durable target commit overflows"))?
+            .max(previous_cursor.map_or(1, |cursor| cursor.next_commit_seq));
+        metadata.next_checkpoint_id =
+            Self::next_u128_after_max(metadata.checkpoints.keys().map(|id| id.raw()))?
+                .max(previous_cursor.map_or(1, |cursor| cursor.next_checkpoint_id));
+        Ok(metadata)
+    }
+
+    fn keyspace_for_group(owner: MappingOwner) -> Result<KeyspaceId> {
+        match owner {
+            MappingOwner::NativeKeyspace(keyspace_id) => Ok(keyspace_id),
+            MappingOwner::BlockDevice(_) => Err(StorageError::corrupt(
+                "block commit group contains native root update",
+            )),
+        }
+    }
+
+    fn latest_device_commit_at_or_before(
+        metadata: &MetadataInner,
+        device_id: DeviceId,
+        target_commit: CommitSeq,
+    ) -> CommitSeq {
+        let target_raw = target_commit.raw();
+        let max_commit = metadata
+            .shard_commits
+            .iter()
+            .filter(|commit| commit.device_id == device_id && commit.commit_seq.raw() <= target_raw)
+            .map(|commit| commit.commit_seq.raw())
+            .chain(
+                metadata
+                    .fork_records
+                    .values()
+                    .filter(|record| {
+                        record.target == device_id && record.commit_seq.raw() <= target_raw
+                    })
+                    .map(|record| record.commit_seq.raw()),
+            )
+            .chain(
+                metadata
+                    .delete_records
+                    .values()
+                    .filter(|record| {
+                        record.device_id == device_id && record.commit_seq.raw() <= target_raw
+                    })
+                    .map(|record| record.commit_seq.raw()),
+            )
+            .chain(metadata.checkpoints.values().filter_map(|checkpoint| {
+                (checkpoint.owner == MappingOwner::BlockDevice(device_id)
+                    && checkpoint.commit_seq.raw() <= target_raw)
+                    .then_some(checkpoint.commit_seq.raw())
+            }))
+            .max()
+            .unwrap_or(0);
+        CommitSeq::from_raw(max_commit)
+    }
+
+    fn latest_keyspace_commit_at_or_before(
+        metadata: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        target_commit: CommitSeq,
+    ) -> CommitSeq {
+        let target_raw = target_commit.raw();
+        let max_commit = metadata
+            .keyspace_commits
+            .iter()
+            .filter(|commit| {
+                commit.keyspace_id == keyspace_id && commit.commit_seq.raw() <= target_raw
+            })
+            .map(|commit| commit.commit_seq.raw())
+            .chain(metadata.checkpoints.values().filter_map(|checkpoint| {
+                (checkpoint.owner == MappingOwner::NativeKeyspace(keyspace_id)
+                    && checkpoint.commit_seq.raw() <= target_raw)
+                    .then_some(checkpoint.commit_seq.raw())
+            }))
+            .max()
+            .unwrap_or(0);
+        CommitSeq::from_raw(max_commit)
+    }
+
+    fn collect_metadata_root_for_export(
+        metadata: &MetadataInner,
+        root: MetadataNodeId,
+        retained: &mut DurableExportRetention,
+    ) -> Result<()> {
+        if !retained.should_collect_metadata_node(root) {
+            return Ok(());
+        }
+        if !retained.nodes.insert(root) {
+            return Ok(());
+        }
+        let node = metadata
+            .metadata_nodes
+            .get(&root)
+            .ok_or_else(|| StorageError::not_found("metadata_node", root.to_string()))?;
+        match &node.kind {
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    Self::collect_metadata_root_for_export(metadata, child.node_id, retained)?;
+                }
+            }
+            MetadataNodeKind::Leaf { entries } => {
+                retained
+                    .segments
+                    .extend(entries.iter().map(|entry| entry.segment_id));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_keyspace_root_for_export(
+        metadata: &MetadataInner,
+        keyspace_id: KeyspaceId,
+        root_id: KeyspaceRootId,
+        retained: &mut DurableExportRetention,
+    ) -> Result<()> {
+        if !retained.should_collect_keyspace_root(root_id) {
+            return Ok(());
+        }
+        retained.keyspace_roots.insert(root_id);
+        let root = metadata
+            .keyspace_roots
+            .get(&root_id)
+            .ok_or_else(|| StorageError::not_found("keyspace_root", root_id.to_string()))?;
+        for shard_id in root.shard_roots.iter().copied() {
+            if !retained.should_collect_keyspace_shard(shard_id) {
+                continue;
+            }
+            retained.keyspace_shards.insert(shard_id);
+            let shard = metadata
+                .keyspace_catalog_shards
+                .get(&shard_id)
+                .ok_or_else(|| {
+                    StorageError::not_found("keyspace_catalog_shard", shard_id.to_string())
+                })?;
+            for (file_id, entry) in &shard.files {
+                retained.files.insert((keyspace_id, *file_id));
+                Self::collect_metadata_root_for_export(metadata, entry.head.root, retained)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn durable_export_segment_ids(metadata: &MetadataInner) -> BTreeSet<SegmentId> {
+        let mut segments = metadata_referenced_segments(metadata);
+        for stream in metadata.append_streams.values() {
+            for record in &stream.records {
+                segments.insert(record.segment_id);
+            }
+        }
+        segments
+    }
+
+    fn next_u128_after_max(values: impl Iterator<Item = u128>) -> Result<u128> {
+        values
+            .max()
+            .map(|max| {
+                max.checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("durable cursor id overflow"))
+            })
+            .unwrap_or(Ok(1))
     }
 
     fn state_for_segment_ids(
@@ -4685,6 +5283,7 @@ struct PersistCoordinatorState {
     in_flight: bool,
     generation: u64,
     durable_through: CommitSeq,
+    requested_through: CommitSeq,
     last_error: Option<(u64, StorageError)>,
 }
 
@@ -4695,6 +5294,7 @@ impl PersistCoordinator {
                 in_flight: false,
                 generation: 0,
                 durable_through,
+                requested_through: durable_through,
                 last_error: None,
             }),
             cvar: Condvar::new(),
@@ -5102,7 +5702,7 @@ impl DurableSqliteStore {
                 records.insert(
                     *segment_id,
                     SegmentRecord {
-                        bytes,
+                        bytes: Arc::from(bytes),
                         synced: record.synced,
                         commit: record.commit,
                     },
@@ -5621,7 +6221,7 @@ impl DurableSqliteStore {
                 return Err(StorageError::conflict("data-log writer was not opened"));
             };
             let started = Instant::now();
-            let record = encode_data_log_record(segment_id, integrity, &bytes)?;
+            let record = encode_data_log_record(segment_id, integrity, bytes.as_ref())?;
             profile.encode_nanos = profile
                 .encode_nanos
                 .saturating_add(duration_nanos_u64(started.elapsed()));
@@ -6004,7 +6604,7 @@ impl DurableSqliteStore {
                     segment_id: placement.segment_id,
                     storage_node: placement.storage_node,
                     integrity: placement.integrity,
-                    bytes: self.read_segment_payload(placement)?,
+                    bytes: Arc::from(self.read_segment_payload(placement)?),
                 });
             }
             let appended = self.append_segments(payloads, DataLogSyncMode::Sync, None)?;
@@ -7923,7 +8523,7 @@ fn validate_row_native_state(image: &DurableStoreState) -> Result<()> {
     }
     for root in image.metadata.keyspace_roots.values() {
         root.validate()?;
-        for shard_id in &root.shard_roots {
+        for shard_id in root.shard_roots.iter() {
             if !image
                 .metadata
                 .keyspace_catalog_shards
@@ -9190,13 +9790,15 @@ impl DurableCoordinator {
         let total_started = Instant::now();
         loop {
             let mut state = lock(&self.persist_coordinator.inner)?;
+            state.requested_through = state.requested_through.max(required);
             if state.durable_through >= required {
                 return Ok(());
             }
             if !state.in_flight {
+                let target_commit = state.requested_through;
                 state.in_flight = true;
                 drop(state);
-                let result = self.persist_physical(total_started, None);
+                let result = self.persist_physical(total_started, None, Some(target_commit));
                 let mut state = lock(&self.persist_coordinator.inner)?;
                 state.in_flight = false;
                 state.generation = state.generation.saturating_add(1);
@@ -9204,6 +9806,8 @@ impl DurableCoordinator {
                 match result {
                     Ok(durable_through) => {
                         state.durable_through = state.durable_through.max(durable_through);
+                        state.requested_through =
+                            state.requested_through.max(state.durable_through);
                         state.last_error = None;
                         self.persist_coordinator.cvar.notify_all();
                         if state.durable_through >= required {
@@ -9247,7 +9851,7 @@ impl DurableCoordinator {
             if !state.in_flight {
                 state.in_flight = true;
                 drop(state);
-                let result = self.persist_physical(total_started, changed_catalog_segments);
+                let result = self.persist_physical(total_started, changed_catalog_segments, None);
                 let mut state = lock(&self.persist_coordinator.inner)?;
                 state.in_flight = false;
                 state.generation = state.generation.saturating_add(1);
@@ -9255,6 +9859,8 @@ impl DurableCoordinator {
                 match result {
                     Ok(durable_through) => {
                         state.durable_through = state.durable_through.max(durable_through);
+                        state.requested_through =
+                            state.requested_through.max(state.durable_through);
                         state.last_error = None;
                         self.persist_coordinator.cvar.notify_all();
                         return Ok(());
@@ -9279,6 +9885,7 @@ impl DurableCoordinator {
         &self,
         total_started: Instant,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
+        target_commit: Option<CommitSeq>,
     ) -> Result<CommitSeq> {
         let _persist_guard = lock(&self.persist_lock)?;
         let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
@@ -9287,8 +9894,20 @@ impl DurableCoordinator {
         let pending_append = lock(&self.pending_data_log_append)?.clone();
         let mut exported_segments = previous_segments.clone();
         exported_segments.extend(pending_append.segment_ids());
-        let (image, current_segments, new_segments) =
-            self.local.state_for_durable_persist(&exported_segments)?;
+        let previous_cursor = if target_commit.is_some() {
+            self.durable.export_cursor()?
+        } else {
+            None
+        };
+        let (image, current_segments, new_segments) = if let Some(target_commit) = target_commit {
+            self.local.state_for_durable_persist_through(
+                &exported_segments,
+                target_commit,
+                previous_cursor.as_ref(),
+            )?
+        } else {
+            self.local.state_for_durable_persist(&exported_segments)?
+        };
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
         let outcome = self.durable.persist(
             &image,
@@ -9423,6 +10042,8 @@ impl DurableCoordinator {
                 match result {
                     Ok(durable_high_water) => {
                         state.durable_through = state.durable_through.max(durable_high_water);
+                        state.requested_through =
+                            state.requested_through.max(state.durable_through);
                         state.last_error = None;
                         self.persist_coordinator.cvar.notify_all();
                         return Ok(());
@@ -9464,12 +10085,12 @@ impl DurableCoordinator {
         let snapshot_started = Instant::now();
         let Some(previous_cursor) = self.durable.export_cursor()? else {
             drop(_persist_guard);
-            return self.persist_physical(total_started, None);
+            return self.persist_physical(total_started, None, Some(commit_seq));
         };
         let pending_append = lock(&self.pending_data_log_append)?.clone();
         if !pending_append.is_empty() {
             drop(_persist_guard);
-            return self.persist_physical(total_started, None);
+            return self.persist_physical(total_started, None, Some(commit_seq));
         }
         let delta = self
             .local
@@ -9481,7 +10102,7 @@ impl DurableCoordinator {
             .any(|segment_id| !previous_segments.contains(segment_id))
         {
             drop(_persist_guard);
-            return self.persist_physical(total_started, None);
+            return self.persist_physical(total_started, None, Some(commit_seq));
         }
         let mut changed_segments = changed_segments.clone();
         changed_segments.extend(delta.referenced_segment_ids.iter().copied());
@@ -10220,6 +10841,43 @@ struct StorageNodeInner {
 }
 
 type SelectedStorageNodeState = BTreeMap<StorageNodeId, (usize, StorageNodeInner)>;
+
+#[derive(Debug, Default)]
+struct DurableExportRetention {
+    devices: BTreeSet<DeviceId>,
+    keyspace_roots: BTreeSet<KeyspaceRootId>,
+    keyspace_shards: BTreeSet<KeyspaceCatalogShardId>,
+    files: BTreeSet<(KeyspaceId, FileId)>,
+    nodes: BTreeSet<MetadataNodeId>,
+    segments: BTreeSet<SegmentId>,
+    keyspace_root_floor: u128,
+    keyspace_shard_floor: u128,
+    metadata_node_floor: u128,
+}
+
+impl DurableExportRetention {
+    fn from_previous_cursor(previous: Option<&DurableExportCursor>) -> Self {
+        let mut retained = Self::default();
+        if let Some(previous) = previous {
+            retained.keyspace_root_floor = previous.next_keyspace_root_id;
+            retained.keyspace_shard_floor = previous.next_keyspace_catalog_shard_id;
+            retained.metadata_node_floor = previous.next_metadata_node_id;
+        }
+        retained
+    }
+
+    fn should_collect_keyspace_root(&self, root_id: KeyspaceRootId) -> bool {
+        root_id.raw() >= self.keyspace_root_floor
+    }
+
+    fn should_collect_keyspace_shard(&self, shard_id: KeyspaceCatalogShardId) -> bool {
+        shard_id.raw() >= self.keyspace_shard_floor
+    }
+
+    fn should_collect_metadata_node(&self, node_id: MetadataNodeId) -> bool {
+        node_id.raw() >= self.metadata_node_floor
+    }
+}
 
 fn metadata_referenced_segments(metadata: &MetadataInner) -> BTreeSet<SegmentId> {
     let mut segments = BTreeSet::new();
@@ -11486,7 +12144,7 @@ impl InMemoryMetadataPlane {
     ) -> Result<KeyspaceRoot> {
         let root = KeyspaceRoot {
             root_id: inner.alloc_keyspace_root_id(),
-            shard_roots,
+            shard_roots: shard_roots.into(),
             file_count,
         };
         root.validate()?;
@@ -11557,7 +12215,7 @@ impl InMemoryMetadataPlane {
         let mut files = shard.files.clone();
         let replaced = files.insert(file_id, entry).is_some();
         let new_shard = Self::insert_keyspace_catalog_shard_locked(inner, files)?;
-        let mut shard_roots = root.shard_roots.clone();
+        let mut shard_roots = root.shard_roots.to_vec();
         shard_roots[shard_index] = new_shard.shard_id;
         let file_count = if replaced {
             root.file_count
@@ -11575,7 +12233,7 @@ impl InMemoryMetadataPlane {
         out: &mut Vec<MetadataNodeId>,
     ) -> Result<()> {
         let root = Self::keyspace_root_locked(inner, root_id)?;
-        for shard_id in root.shard_roots {
+        for shard_id in root.shard_roots.iter().copied() {
             let shard = Self::keyspace_catalog_shard_locked(inner, shard_id)?;
             out.extend(shard.files.values().map(|entry| entry.head.root));
         }
@@ -13144,7 +13802,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SegmentRecord {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     synced: bool,
     commit: SegmentReplicaCommit,
 }
@@ -13154,7 +13812,7 @@ struct DurableSegmentPayload {
     segment_id: SegmentId,
     storage_node: StorageNodeId,
     integrity: SegmentPayloadIntegrity,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -13209,7 +13867,7 @@ impl InMemorySegmentStore {
                     segment_id: *segment_id,
                     storage_node,
                     integrity: record.commit.descriptor.integrity,
-                    bytes: record.bytes.clone(),
+                    bytes: Arc::clone(&record.bytes),
                 });
             }
         }
@@ -13237,8 +13895,34 @@ impl InMemorySegmentStore {
             segment_id,
             storage_node,
             integrity: record.commit.descriptor.integrity,
-            bytes: record.bytes.clone(),
+            bytes: Arc::clone(&record.bytes),
         })
+    }
+
+    fn payloads_for_segments(
+        &self,
+        storage_node: StorageNodeId,
+        selected: &BTreeSet<SegmentId>,
+        previous_segments: &BTreeSet<SegmentId>,
+    ) -> Result<(u64, Vec<DurableSegmentPayload>)> {
+        let inner = lock(&self.inner)?;
+        let mut payloads = Vec::new();
+        for segment_id in selected
+            .iter()
+            .filter(|segment_id| !previous_segments.contains(segment_id))
+        {
+            let record = inner
+                .segments
+                .get(segment_id)
+                .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+            payloads.push(DurableSegmentPayload {
+                segment_id: *segment_id,
+                storage_node,
+                integrity: record.commit.descriptor.integrity,
+                bytes: Arc::clone(&record.bytes),
+            });
+        }
+        Ok((inner.next_offset, payloads))
     }
 
     fn verify_segment_payload_for_read(
@@ -13265,7 +13949,7 @@ impl InMemorySegmentStore {
                 }
             }
             integrity @ SegmentPayloadIntegrity::Crc32c(_) => {
-                verify_segment_payload_integrity(integrity, &record.bytes)
+                verify_segment_payload_integrity(integrity, record.bytes.as_ref())
             }
         }
     }
@@ -13321,7 +14005,7 @@ impl InMemorySegmentStore {
 
         let mut inner = lock(&self.inner)?;
         if let Some(existing) = inner.segments.get(&reservation.segment_id) {
-            if existing.bytes == bytes {
+            if existing.bytes.as_ref() == bytes.as_slice() {
                 return Ok(existing.commit.clone());
             }
             return Err(StorageError::conflict(
@@ -13353,7 +14037,7 @@ impl InMemorySegmentStore {
         inner.segments.insert(
             reservation.segment_id,
             SegmentRecord {
-                bytes,
+                bytes: Arc::from(bytes),
                 synced: false,
                 commit: commit.clone(),
             },
@@ -17004,14 +17688,14 @@ impl DurableCodec for KeyspaceCatalogShard {
 impl DurableCodec for KeyspaceRoot {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.root_id.encode(out)?;
-        self.shard_roots.encode(out)?;
+        self.shard_roots.as_ref().to_vec().encode(out)?;
         self.file_count.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
         Ok(Self {
             root_id: KeyspaceRootId::decode(input)?,
-            shard_roots: Vec::decode(input)?,
+            shard_roots: Vec::decode(input)?.into(),
             file_count: usize::decode(input)?,
         })
     }
@@ -21539,6 +22223,193 @@ mod tests {
             .read_device(device_id, ByteRange::new(0, 4096), &mut after_flush)
             .unwrap();
         assert_eq!(after_flush, repeated_blocks(1, 7));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_persist_until_does_not_export_later_block_commits() {
+        let root = durable_temp_dir("persist-target-block");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: None,
+            })
+            .unwrap();
+        store.enable_persist_profiling(8).unwrap();
+        let first = store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 11),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let second = store
+            .write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 12),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        store.persist_until(first.commit_seq).unwrap();
+        let profiles = store.drain_persist_profiles(8).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].durable_commit_high_water,
+            first.commit_seq.raw()
+        );
+        assert_eq!(profiles[0].new_segment_count, 1);
+        assert!(second.commit_seq.raw() > first.commit_seq.raw());
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 11));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_persist_until_does_not_export_later_native_commits() {
+        let root = durable_temp_dir("persist-target-native");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store.enable_persist_profiling(8).unwrap();
+        let first = store
+            .write_file_at(
+                keyspace_id,
+                file_id,
+                0,
+                b"first",
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let second = store
+            .write_file_at(
+                keyspace_id,
+                file_id,
+                0,
+                b"later",
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        store.persist_until(first.commit_seq).unwrap();
+        let profiles = store.drain_persist_profiles(8).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].durable_commit_high_water,
+            first.commit_seq.raw()
+        );
+        assert_eq!(profiles[0].new_segment_count, 1);
+        assert!(second.commit_seq.raw() > first.commit_seq.raw());
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; b"first".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, b"first".len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"first");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_target_persist_can_advance_to_later_native_commit_without_restart() {
+        let root = durable_temp_dir("persist-target-native-advance");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store.enable_persist_profiling(8).unwrap();
+        let first = store
+            .write_file_at(
+                keyspace_id,
+                file_id,
+                0,
+                b"first",
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        let second = store
+            .write_file_at(
+                keyspace_id,
+                file_id,
+                0,
+                b"later",
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+
+        store.persist_until(first.commit_seq).unwrap();
+        store.persist_until(second.commit_seq).unwrap();
+        let profiles = store.drain_persist_profiles(8).unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles[0].durable_commit_high_water,
+            first.commit_seq.raw()
+        );
+        assert_eq!(
+            profiles[1].durable_commit_high_water,
+            second.commit_seq.raw()
+        );
+        assert_eq!(profiles[0].new_segment_count, 1);
+        assert_eq!(profiles[1].new_segment_count, 1);
+
+        drop(store);
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; b"later".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, b"later".len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"later");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -28916,7 +29787,7 @@ mod tests {
         {
             let mut inner = lock(&node.segment_store.inner).unwrap();
             let record = inner.segments.get_mut(&segment_id).unwrap();
-            record.bytes = repeated_blocks(1, 8);
+            record.bytes = Arc::from(repeated_blocks(1, 8));
         }
 
         assert!(
@@ -29592,7 +30463,7 @@ mod tests {
             .unwrap();
         let mut inner = lock(&segment_store.inner).unwrap();
         let record = inner.segments.get_mut(&segment_id).unwrap();
-        record.bytes[0] ^= 0xff;
+        Arc::make_mut(&mut record.bytes)[0] ^= 0xff;
     }
 
     fn node_catalog_conn(root: &Path, storage_node: StorageNodeId) -> Connection {
@@ -29718,7 +30589,7 @@ mod tests {
         before
             .shard_roots
             .iter()
-            .zip(&after.shard_roots)
+            .zip(after.shard_roots.iter())
             .filter(|(before, after)| before != after)
             .count()
     }
