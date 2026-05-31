@@ -48,8 +48,10 @@ pub use local::{
     MaintenanceDiagnostics, MaintenanceMode, MaintenanceNodeObservation, MaintenanceObservation,
     MaintenancePolicy, MaintenanceScheduler, MaintenanceSkippedLog, MaintenanceTickPlan,
     MaintenanceTickReport, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
-    RemoteBlockEndpoint, RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport,
-    RemoteWireTransport, SegmentLifecycleState, WriteAdmission,
+    MetadataTxnMode, MetadataTxnProfile, MetadataTxnProfilePhase, RemoteBlockEndpoint,
+    RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport, RemoteWireTransport,
+    SegmentLifecycleState, TxnBlockCoordinator, TxnBlockMetadataPlane, TxnBlockWriteProfile,
+    WriteAdmission,
 };
 pub use object::SegmentPayloadIntegrity;
 pub use provider::{

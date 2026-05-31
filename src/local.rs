@@ -11,7 +11,7 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -69,6 +69,132 @@ const LOCAL_GRANT_EPOCH: GrantEpoch = GrantEpoch::from_raw(1);
 const LOCAL_GRANT_EXPIRATION: LogicalDeadline = LogicalDeadline::from_raw(u64::MAX);
 const LOCAL_STORAGE_NODE_INCARNATION: ServerIncarnation = ServerIncarnation::from_raw(1);
 const DEFAULT_OBSERVABILITY_EVENT_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalCatalogOpProfile {
+    total_nanos: u64,
+    lock_wait_nanos: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalSegmentStoreWriteProfile {
+    total_nanos: u64,
+    lock_wait_nanos: u64,
+    checksum_integrity_nanos: u64,
+    insert_nanos: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalSegmentStoreSyncProfile {
+    total_nanos: u64,
+    lock_wait_nanos: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalSegmentWriteProfile {
+    storage_node_ids_nanos: u64,
+    placement_select_nanos: u64,
+    segment_id_alloc_nanos: u64,
+    grant_issue_nanos: u64,
+    storage_node_transport_dispatch_nanos: u64,
+    grant_verify_nanos: u64,
+    catalog_duplicate_probe_nanos: u64,
+    catalog_duplicate_probe_lock_wait_nanos: u64,
+    catalog_reserve_nanos: u64,
+    catalog_reserve_lock_wait_nanos: u64,
+    catalog_begin_nanos: u64,
+    catalog_begin_lock_wait_nanos: u64,
+    segment_store_write_nanos: u64,
+    segment_store_lock_wait_nanos: u64,
+    checksum_integrity_nanos: u64,
+    segment_store_insert_nanos: u64,
+    segment_sync_nanos: u64,
+    segment_sync_lock_wait_nanos: u64,
+    receipt_create_nanos: u64,
+    receipt_verify_nanos: u64,
+    catalog_commit_nanos: u64,
+    catalog_commit_lock_wait_nanos: u64,
+}
+
+impl LocalSegmentWriteProfile {
+    fn absorb(&mut self, other: Self) {
+        self.storage_node_ids_nanos = self
+            .storage_node_ids_nanos
+            .saturating_add(other.storage_node_ids_nanos);
+        self.placement_select_nanos = self
+            .placement_select_nanos
+            .saturating_add(other.placement_select_nanos);
+        self.segment_id_alloc_nanos = self
+            .segment_id_alloc_nanos
+            .saturating_add(other.segment_id_alloc_nanos);
+        self.grant_issue_nanos = self
+            .grant_issue_nanos
+            .saturating_add(other.grant_issue_nanos);
+        self.storage_node_transport_dispatch_nanos = self
+            .storage_node_transport_dispatch_nanos
+            .saturating_add(other.storage_node_transport_dispatch_nanos);
+        self.grant_verify_nanos = self
+            .grant_verify_nanos
+            .saturating_add(other.grant_verify_nanos);
+        self.catalog_duplicate_probe_nanos = self
+            .catalog_duplicate_probe_nanos
+            .saturating_add(other.catalog_duplicate_probe_nanos);
+        self.catalog_duplicate_probe_lock_wait_nanos = self
+            .catalog_duplicate_probe_lock_wait_nanos
+            .saturating_add(other.catalog_duplicate_probe_lock_wait_nanos);
+        self.catalog_reserve_nanos = self
+            .catalog_reserve_nanos
+            .saturating_add(other.catalog_reserve_nanos);
+        self.catalog_reserve_lock_wait_nanos = self
+            .catalog_reserve_lock_wait_nanos
+            .saturating_add(other.catalog_reserve_lock_wait_nanos);
+        self.catalog_begin_nanos = self
+            .catalog_begin_nanos
+            .saturating_add(other.catalog_begin_nanos);
+        self.catalog_begin_lock_wait_nanos = self
+            .catalog_begin_lock_wait_nanos
+            .saturating_add(other.catalog_begin_lock_wait_nanos);
+        self.segment_store_write_nanos = self
+            .segment_store_write_nanos
+            .saturating_add(other.segment_store_write_nanos);
+        self.segment_store_lock_wait_nanos = self
+            .segment_store_lock_wait_nanos
+            .saturating_add(other.segment_store_lock_wait_nanos);
+        self.checksum_integrity_nanos = self
+            .checksum_integrity_nanos
+            .saturating_add(other.checksum_integrity_nanos);
+        self.segment_store_insert_nanos = self
+            .segment_store_insert_nanos
+            .saturating_add(other.segment_store_insert_nanos);
+        self.segment_sync_nanos = self
+            .segment_sync_nanos
+            .saturating_add(other.segment_sync_nanos);
+        self.segment_sync_lock_wait_nanos = self
+            .segment_sync_lock_wait_nanos
+            .saturating_add(other.segment_sync_lock_wait_nanos);
+        self.receipt_create_nanos = self
+            .receipt_create_nanos
+            .saturating_add(other.receipt_create_nanos);
+        self.receipt_verify_nanos = self
+            .receipt_verify_nanos
+            .saturating_add(other.receipt_verify_nanos);
+        self.catalog_commit_nanos = self
+            .catalog_commit_nanos
+            .saturating_add(other.catalog_commit_nanos);
+        self.catalog_commit_lock_wait_nanos = self
+            .catalog_commit_lock_wait_nanos
+            .saturating_add(other.catalog_commit_lock_wait_nanos);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalMarkReferencedProfile {
+    evidence_create_nanos: u64,
+    transport_dispatch_nanos: u64,
+    verify_nanos: u64,
+    catalog_mark_nanos: u64,
+    catalog_mark_lock_wait_nanos: u64,
+}
 
 /// Local provider configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -710,6 +836,175 @@ struct LocalStorageNode {
 }
 
 impl LocalStorageNode {
+    fn write_segment_profiled(
+        &self,
+        grant: WriteGrant,
+        bytes: Vec<u8>,
+    ) -> Result<(SegmentWriteReceipt, LocalSegmentWriteProfile)> {
+        let mut profile = LocalSegmentWriteProfile::default();
+        let bytes_len = u64::try_from(bytes.len())
+            .map_err(|_| StorageError::invalid_argument("segment write length overflows u64"))?;
+        let grant_started = Instant::now();
+        let grant_hash = match self.authority.verify_write_grant_and_hash(
+            &grant,
+            self.storage_node,
+            grant.segment_id,
+            bytes_len,
+        ) {
+            Ok(hash) => {
+                profile.grant_verify_nanos = duration_nanos_u64(grant_started.elapsed());
+                hash
+            }
+            Err(error) => {
+                self.observability.record_with_update(
+                    StorageEventKind::GrantRejected,
+                    Some(self.storage_node),
+                    Some(grant.segment_id),
+                    None,
+                    Some("scope"),
+                    |counters| {
+                        counters.grant_rejections = counters.grant_rejections.saturating_add(1);
+                    },
+                );
+                return Err(error);
+            }
+        };
+
+        let (contains_segment, contains_profile) = self
+            .segment_catalog
+            .contains_segment_profiled(grant.segment_id)?;
+        profile.catalog_duplicate_probe_nanos = contains_profile.total_nanos;
+        profile.catalog_duplicate_probe_lock_wait_nanos = contains_profile.lock_wait_nanos;
+        if contains_segment {
+            let receipt = self.segment_catalog.receipt_for_segment(grant.segment_id)?;
+            self.authority.verify_segment_receipt(&receipt)?;
+            if receipt.grant_id == grant.grant_id
+                && receipt.grant_hash == grant_hash
+                && receipt.bytes == bytes_len
+                && receipt.integrity == segment_payload_integrity(grant.payload_integrity, &bytes)
+            {
+                let existing_len = usize::try_from(bytes_len).map_err(|_| {
+                    StorageError::invalid_argument("duplicate segment length overflows usize")
+                })?;
+                let mut existing = vec![0; existing_len];
+                self.segment_store.read_segment(
+                    grant.segment_id,
+                    ByteRange::new(0, bytes_len),
+                    &mut existing,
+                )?;
+                if existing == bytes {
+                    self.observability.record_with_update(
+                        StorageEventKind::StorageSegmentWriteRetried,
+                        Some(self.storage_node),
+                        Some(grant.segment_id),
+                        None,
+                        None,
+                        |counters| {
+                            counters.storage_segment_duplicate_writes =
+                                counters.storage_segment_duplicate_writes.saturating_add(1);
+                            counters.coordinator_write_idempotency_hits = counters
+                                .coordinator_write_idempotency_hits
+                                .saturating_add(1);
+                        },
+                    );
+                    return Ok((receipt, profile));
+                }
+            }
+            return Err(StorageError::conflict(
+                "duplicate segment write conflicts with existing receipt",
+            ));
+        }
+
+        let intent = SegmentReservationIntent {
+            write_intent: grant.write_intent,
+            owner: grant.owner,
+            bytes: grant.max_bytes,
+        };
+        let (reservation, reserve_profile) = self
+            .segment_catalog
+            .reserve_segment_with_id_profiled(grant.segment_id, intent)?;
+        profile.catalog_reserve_nanos = reserve_profile.total_nanos;
+        profile.catalog_reserve_lock_wait_nanos = reserve_profile.lock_wait_nanos;
+
+        let begin_profile = self.segment_catalog.begin_write_profiled(&reservation)?;
+        profile.catalog_begin_nanos = begin_profile.total_nanos;
+        profile.catalog_begin_lock_wait_nanos = begin_profile.lock_wait_nanos;
+
+        let (commit, write_profile) = self.segment_store.write_segment_owned_profiled(
+            &reservation,
+            bytes,
+            grant.payload_integrity,
+        )?;
+        profile.segment_store_write_nanos = write_profile.total_nanos;
+        profile.segment_store_lock_wait_nanos = write_profile.lock_wait_nanos;
+        profile.checksum_integrity_nanos = write_profile.checksum_integrity_nanos;
+        profile.segment_store_insert_nanos = write_profile.insert_nanos;
+
+        let sync_profile = self
+            .segment_store
+            .sync_segment_profiled(reservation.segment_id)?;
+        profile.segment_sync_nanos = sync_profile.total_nanos;
+        profile.segment_sync_lock_wait_nanos = sync_profile.lock_wait_nanos;
+
+        let receipt_started = Instant::now();
+        let receipt = self.authority.create_segment_receipt_after_verified_write(
+            &grant,
+            grant_hash,
+            commit,
+            LOCAL_STORAGE_NODE_INCARNATION,
+        )?;
+        profile.receipt_create_nanos = duration_nanos_u64(receipt_started.elapsed());
+
+        let commit_profile = self
+            .segment_catalog
+            .commit_segment_profiled(reservation, receipt.clone())?;
+        profile.catalog_commit_nanos = commit_profile.total_nanos;
+        profile.catalog_commit_lock_wait_nanos = commit_profile.lock_wait_nanos;
+
+        self.observability.record_with_update(
+            StorageEventKind::StorageSegmentWritten,
+            Some(self.storage_node),
+            Some(receipt.segment_id),
+            None,
+            None,
+            |counters| {
+                counters.storage_segment_writes = counters.storage_segment_writes.saturating_add(1);
+            },
+        );
+        Ok((receipt, profile))
+    }
+
+    fn mark_segment_referenced_profiled(
+        &self,
+        evidence: ReferenceEvidence,
+    ) -> Result<LocalMarkReferencedProfile> {
+        let mut profile = LocalMarkReferencedProfile::default();
+        let segment_id = evidence.segment_id;
+        let verify_started = Instant::now();
+        self.authority
+            .verify_reference_evidence(&evidence, segment_id, self.storage_node)?;
+        profile.verify_nanos = duration_nanos_u64(verify_started.elapsed());
+
+        let catalog_profile = self
+            .segment_catalog
+            .mark_segment_referenced_profiled(segment_id)?;
+        profile.catalog_mark_nanos = catalog_profile.total_nanos;
+        profile.catalog_mark_lock_wait_nanos = catalog_profile.lock_wait_nanos;
+
+        self.observability.record_with_update(
+            StorageEventKind::StorageSegmentReferenced,
+            Some(self.storage_node),
+            Some(segment_id),
+            Some(evidence.metadata_commit),
+            None,
+            |counters| {
+                counters.storage_segment_references =
+                    counters.storage_segment_references.saturating_add(1);
+            },
+        );
+        Ok(profile)
+    }
+
     fn observe_maintenance(&self) -> Result<StorageNodeMaintenanceObservation> {
         let counts = self.segment_catalog.lifecycle_counts()?;
         Ok(StorageNodeMaintenanceObservation {
@@ -800,109 +1095,7 @@ impl StorageNodeTransport for LocalStorageNode {
     fn send(&self, request: StorageNodeRequest) -> Result<StorageNodeResponse> {
         match request {
             StorageNodeRequest::WriteSegment { grant, bytes } => {
-                let bytes_len = u64::try_from(bytes.len()).map_err(|_| {
-                    StorageError::invalid_argument("segment write length overflows u64")
-                })?;
-                let grant_hash = match self.authority.verify_write_grant_and_hash(
-                    &grant,
-                    self.storage_node,
-                    grant.segment_id,
-                    bytes_len,
-                ) {
-                    Ok(hash) => hash,
-                    Err(error) => {
-                        self.observability.record_with_update(
-                            StorageEventKind::GrantRejected,
-                            Some(self.storage_node),
-                            Some(grant.segment_id),
-                            None,
-                            Some("scope"),
-                            |counters| {
-                                counters.grant_rejections =
-                                    counters.grant_rejections.saturating_add(1);
-                            },
-                        );
-                        return Err(error);
-                    }
-                };
-                if self.segment_catalog.contains_segment(grant.segment_id)? {
-                    let receipt = self.segment_catalog.receipt_for_segment(grant.segment_id)?;
-                    self.authority.verify_segment_receipt(&receipt)?;
-                    if receipt.grant_id == grant.grant_id
-                        && receipt.grant_hash == grant_hash
-                        && receipt.bytes == bytes_len
-                        && receipt.integrity
-                            == segment_payload_integrity(grant.payload_integrity, &bytes)
-                    {
-                        let existing_len = usize::try_from(bytes_len).map_err(|_| {
-                            StorageError::invalid_argument(
-                                "duplicate segment length overflows usize",
-                            )
-                        })?;
-                        let mut existing = vec![0; existing_len];
-                        self.segment_store.read_segment(
-                            grant.segment_id,
-                            ByteRange::new(0, bytes_len),
-                            &mut existing,
-                        )?;
-                        if existing == bytes {
-                            self.observability.record_with_update(
-                                StorageEventKind::StorageSegmentWriteRetried,
-                                Some(self.storage_node),
-                                Some(grant.segment_id),
-                                None,
-                                None,
-                                |counters| {
-                                    counters.storage_segment_duplicate_writes =
-                                        counters.storage_segment_duplicate_writes.saturating_add(1);
-                                    counters.coordinator_write_idempotency_hits = counters
-                                        .coordinator_write_idempotency_hits
-                                        .saturating_add(1);
-                                },
-                            );
-                            return Ok(StorageNodeResponse::WriteSegment {
-                                receipt: Box::new(receipt),
-                            });
-                        }
-                    }
-                    return Err(StorageError::conflict(
-                        "duplicate segment write conflicts with existing receipt",
-                    ));
-                }
-                let intent = SegmentReservationIntent {
-                    write_intent: grant.write_intent,
-                    owner: grant.owner,
-                    bytes: grant.max_bytes,
-                };
-                let reservation = self
-                    .segment_catalog
-                    .reserve_segment_with_id(grant.segment_id, intent)?;
-                self.segment_catalog.begin_write(&reservation)?;
-                let commit = self.segment_store.write_segment_owned(
-                    &reservation,
-                    bytes,
-                    grant.payload_integrity,
-                )?;
-                self.segment_store.sync_segment(reservation.segment_id)?;
-                let receipt = self.authority.create_segment_receipt_after_verified_write(
-                    &grant,
-                    grant_hash,
-                    commit,
-                    LOCAL_STORAGE_NODE_INCARNATION,
-                )?;
-                self.segment_catalog
-                    .commit_segment(reservation, receipt.clone())?;
-                self.observability.record_with_update(
-                    StorageEventKind::StorageSegmentWritten,
-                    Some(self.storage_node),
-                    Some(receipt.segment_id),
-                    None,
-                    None,
-                    |counters| {
-                        counters.storage_segment_writes =
-                            counters.storage_segment_writes.saturating_add(1);
-                    },
-                );
+                let (receipt, _) = self.write_segment_profiled(grant, bytes)?;
                 Ok(StorageNodeResponse::WriteSegment {
                     receipt: Box::new(receipt),
                 })
@@ -917,24 +1110,7 @@ impl StorageNodeTransport for LocalStorageNode {
                 Ok(StorageNodeResponse::ReadSegment { bytes })
             }
             StorageNodeRequest::MarkReferenced { evidence } => {
-                let segment_id = evidence.segment_id;
-                self.authority.verify_reference_evidence(
-                    &evidence,
-                    segment_id,
-                    self.storage_node,
-                )?;
-                self.segment_catalog.mark_segment_referenced(segment_id)?;
-                self.observability.record_with_update(
-                    StorageEventKind::StorageSegmentReferenced,
-                    Some(self.storage_node),
-                    Some(segment_id),
-                    Some(evidence.metadata_commit),
-                    None,
-                    |counters| {
-                        counters.storage_segment_references =
-                            counters.storage_segment_references.saturating_add(1);
-                    },
-                );
+                self.mark_segment_referenced_profiled(evidence)?;
                 Ok(StorageNodeResponse::MarkReferenced)
             }
             StorageNodeRequest::Release { segment_id } => {
@@ -973,7 +1149,7 @@ struct StorageNodeRegistry {
     node_order: Arc<Vec<StorageNodeId>>,
     nodes: Arc<BTreeMap<StorageNodeId, LocalStorageNode>>,
     next_placement_index: Arc<Mutex<u64>>,
-    next_segment_id: Arc<Mutex<u128>>,
+    next_segment_id: Arc<AtomicU64>,
 }
 
 impl StorageNodeRegistry {
@@ -1010,7 +1186,7 @@ impl StorageNodeRegistry {
             node_order: Arc::new(node_order),
             nodes: Arc::new(nodes),
             next_placement_index: Arc::new(Mutex::new(0)),
-            next_segment_id: Arc::new(Mutex::new(1)),
+            next_segment_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -1075,7 +1251,11 @@ impl StorageNodeRegistry {
             node_order: Arc::new(inner.node_order),
             nodes: Arc::new(nodes),
             next_placement_index: Arc::new(Mutex::new(inner.next_placement_index)),
-            next_segment_id: Arc::new(Mutex::new(inner.next_segment_id)),
+            next_segment_id: Arc::new(AtomicU64::new(
+                u64::try_from(inner.next_segment_id).map_err(|_| {
+                    StorageError::corrupt("storage node segment id cursor exceeds local limit")
+                })?,
+            )),
         })
     }
 
@@ -1106,7 +1286,7 @@ impl StorageNodeRegistry {
         }
         Ok((
             StorageNodeRegistryInner {
-                next_segment_id: *lock(&self.next_segment_id)?,
+                next_segment_id: u128::from(self.next_segment_id.load(Ordering::Relaxed)),
                 next_placement_index: *lock(&self.next_placement_index)?,
                 node_order: self.node_order.as_ref().clone(),
                 nodes,
@@ -1216,7 +1396,7 @@ impl StorageNodeRegistry {
         }
         Ok((
             StorageNodeRegistryInner {
-                next_segment_id: *lock(&self.next_segment_id)?,
+                next_segment_id: u128::from(self.next_segment_id.load(Ordering::Relaxed)),
                 next_placement_index: *lock(&self.next_placement_index)?,
                 node_order: self.node_order.as_ref().clone(),
                 nodes,
@@ -1360,6 +1540,30 @@ impl StorageNodeRegistry {
         Ok(())
     }
 
+    fn mark_segment_referenced_profiled(
+        &self,
+        receipt: &SegmentWriteReceipt,
+        commit_seq: CommitSeq,
+        authority: &dyn GrantReceiptAuthority,
+    ) -> Result<LocalMarkReferencedProfile> {
+        let evidence_started = Instant::now();
+        let evidence = authority.create_reference_evidence(receipt, commit_seq)?;
+        let mut profile = LocalMarkReferencedProfile {
+            evidence_create_nanos: duration_nanos_u64(evidence_started.elapsed()),
+            ..LocalMarkReferencedProfile::default()
+        };
+
+        let dispatch_started = Instant::now();
+        let node = self.owner_node_for_segment(receipt.segment_id)?;
+        profile.transport_dispatch_nanos = duration_nanos_u64(dispatch_started.elapsed());
+
+        let node_profile = node.mark_segment_referenced_profiled(evidence)?;
+        profile.verify_nanos = node_profile.verify_nanos;
+        profile.catalog_mark_nanos = node_profile.catalog_mark_nanos;
+        profile.catalog_mark_lock_wait_nanos = node_profile.catalog_mark_lock_wait_nanos;
+        Ok(profile)
+    }
+
     fn release_segment(&self, segment_id: SegmentId) -> Result<()> {
         let response = self
             .transport_for_segment(segment_id)?
@@ -1460,23 +1664,12 @@ impl StorageNodeDirectory for StorageNodeRegistry {
     }
 
     fn allocate_segment_id(&self) -> Result<SegmentId> {
-        let mut next = lock(&self.next_segment_id)?;
-        loop {
-            let candidate = SegmentId::from_raw(*next);
-            *next = next
-                .checked_add(1)
-                .ok_or_else(|| StorageError::conflict("segment id overflow"))?;
-            let mut exists = false;
-            for node in self.nodes.values() {
-                if node.segment_catalog.contains_segment(candidate)? {
-                    exists = true;
-                    break;
-                }
-            }
-            if !exists {
-                return Ok(candidate);
-            }
-        }
+        self.next_segment_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+                next.checked_add(1)
+            })
+            .map(|raw| SegmentId::from_raw(u128::from(raw)))
+            .map_err(|_| StorageError::conflict("segment id overflow"))
     }
 
     fn transport_for_node(
@@ -2158,7 +2351,7 @@ impl LocalCoordinator {
             next_gc_epoch: metadata.next_gc_epoch,
             next_write_intent: *lock(&self.next_write_intent)?,
             next_extent_id: *lock(&self.next_extent_id)?,
-            next_segment_id: *lock(&self.storage_nodes.next_segment_id)?,
+            next_segment_id: u128::from(self.storage_nodes.next_segment_id.load(Ordering::Relaxed)),
             next_placement_index: *lock(&self.storage_nodes.next_placement_index)?,
         })
     }
@@ -2464,7 +2657,8 @@ impl LocalCoordinator {
         drop(metadata);
         cursor.next_write_intent = *lock(&self.next_write_intent)?;
         cursor.next_extent_id = *lock(&self.next_extent_id)?;
-        cursor.next_segment_id = *lock(&self.storage_nodes.next_segment_id)?;
+        cursor.next_segment_id =
+            u128::from(self.storage_nodes.next_segment_id.load(Ordering::Relaxed));
         cursor.next_placement_index = *lock(&self.storage_nodes.next_placement_index)?;
 
         Ok(Some(NativeMetadataDelta {
@@ -3670,6 +3864,52 @@ impl LocalCoordinator {
         self.write_granted_segment_verified(&grant, data)
     }
 
+    fn write_segment_for_intent_with_id_owned_verified_profiled(
+        &self,
+        intent: WriteGrantIntent,
+        write_intent: WriteIntentId,
+        data: Vec<u8>,
+        durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<(VerifiedSegmentReceipt, LocalSegmentWriteProfile)> {
+        let mut profile = LocalSegmentWriteProfile::default();
+        let max_bytes = u64::try_from(data.len()).map_err(|_| {
+            StorageError::invalid_argument("segment reservation byte length overflows u64")
+        })?;
+
+        let started = Instant::now();
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        profile.storage_node_ids_nanos = duration_nanos_u64(started.elapsed());
+
+        let started = Instant::now();
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        profile.placement_select_nanos = duration_nanos_u64(started.elapsed());
+
+        let started = Instant::now();
+        let segment_id = self.storage_nodes.allocate_segment_id()?;
+        profile.segment_id_alloc_nanos = duration_nanos_u64(started.elapsed());
+
+        let started = Instant::now();
+        let grant = self.issue_write_grant(WriteGrantRequest {
+            tenant: LOCAL_TENANT_ID,
+            principal: LOCAL_PRINCIPAL_ID,
+            intent,
+            write_intent,
+            segment_id,
+            storage_node,
+            max_bytes,
+            payload_integrity,
+            durability,
+            expires_at: LOCAL_GRANT_EXPIRATION,
+        })?;
+        profile.grant_issue_nanos = duration_nanos_u64(started.elapsed());
+
+        let (receipt, write_profile) =
+            self.write_granted_segment_verified_profiled(&grant, data)?;
+        profile.absorb(write_profile);
+        Ok((receipt, profile))
+    }
+
     pub fn issue_write_grant(&self, request: WriteGrantRequest) -> Result<WriteGrant> {
         match self.authority.issue_write_grant(request) {
             Ok(grant) => {
@@ -3810,6 +4050,33 @@ impl LocalCoordinator {
             ));
         }
         self.verify_receipt_matches_grant_observed(grant, &receipt)
+    }
+
+    fn write_granted_segment_verified_profiled(
+        &self,
+        grant: &WriteGrant,
+        data: Vec<u8>,
+    ) -> Result<(VerifiedSegmentReceipt, LocalSegmentWriteProfile)> {
+        let mut profile = LocalSegmentWriteProfile::default();
+        let expected_segment = grant.segment_id;
+        let storage_node = grant.storage_node;
+
+        let started = Instant::now();
+        let node = self.storage_nodes.node(storage_node)?.clone();
+        profile.storage_node_transport_dispatch_nanos = duration_nanos_u64(started.elapsed());
+
+        let (receipt, node_profile) = node.write_segment_profiled(grant.clone(), data)?;
+        profile.absorb(node_profile);
+        if receipt.segment_id != expected_segment {
+            return Err(StorageError::corrupt(
+                "storage node write receipt disagrees with requested segment ID",
+            ));
+        }
+
+        let started = Instant::now();
+        let verified = self.verify_receipt_matches_grant_observed(grant, &receipt)?;
+        profile.receipt_verify_nanos = duration_nanos_u64(started.elapsed());
+        Ok((verified, profile))
     }
 
     pub fn storage_node_transport_for_grant(
@@ -4983,6 +5250,12 @@ impl Default for LocalCoordinator {
         Self::new()
     }
 }
+
+mod txn_metadata;
+pub use txn_metadata::{
+    MetadataTxnMode, MetadataTxnProfile, MetadataTxnProfilePhase, TxnBlockCoordinator,
+    TxnBlockMetadataPlane, TxnBlockWriteProfile,
+};
 
 #[derive(Debug, Clone)]
 struct DurableStorePaths {
@@ -15630,6 +15903,18 @@ impl InMemorySegmentStore {
         bytes: Vec<u8>,
         payload_integrity: PayloadIntegrity,
     ) -> Result<SegmentReplicaCommit> {
+        self.write_segment_owned_profiled(reservation, bytes, payload_integrity)
+            .map(|(commit, _)| commit)
+    }
+
+    fn write_segment_owned_profiled(
+        &self,
+        reservation: &SegmentReservation,
+        bytes: Vec<u8>,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<(SegmentReplicaCommit, LocalSegmentStoreWriteProfile)> {
+        let total_started = Instant::now();
+        let mut profile = LocalSegmentStoreWriteProfile::default();
         self.config.validate()?;
 
         if bytes.is_empty() {
@@ -15652,10 +15937,18 @@ impl InMemorySegmentStore {
             ));
         }
 
+        let checksum_started = Instant::now();
+        let integrity = segment_payload_integrity(payload_integrity, &bytes);
+        profile.checksum_integrity_nanos = duration_nanos_u64(checksum_started.elapsed());
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+
+        let lock_started = Instant::now();
         let mut inner = lock(&self.inner)?;
+        profile.lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         if let Some(existing) = inner.segments.get(&reservation.segment_id) {
-            if existing.bytes.as_ref() == bytes.as_slice() {
-                return Ok(existing.commit.clone());
+            if existing.bytes.as_ref() == bytes.as_ref() {
+                profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+                return Ok((existing.commit.clone(), profile));
             }
             return Err(StorageError::conflict(
                 "segment ID already exists with different bytes",
@@ -15668,7 +15961,6 @@ impl InMemorySegmentStore {
             .checked_add(reservation.bytes)
             .ok_or_else(|| StorageError::conflict("local segment offset overflow"))?;
         let blocks = reservation.bytes / u64::from(self.config.block_size);
-        let integrity = segment_payload_integrity(payload_integrity, &bytes);
         let commit = SegmentReplicaCommit {
             descriptor: SegmentDescriptor {
                 segment_id: reservation.segment_id,
@@ -15683,15 +15975,34 @@ impl InMemorySegmentStore {
                 bytes: reservation.bytes,
             },
         };
+        let insert_started = Instant::now();
         inner.segments.insert(
             reservation.segment_id,
             SegmentRecord {
-                bytes: Arc::from(bytes),
+                bytes,
                 synced: false,
                 commit: commit.clone(),
             },
         );
-        Ok(commit)
+        profile.insert_nanos = duration_nanos_u64(insert_started.elapsed());
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        Ok((commit, profile))
+    }
+
+    fn sync_segment_profiled(&self, segment_id: SegmentId) -> Result<LocalSegmentStoreSyncProfile> {
+        let total_started = Instant::now();
+        let lock_started = Instant::now();
+        let mut inner = lock(&self.inner)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let record = inner
+            .segments
+            .get_mut(&segment_id)
+            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+        record.synced = true;
+        Ok(LocalSegmentStoreSyncProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            lock_wait_nanos,
+        })
     }
 }
 
@@ -15743,13 +16054,7 @@ impl SegmentStore for InMemorySegmentStore {
     }
 
     fn sync_segment(&self, segment_id: SegmentId) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
-        let record = inner
-            .segments
-            .get_mut(&segment_id)
-            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
-        record.synced = true;
-        Ok(())
+        self.sync_segment_profiled(segment_id).map(|_| ())
     }
 
     fn delete_segment(&self, segment_id: SegmentId) -> Result<()> {
@@ -15829,13 +16134,25 @@ impl InMemoryLocalSegmentCatalog {
         segment_id: SegmentId,
         intent: SegmentReservationIntent,
     ) -> Result<SegmentReservation> {
+        self.reserve_segment_with_id_profiled(segment_id, intent)
+            .map(|(reservation, _)| reservation)
+    }
+
+    fn reserve_segment_with_id_profiled(
+        &self,
+        segment_id: SegmentId,
+        intent: SegmentReservationIntent,
+    ) -> Result<(SegmentReservation, LocalCatalogOpProfile)> {
+        let total_started = Instant::now();
         if intent.bytes == 0 {
             return Err(StorageError::invalid_argument(
                 "segment reservation must contain bytes",
             ));
         }
 
+        let lock_started = Instant::now();
         let mut inner = lock(&self.inner)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         if inner.entries.contains_key(&segment_id) {
             return Err(StorageError::conflict("segment ID already exists"));
         }
@@ -15858,11 +16175,35 @@ impl InMemoryLocalSegmentCatalog {
                 receipt: None,
             },
         );
-        Ok(reservation)
+        Ok((
+            reservation,
+            LocalCatalogOpProfile {
+                total_nanos: duration_nanos_u64(total_started.elapsed()),
+                lock_wait_nanos,
+            },
+        ))
     }
 
     pub fn contains_segment(&self, segment_id: SegmentId) -> Result<bool> {
-        Ok(lock(&self.inner)?.entries.contains_key(&segment_id))
+        self.contains_segment_profiled(segment_id)
+            .map(|(contains, _)| contains)
+    }
+
+    fn contains_segment_profiled(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<(bool, LocalCatalogOpProfile)> {
+        let total_started = Instant::now();
+        let lock_started = Instant::now();
+        let inner = lock(&self.inner)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        Ok((
+            inner.entries.contains_key(&segment_id),
+            LocalCatalogOpProfile {
+                total_nanos: duration_nanos_u64(total_started.elapsed()),
+                lock_wait_nanos,
+            },
+        ))
     }
 
     pub fn state(&self, segment_id: SegmentId) -> Result<SegmentLifecycleState> {
@@ -15933,31 +16274,14 @@ impl InMemoryLocalSegmentCatalog {
         Ok(counts)
     }
 
-    fn get_entry_mut(inner: &mut CatalogInner, segment_id: SegmentId) -> Result<&mut CatalogEntry> {
-        inner
-            .entries
-            .get_mut(&segment_id)
-            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))
-    }
-}
-
-impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
-    fn reserve_segment(&self, intent: SegmentReservationIntent) -> Result<SegmentReservation> {
-        if intent.bytes == 0 {
-            return Err(StorageError::invalid_argument(
-                "segment reservation must contain bytes",
-            ));
-        }
-
-        let segment_id = {
-            let inner = lock(&self.inner)?;
-            SegmentId::from_raw(inner.next_segment_id)
-        };
-        self.reserve_segment_with_id(segment_id, intent)
-    }
-
-    fn begin_write(&self, reservation: &SegmentReservation) -> Result<()> {
+    fn begin_write_profiled(
+        &self,
+        reservation: &SegmentReservation,
+    ) -> Result<LocalCatalogOpProfile> {
+        let total_started = Instant::now();
+        let lock_started = Instant::now();
         let mut inner = lock(&self.inner)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let entry = Self::get_entry_mut(&mut inner, reservation.segment_id)?;
         if entry.reservation != *reservation {
             return Err(StorageError::conflict(
@@ -15967,21 +16291,30 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
         match entry.state {
             SegmentLifecycleState::Reserved => {
                 entry.state = SegmentLifecycleState::Writing;
-                Ok(())
+                Ok(LocalCatalogOpProfile {
+                    total_nanos: duration_nanos_u64(total_started.elapsed()),
+                    lock_wait_nanos,
+                })
             }
-            SegmentLifecycleState::Writing => Ok(()),
+            SegmentLifecycleState::Writing => Ok(LocalCatalogOpProfile {
+                total_nanos: duration_nanos_u64(total_started.elapsed()),
+                lock_wait_nanos,
+            }),
             _ => Err(StorageError::conflict(
                 "segment write can only begin from Reserved state",
             )),
         }
     }
 
-    fn commit_segment(
+    fn commit_segment_profiled(
         &self,
         reservation: SegmentReservation,
         receipt: SegmentWriteReceipt,
-    ) -> Result<()> {
+    ) -> Result<LocalCatalogOpProfile> {
+        let total_started = Instant::now();
+        let lock_started = Instant::now();
         let mut inner = lock(&self.inner)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let entry = Self::get_entry_mut(&mut inner, reservation.segment_id)?;
         if entry.reservation != reservation {
             return Err(StorageError::conflict(
@@ -16016,12 +16349,18 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
             SegmentLifecycleState::Writing => {
                 entry.receipt = Some(receipt);
                 entry.state = SegmentLifecycleState::DurablePendingMetadata;
-                Ok(())
+                Ok(LocalCatalogOpProfile {
+                    total_nanos: duration_nanos_u64(total_started.elapsed()),
+                    lock_wait_nanos,
+                })
             }
             SegmentLifecycleState::DurablePendingMetadata
                 if entry.receipt.as_ref() == Some(&receipt) =>
             {
-                Ok(())
+                Ok(LocalCatalogOpProfile {
+                    total_nanos: duration_nanos_u64(total_started.elapsed()),
+                    lock_wait_nanos,
+                })
             }
             _ => Err(StorageError::conflict(
                 "segment receipt requires Writing state",
@@ -16029,19 +16368,72 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
         }
     }
 
-    fn mark_segment_referenced(&self, segment_id: SegmentId) -> Result<()> {
+    fn mark_segment_referenced_profiled(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<LocalCatalogOpProfile> {
+        let total_started = Instant::now();
+        let lock_started = Instant::now();
         let mut inner = lock(&self.inner)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let entry = Self::get_entry_mut(&mut inner, segment_id)?;
         match entry.state {
             SegmentLifecycleState::DurablePendingMetadata => {
                 entry.state = SegmentLifecycleState::Referenced;
-                Ok(())
+                Ok(LocalCatalogOpProfile {
+                    total_nanos: duration_nanos_u64(total_started.elapsed()),
+                    lock_wait_nanos,
+                })
             }
-            SegmentLifecycleState::Referenced => Ok(()),
+            SegmentLifecycleState::Referenced => Ok(LocalCatalogOpProfile {
+                total_nanos: duration_nanos_u64(total_started.elapsed()),
+                lock_wait_nanos,
+            }),
             _ => Err(StorageError::conflict(
                 "segment can be referenced only from DurablePendingMetadata state",
             )),
         }
+    }
+
+    fn get_entry_mut(inner: &mut CatalogInner, segment_id: SegmentId) -> Result<&mut CatalogEntry> {
+        inner
+            .entries
+            .get_mut(&segment_id)
+            .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))
+    }
+}
+
+impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
+    fn reserve_segment(&self, intent: SegmentReservationIntent) -> Result<SegmentReservation> {
+        if intent.bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "segment reservation must contain bytes",
+            ));
+        }
+
+        let segment_id = {
+            let inner = lock(&self.inner)?;
+            SegmentId::from_raw(inner.next_segment_id)
+        };
+        self.reserve_segment_with_id(segment_id, intent)
+    }
+
+    fn begin_write(&self, reservation: &SegmentReservation) -> Result<()> {
+        self.begin_write_profiled(reservation).map(|_| ())
+    }
+
+    fn commit_segment(
+        &self,
+        reservation: SegmentReservation,
+        receipt: SegmentWriteReceipt,
+    ) -> Result<()> {
+        self.commit_segment_profiled(reservation, receipt)
+            .map(|_| ())
+    }
+
+    fn mark_segment_referenced(&self, segment_id: SegmentId) -> Result<()> {
+        self.mark_segment_referenced_profiled(segment_id)
+            .map(|_| ())
     }
 
     fn release_segment(&self, segment_id: SegmentId) -> Result<()> {
@@ -23647,28 +24039,37 @@ mod tests {
         let store = LocalCoordinator::with_config(config()).unwrap();
         let reserved = store
             .segment_catalog()
-            .reserve_segment(SegmentReservationIntent {
-                write_intent: WriteIntentId::from_raw(10),
-                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
-                bytes: 4096,
-            })
+            .reserve_segment_with_id(
+                SegmentId::from_raw(101),
+                SegmentReservationIntent {
+                    write_intent: WriteIntentId::from_raw(10),
+                    owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                    bytes: 4096,
+                },
+            )
             .unwrap();
         let writing = store
             .segment_catalog()
-            .reserve_segment(SegmentReservationIntent {
-                write_intent: WriteIntentId::from_raw(11),
-                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
-                bytes: 4096,
-            })
+            .reserve_segment_with_id(
+                SegmentId::from_raw(102),
+                SegmentReservationIntent {
+                    write_intent: WriteIntentId::from_raw(11),
+                    owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                    bytes: 4096,
+                },
+            )
             .unwrap();
         store.segment_catalog().begin_write(&writing).unwrap();
         let orphan = store
             .segment_catalog()
-            .reserve_segment(SegmentReservationIntent {
-                write_intent: WriteIntentId::from_raw(12),
-                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
-                bytes: 4096,
-            })
+            .reserve_segment_with_id(
+                SegmentId::from_raw(103),
+                SegmentReservationIntent {
+                    write_intent: WriteIntentId::from_raw(12),
+                    owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                    bytes: 4096,
+                },
+            )
             .unwrap();
         store.segment_catalog().begin_write(&orphan).unwrap();
         let orphan_commit = store

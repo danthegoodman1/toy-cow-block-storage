@@ -17,8 +17,9 @@ use toy_cow_block_storage::{
     AppendStream, AppendTicket, ByteRange, CreateDeviceRequest, CreateFileRequest,
     CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableAppendMark, DurableCoordinator,
     DurableDataLogPolicy, DurablePersistProfile, FileId, FileSpec, FlushResult, KeyspaceId,
-    LocalCoordinator, LocalStoreConfig, PayloadIntegrity, ReadVerification, Result, StorageError,
-    StorageNodeId, WriteDurability,
+    LocalCoordinator, LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile, PayloadIntegrity,
+    ReadVerification, Result, StorageError, StorageNodeId, TxnBlockCoordinator,
+    TxnBlockWriteProfile, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -71,6 +72,8 @@ struct Args {
     device_blocks: u64,
     samples_per_worker: usize,
     durable_profile_csv: Option<PathBuf>,
+    metadata_profile_csv: Option<PathBuf>,
+    block_write_profile_csv: Option<PathBuf>,
     stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
     payload_integrity: PayloadIntegrity,
@@ -96,6 +99,8 @@ impl Args {
             device_blocks: DEFAULT_DEVICE_BLOCKS,
             samples_per_worker: 200_000,
             durable_profile_csv: None,
+            metadata_profile_csv: None,
+            block_write_profile_csv: None,
             stream_flush_bytes: None,
             stream_publish_bytes: None,
             payload_integrity: PayloadIntegrity::Verified,
@@ -145,6 +150,18 @@ impl Args {
                     args.durable_profile_csv = Some(PathBuf::from(parse_next::<String>(
                         &mut raw,
                         "--durable-profile-csv",
+                    )?));
+                }
+                "--metadata-profile-csv" => {
+                    args.metadata_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--metadata-profile-csv",
+                    )?));
+                }
+                "--block-write-profile-csv" => {
+                    args.block_write_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--block-write-profile-csv",
                     )?));
                 }
                 "--stream-flush-mib" => {
@@ -240,7 +257,8 @@ fn print_help() {
         "usage: cargo run --release --bin loadbench -- [options]\n\
 \n\
 options:\n\
-  --provider local|durable                 default: local\n\
+  --provider local|durable|txn-serial|txn-sharded\n\
+                                           default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
                                            aliases: north-star, append-batch, append-stream, block-metadata\n\
@@ -277,6 +295,8 @@ options:\n\
   --device-blocks N                        logical device blocks, default: 1048576\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
   --durable-profile-csv PATH               append durable persist profiles to CSV\n\
+  --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
+  --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --stream-flush-mib N                     flush append streams after N MiB per stream; 2-4 is latency-first\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --payload-integrity verified|unchecked   write payload integrity, default: verified\n\
@@ -325,6 +345,13 @@ fn parse_payload_integrity(value: &str) -> Result<PayloadIntegrity> {
     }
 }
 
+fn payload_integrity_name(value: PayloadIntegrity) -> &'static str {
+    match value {
+        PayloadIntegrity::Verified => "verified",
+        PayloadIntegrity::Unchecked => "unchecked",
+    }
+}
+
 fn parse_read_verification(value: &str) -> Result<ReadVerification> {
     match value {
         "default" => Ok(ReadVerification::Default),
@@ -354,6 +381,8 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
 enum ProviderKind {
     Local,
     Durable,
+    TxnSerial,
+    TxnSharded,
 }
 
 impl fmt::Display for ProviderKind {
@@ -361,6 +390,8 @@ impl fmt::Display for ProviderKind {
         match self {
             Self::Local => f.write_str("local"),
             Self::Durable => f.write_str("durable"),
+            Self::TxnSerial => f.write_str("txn-serial"),
+            Self::TxnSharded => f.write_str("txn-sharded"),
         }
     }
 }
@@ -372,6 +403,8 @@ impl FromStr for ProviderKind {
         match value {
             "local" => Ok(Self::Local),
             "durable" => Ok(Self::Durable),
+            "txn-serial" => Ok(Self::TxnSerial),
+            "txn-sharded" => Ok(Self::TxnSharded),
             _ => Err(StorageError::invalid_argument(format!(
                 "unknown provider {value}"
             ))),
@@ -729,6 +762,7 @@ impl FromStr for Workload {
 enum BenchStore {
     Local(Arc<LocalCoordinator>),
     Durable(Arc<DurableCoordinator>),
+    Txn(Arc<TxnBlockCoordinator>),
 }
 
 impl BenchStore {
@@ -738,6 +772,36 @@ impl BenchStore {
                 args.config(),
                 args.storage_node_ids(),
             )?))),
+            ProviderKind::TxnSerial => {
+                let store = Arc::new(TxnBlockCoordinator::with_storage_nodes(
+                    args.config(),
+                    args.storage_node_ids(),
+                    MetadataTxnMode::Serial,
+                )?);
+                if args.metadata_profile_csv.is_some() {
+                    store.enable_metadata_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                if args.block_write_profile_csv.is_some() {
+                    store.enable_block_write_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                Ok(Self::Txn(store))
+            }
+            ProviderKind::TxnSharded => {
+                let store = Arc::new(TxnBlockCoordinator::with_storage_nodes(
+                    args.config(),
+                    args.storage_node_ids(),
+                    MetadataTxnMode::Sharded {
+                        shard_count: args.shards,
+                    },
+                )?);
+                if args.metadata_profile_csv.is_some() {
+                    store.enable_metadata_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                if args.block_write_profile_csv.is_some() {
+                    store.enable_block_write_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                Ok(Self::Txn(store))
+            }
             ProviderKind::Durable => {
                 let store = Arc::new(
                     DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
@@ -762,6 +826,7 @@ impl BenchStore {
                 .create_device(MetadataCreateDeviceRequest::from(request))
                 .map(|head| head.device_id),
             Self::Durable(store) => store.create_device(request),
+            Self::Txn(store) => store.create_device(request),
         }
     }
 
@@ -772,6 +837,9 @@ impl BenchStore {
                 .create_keyspace(MetadataCreateKeyspaceRequest { request })
                 .map(|head| head.keyspace_id),
             Self::Durable(store) => store.create_keyspace(request),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
     }
 
@@ -785,6 +853,9 @@ impl BenchStore {
                 })
                 .map(|head| head.file_id),
             Self::Durable(store) => store.create_file(keyspace_id, request),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
     }
 
@@ -811,6 +882,13 @@ impl BenchStore {
                 durability,
                 payload_integrity,
             ),
+            Self::Txn(store) => store.write_device_with_integrity(
+                device_id,
+                offset,
+                data,
+                durability,
+                payload_integrity,
+            ),
         }
         .map(|_| ())
     }
@@ -829,6 +907,9 @@ impl BenchStore {
             Self::Durable(store) => {
                 store.read_device_with_verification(device_id, range, buf, verification)
             }
+            Self::Txn(store) => {
+                store.read_device_with_verification(device_id, range, buf, verification)
+            }
         }
     }
 
@@ -842,6 +923,7 @@ impl BenchStore {
                 })
             }
             Self::Durable(store) => store.flush_device(device_id),
+            Self::Txn(store) => store.flush_device(device_id),
         }
     }
 
@@ -871,6 +953,9 @@ impl BenchStore {
                 durability,
                 payload_integrity,
             ),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
         .map(|_| ())
     }
@@ -879,6 +964,9 @@ impl BenchStore {
         match self {
             Self::Local(store) => store.open_append_stream(keyspace_id, file_id),
             Self::Durable(store) => store.open_append_stream(keyspace_id, file_id),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
     }
 
@@ -910,6 +998,9 @@ impl BenchStore {
             Self::Durable(store) => {
                 store.append_stream_with_integrity(stream, data, durability, payload_integrity)
             }
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
     }
 
@@ -917,6 +1008,9 @@ impl BenchStore {
         match self {
             Self::Local(store) => store.flush_append_stream(stream),
             Self::Durable(store) => store.flush_append_stream(stream),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
     }
 
@@ -926,6 +1020,9 @@ impl BenchStore {
                 store.publish_append_stream(stream, mark, WriteDurability::Acknowledged)
             }
             Self::Durable(store) => store.publish_append_stream(stream, mark),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
         .map(|_| ())
     }
@@ -945,6 +1042,9 @@ impl BenchStore {
             Self::Durable(store) => {
                 store.read_file_with_verification(keyspace_id, file_id, range, buf, verification)
             }
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
     }
 
@@ -958,6 +1058,9 @@ impl BenchStore {
                 })
             }
             Self::Durable(store) => store.flush_file(keyspace_id, file_id),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider is block-only in loadbench",
+            )),
         }
     }
 
@@ -965,6 +1068,21 @@ impl BenchStore {
         match self {
             Self::Local(_) => Ok(Vec::new()),
             Self::Durable(store) => store.drain_persist_profiles(max),
+            Self::Txn(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn drain_metadata_profiles(&self, max: usize) -> Result<Vec<MetadataTxnProfile>> {
+        match self {
+            Self::Txn(store) => store.drain_metadata_profiles(max),
+            Self::Local(_) | Self::Durable(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn drain_block_write_profiles(&self, max: usize) -> Result<Vec<TxnBlockWriteProfile>> {
+        match self {
+            Self::Txn(store) => store.drain_block_write_profiles(max),
+            Self::Local(_) | Self::Durable(_) => Ok(Vec::new()),
         }
     }
 }
@@ -1010,12 +1128,18 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     let context = setup_context(args, workload, concurrency, store)?;
     let profile_store = context.store.clone();
     let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
     if !args.warmup.is_zero() {
         let _ = execute_load(args, workload, concurrency, context.clone(), args.warmup)?;
         let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
+        let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
+        let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
     }
     let mut report = execute_load(args, workload, concurrency, context, args.duration)?;
     append_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_metadata_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_block_write_profile_csv(args, workload, concurrency, &profile_store)?;
     report.provider = args.provider;
     report.durability = args.durability;
     report.workload = workload;
@@ -1094,6 +1218,151 @@ fn append_profile_csv(
             profile.touched_manifest_rows,
             profile.commit_rows_written,
             profile.durable_commit_high_water,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}
+
+fn append_metadata_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.metadata_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,phase,total_nanos,tx_lock_wait_nanos,read_validation_nanos,apply_write_nanos,commit_version_alloc_nanos,touched_key_shards,read_key_count,write_key_count,conflict_count"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.name(),
+            args.provider,
+            args.durability,
+            args.rtt.as_micros(),
+            args.serial_rtts,
+            concurrency,
+            workload.op_size(),
+            profile.sequence,
+            profile.phase,
+            profile.total_nanos,
+            profile.tx_lock_wait_nanos,
+            profile.read_validation_nanos,
+            profile.apply_write_nanos,
+            profile.commit_version_alloc_nanos,
+            profile.touched_key_shards,
+            profile.read_key_count,
+            profile.write_key_count,
+            profile.conflict_count,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}
+
+fn append_block_write_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.block_write_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,payload_integrity,sequence,total_nanos,device_spec_lookup_nanos,range_split_shard_head_read_nanos,write_intent_alloc_nanos,payload_copy_nanos,segment_write_nanos,storage_node_ids_nanos,placement_select_nanos,segment_id_alloc_nanos,grant_issue_nanos,storage_node_transport_dispatch_nanos,grant_verify_nanos,catalog_duplicate_probe_nanos,catalog_duplicate_probe_lock_wait_nanos,catalog_reserve_nanos,catalog_reserve_lock_wait_nanos,catalog_begin_nanos,catalog_begin_lock_wait_nanos,segment_store_write_nanos,segment_store_lock_wait_nanos,checksum_integrity_nanos,segment_store_insert_nanos,segment_sync_nanos,segment_sync_lock_wait_nanos,receipt_create_nanos,receipt_verify_nanos,catalog_commit_nanos,catalog_commit_lock_wait_nanos,tree_path_copy_nanos,metadata_publish_call_nanos,mark_referenced_nanos,mark_reference_evidence_nanos,mark_reference_transport_dispatch_nanos,mark_reference_verify_nanos,mark_reference_catalog_nanos,mark_reference_catalog_lock_wait_nanos,touched_shard_count,segment_count,profile_storage_node_count"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.name(),
+            args.provider,
+            args.durability,
+            args.rtt.as_micros(),
+            args.serial_rtts,
+            concurrency,
+            workload.op_size(),
+            args.storage_nodes,
+            payload_integrity_name(args.payload_integrity),
+            profile.sequence,
+            profile.total_nanos,
+            profile.device_spec_lookup_nanos,
+            profile.range_split_shard_head_read_nanos,
+            profile.write_intent_alloc_nanos,
+            profile.payload_copy_nanos,
+            profile.segment_write_nanos,
+            profile.storage_node_ids_nanos,
+            profile.placement_select_nanos,
+            profile.segment_id_alloc_nanos,
+            profile.grant_issue_nanos,
+            profile.storage_node_transport_dispatch_nanos,
+            profile.grant_verify_nanos,
+            profile.catalog_duplicate_probe_nanos,
+            profile.catalog_duplicate_probe_lock_wait_nanos,
+            profile.catalog_reserve_nanos,
+            profile.catalog_reserve_lock_wait_nanos,
+            profile.catalog_begin_nanos,
+            profile.catalog_begin_lock_wait_nanos,
+            profile.segment_store_write_nanos,
+            profile.segment_store_lock_wait_nanos,
+            profile.checksum_integrity_nanos,
+            profile.segment_store_insert_nanos,
+            profile.segment_sync_nanos,
+            profile.segment_sync_lock_wait_nanos,
+            profile.receipt_create_nanos,
+            profile.receipt_verify_nanos,
+            profile.catalog_commit_nanos,
+            profile.catalog_commit_lock_wait_nanos,
+            profile.tree_path_copy_nanos,
+            profile.metadata_publish_call_nanos,
+            profile.mark_referenced_nanos,
+            profile.mark_reference_evidence_nanos,
+            profile.mark_reference_transport_dispatch_nanos,
+            profile.mark_reference_verify_nanos,
+            profile.mark_reference_catalog_nanos,
+            profile.mark_reference_catalog_lock_wait_nanos,
+            profile.touched_shard_count,
+            profile.segment_count,
+            profile.storage_node_count,
         )
         .map_err(fs_error)?;
     }
