@@ -66,6 +66,7 @@ id_type!(GrantNonce, u128);
 id_type!(GrantEpoch, u64);
 id_type!(AppendStreamId, u128);
 id_type!(AppendTicketId, u128);
+id_type!(AppendRunId, u128);
 id_type!(ExtentId, u128);
 id_type!(LogicalTime, u64);
 id_type!(LogicalDeadline, u64);

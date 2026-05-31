@@ -4,9 +4,10 @@ use std::sync::Arc;
 use crate::api::BlockRange;
 use crate::error::{Result, StorageError};
 use crate::id::{
-    BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq, DeviceGeneration, DeviceId,
-    FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId,
-    LogicalTime, MetadataNodeId, SegmentId, ShardId,
+    AppendRunId, AppendStreamId, BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq,
+    DeviceGeneration, DeviceId, FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration,
+    KeyspaceId, KeyspaceRootId, LogicalTime, MetadataNodeId, SegmentId, ShardId, StorageNodeId,
+    WriterEpoch,
 };
 
 /// Stored payload integrity for one immutable data segment.
@@ -307,6 +308,196 @@ impl LeafEntry {
             ));
         }
 
+        Ok(())
+    }
+}
+
+/// Durable append-run manifest owned by a storage-node append lane.
+///
+/// A run is private append-stream data until a stream publish attaches a covered
+/// range to visible native file metadata. Unlike an ordinary immutable segment,
+/// the run identity describes bytes already present in a storage-node append
+/// log. A publish may coalesce adjacent compatible runs into one visible extent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppendLogRun {
+    pub run_id: AppendRunId,
+    pub storage_node: StorageNodeId,
+    pub stream_id: AppendStreamId,
+    pub writer_epoch: WriterEpoch,
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
+    pub file_offset_start: u64,
+    pub payload_len: u64,
+    pub log_id: u64,
+    pub log_payload_offset: u64,
+    pub log_record_bytes: u64,
+    pub integrity: SegmentPayloadIntegrity,
+}
+
+impl AppendLogRun {
+    pub fn validate(&self) -> Result<()> {
+        if self.payload_len == 0 {
+            return Err(StorageError::invalid_argument(
+                "append log run must contain bytes",
+            ));
+        }
+        self.file_offset_end()?;
+        self.log_payload_end()?;
+        if self.log_record_bytes < self.payload_len {
+            return Err(StorageError::invalid_argument(
+                "append log record must cover payload bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn file_offset_end(&self) -> Result<u64> {
+        self.file_offset_start
+            .checked_add(self.payload_len)
+            .ok_or_else(|| StorageError::invalid_argument("append run file range overflows"))
+    }
+
+    pub fn log_payload_end(&self) -> Result<u64> {
+        self.log_payload_offset
+            .checked_add(self.payload_len)
+            .ok_or_else(|| StorageError::invalid_argument("append run log range overflows"))
+    }
+
+    pub fn full_range(&self) -> AppendLogRunRange {
+        AppendLogRunRange {
+            run_id: self.run_id,
+            storage_node: self.storage_node,
+            stream_id: self.stream_id,
+            writer_epoch: self.writer_epoch,
+            keyspace_id: self.keyspace_id,
+            file_id: self.file_id,
+            file_offset_start: self.file_offset_start,
+            payload_len: self.payload_len,
+            log_id: self.log_id,
+            log_payload_offset: self.log_payload_offset,
+            integrity: self.integrity,
+        }
+    }
+}
+
+/// Visible or private byte range inside an append log run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppendLogRunRange {
+    pub run_id: AppendRunId,
+    pub storage_node: StorageNodeId,
+    pub stream_id: AppendStreamId,
+    pub writer_epoch: WriterEpoch,
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
+    pub file_offset_start: u64,
+    pub payload_len: u64,
+    pub log_id: u64,
+    pub log_payload_offset: u64,
+    pub integrity: SegmentPayloadIntegrity,
+}
+
+impl AppendLogRunRange {
+    pub fn validate(&self) -> Result<()> {
+        if self.payload_len == 0 {
+            return Err(StorageError::invalid_argument(
+                "append log run range must contain bytes",
+            ));
+        }
+        self.file_offset_end()?;
+        self.log_payload_end()?;
+        Ok(())
+    }
+
+    pub fn file_offset_end(&self) -> Result<u64> {
+        self.file_offset_start
+            .checked_add(self.payload_len)
+            .ok_or_else(|| StorageError::invalid_argument("append run file range overflows"))
+    }
+
+    pub fn log_payload_end(&self) -> Result<u64> {
+        self.log_payload_offset
+            .checked_add(self.payload_len)
+            .ok_or_else(|| StorageError::invalid_argument("append run log range overflows"))
+    }
+
+    fn can_coalesce_with(&self, next: &Self) -> Result<bool> {
+        Ok(self.run_id == next.run_id
+            && self.storage_node == next.storage_node
+            && self.stream_id == next.stream_id
+            && self.writer_epoch == next.writer_epoch
+            && self.keyspace_id == next.keyspace_id
+            && self.file_id == next.file_id
+            && self.log_id == next.log_id
+            && self.integrity == next.integrity
+            && self.file_offset_end()? == next.file_offset_start
+            && self.log_payload_end()? == next.log_payload_offset)
+    }
+}
+
+/// Coalesce adjacent compatible append-run ranges in deterministic file order.
+///
+/// Gaps are preserved as separate ranges. Overlaps are invalid because a
+/// visible file extent set must not contain ambiguous bytes.
+pub fn coalesce_append_log_run_ranges(
+    mut ranges: Vec<AppendLogRunRange>,
+) -> Result<Vec<AppendLogRunRange>> {
+    ranges.sort_by_key(|range| {
+        (
+            range.file_offset_start,
+            range.storage_node.raw(),
+            range.log_id,
+            range.log_payload_offset,
+            range.run_id.raw(),
+        )
+    });
+
+    let mut coalesced: Vec<AppendLogRunRange> = Vec::new();
+    for range in ranges {
+        range.validate()?;
+        if let Some(previous) = coalesced.last_mut() {
+            if range.file_offset_start < previous.file_offset_end()? {
+                return Err(StorageError::invalid_argument(
+                    "append run ranges must not overlap",
+                ));
+            }
+            if previous.can_coalesce_with(&range)? {
+                previous.payload_len = previous
+                    .payload_len
+                    .checked_add(range.payload_len)
+                    .ok_or_else(|| {
+                        StorageError::invalid_argument("append run coalesced length overflows")
+                    })?;
+                continue;
+            }
+        }
+        coalesced.push(range);
+    }
+    Ok(coalesced)
+}
+
+/// Native file extent backed directly by an append-log run range.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunBackedFileExtent {
+    pub file_offset_start: u64,
+    pub payload_len: u64,
+    pub run: AppendLogRunRange,
+}
+
+impl RunBackedFileExtent {
+    pub fn validate(&self) -> Result<()> {
+        self.run.validate()?;
+        if self.payload_len == 0 {
+            return Err(StorageError::invalid_argument(
+                "run-backed file extent must contain bytes",
+            ));
+        }
+        if self.file_offset_start != self.run.file_offset_start
+            || self.payload_len != self.run.payload_len
+        {
+            return Err(StorageError::invalid_argument(
+                "run-backed file extent range must match run range",
+            ));
+        }
         Ok(())
     }
 }
@@ -636,6 +827,22 @@ mod tests {
         }
     }
 
+    fn append_run_range(file_offset_start: u64, payload_len: u64) -> AppendLogRunRange {
+        AppendLogRunRange {
+            run_id: AppendRunId::from_raw(1),
+            storage_node: StorageNodeId::from_raw(7),
+            stream_id: AppendStreamId::from_raw(9),
+            writer_epoch: WriterEpoch::from_raw(11),
+            keyspace_id: KeyspaceId::from_raw(13),
+            file_id: FileId::from_raw(15),
+            file_offset_start,
+            payload_len,
+            log_id: 17,
+            log_payload_offset: 4096 + file_offset_start,
+            integrity: SegmentPayloadIntegrity::Unchecked,
+        }
+    }
+
     #[test]
     fn device_head_validation_requires_fixed_nonzero_shard_count() {
         let head = DeviceHead {
@@ -753,6 +960,102 @@ mod tests {
         assert!(overflow.validate(BLOCK_SIZE).is_err());
 
         assert!(segment(1, 4).validate(3000).is_err());
+    }
+
+    #[test]
+    fn append_log_run_validation_rejects_empty_and_overflowing_ranges() {
+        let run = AppendLogRun {
+            run_id: AppendRunId::from_raw(1),
+            storage_node: StorageNodeId::from_raw(2),
+            stream_id: AppendStreamId::from_raw(3),
+            writer_epoch: WriterEpoch::from_raw(4),
+            keyspace_id: KeyspaceId::from_raw(5),
+            file_id: FileId::from_raw(6),
+            file_offset_start: 1024,
+            payload_len: 4096,
+            log_id: 7,
+            log_payload_offset: 8192,
+            log_record_bytes: 4096 + 64,
+            integrity: SegmentPayloadIntegrity::Unchecked,
+        };
+        assert!(run.validate().is_ok());
+        assert_eq!(run.full_range().payload_len, 4096);
+
+        assert!(
+            AppendLogRun {
+                payload_len: 0,
+                ..run.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AppendLogRun {
+                file_offset_start: u64::MAX,
+                ..run.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AppendLogRun {
+                log_record_bytes: 4095,
+                ..run
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn append_log_run_ranges_coalesce_only_adjacent_compatible_runs() {
+        let one_mib = 1024 * 1024;
+        let ranges = vec![
+            append_run_range(one_mib, one_mib),
+            append_run_range(0, one_mib),
+            append_run_range(2 * one_mib, one_mib),
+        ];
+        let coalesced = coalesce_append_log_run_ranges(ranges).unwrap();
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].file_offset_start, 0);
+        assert_eq!(coalesced[0].payload_len, 3 * one_mib);
+
+        let mut different_log = append_run_range(3 * one_mib, one_mib);
+        different_log.log_id += 1;
+        let coalesced =
+            coalesce_append_log_run_ranges(vec![append_run_range(0, one_mib), different_log])
+                .unwrap();
+        assert_eq!(coalesced.len(), 2);
+
+        let overlap = coalesce_append_log_run_ranges(vec![
+            append_run_range(0, one_mib),
+            append_run_range(one_mib / 2, one_mib),
+        ]);
+        assert!(overlap.is_err());
+    }
+
+    #[test]
+    fn run_backed_file_extent_range_must_match_its_run() {
+        let run = append_run_range(4096, 8192);
+        assert!(
+            RunBackedFileExtent {
+                file_offset_start: 4096,
+                payload_len: 8192,
+                run: run.clone(),
+            }
+            .validate()
+            .is_ok()
+        );
+
+        assert!(
+            RunBackedFileExtent {
+                file_offset_start: 0,
+                payload_len: 8192,
+                run,
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

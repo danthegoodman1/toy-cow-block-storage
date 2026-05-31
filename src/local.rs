@@ -33,7 +33,7 @@ use crate::extent::{
     NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
 };
 use crate::id::{
-    AppendStreamId, AppendTicketId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
+    AppendRunId, AppendStreamId, AppendTicketId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
     CommitGroupId, CommitSeq, DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion,
     GrantEpoch, GrantId, GrantNonce, KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId,
     KeyspaceRootId, LogicalDeadline, LogicalTime, MetadataNodeId, PrincipalId, RequestId,
@@ -41,10 +41,11 @@ use crate::id::{
     WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead,
-    ForkRecord, KeyspaceCatalogShard, KeyspaceCommit, KeyspaceFile, KeyspaceHead, KeyspaceRoot,
-    LeafEntry, MappingOwner, MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate,
-    SegmentDescriptor, SegmentPayloadIntegrity, ShardCommit, ShardRootUpdate,
+    AppendLogRun, AppendLogRunRange, Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord,
+    DeviceHead, FileCommit, FileHead, ForkRecord, KeyspaceCatalogShard, KeyspaceCommit,
+    KeyspaceFile, KeyspaceHead, KeyspaceRoot, LeafEntry, MappingOwner, MetadataChild, MetadataNode,
+    MetadataNodeKind, RootUpdate, RunBackedFileExtent, SegmentDescriptor, SegmentPayloadIntegrity,
+    ShardCommit, ShardRootUpdate,
 };
 use crate::provider::{
     CommitGroupIntent, DiagnosticsCounters, DiagnosticsGauges, DiagnosticsNodeSnapshot,
@@ -18433,6 +18434,7 @@ macro_rules! durable_id_codec_u32 {
 }
 
 durable_id_codec_u128!(
+    AppendRunId,
     AppendStreamId,
     AppendTicketId,
     CheckpointId,
@@ -18689,6 +18691,88 @@ impl DurableCodec for LeafEntry {
             blocks: BlockCount::decode(input)?,
             segment_id: SegmentId::decode(input)?,
             segment_offset: BlockIndex::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendLogRun {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.run_id.encode(out)?;
+        self.storage_node.encode(out)?;
+        self.stream_id.encode(out)?;
+        self.writer_epoch.encode(out)?;
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.file_offset_start.encode(out)?;
+        self.payload_len.encode(out)?;
+        self.log_id.encode(out)?;
+        self.log_payload_offset.encode(out)?;
+        self.log_record_bytes.encode(out)?;
+        self.integrity.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            run_id: AppendRunId::decode(input)?,
+            storage_node: StorageNodeId::decode(input)?,
+            stream_id: AppendStreamId::decode(input)?,
+            writer_epoch: WriterEpoch::decode(input)?,
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            file_offset_start: u64::decode(input)?,
+            payload_len: u64::decode(input)?,
+            log_id: u64::decode(input)?,
+            log_payload_offset: u64::decode(input)?,
+            log_record_bytes: u64::decode(input)?,
+            integrity: SegmentPayloadIntegrity::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for AppendLogRunRange {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.run_id.encode(out)?;
+        self.storage_node.encode(out)?;
+        self.stream_id.encode(out)?;
+        self.writer_epoch.encode(out)?;
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.file_offset_start.encode(out)?;
+        self.payload_len.encode(out)?;
+        self.log_id.encode(out)?;
+        self.log_payload_offset.encode(out)?;
+        self.integrity.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            run_id: AppendRunId::decode(input)?,
+            storage_node: StorageNodeId::decode(input)?,
+            stream_id: AppendStreamId::decode(input)?,
+            writer_epoch: WriterEpoch::decode(input)?,
+            keyspace_id: KeyspaceId::decode(input)?,
+            file_id: FileId::decode(input)?,
+            file_offset_start: u64::decode(input)?,
+            payload_len: u64::decode(input)?,
+            log_id: u64::decode(input)?,
+            log_payload_offset: u64::decode(input)?,
+            integrity: SegmentPayloadIntegrity::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for RunBackedFileExtent {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.file_offset_start.encode(out)?;
+        self.payload_len.encode(out)?;
+        self.run.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            file_offset_start: u64::decode(input)?,
+            payload_len: u64::decode(input)?,
+            run: AppendLogRunRange::decode(input)?,
         })
     }
 }
@@ -22922,6 +23006,29 @@ mod tests {
 
         let catalog = store.segment_catalog().state_inner().unwrap();
         assert_durable_row_round_trip(catalog.entries.values().next().unwrap());
+
+        let run = AppendLogRun {
+            run_id: AppendRunId::from_raw(1),
+            storage_node: StorageNodeId::from_raw(1),
+            stream_id: AppendStreamId::from_raw(2),
+            writer_epoch: WriterEpoch::from_raw(3),
+            keyspace_id,
+            file_id: _file_id,
+            file_offset_start: 0,
+            payload_len: 4096,
+            log_id: 4,
+            log_payload_offset: 512,
+            log_record_bytes: 4096 + 64,
+            integrity: SegmentPayloadIntegrity::Unchecked,
+        };
+        let run_range = run.full_range();
+        assert_durable_row_round_trip(&run);
+        assert_durable_row_round_trip(&run_range);
+        assert_durable_row_round_trip(&RunBackedFileExtent {
+            file_offset_start: run_range.file_offset_start,
+            payload_len: run_range.payload_len,
+            run: run_range,
+        });
     }
 
     #[test]
