@@ -1306,7 +1306,7 @@ host/filesystem dependent.
 
 ## Phase 23A: Durable Append-Run Native Streams
 
-Status: planned.
+Status: implemented with measured tail follow-up.
 
 Replace the native append-stream storage shape with durable append runs and
 compact run-backed visible file extents. The public stream API keeps the
@@ -1324,37 +1324,45 @@ Non-goals:
 
 Deliverables:
 
-- [ ] Core append-run, run-range, checksum-range, durable-mark, and
+- [x] Core append-run, run-range, checksum-range, durable-mark, and
   run-backed-file-extent types with deterministic validation.
-- [ ] Stream ingest writes payloads once into storage-node append lanes, not
+- [x] Stream ingest writes payloads once into storage-node append lanes, not
   into both append logs and ordinary segments.
-- [ ] Bounded durable stream flush persists log runs and stream high-water
+- [x] Bounded durable stream flush persists log runs and stream high-water
   without generic full-state or generic segment publish paths.
-- [ ] Visible publish converts durable stream runs into coalesced file extents
+- [x] Visible publish converts durable stream runs into coalesced file extents
   in one metadata transition.
-- [ ] Reopen restores visible heads and resumable private stream state while
+- [x] Reopen restores visible heads and resumable private stream state while
   ignoring unflushed bytes.
-- [ ] GC roots include active/resumable private stream ranges and stop
+- [x] GC roots include active/resumable private stream ranges and stop
   protecting fenced, aborted, expired, superseded, or fully published private
   ranges.
-- [ ] Read paths support verified reads from run-backed extents and explicit
+- [x] Read paths support verified reads from run-backed extents and explicit
   no-verify policy when callers choose it.
-- [ ] `loadbench` reports the append-run matrix at 200 us modeled RTT with
+- [x] `loadbench` reports the append-run matrix at 200 us modeled RTT with
   phase-level durable profiles.
 
 Exit gate:
 
-- [ ] `append_stream` does not create ordinary segment placements or durable
+- [x] `append_stream` does not create ordinary segment placements or durable
   stream rows with one record per client append.
-- [ ] Publishing 128 one-MiB appends produces one or a small deterministic
+- [x] Publishing 128 one-MiB appends produces one or a small deterministic
   number of visible extents when the physical run is contiguous.
 - [ ] Stream flush p99 is dominated by bounded physical sync groups, not global
   lock wait or metadata fanout.
-- [ ] Publish profile has no payload append/sync and scales with run count.
-- [ ] Fencing, restart, corruption, PITR, fork, and GC tests pass for
+- [x] Publish profile has no payload append/sync and scales with run count.
+- [x] Fencing, restart, corruption, PITR, fork, and GC tests pass for
   durable-but-invisible private data.
-- [ ] The no-tombstones rule is upheld: once the run-backed path is complete,
+- [x] The no-tombstones rule is upheld: once the run-backed path is complete,
   the old stream-segment path is deleted rather than kept as a wrapper.
+
+Measured checkpoint: `target/loadbench/append-run-waiter-batch-final/` has the
+200 us RTT matrix and phase profiles for the run-backed implementation. c16
+stream ingest now reaches multi-GiB/s throughput, and metadata phases are no
+longer the dominant cost. The remaining unchecked exit item is conservative:
+large c16 stream flushes still show occasional wait tails behind bounded data-log
+sync groups, so the next performance pass should focus on whether that queueing
+is acceptable or should be split across more independent storage-node lanes.
 
 ## Phase 24: Background Compaction Scheduling and Backpressure Policy
 

@@ -3153,13 +3153,10 @@ impl LocalCoordinator {
         let run_extents: Vec<_> = unpublished
             .iter()
             .map(|record| {
-                let run = record
-                    .append_run()
-                    .ok_or_else(|| StorageError::conflict("append stream record is not durable"))?;
                 let extent = RunBackedFileExtent {
                     file_offset_start: record.offset,
                     payload_len: record.len,
-                    run: run.full_range(),
+                    run: record.run.full_range(),
                 };
                 extent.validate()?;
                 Ok(extent)
@@ -3453,9 +3450,7 @@ impl LocalCoordinator {
                 continue;
             }
             for record in &stream.records {
-                if let Some(run) = record.append_run() {
-                    retained.insert((run.storage_node, run.log_id));
-                }
+                retained.insert((record.run.storage_node, record.run.log_id));
             }
         }
         lock(&self.append_run_logs)?.retain(|key, _| retained.contains(key));
@@ -5774,7 +5769,48 @@ struct StreamFlushCoordinator {
 struct StreamFlushCoordinatorState {
     in_flight: bool,
     generation: u64,
+    requests: BTreeMap<AppendStreamId, StreamFlushRequest>,
     last_error: Option<(u64, StorageError)>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamFlushRequest {
+    stream: AppendStream,
+    durable_through: u64,
+    waiters: usize,
+}
+
+impl StreamFlushCoordinatorState {
+    fn add_request(&mut self, stream: &AppendStream, durable_through: u64) {
+        self.requests
+            .entry(stream.stream_id)
+            .and_modify(|request| {
+                request.durable_through = request.durable_through.max(durable_through);
+                request.waiters = request.waiters.saturating_add(1);
+            })
+            .or_insert_with(|| StreamFlushRequest {
+                stream: stream.clone(),
+                durable_through,
+                waiters: 1,
+            });
+    }
+
+    fn release_request(&mut self, stream_id: AppendStreamId) {
+        if let Some(request) = self.requests.get_mut(&stream_id)
+            && request.waiters > 1
+        {
+            request.waiters -= 1;
+            return;
+        }
+        self.requests.remove(&stream_id);
+    }
+
+    fn snapshot_requests(&self) -> Vec<(AppendStream, u64)> {
+        self.requests
+            .values()
+            .map(|request| (request.stream.clone(), request.durable_through))
+            .collect()
+    }
 }
 
 impl StreamFlushCoordinator {
@@ -5783,6 +5819,7 @@ impl StreamFlushCoordinator {
             inner: Mutex::new(StreamFlushCoordinatorState {
                 in_flight: false,
                 generation: 0,
+                requests: BTreeMap::new(),
                 last_error: None,
             }),
             cvar: Condvar::new(),
@@ -10899,26 +10936,33 @@ impl DurableCoordinator {
     fn persist_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
         let target = self.local.metadata.append_stream_flush_target(stream)?;
         let mut observed_generation = 0_u64;
+        {
+            let mut state = lock(&self.stream_flush_coordinator.inner)?;
+            state.add_request(stream, target.durable_through);
+        }
         loop {
             if let Some(mark) = self
                 .local
                 .metadata
                 .append_stream_durable_mark_if_reached(stream, target.durable_through)?
             {
+                lock(&self.stream_flush_coordinator.inner)?.release_request(stream.stream_id);
                 return Ok(mark);
             }
 
             let mut state = lock(&self.stream_flush_coordinator.inner)?;
-            if let Some((error_generation, error)) = &state.last_error
-                && *error_generation > observed_generation
+            if let Some((error_generation, error)) = state.last_error.clone()
+                && error_generation > observed_generation
             {
-                return Err(error.clone());
+                state.release_request(stream.stream_id);
+                return Err(error);
             }
             if !state.in_flight {
                 state.in_flight = true;
+                let requests = state.snapshot_requests();
                 drop(state);
 
-                let result = self.persist_available_append_stream_batches();
+                let result = self.persist_append_stream_batches_until(&requests);
 
                 let mut state = lock(&self.stream_flush_coordinator.inner)?;
                 state.in_flight = false;
@@ -10930,6 +10974,7 @@ impl DurableCoordinator {
                         self.stream_flush_coordinator.cvar.notify_all();
                     }
                     Err(error) => {
+                        state.release_request(stream.stream_id);
                         state.last_error = Some((state.generation, error.clone()));
                         self.stream_flush_coordinator.cvar.notify_all();
                         return Err(error);
@@ -10946,173 +10991,40 @@ impl DurableCoordinator {
         }
     }
 
-    fn persist_available_append_stream_batches(&self) -> Result<()> {
+    fn persist_append_stream_batches_until(&self, requests: &[(AppendStream, u64)]) -> Result<()> {
         for _ in 0..MAX_STREAM_FLUSH_GROUPS_PER_RUN {
-            if !self.persist_one_available_append_stream_batch()? {
+            if self.append_stream_requests_reached(requests)? {
                 return Ok(());
             }
+            if !self.persist_one_append_stream_request_batch(requests)? {
+                return Err(StorageError::conflict(
+                    "append stream flush target has no persistable records",
+                ));
+            }
         }
-        Ok(())
-    }
-
-    fn materialize_pending_append_stream_flush_plan(
-        &self,
-        plan: &AppendStreamFlushPlan,
-    ) -> Result<(
-        AppendStreamFlushPlan,
-        PendingDataLogAppend,
-        DataLogAppendProfile,
-    )> {
-        if plan.batch.records.is_empty() {
-            return Ok((
-                plan.clone(),
-                PendingDataLogAppend::default(),
-                DataLogAppendProfile::default(),
-            ));
-        }
-        if let Some(coalesced) = self.coalesce_raw_append_run_flush_plan(plan)? {
-            return Ok((
-                coalesced,
-                PendingDataLogAppend::default(),
-                DataLogAppendProfile::default(),
-            ));
-        }
-        Ok((
-            plan.clone(),
-            PendingDataLogAppend::default(),
-            DataLogAppendProfile::default(),
+        Err(StorageError::conflict(
+            "append stream flush target exceeded bounded persist groups",
         ))
     }
 
-    fn coalesce_raw_append_run_flush_plan(
-        &self,
-        plan: &AppendStreamFlushPlan,
-    ) -> Result<Option<AppendStreamFlushPlan>> {
-        if plan.batch.records.len() <= 1 {
-            return Ok(None);
-        }
-        let mut records = plan.batch.records.clone();
-        records.sort_by_key(|record| record.offset);
-        let first = records
-            .first()
-            .ok_or_else(|| StorageError::corrupt("append stream flush batch is empty"))?;
-        let first_run = first
-            .append_run()
-            .ok_or_else(|| StorageError::conflict("append stream record is not append-run"))?;
-        if first_run.log_record_bytes != first_run.payload_len {
-            return Ok(None);
-        }
-
-        let mut expected_file_offset = first.offset;
-        let mut expected_log_offset = first_run.log_payload_offset;
-        let mut total_len = 0_u64;
-        let mut integrity = first_run.integrity;
-        for (index, record) in records.iter().enumerate() {
-            let run = record
-                .append_run()
-                .ok_or_else(|| StorageError::conflict("append stream record is not append-run"))?;
-            if run.log_record_bytes != run.payload_len
-                || run.storage_node != first_run.storage_node
-                || run.stream_id != first_run.stream_id
-                || run.writer_epoch != first_run.writer_epoch
-                || run.keyspace_id != first_run.keyspace_id
-                || run.file_id != first_run.file_id
-                || run.log_id != first_run.log_id
-                || record.offset != expected_file_offset
-                || run.file_offset_start != expected_file_offset
-                || run.log_payload_offset != expected_log_offset
+    fn append_stream_requests_reached(&self, requests: &[(AppendStream, u64)]) -> Result<bool> {
+        for (stream, durable_through) in requests {
+            if self
+                .local
+                .metadata
+                .append_stream_durable_mark_if_reached(stream, *durable_through)?
+                .is_none()
             {
-                return Ok(None);
+                return Ok(false);
             }
-            if index != 0 {
-                integrity =
-                    combine_segment_payload_integrity(integrity, run.integrity, run.payload_len)?;
-            }
-            total_len = total_len
-                .checked_add(run.payload_len)
-                .ok_or_else(|| StorageError::invalid_argument("append run length overflows"))?;
-            expected_file_offset = expected_file_offset
-                .checked_add(run.payload_len)
-                .ok_or_else(|| {
-                    StorageError::invalid_argument("append run file offset overflows")
-                })?;
-            expected_log_offset = expected_log_offset
-                .checked_add(run.payload_len)
-                .ok_or_else(|| StorageError::invalid_argument("append run log offset overflows"))?;
         }
-        if expected_file_offset != plan.batch.durable_through {
-            return Ok(None);
-        }
-
-        let run = AppendLogRun {
-            run_id: first_run.run_id,
-            storage_node: first_run.storage_node,
-            stream_id: first_run.stream_id,
-            writer_epoch: first_run.writer_epoch,
-            keyspace_id: first_run.keyspace_id,
-            file_id: first_run.file_id,
-            file_offset_start: first_run.file_offset_start,
-            payload_len: total_len,
-            log_id: first_run.log_id,
-            log_payload_offset: first_run.log_payload_offset,
-            log_record_bytes: total_len,
-            integrity,
-        };
-        run.validate()?;
-        let replacement = AppendStreamSegment {
-            ticket_id: first.ticket_id,
-            offset: first.offset,
-            len: total_len,
-            backing: AppendStreamSegmentBacking::AppendRun { run },
-        };
-        self.local.metadata.replace_append_stream_records(
-            &plan.stream,
-            first.offset,
-            expected_file_offset,
-            replacement.clone(),
-        )?;
-        Ok(Some(AppendStreamFlushPlan {
-            stream: plan.stream.clone(),
-            batch: AppendStreamFlushBatch {
-                records: vec![replacement],
-                durable_through: expected_file_offset,
-                segment_bytes: total_len,
-            },
-        }))
+        Ok(true)
     }
 
-    fn materialize_pending_append_stream_flush_plans(
+    fn persist_one_append_stream_request_batch(
         &self,
-        plans: &[AppendStreamFlushPlan],
-    ) -> Result<(
-        Vec<AppendStreamFlushPlan>,
-        PendingDataLogAppend,
-        DataLogAppendProfile,
-    )> {
-        let mut materialized_append = PendingDataLogAppend::default();
-        let mut materialized_profile = DataLogAppendProfile::default();
-        let mut materialized_plans = Vec::with_capacity(plans.len());
-
-        for plan in plans {
-            let (plan, append, profile) =
-                self.materialize_pending_append_stream_flush_plan(plan)?;
-            materialized_append.merge(append);
-            materialized_profile.merge(profile);
-            materialized_plans.push(plan);
-        }
-
-        if !materialized_append.is_empty() {
-            lock(&self.pending_stream_data_log_append)?.merge(materialized_append.clone());
-        }
-
-        Ok((
-            materialized_plans,
-            materialized_append,
-            materialized_profile,
-        ))
-    }
-
-    fn persist_one_available_append_stream_batch(&self) -> Result<bool> {
+        requests: &[(AppendStream, u64)],
+    ) -> Result<bool> {
         let total_started = Instant::now();
         let _persist_guard = lock(&self.persist_lock)?;
         let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
@@ -11121,12 +11033,10 @@ impl DurableCoordinator {
         let plans = self
             .local
             .metadata
-            .append_stream_flush_plans_any(MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES)?;
+            .append_stream_flush_plans_for(requests, MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES)?;
         if plans.is_empty() {
             return Ok(false);
         }
-        let (plans, materialized_append, materialized_profile) =
-            self.materialize_pending_append_stream_flush_plans(&plans)?;
         let segment_ids: BTreeSet<SegmentId> = BTreeSet::new();
         let run_log_refs: BTreeSet<_> = plans
             .iter()
@@ -11134,26 +11044,23 @@ impl DurableCoordinator {
                 plan.batch
                     .records
                     .iter()
-                    .filter_map(AppendStreamSegment::log_ref)
+                    .map(AppendStreamRunRecord::log_ref)
             })
             .collect();
         let new_run_count = usize_to_u64(
             plans
                 .iter()
                 .flat_map(|plan| plan.batch.records.iter())
-                .filter(|record| record.append_run().is_some())
                 .count(),
         );
         let new_run_bytes = plans
             .iter()
             .flat_map(|plan| plan.batch.records.iter())
-            .filter(|record| record.append_run().is_some())
             .map(|record| record.len)
             .fold(0_u64, u64::saturating_add);
         let pending_stream = lock(&self.pending_stream_data_log_append)?;
         let mut pending_stream_append = pending_stream.selected_log_refs(&run_log_refs);
         drop(pending_stream);
-        pending_stream_append.merge(materialized_append);
         let mut pending_log_refs = pending_stream_append.log_refs();
         let missing_log_refs: Vec<_> = run_log_refs
             .difference(&pending_log_refs)
@@ -11204,16 +11111,6 @@ impl DurableCoordinator {
                 .mark_append_stream_durable_through(&plan.stream, plan.batch.durable_through)?;
         }
 
-        profile.data_log_encode_nanos = profile
-            .data_log_encode_nanos
-            .saturating_add(materialized_profile.encode_nanos);
-        profile.data_log_write_nanos = profile
-            .data_log_write_nanos
-            .saturating_add(materialized_profile.write_nanos);
-        profile.data_log_append_sync_nanos = profile
-            .data_log_append_sync_nanos
-            .saturating_add(materialized_profile.encode_nanos)
-            .saturating_add(materialized_profile.write_nanos);
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.new_segment_count = profile.new_segment_count.saturating_add(new_run_count);
@@ -12391,21 +12288,16 @@ enum AppendStreamStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum AppendStreamSegmentBacking {
-    AppendRun { run: AppendLogRun },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct AppendStreamSegment {
+struct AppendStreamRunRecord {
     ticket_id: AppendTicketId,
     offset: u64,
     len: u64,
-    backing: AppendStreamSegmentBacking,
+    run: AppendLogRun,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppendStreamFlushBatch {
-    records: Vec<AppendStreamSegment>,
+    records: Vec<AppendStreamRunRecord>,
     durable_through: u64,
     segment_bytes: u64,
 }
@@ -12425,30 +12317,75 @@ struct PreparedAppendStreamRun {
     run_id: AppendRunId,
 }
 
-impl AppendStreamSegment {
+impl AppendStreamRunRecord {
     fn end_exclusive(&self) -> Result<u64> {
         self.offset
             .checked_add(self.len)
             .ok_or_else(|| StorageError::invalid_argument("append record end overflows"))
     }
 
-    fn append_run(&self) -> Option<&AppendLogRun> {
-        match &self.backing {
-            AppendStreamSegmentBacking::AppendRun { run } => Some(run),
+    fn log_ref(&self) -> DurableDataLogRef {
+        DurableDataLogRef {
+            storage_node: self.run.storage_node,
+            log_id: self.run.log_id,
         }
-    }
-
-    fn log_ref(&self) -> Option<DurableDataLogRef> {
-        self.append_run().map(|run| DurableDataLogRef {
-            storage_node: run.storage_node,
-            log_id: run.log_id,
-        })
     }
 
     fn segment_bytes(&self) -> u64 {
-        match &self.backing {
-            AppendStreamSegmentBacking::AppendRun { run } => run.payload_len,
+        self.run.payload_len
+    }
+
+    fn coalesce_with(&self, next: &Self) -> Result<Option<Self>> {
+        let self_end = self.end_exclusive()?;
+        if self_end != next.offset
+            || self.run.log_record_bytes != self.run.payload_len
+            || next.run.log_record_bytes != next.run.payload_len
+            || self.run.storage_node != next.run.storage_node
+            || self.run.stream_id != next.run.stream_id
+            || self.run.writer_epoch != next.run.writer_epoch
+            || self.run.keyspace_id != next.run.keyspace_id
+            || self.run.file_id != next.run.file_id
+            || self.run.log_id != next.run.log_id
+            || self.run.file_offset_start != self.offset
+            || next.run.file_offset_start != next.offset
+            || self
+                .run
+                .log_payload_offset
+                .checked_add(self.run.payload_len)
+                != Some(next.run.log_payload_offset)
+        {
+            return Ok(None);
         }
+        let len = self
+            .len
+            .checked_add(next.len)
+            .ok_or_else(|| StorageError::invalid_argument("append run length overflows"))?;
+        if len > MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES {
+            return Ok(None);
+        }
+        let integrity =
+            combine_segment_payload_integrity(self.run.integrity, next.run.integrity, next.len)?;
+        let run = AppendLogRun {
+            run_id: self.run.run_id,
+            storage_node: self.run.storage_node,
+            stream_id: self.run.stream_id,
+            writer_epoch: self.run.writer_epoch,
+            keyspace_id: self.run.keyspace_id,
+            file_id: self.run.file_id,
+            file_offset_start: self.run.file_offset_start,
+            payload_len: len,
+            log_id: self.run.log_id,
+            log_payload_offset: self.run.log_payload_offset,
+            log_record_bytes: len,
+            integrity,
+        };
+        run.validate()?;
+        Ok(Some(Self {
+            ticket_id: self.ticket_id,
+            offset: self.offset,
+            len,
+            run,
+        }))
     }
 }
 
@@ -12464,7 +12401,7 @@ struct AppendStreamState {
     durable_through: u64,
     published_through: u64,
     status: AppendStreamStatus,
-    records: Vec<AppendStreamSegment>,
+    records: Vec<AppendStreamRunRecord>,
 }
 
 impl AppendStreamState {
@@ -13018,12 +12955,20 @@ impl InMemoryMetadataPlane {
                 "append stream record exceeds reserved tail",
             ));
         }
-        state.records.push(AppendStreamSegment {
+        let record = AppendStreamRunRecord {
             ticket_id,
             offset: range.offset,
             len: range.len,
-            backing: AppendStreamSegmentBacking::AppendRun { run },
-        });
+            run,
+        };
+        if let Some(last) = state.records.last_mut()
+            && last.end_exclusive()? > state.durable_through
+            && let Some(coalesced) = last.coalesce_with(&record)?
+        {
+            *last = coalesced;
+        } else {
+            state.records.push(record);
+        }
         Ok(AppendTicket {
             keyspace_id: stream.keyspace_id,
             file_id: stream.file_id,
@@ -13049,55 +12994,6 @@ impl InMemoryMetadataPlane {
             writer_epoch: stream.writer_epoch,
             durable_through: state.durable_through,
         })
-    }
-
-    fn replace_append_stream_records(
-        &self,
-        stream: &AppendStream,
-        start: u64,
-        end: u64,
-        replacement: AppendStreamSegment,
-    ) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
-        let state = inner
-            .append_streams
-            .get_mut(&stream.stream_id)
-            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
-        state.validate_token(stream)?;
-        if start < state.durable_through || end > state.reserved_tail || start >= end {
-            return Err(StorageError::conflict(
-                "append stream materialization range is invalid",
-            ));
-        }
-        if replacement.offset != start || replacement.end_exclusive()? != end {
-            return Err(StorageError::conflict(
-                "append stream materialized replacement range disagrees with records",
-            ));
-        }
-        let mut retained = Vec::with_capacity(state.records.len() + 1);
-        let mut replaced_any = false;
-        for record in state.records.drain(..) {
-            let record_end = record.end_exclusive()?;
-            if record.offset >= start && record_end <= end {
-                replaced_any = true;
-                continue;
-            }
-            if record.offset < end && record_end > start {
-                return Err(StorageError::conflict(
-                    "append stream materialization cannot replace partial records",
-                ));
-            }
-            retained.push(record);
-        }
-        if !replaced_any {
-            return Err(StorageError::conflict(
-                "append stream materialization found no records to replace",
-            ));
-        }
-        retained.push(replacement);
-        retained.sort_by_key(|record| record.offset);
-        state.records = retained;
-        Ok(())
     }
 
     fn append_stream_flush_target(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
@@ -13139,16 +13035,23 @@ impl InMemoryMetadataPlane {
         }))
     }
 
-    fn append_stream_flush_plans_any(
+    fn append_stream_flush_plans_for(
         &self,
+        requests: &[(AppendStream, u64)],
         max_segment_bytes: u64,
     ) -> Result<Vec<AppendStreamFlushPlan>> {
         let inner = lock(&self.inner)?;
         let mut total_bytes = 0_u64;
         let mut plans = Vec::new();
-
-        for state in inner.append_streams.values() {
-            if state.status != AppendStreamStatus::Active {
+        for (stream, durable_through) in requests {
+            let state = inner
+                .append_streams
+                .get(&stream.stream_id)
+                .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+            state.validate_token(stream)?;
+            if state.status != AppendStreamStatus::Active
+                || state.durable_through >= *durable_through
+            {
                 continue;
             }
             let batch = state.flush_batch(max_segment_bytes)?;
@@ -13171,7 +13074,6 @@ impl InMemoryMetadataPlane {
                 batch,
             });
         }
-
         Ok(plans)
     }
 
@@ -20402,28 +20304,24 @@ impl DurableCodec for AppendStreamStatus {
     }
 }
 
-impl DurableCodec for AppendStreamSegment {
+impl DurableCodec for AppendStreamRunRecord {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.ticket_id.encode(out)?;
         self.offset.encode(out)?;
         self.len.encode(out)?;
-        match &self.backing {
-            AppendStreamSegmentBacking::AppendRun { run } => run.encode(out),
-        }
+        self.run.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
         let ticket_id = AppendTicketId::decode(input)?;
         let offset = u64::decode(input)?;
         let len = u64::decode(input)?;
-        let backing = AppendStreamSegmentBacking::AppendRun {
-            run: AppendLogRun::decode(input)?,
-        };
+        let run = AppendLogRun::decode(input)?;
         Ok(Self {
             ticket_id,
             offset,
             len,
-            backing,
+            run,
         })
     }
 }
@@ -24159,6 +24057,19 @@ mod tests {
                 .append_stream(&stream, &one_mib, WriteDurability::Acknowledged)
                 .unwrap();
         }
+        let preflush_state = store.local.metadata.state_inner().unwrap();
+        let preflush_runs = &preflush_state
+            .append_streams
+            .get(&stream.stream_id)
+            .unwrap()
+            .records;
+        assert_eq!(
+            preflush_runs.len(),
+            2,
+            "stream rows should store bounded append runs, not one record per client append"
+        );
+        assert_eq!(preflush_runs[0].len, MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES);
+        assert_eq!(preflush_runs[1].len, 8 * 1024 * 1024);
 
         let mark = store.flush_append_stream(&stream).unwrap();
         assert_eq!(mark.durable_through, total_bytes);
@@ -24213,6 +24124,17 @@ mod tests {
                 .append_stream(&stream, &one_mib, WriteDurability::Acknowledged)
                 .unwrap();
         }
+        let preflush_state = store.local.metadata.state_inner().unwrap();
+        assert_eq!(
+            preflush_state
+                .append_streams
+                .get(&stream.stream_id)
+                .unwrap()
+                .records
+                .len(),
+            1,
+            "stream rows should coalesce contiguous ingest before durable flush"
+        );
 
         let mark = store.flush_append_stream(&stream).unwrap();
         assert_eq!(mark.durable_through, 16 * 1024 * 1024);
@@ -24303,8 +24225,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_concurrent_append_stream_flushes_share_one_stream_group() {
-        let root = durable_temp_dir("stream-flush-coalesce");
+    fn durable_concurrent_append_stream_flushes_do_not_overdrain_other_streams() {
+        let root = durable_temp_dir("stream-flush-no-overdrain");
         let cfg = config();
         let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
         let keyspace_id = store
@@ -24357,10 +24279,9 @@ mod tests {
                 .all(|mark| mark.durable_through == 16 * 1024 * 1024)
         );
         let profiles = store.drain_persist_profiles(16).unwrap();
-        assert_eq!(
-            profiles.len(),
-            2,
-            "one stream-flush runner should coalesce pending stream bytes into bounded groups"
+        assert!(
+            (2..=4).contains(&profiles.len()),
+            "flush runners may batch waiting streams, but must not overdrain non-waiters"
         );
         assert_eq!(
             profiles
@@ -24380,6 +24301,40 @@ mod tests {
                 .all(|profile| profile.lock_wait_nanos < 1_000_000)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_flush_request_table_keeps_same_stream_waiters() {
+        let stream = AppendStream {
+            keyspace_id: KeyspaceId::from_raw(1),
+            file_id: FileId::from_raw(2),
+            stream_id: AppendStreamId::from_raw(3),
+            writer_epoch: WriterEpoch::from_raw(4),
+            base_version: FileVersion::from_raw(5),
+            visible_base_size: 0,
+        };
+        let mut state = StreamFlushCoordinatorState {
+            in_flight: false,
+            generation: 0,
+            requests: BTreeMap::new(),
+            last_error: None,
+        };
+
+        state.add_request(&stream, 16 * 1024 * 1024);
+        state.add_request(&stream, 32 * 1024 * 1024);
+
+        let requests = state.snapshot_requests();
+        assert_eq!(requests, vec![(stream.clone(), 32 * 1024 * 1024)]);
+        let request = state.requests.get(&stream.stream_id).unwrap();
+        assert_eq!(request.waiters, 2);
+
+        state.release_request(stream.stream_id);
+        let request = state.requests.get(&stream.stream_id).unwrap();
+        assert_eq!(request.waiters, 1);
+        assert_eq!(request.durable_through, 32 * 1024 * 1024);
+
+        state.release_request(stream.stream_id);
+        assert!(state.requests.is_empty());
     }
 
     #[test]
@@ -27726,19 +27681,18 @@ mod tests {
             .append_stream(&stream, b"private", WriteDurability::Acknowledged)
             .unwrap();
         store.flush_append_stream(&stream).unwrap();
-        let private_log = store
-            .metadata()
-            .state_inner()
-            .unwrap()
-            .append_streams
-            .get(&stream.stream_id)
-            .unwrap()
-            .records
-            .first()
-            .unwrap()
-            .append_run()
-            .map(|run| (run.storage_node, run.log_id))
-            .unwrap();
+        let private_log = {
+            let state = store.metadata().state_inner().unwrap();
+            let private_run = &state
+                .append_streams
+                .get(&stream.stream_id)
+                .unwrap()
+                .records
+                .first()
+                .unwrap()
+                .run;
+            (private_run.storage_node, private_run.log_id)
+        };
 
         let active_mark = store
             .mark_reachable_for_gc(RetentionPolicy::expire_deleted_immediately())

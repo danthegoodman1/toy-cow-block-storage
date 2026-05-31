@@ -1,7 +1,7 @@
 # Durable Append-Run Architecture Plan
 
-Status: proposed  
-Scope: native append streams, durable ingest, visible publish, stream GC  
+Status: implemented and measured checkpoint
+Scope: native append streams, durable ingest, visible publish, stream GC
 Goal: make append performance scale with large sequential log writes and compact
 metadata publishes, not with per-append segment placement or full-state durable
 persists.
@@ -19,22 +19,18 @@ publish stream   -> metadata service attaches durable runs as visible file exten
 gc               -> visible extents and active streams protect only live log ranges
 ```
 
-The current implementation is close in public shape but wrong in storage shape.
-It still persists stream bytes as ordinary segments, places each segment in the
-node catalog, and uses durable-provider persist paths that were originally built
-for whole-state or generic segment commits. That makes p99 latency follow the
-burst cost of many small segment placements and data-log syncs. The target
-architecture stores stream appends as large durable runs and publishes those
-runs as compact file extents.
+The earlier implementation had the right public stream shape but the wrong
+storage shape: it persisted stream bytes as ordinary segments, placed each
+segment in the node catalog, and used durable-provider persist paths built for
+whole-state or generic segment commits. That made p99 latency follow the burst
+cost of many small segment placements and data-log syncs.
 
-The first measured pre-ingest experiment improved the stream path by writing
-payloads to an unsynced stream-private data log before flush, then syncing those
-records in bounded groups. That proved the direction: lock wait disappeared and
-flush tails became physical-sync dominated. It is not the final shape because it
-still duplicates payloads through the ordinary in-memory segment path and still
-publishes one segment-backed record per append. The final architecture must have
-one payload owner for stream ingest: append-run data, not append-run data plus
-ordinary segments.
+The current implementation stores stream appends as durable append runs and
+publishes those runs as compact file extents. Stream ingest now has one payload
+owner: append-run data, not append-run data plus ordinary segments. Contiguous
+unflushed stream appends coalesce into bounded run records before durable flush,
+and concurrent stream flush waiters batch only requested stream ranges so they
+do not make unrelated private data durable behind its writer.
 
 The north-star outcome is:
 
@@ -44,6 +40,16 @@ The north-star outcome is:
 - file metadata contains a small number of large extents per publish;
 - GC treats private durable stream data as a first-class root only while the
   stream is active or resumable.
+
+Measured checkpoint: `target/loadbench/append-run-waiter-batch-final/` records
+the 200 us RTT durable matrix for the append-run implementation. At c16,
+`native-stream-ingest-1m` reached about 3.6 GiB/s with p50 624 us and p99
+70 ms; `native-stream-ingest-32m` reached about 4.9 GiB/s with p50 111 ms and
+p99 159 ms; preflushed publish reached about 923 MiB/s with p50 5.2 ms and p99
+17 ms; flush+publish reached about 1.1 GiB/s with p50 14 ms and p99 42 ms.
+Profile rows show metadata work is generally sub-ms to low-single-digit ms; the
+remaining tail is bounded data-log sync groups plus occasional c16 wait time
+while other sync groups finish.
 
 ## Mental Model
 
