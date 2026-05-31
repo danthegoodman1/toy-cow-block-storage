@@ -234,8 +234,12 @@ impl MetadataNode {
             MetadataNodeKind::Internal { children } => {
                 validate_child_ranges(self.covered_range, children)
             }
-            MetadataNodeKind::Leaf { entries } => {
-                validate_leaf_entries(self.covered_range, entries, segments)
+            MetadataNodeKind::Leaf {
+                entries,
+                run_extents,
+            } => {
+                validate_leaf_entries(self.covered_range, entries, segments)?;
+                validate_run_backed_file_extents(run_extents)
             }
         }
     }
@@ -247,8 +251,13 @@ impl MetadataNode {
 /// validation will enforce ordering, coverage, and overlap invariants.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetadataNodeKind {
-    Internal { children: Vec<MetadataChild> },
-    Leaf { entries: Vec<LeafEntry> },
+    Internal {
+        children: Vec<MetadataChild>,
+    },
+    Leaf {
+        entries: Vec<LeafEntry>,
+        run_extents: Vec<RunBackedFileExtent>,
+    },
 }
 
 /// Child pointer in an internal metadata node.
@@ -473,6 +482,29 @@ pub fn coalesce_append_log_run_ranges(
         coalesced.push(range);
     }
     Ok(coalesced)
+}
+
+pub fn validate_run_backed_file_extents(extents: &[RunBackedFileExtent]) -> Result<()> {
+    let mut previous_end = None;
+    for extent in extents {
+        extent.validate()?;
+        if let Some(previous_end) = previous_end
+            && extent.file_offset_start < previous_end
+        {
+            return Err(StorageError::invalid_argument(
+                "run-backed file extents must not overlap",
+            ));
+        }
+        previous_end = Some(
+            extent
+                .file_offset_start
+                .checked_add(extent.payload_len)
+                .ok_or_else(|| {
+                    StorageError::invalid_argument("run-backed file extent range overflows")
+                })?,
+        );
+    }
+    Ok(())
 }
 
 /// Native file extent backed directly by an append-log run range.
@@ -1065,6 +1097,7 @@ mod tests {
             covered_range: range(10, 20),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(10, 2, 1, 0), entry(15, 3, 2, 4)],
+                run_extents: Vec::new(),
             },
         };
         let segments = [segment(1, 10), segment(2, 10)];
@@ -1081,6 +1114,7 @@ mod tests {
             covered_range: range(0, 10),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(1, 4, 1, 0), entry(3, 2, 1, 4)],
+                run_extents: Vec::new(),
             },
         };
         assert!(overlapping.validate(&segments).is_err());
@@ -1090,6 +1124,7 @@ mod tests {
             covered_range: range(0, 30),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(20, 2, 1, 0), entry(10, 2, 1, 2)],
+                run_extents: Vec::new(),
             },
         };
         assert!(unsorted.validate(&segments).is_err());
@@ -1099,6 +1134,7 @@ mod tests {
             covered_range: range(0, 10),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(1, 0, 1, 0)],
+                run_extents: Vec::new(),
             },
         };
         assert!(zero_length.validate(&segments).is_err());
@@ -1108,6 +1144,7 @@ mod tests {
             covered_range: range(0, 10),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(9, 2, 1, 0)],
+                run_extents: Vec::new(),
             },
         };
         assert!(out_of_range.validate(&segments).is_err());
@@ -1117,6 +1154,7 @@ mod tests {
             covered_range: range(0, 10),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(1, 2, 99, 0)],
+                run_extents: Vec::new(),
             },
         };
         assert!(missing_segment.validate(&segments).is_err());
@@ -1126,6 +1164,7 @@ mod tests {
             covered_range: range(0, 10),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(1, 2, 1, 9)],
+                run_extents: Vec::new(),
             },
         };
         assert!(segment_bounds.validate(&segments).is_err());
@@ -1135,6 +1174,7 @@ mod tests {
             covered_range: range(0, 10),
             kind: MetadataNodeKind::Leaf {
                 entries: vec![entry(1, 1, 1, u64::MAX)],
+                run_extents: Vec::new(),
             },
         };
         assert!(segment_slice_overflow.validate(&segments).is_err());

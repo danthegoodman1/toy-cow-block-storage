@@ -45,7 +45,7 @@ use crate::object::{
     DeviceHead, FileCommit, FileHead, ForkRecord, KeyspaceCatalogShard, KeyspaceCommit,
     KeyspaceFile, KeyspaceHead, KeyspaceRoot, LeafEntry, MappingOwner, MetadataChild, MetadataNode,
     MetadataNodeKind, RootUpdate, RunBackedFileExtent, SegmentDescriptor, SegmentPayloadIntegrity,
-    ShardCommit, ShardRootUpdate,
+    ShardCommit, ShardRootUpdate, coalesce_append_log_run_ranges,
 };
 use crate::provider::{
     CommitGroupIntent, DiagnosticsCounters, DiagnosticsGauges, DiagnosticsNodeSnapshot,
@@ -2077,7 +2077,7 @@ impl LocalCoordinator {
                     Self::collect_metadata_root_for_export(metadata, child.node_id, retained)?;
                 }
             }
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf { entries, .. } => {
                 retained
                     .segments
                     .extend(entries.iter().map(|entry| entry.segment_id));
@@ -2235,7 +2235,7 @@ impl LocalCoordinator {
             .collect();
         let mut referenced_segment_ids = BTreeSet::new();
         for node in metadata_nodes.values() {
-            if let MetadataNodeKind::Leaf { entries } = &node.kind {
+            if let MetadataNodeKind::Leaf { entries, .. } = &node.kind {
                 referenced_segment_ids.extend(entries.iter().map(|entry| entry.segment_id));
             }
         }
@@ -2544,7 +2544,7 @@ impl LocalCoordinator {
                     )?;
                 }
             }
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf { entries, .. } => {
                 referenced_segment_ids.extend(entries.iter().map(|entry| entry.segment_id));
             }
         }
@@ -3363,9 +3363,14 @@ impl LocalCoordinator {
             ));
         }
 
+        let all_append_runs = unpublished
+            .iter()
+            .all(|record| record.append_run().is_some());
+        let mut contiguous = true;
         let mut direct = head.size % block_size == 0;
         let mut expected_offset = head.size;
         for (index, record) in unpublished.iter().enumerate() {
+            contiguous &= record.offset == expected_offset;
             direct &= record.offset == expected_offset;
             direct &= record.offset % block_size == 0;
             if index + 1 != unpublished.len() {
@@ -3376,9 +3381,36 @@ impl LocalCoordinator {
                 .checked_add(record.len)
                 .ok_or_else(|| StorageError::invalid_argument("append record end overflows"))?;
         }
+        contiguous &= expected_offset == mark.durable_through;
         direct &= expected_offset == mark.durable_through;
 
-        let (new_root, receipts) = if direct {
+        let (new_root, receipts) = if all_append_runs {
+            if !contiguous {
+                return Err(StorageError::conflict(
+                    "append-run publish requires contiguous durable records",
+                ));
+            }
+            let run_extents: Vec<_> = unpublished
+                .iter()
+                .map(|record| {
+                    let run = record.append_run().ok_or_else(|| {
+                        StorageError::conflict("append stream record is not durable")
+                    })?;
+                    let extent = RunBackedFileExtent {
+                        file_offset_start: record.offset,
+                        payload_len: record.len,
+                        run: run.full_range(),
+                    };
+                    extent.validate()?;
+                    Ok(extent)
+                })
+                .collect::<Result<_>>()?;
+            let publish_range = ByteRange::new(head.size, mark.durable_through - head.size);
+            let new_root = self
+                .replace_tree_byte_range_with_run_extents(head.root, publish_range, run_extents)?
+                .root;
+            (new_root, Vec::new())
+        } else if direct {
             let mut root = head.root;
             let mut receipts = Vec::with_capacity(unpublished.len());
             for record in &unpublished {
@@ -4453,6 +4485,133 @@ impl LocalCoordinator {
         self.replace_tree_range_with_receipts(root_id, edit, &[])
     }
 
+    fn replace_tree_byte_range_with_run_extents(
+        &self,
+        root_id: MetadataNodeId,
+        replacement_range: ByteRange,
+        replacements: Vec<RunBackedFileExtent>,
+    ) -> Result<TreeEditResult> {
+        if replacement_range.len == 0 {
+            return Ok(TreeEditResult {
+                root: root_id,
+                changed: false,
+            });
+        }
+        let root = self.metadata.get_metadata_node(root_id)?;
+        self.replace_tree_byte_range_with_run_extents_at(&root, replacement_range, &replacements)
+    }
+
+    fn replace_tree_byte_range_with_run_extents_at(
+        &self,
+        node: &MetadataNode,
+        replacement_range: ByteRange,
+        replacements: &[RunBackedFileExtent],
+    ) -> Result<TreeEditResult> {
+        let block_size = u64::from(self.metadata.config.block_size);
+        let node_range = block_range_to_byte_range(node.covered_range, block_size)?;
+        let Some(overlap) = byte_range_intersection(node_range, replacement_range)? else {
+            return Ok(TreeEditResult {
+                root: node.node_id,
+                changed: false,
+            });
+        };
+
+        match &node.kind {
+            MetadataNodeKind::Leaf {
+                entries,
+                run_extents,
+            } => {
+                let mut leaf_replacements = Vec::new();
+                for replacement in replacements {
+                    let replacement_extent_range =
+                        ByteRange::new(replacement.file_offset_start, replacement.payload_len);
+                    if let Some(extent_overlap) =
+                        byte_range_intersection(replacement_extent_range, overlap)?
+                        && let Some(sliced) = slice_run_extent(
+                            replacement,
+                            extent_overlap.offset,
+                            extent_overlap.end_exclusive()?,
+                        )?
+                    {
+                        leaf_replacements.push(sliced);
+                    }
+                }
+                let new_run_extents =
+                    replace_run_backed_file_extents(run_extents, overlap, leaf_replacements)?;
+                if new_run_extents == *run_extents {
+                    return Ok(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    });
+                }
+                let segment_receipts = self.verified_receipts_for_entries(entries)?;
+                let new_node = self.metadata.allocate_metadata_node(
+                    node.covered_range,
+                    MetadataNodeKind::Leaf {
+                        entries: entries.clone(),
+                        run_extents: new_run_extents,
+                    },
+                )?;
+                let segment_descriptors: Vec<_> = segment_receipts
+                    .iter()
+                    .map(|receipt| receipt.descriptor.clone())
+                    .collect();
+                new_node.validate(&segment_descriptors)?;
+                self.metadata.persist_metadata_node(MetadataNodeWrite::new(
+                    new_node.clone(),
+                    segment_receipts,
+                ))?;
+                Ok(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                })
+            }
+            MetadataNodeKind::Internal { children } => {
+                let mut changed = false;
+                let mut new_children = Vec::with_capacity(children.len());
+                for child in children {
+                    let child_range = block_range_to_byte_range(child.range, block_size)?;
+                    if byte_range_intersection(child_range, overlap)?.is_some() {
+                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                        let child_result = self.replace_tree_byte_range_with_run_extents_at(
+                            &child_node,
+                            overlap,
+                            replacements,
+                        )?;
+                        changed |= child_result.changed;
+                        new_children.push(MetadataChild {
+                            range: child.range,
+                            node_id: child_result.root,
+                        });
+                    } else {
+                        new_children.push(child.clone());
+                    }
+                }
+
+                if !changed {
+                    return Ok(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    });
+                }
+
+                let new_node = self.metadata.allocate_metadata_node(
+                    node.covered_range,
+                    MetadataNodeKind::Internal {
+                        children: new_children,
+                    },
+                )?;
+                new_node.validate(&[])?;
+                self.metadata
+                    .persist_metadata_node(MetadataNodeWrite::new(new_node.clone(), Vec::new()))?;
+                Ok(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                })
+            }
+        }
+    }
+
     fn replace_tree_range_with_receipts(
         &self,
         root_id: MetadataNodeId,
@@ -4483,7 +4642,10 @@ impl LocalCoordinator {
         }
 
         match &node.kind {
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf {
+                entries,
+                run_extents,
+            } => {
                 let Some(overlap) = node.covered_range.intersection(edit.range)? else {
                     return Ok(TreeEditResult {
                         root: node.node_id,
@@ -4501,7 +4663,11 @@ impl LocalCoordinator {
                 });
                 let new_entries =
                     replace_leaf_entries(entries, node.covered_range, overlap, replacement)?;
-                if new_entries == *entries {
+                let block_size = u64::from(self.metadata.config.block_size);
+                let overlap_bytes = block_range_to_byte_range(overlap, block_size)?;
+                let new_run_extents =
+                    replace_run_backed_file_extents(run_extents, overlap_bytes, Vec::new())?;
+                if new_entries == *entries && new_run_extents == *run_extents {
                     return Ok(TreeEditResult {
                         root: node.node_id,
                         changed: false,
@@ -4513,6 +4679,7 @@ impl LocalCoordinator {
                     node.covered_range,
                     MetadataNodeKind::Leaf {
                         entries: new_entries,
+                        run_extents: new_run_extents,
                     },
                 )?;
                 let segment_descriptors: Vec<_> = segment_receipts
@@ -4602,7 +4769,7 @@ impl LocalCoordinator {
                 }
                 Ok(false)
             }
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf { entries, .. } => {
                 for entry in entries {
                     if entry.logical_range().overlaps(range)? {
                         return Ok(true);
@@ -4632,7 +4799,7 @@ impl LocalCoordinator {
 
         let node = self.metadata.get_metadata_node(node_id)?;
         match &node.kind {
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf { entries, .. } => {
                 if node.covered_range.blocks.raw() > self.metadata.config.metadata_leaf_blocks {
                     return Err(StorageError::corrupt(
                         "metadata leaf exceeds configured leaf block span",
@@ -4728,13 +4895,17 @@ impl LocalCoordinator {
                     self.render_metadata_tree_at(child.node_id, depth + 1, out)?;
                 }
             }
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf {
+                entries,
+                run_extents,
+            } => {
                 out.push_str(&format!(
-                    "{indent}node {} leaf [{}..{}) entries={}\n",
+                    "{indent}node {} leaf [{}..{}) entries={} run_extents={}\n",
                     node.node_id,
                     node.covered_range.start.raw(),
                     node.covered_range.end_exclusive()?.raw(),
-                    entries.len()
+                    entries.len(),
+                    run_extents.len()
                 ));
                 for entry in entries {
                     out.push_str(&format!(
@@ -4743,6 +4914,15 @@ impl LocalCoordinator {
                         entry.logical_range().end_exclusive()?.raw(),
                         entry.segment_id,
                         entry.segment_offset.raw()
+                    ));
+                }
+                for extent in run_extents {
+                    out.push_str(&format!(
+                        "{indent}  [{}..{}) -> append-run {}@{}\n",
+                        extent.file_offset_start,
+                        extent.file_offset_start + extent.payload_len,
+                        extent.run.run_id,
+                        extent.run.log_payload_offset
                     ));
                 }
             }
@@ -4955,6 +5135,41 @@ impl LocalCoordinator {
         Ok(out)
     }
 
+    fn run_extents_for_file_read(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+    ) -> Result<Vec<RunBackedFileExtent>> {
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        let end = range.end_exclusive()?;
+        if end > head.size {
+            return Err(StorageError::invalid_argument(
+                "native file read extends past end of file",
+            ));
+        }
+        let mut out = Vec::new();
+        if range.len == 0 {
+            let _ = self.metadata.get_metadata_node(head.root)?;
+            return Ok(out);
+        }
+
+        let block_size = u64::from(self.metadata.config.block_size);
+        let first_block = range.offset / block_size;
+        let requested_start = first_block
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("native read range overflows"))?;
+        let requested_blocks = blocks_for_bytes(end - requested_start, block_size)?;
+        let requested = crate::api::BlockRange::new(
+            BlockIndex::from_raw(first_block),
+            BlockCount::from_raw(requested_blocks),
+        );
+        let root = self.metadata.get_metadata_node(head.root)?;
+        self.collect_run_extents_for_metadata_node(&root, requested, range, &mut out)?;
+        out.sort_by_key(|extent| extent.file_offset_start);
+        Ok(out)
+    }
+
     fn collect_segment_ids_for_metadata_node(
         &self,
         node: &MetadataNode,
@@ -4970,10 +5185,46 @@ impl LocalCoordinator {
                     }
                 }
             }
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf { entries, .. } => {
                 for entry in entries {
                     if entry.logical_range().overlaps(requested)? {
                         out.insert(entry.segment_id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_run_extents_for_metadata_node(
+        &self,
+        node: &MetadataNode,
+        requested_blocks: crate::api::BlockRange,
+        requested_bytes: ByteRange,
+        out: &mut Vec<RunBackedFileExtent>,
+    ) -> Result<()> {
+        match &node.kind {
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    if child.range.overlaps(requested_blocks)? {
+                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                        self.collect_run_extents_for_metadata_node(
+                            &child_node,
+                            requested_blocks,
+                            requested_bytes,
+                            out,
+                        )?;
+                    }
+                }
+            }
+            MetadataNodeKind::Leaf { run_extents, .. } => {
+                for extent in run_extents {
+                    let extent_range = ByteRange::new(extent.file_offset_start, extent.payload_len);
+                    if let Some(overlap) = byte_range_intersection(extent_range, requested_bytes)?
+                        && let Some(sliced) =
+                            slice_run_extent(extent, overlap.offset, overlap.end_exclusive()?)?
+                    {
+                        out.push(sliced);
                     }
                 }
             }
@@ -4998,7 +5249,7 @@ impl LocalCoordinator {
                 }
                 Ok(())
             }
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf { entries, .. } => {
                 for entry in entries {
                     let Some(overlap) = entry.logical_range().intersection(requested)? else {
                         continue;
@@ -6872,30 +7123,65 @@ impl DurableSqliteStore {
         Ok((run, append, profile))
     }
 
-    fn read_append_run_payload(&self, run: &AppendLogRun) -> Result<Vec<u8>> {
+    fn read_append_run_range_payload(
+        &self,
+        run: &AppendLogRunRange,
+        verification: ReadVerification,
+    ) -> Result<Vec<u8>> {
         run.validate()?;
-        let record_offset = run
-            .log_payload_offset
-            .checked_sub(DATA_LOG_HEADER_LEN as u64)
-            .ok_or_else(|| StorageError::corrupt("append run payload offset precedes record"))?;
         let path = data_log_path(&self.paths.data_dir, run.storage_node, run.log_id);
         let mut file = File::open(&path).map_err(fs_error)?;
-        file.seek(SeekFrom::Start(record_offset))
-            .map_err(fs_error)?;
-        let record_len = usize::try_from(run.log_record_bytes)
-            .map_err(|_| StorageError::corrupt("append run record length overflows usize"))?;
-        let mut record = vec![0; record_len];
-        file.read_exact(&mut record).map_err(fs_error)?;
-        let data = decode_append_run_data_log_record(&record)?;
-        if data.run_id != run.run_id
-            || data.bytes.len() as u64 != run.payload_len
-            || data.integrity != run.integrity
-        {
-            return Err(StorageError::corrupt(
-                "append-run data-log record disagrees with manifest",
-            ));
+        if !matches!(
+            (run.integrity, verification),
+            (SegmentPayloadIntegrity::Unchecked, _) | (_, ReadVerification::Skip)
+        ) {
+            let record_offset = run
+                .log_payload_offset
+                .checked_sub(DATA_LOG_HEADER_LEN as u64);
+            if let Some(record_offset) = record_offset {
+                let record_len = (DATA_LOG_HEADER_LEN as u64)
+                    .checked_add(run.payload_len)
+                    .ok_or_else(|| StorageError::corrupt("append run record length overflows"))?;
+                let record_len = usize::try_from(record_len).map_err(|_| {
+                    StorageError::corrupt("append run record length overflows usize")
+                })?;
+                file.seek(SeekFrom::Start(record_offset))
+                    .map_err(fs_error)?;
+                let mut record = vec![0; record_len];
+                file.read_exact(&mut record).map_err(fs_error)?;
+                let data = decode_append_run_data_log_record(&record)?;
+                if data.run_id != run.run_id
+                    || data.bytes.len() as u64 != run.payload_len
+                    || data.integrity != run.integrity
+                {
+                    return Err(StorageError::corrupt(
+                        "append-run data-log record disagrees with manifest",
+                    ));
+                }
+                return Ok(data.bytes);
+            }
         }
-        Ok(data.bytes)
+        file.seek(SeekFrom::Start(run.log_payload_offset))
+            .map_err(fs_error)?;
+        let len = usize::try_from(run.payload_len)
+            .map_err(|_| StorageError::corrupt("append run range length overflows usize"))?;
+        let mut bytes = vec![0; len];
+        file.read_exact(&mut bytes).map_err(fs_error)?;
+        match run.integrity {
+            SegmentPayloadIntegrity::Unchecked => {
+                if matches!(verification, ReadVerification::RequireVerified) {
+                    return Err(StorageError::conflict(
+                        "read requires verified payload but append run is unchecked",
+                    ));
+                }
+            }
+            integrity @ SegmentPayloadIntegrity::Crc32c(_) => {
+                if !matches!(verification, ReadVerification::Skip) {
+                    verify_segment_payload_integrity(integrity, &bytes)?;
+                }
+            }
+        }
+        Ok(bytes)
     }
 
     fn append_segments_profiled_with_state(
@@ -8360,18 +8646,25 @@ fn persist_data_log_manifest(
     log: &PendingDataLogManifest,
 ) -> Result<()> {
     let data_logs = node_catalog_table(log.storage_node, "data_logs")?;
+    let live_bytes = if log.state == STREAM_DATA_LOG_STATE_ACTIVE {
+        log.total_bytes
+    } else {
+        0
+    };
     tx.execute(
         &format!(
             "INSERT INTO {data_logs}(log_id, state, total_bytes, live_bytes, dead_bytes)
-             VALUES (?1, ?2, ?3, 0, 0)
+             VALUES (?1, ?2, ?3, ?4, 0)
              ON CONFLICT(log_id) DO UPDATE SET
                state = excluded.state,
-               total_bytes = MAX(total_bytes, excluded.total_bytes)"
+               total_bytes = MAX(total_bytes, excluded.total_bytes),
+               live_bytes = MAX(live_bytes, excluded.live_bytes)"
         ),
         params![
             u64_to_i64(log.log_id)?,
             log.state,
-            u64_to_i64(log.total_bytes)?
+            u64_to_i64(log.total_bytes)?,
+            u64_to_i64(live_bytes)?
         ],
     )
     .map_err(sqlite_error)?;
@@ -9477,7 +9770,7 @@ fn validate_row_native_state(image: &DurableStoreState) -> Result<()> {
     }
     for node in image.metadata.metadata_nodes.values() {
         let mut node_descriptors = Vec::new();
-        if let MetadataNodeKind::Leaf { entries } = &node.kind {
+        if let MetadataNodeKind::Leaf { entries, .. } = &node.kind {
             for entry in entries {
                 let descriptor = descriptors.get(&entry.segment_id).ok_or_else(|| {
                     StorageError::corrupt("metadata leaf references missing segment descriptor")
@@ -11048,6 +11341,19 @@ impl DurableCoordinator {
                     .filter_map(AppendStreamSegment::log_ref)
             })
             .collect();
+        let new_run_count = usize_to_u64(
+            plans
+                .iter()
+                .flat_map(|plan| plan.batch.records.iter())
+                .filter(|record| record.append_run().is_some())
+                .count(),
+        );
+        let new_run_bytes = plans
+            .iter()
+            .flat_map(|plan| plan.batch.records.iter())
+            .filter(|record| record.append_run().is_some())
+            .map(|record| record.len)
+            .fold(0_u64, u64::saturating_add);
         let pending_stream = lock(&self.pending_stream_data_log_append)?;
         let mut pending_stream_append = pending_stream.selected_segments(&missing_pending);
         pending_stream_append.merge(pending_stream.selected_log_refs(&run_log_refs));
@@ -11089,6 +11395,8 @@ impl DurableCoordinator {
 
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.new_segment_count = profile.new_segment_count.saturating_add(new_run_count);
+        profile.new_segment_bytes = profile.new_segment_bytes.saturating_add(new_run_bytes);
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.record_persist_profile(profile)?;
         Ok(true)
@@ -11664,85 +11972,16 @@ impl DurableCoordinator {
         self.persist_append_stream(stream)
     }
 
-    fn materialize_append_runs_for_publish(
-        &self,
-        stream: &AppendStream,
-        mark: &DurableAppendMark,
-    ) -> Result<BTreeSet<SegmentId>> {
-        let state = self
-            .local
-            .metadata
-            .validate_append_stream_mark(stream, mark)?;
-        let records: Vec<_> = state
-            .records
-            .iter()
-            .filter(|record| {
-                record.offset >= state.published_through
-                    && record.offset < mark.durable_through
-                    && record
-                        .offset
-                        .checked_add(record.len)
-                        .is_some_and(|end| end <= mark.durable_through)
-                    && record.append_run().is_some()
-            })
-            .cloned()
-            .collect();
-        let mut materialized = BTreeSet::new();
-        for record in records {
-            let run = record
-                .append_run()
-                .ok_or_else(|| StorageError::corrupt("append run record missing run"))?
-                .clone();
-            let bytes = self.durable.read_append_run_payload(&run)?;
-            let segment_bytes = self.local.padded_append_segment_bytes(&bytes)?;
-            let payload_integrity = payload_integrity_from_segment(run.integrity);
-            let verified = self.local.write_segment_for_intent_with_id_owned_verified(
-                WriteGrantIntent::NativeAppendStream {
-                    keyspace_id: stream.keyspace_id,
-                    file_id: stream.file_id,
-                    stream_id: stream.stream_id,
-                    ticket_id: record.ticket_id,
-                    append_offset: record.offset,
-                    bytes: record.len,
-                    writer_epoch: stream.writer_epoch,
-                },
-                self.local.next_write_intent()?,
-                segment_bytes,
-                WriteDurability::Acknowledged,
-                payload_integrity,
-            )?;
-            let replacement = AppendStreamSegment {
-                ticket_id: record.ticket_id,
-                offset: record.offset,
-                len: record.len,
-                backing: AppendStreamSegmentBacking::Segment {
-                    segment_id: verified.descriptor.segment_id,
-                    segment_bytes: verified.descriptor.bytes,
-                    payload_integrity,
-                },
-            };
-            self.local.metadata.replace_append_stream_records(
-                stream,
-                record.offset,
-                record.end_exclusive()?,
-                replacement,
-            )?;
-            materialized.insert(verified.descriptor.segment_id);
-        }
-        Ok(materialized)
-    }
-
     pub fn publish_append_stream(
         &self,
         stream: &AppendStream,
         mark: &DurableAppendMark,
     ) -> Result<AppendPublishCommit> {
-        let materialized_segments = self.materialize_append_runs_for_publish(stream, mark)?;
         let state = self
             .local
             .metadata
             .validate_append_stream_mark(stream, mark)?;
-        let mut changed_segments: BTreeSet<_> = state
+        let changed_segments: BTreeSet<_> = state
             .records
             .iter()
             .filter(|record| {
@@ -11755,7 +11994,6 @@ impl DurableCoordinator {
             })
             .filter_map(AppendStreamSegment::segment_id)
             .collect();
-        changed_segments.extend(materialized_segments);
         let commit = self
             .local
             .publish_append_stream(stream, mark, WriteDurability::Flushed)?;
@@ -11795,8 +12033,33 @@ impl DurableCoordinator {
         let segment_ids = self
             .local
             .segment_ids_for_file_read(keyspace_id, file_id, range)?;
+        let run_extents = self
+            .local
+            .run_extents_for_file_read(keyspace_id, file_id, range)?;
         self.local
             .read_file_unverified(keyspace_id, file_id, range, buf)?;
+        for extent in run_extents {
+            let bytes = self
+                .durable
+                .read_append_run_range_payload(&extent.run, verification)?;
+            let output_offset = usize::try_from(
+                extent
+                    .file_offset_start
+                    .checked_sub(range.offset)
+                    .ok_or_else(|| {
+                        StorageError::corrupt("run-backed extent precedes read range")
+                    })?,
+            )
+            .map_err(|_| StorageError::invalid_argument("run read offset overflows usize"))?;
+            let output_len = bytes.len();
+            let output_end = output_offset
+                .checked_add(output_len)
+                .ok_or_else(|| StorageError::invalid_argument("run read end overflows"))?;
+            let output = buf
+                .get_mut(output_offset..output_end)
+                .ok_or_else(|| StorageError::corrupt("run-backed read output exceeds buffer"))?;
+            output.copy_from_slice(&bytes);
+        }
         self.local
             .verify_segment_payloads_for_read(segment_ids, verification)
     }
@@ -12066,7 +12329,7 @@ impl DurableExportRetention {
 fn metadata_referenced_segments(metadata: &MetadataInner) -> BTreeSet<SegmentId> {
     let mut segments = BTreeSet::new();
     for node in metadata.metadata_nodes.values() {
-        if let MetadataNodeKind::Leaf { entries } = &node.kind {
+        if let MetadataNodeKind::Leaf { entries, .. } = &node.kind {
             segments.extend(entries.iter().map(|entry| entry.segment_id));
         }
     }
@@ -13414,6 +13677,7 @@ impl InMemoryMetadataPlane {
                 covered_range: range,
                 kind: MetadataNodeKind::Leaf {
                     entries: Vec::new(),
+                    run_extents: Vec::new(),
                 },
             };
             node.validate(&[])?;
@@ -14310,7 +14574,7 @@ impl InMemoryMetadataPlane {
     }
 
     fn collect_node_segments(node: &MetadataNode, out: &mut BTreeSet<SegmentId>) {
-        if let MetadataNodeKind::Leaf { entries } = &node.kind {
+        if let MetadataNodeKind::Leaf { entries, .. } = &node.kind {
             for entry in entries {
                 out.insert(entry.segment_id);
             }
@@ -14371,7 +14635,7 @@ impl InMemoryMetadataPlane {
                         stack.push(child.node_id);
                     }
                 }
-                MetadataNodeKind::Leaf { entries } => {
+                MetadataNodeKind::Leaf { entries, .. } => {
                     for entry in entries {
                         segments.insert(entry.segment_id);
                     }
@@ -19306,9 +19570,13 @@ impl DurableCodec for MetadataNodeKind {
                 1u8.encode(out)?;
                 children.encode(out)
             }
-            Self::Leaf { entries } => {
+            Self::Leaf {
+                entries,
+                run_extents,
+            } => {
                 2u8.encode(out)?;
-                entries.encode(out)
+                entries.encode(out)?;
+                run_extents.encode(out)
             }
         }
     }
@@ -19320,6 +19588,7 @@ impl DurableCodec for MetadataNodeKind {
             }),
             2 => Ok(Self::Leaf {
                 entries: Vec::decode(input)?,
+                run_extents: Vec::decode(input)?,
             }),
             _ => Err(durable_codec_error("invalid metadata node kind tag")),
         }
@@ -21147,6 +21416,135 @@ fn replace_leaf_entries(
     coalesce_leaf_entries(out)
 }
 
+fn run_extent_end(extent: &RunBackedFileExtent) -> Result<u64> {
+    extent
+        .file_offset_start
+        .checked_add(extent.payload_len)
+        .ok_or_else(|| StorageError::invalid_argument("run-backed extent end overflows"))
+}
+
+fn byte_ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+fn block_range_to_byte_range(range: crate::api::BlockRange, block_size: u64) -> Result<ByteRange> {
+    let offset = range
+        .start
+        .raw()
+        .checked_mul(block_size)
+        .ok_or_else(|| StorageError::invalid_argument("block range byte offset overflows"))?;
+    let len = range
+        .blocks
+        .raw()
+        .checked_mul(block_size)
+        .ok_or_else(|| StorageError::invalid_argument("block range byte length overflows"))?;
+    Ok(ByteRange::new(offset, len))
+}
+
+fn byte_range_intersection(a: ByteRange, b: ByteRange) -> Result<Option<ByteRange>> {
+    let a_end = a.end_exclusive()?;
+    let b_end = b.end_exclusive()?;
+    let start = a.offset.max(b.offset);
+    let end = a_end.min(b_end);
+    if start >= end {
+        return Ok(None);
+    }
+    Ok(Some(ByteRange::new(start, end - start)))
+}
+
+fn slice_run_extent(
+    extent: &RunBackedFileExtent,
+    start: u64,
+    end: u64,
+) -> Result<Option<RunBackedFileExtent>> {
+    if start >= end {
+        return Ok(None);
+    }
+    let extent_end = run_extent_end(extent)?;
+    if start < extent.file_offset_start || end > extent_end {
+        return Err(StorageError::invalid_argument(
+            "run-backed extent slice exceeds source extent",
+        ));
+    }
+    let delta = start - extent.file_offset_start;
+    let integrity = if start == extent.file_offset_start && end == extent_end {
+        extent.run.integrity
+    } else {
+        SegmentPayloadIntegrity::Unchecked
+    };
+    Ok(Some(RunBackedFileExtent {
+        file_offset_start: start,
+        payload_len: end - start,
+        run: AppendLogRunRange {
+            file_offset_start: start,
+            payload_len: end - start,
+            log_payload_offset: extent
+                .run
+                .log_payload_offset
+                .checked_add(delta)
+                .ok_or_else(|| StorageError::invalid_argument("append run offset overflows"))?,
+            integrity,
+            ..extent.run.clone()
+        },
+    }))
+}
+
+fn replace_run_backed_file_extents(
+    extents: &[RunBackedFileExtent],
+    replacement_range: ByteRange,
+    replacements: Vec<RunBackedFileExtent>,
+) -> Result<Vec<RunBackedFileExtent>> {
+    let replacement_start = replacement_range.offset;
+    let replacement_end = replacement_range.end_exclusive()?;
+    let mut out = Vec::with_capacity(extents.len() + replacements.len());
+    for extent in extents {
+        extent.validate()?;
+        let extent_end = run_extent_end(extent)?;
+        if !byte_ranges_overlap(
+            extent.file_offset_start,
+            extent_end,
+            replacement_start,
+            replacement_end,
+        ) {
+            out.push(extent.clone());
+            continue;
+        }
+        if extent.file_offset_start < replacement_start
+            && let Some(left) = slice_run_extent(
+                extent,
+                extent.file_offset_start,
+                replacement_start.min(extent_end),
+            )?
+        {
+            out.push(left);
+        }
+        if extent_end > replacement_end
+            && let Some(right) = slice_run_extent(
+                extent,
+                replacement_end.max(extent.file_offset_start),
+                extent_end,
+            )?
+        {
+            out.push(right);
+        }
+    }
+    out.extend(replacements);
+    let ranges =
+        coalesce_append_log_run_ranges(out.into_iter().map(|extent| extent.run).collect())?;
+    ranges
+        .into_iter()
+        .map(|run| {
+            let extent = RunBackedFileExtent {
+                file_offset_start: run.file_offset_start,
+                payload_len: run.payload_len,
+                run,
+            };
+            extent.validate()?;
+            Ok(extent)
+        })
+        .collect()
+}
+
 fn coalesce_leaf_entries(entries: Vec<LeafEntry>) -> Result<Vec<LeafEntry>> {
     let mut out: Vec<LeafEntry> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -21613,6 +22011,7 @@ mod tests {
             ),
             kind: MetadataNodeKind::Leaf {
                 entries: Vec::new(),
+                run_extents: Vec::new(),
             },
         }
     }
@@ -22191,6 +22590,7 @@ mod tests {
                     segment_id: descriptor.segment_id,
                     segment_offset: BlockIndex::from_raw(0),
                 }],
+                run_extents: Vec::new(),
             },
         };
 
@@ -23760,6 +24160,10 @@ mod tests {
                 &file_segment_ids(&store.metadata(), keyspace_id, file_id),
             )
             .len(),
+            0
+        );
+        assert_eq!(
+            run_storage_nodes(&file_run_extents(&store.metadata(), keyspace_id, file_id)).len(),
             3
         );
 
@@ -23798,6 +24202,15 @@ mod tests {
                 &reopened.local,
                 &file_segment_ids(&reopened.metadata(), keyspace_id, file_id),
             )
+            .len(),
+            0
+        );
+        assert_eq!(
+            run_storage_nodes(&file_run_extents(
+                &reopened.metadata(),
+                keyspace_id,
+                file_id
+            ))
             .len(),
             3
         );
@@ -24377,6 +24790,29 @@ mod tests {
         assert_eq!(publish_profiles[0].data_log_write_nanos, 0);
         assert_eq!(publish_profiles[0].data_log_file_sync_nanos, 0);
         assert_eq!(publish_profiles[0].data_log_dir_sync_nanos, 0);
+        let head = store
+            .local
+            .metadata
+            .get_file_head(keyspace_id, file_id)
+            .unwrap();
+        let root_node = store.local.metadata.get_metadata_node(head.root).unwrap();
+        let MetadataNodeKind::Leaf {
+            entries,
+            run_extents,
+        } = root_node.kind
+        else {
+            panic!("small native file root should remain a leaf");
+        };
+        assert!(
+            entries.is_empty(),
+            "append-run publish should not create ordinary segment entries"
+        );
+        assert_eq!(run_extents.len(), 1);
+        assert_eq!(run_extents[0].file_offset_start, 0);
+        assert_eq!(run_extents[0].payload_len, 4096);
+        assert_eq!(run_extents[0].run.keyspace_id, keyspace_id);
+        assert_eq!(run_extents[0].run.file_id, file_id);
+        assert_eq!(run_extents[0].run.stream_id, stream.stream_id);
 
         drop(store);
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -24960,7 +25396,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_sqlite_persists_native_stream_references_on_publish() {
+    fn durable_sqlite_persists_native_stream_run_extents_on_publish() {
         let root = durable_temp_dir("native-stream-reference-persist");
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -24983,33 +25419,32 @@ mod tests {
             WriteDurability::Flushed,
         )
         .unwrap();
-        let segment_id = file_segment_ids(&store.metadata(), keyspace_id, file_id)
-            .into_iter()
-            .next()
-            .unwrap();
+        assert!(file_segment_ids(&store.metadata(), keyspace_id, file_id).is_empty());
+        let run_extents = file_run_extents(&store.metadata(), keyspace_id, file_id);
+        assert_eq!(run_extents.len(), 1);
+        assert_eq!(run_extents[0].run.storage_node, cfg.storage_node);
+        let data_log_rows = store.durable.data_log_rows_for_test().unwrap();
+        assert_eq!(data_log_rows.len(), 1);
+        assert!(
+            data_log_rows[0].live_bytes > 0,
+            "published append-run log bytes must remain protected from compaction"
+        );
         drop(store);
 
-        assert_eq!(
-            node_catalog_entry(&root, cfg.storage_node, segment_id).state,
-            SegmentLifecycleState::Referenced
-        );
-
         let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        assert!(file_segment_ids(&reopened.metadata(), keyspace_id, file_id).is_empty());
+        let reopened_run_extents = file_run_extents(&reopened.metadata(), keyspace_id, file_id);
+        assert_eq!(reopened_run_extents, run_extents);
+        reopened
+            .durable
+            .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
+            .unwrap();
         let mut bytes = vec![0; 4096];
         reopened
             .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
             .unwrap();
         assert_eq!(bytes, repeated_blocks(1, 12));
-        assert_eq!(
-            reopened.segment_catalog().state(segment_id).unwrap(),
-            SegmentLifecycleState::Referenced
-        );
         drop(reopened);
-
-        assert_eq!(
-            node_catalog_entry(&root, cfg.storage_node, segment_id).state,
-            SegmentLifecycleState::Referenced
-        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -25478,7 +25913,13 @@ mod tests {
         assert_eq!(pending.placements.len(), 0);
         assert_eq!(pending.logs.len(), 1);
         assert!(profile.write_nanos > 0);
-        assert_eq!(store.durable.read_append_run_payload(&run).unwrap(), bytes);
+        assert_eq!(
+            store
+                .durable
+                .read_append_run_range_payload(&run.full_range(), ReadVerification::Default)
+                .unwrap(),
+            bytes
+        );
         assert!(store.local.segment_ids().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -29245,6 +29686,7 @@ mod tests {
                     segment_id: reservation.segment_id,
                     segment_offset: BlockIndex::from_raw(0),
                 }],
+                run_extents: Vec::new(),
             },
         };
         store
@@ -29410,7 +29852,7 @@ mod tests {
         let mut referenced_segments = Vec::new();
         for root in roots {
             let node = store.metadata().get_metadata_node(root).unwrap();
-            let MetadataNodeKind::Leaf { entries } = node.kind else {
+            let MetadataNodeKind::Leaf { entries, .. } = node.kind else {
                 panic!("default test roots should be leaves");
             };
             for entry in entries {
@@ -30136,6 +30578,7 @@ mod tests {
                         segment_id: reservation.segment_id,
                         segment_offset: BlockIndex::from_raw(0),
                     }],
+                    run_extents: Vec::new(),
                 },
             )
             .unwrap();
@@ -30261,7 +30704,7 @@ mod tests {
             .get_file_head(keyspace_id, file_id)
             .unwrap();
         let root = store.metadata().get_metadata_node(head.root).unwrap();
-        let MetadataNodeKind::Leaf { entries } = root.kind else {
+        let MetadataNodeKind::Leaf { entries, .. } = root.kind else {
             panic!("default test native file root should remain a leaf");
         };
         assert_eq!(entries.len(), 2);
@@ -32112,6 +32555,7 @@ mod tests {
                     segment_id: commit.descriptor.segment_id,
                     segment_offset: BlockIndex::from_raw(0),
                 }],
+                run_extents: Vec::new(),
             },
         };
 
@@ -32315,6 +32759,18 @@ mod tests {
         out
     }
 
+    fn file_run_extents(
+        metadata: &Arc<InMemoryMetadataPlane>,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> Vec<RunBackedFileExtent> {
+        let mut out = Vec::new();
+        let head = metadata.get_file_head(keyspace_id, file_id).unwrap();
+        collect_tree_run_extents(metadata, head.root, &mut out);
+        out.sort_by_key(|extent| extent.file_offset_start);
+        out
+    }
+
     fn collect_tree_segments(
         metadata: &Arc<InMemoryMetadataPlane>,
         node_id: MetadataNodeId,
@@ -32322,7 +32778,7 @@ mod tests {
     ) {
         let node = metadata.get_metadata_node(node_id).unwrap();
         match node.kind {
-            MetadataNodeKind::Leaf { entries } => {
+            MetadataNodeKind::Leaf { entries, .. } => {
                 out.extend(entries.into_iter().map(|entry| entry.segment_id));
             }
             MetadataNodeKind::Internal { children } => {
@@ -32331,6 +32787,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn collect_tree_run_extents(
+        metadata: &Arc<InMemoryMetadataPlane>,
+        node_id: MetadataNodeId,
+        out: &mut Vec<RunBackedFileExtent>,
+    ) {
+        let node = metadata.get_metadata_node(node_id).unwrap();
+        match node.kind {
+            MetadataNodeKind::Leaf { run_extents, .. } => {
+                out.extend(run_extents);
+            }
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    collect_tree_run_extents(metadata, child.node_id, out);
+                }
+            }
+        }
+    }
+
+    fn run_storage_nodes(extents: &[RunBackedFileExtent]) -> BTreeSet<StorageNodeId> {
+        extents
+            .iter()
+            .map(|extent| extent.run.storage_node)
+            .collect()
     }
 
     fn segment_storage_nodes(

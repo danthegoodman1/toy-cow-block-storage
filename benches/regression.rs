@@ -120,6 +120,7 @@ fn bench_metadata_leaf_validation(c: &mut Criterion) {
                     segment_offset: BlockIndex::from_raw(0),
                 },
             ],
+            run_extents: Vec::new(),
         },
     };
 
@@ -135,6 +136,7 @@ fn bench_in_memory_metadata_node_lookup(c: &mut Criterion) {
         covered_range: BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(128)),
         kind: MetadataNodeKind::Leaf {
             entries: Vec::new(),
+            run_extents: Vec::new(),
         },
     };
     metadata

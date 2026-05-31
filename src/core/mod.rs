@@ -310,6 +310,7 @@ mod tests {
             covered_range: BlockRange::new(BlockIndex::from_raw(0), BlockCount::from_raw(1)),
             kind: MetadataNodeKind::Leaf {
                 entries: Vec::new(),
+                run_extents: Vec::new(),
             },
         }
     }
