@@ -1,0 +1,213 @@
+fn append_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.durable_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_dir_sync_nanos,node_catalog_publish_nanos,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.name(),
+            args.provider,
+            args.durability,
+            args.rtt.as_micros(),
+            args.serial_rtts,
+            concurrency,
+            workload.op_size(args)?,
+            profile.sequence,
+            profile.total_nanos,
+            profile.lock_wait_nanos,
+            profile.sqlite_lock_wait_nanos,
+            profile.local_snapshot_nanos,
+            profile.metadata_publish_lock_wait_nanos,
+            profile.commit_sequence_alloc_nanos,
+            profile.data_log_append_sync_nanos,
+            profile.data_log_encode_nanos,
+            profile.data_log_write_nanos,
+            profile.data_log_file_sync_nanos,
+            profile.data_log_dir_sync_nanos,
+            profile.node_catalog_publish_nanos,
+            profile.root_sqlite_row_sync_nanos,
+            profile.root_sqlite_commit_nanos,
+            profile.new_segment_count,
+            profile.new_segment_bytes,
+            profile.touched_node_count,
+            profile.logical_conflict_count,
+            profile.touched_shard_head_rows,
+            profile.touched_manifest_rows,
+            profile.commit_rows_written,
+            profile.durable_commit_high_water,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}
+
+fn append_metadata_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.metadata_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,phase,total_nanos,tx_lock_wait_nanos,read_validation_nanos,apply_write_nanos,commit_version_alloc_nanos,touched_key_shards,read_key_count,write_key_count,conflict_count"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.name(),
+            args.provider,
+            args.durability,
+            args.rtt.as_micros(),
+            args.serial_rtts,
+            concurrency,
+            workload.op_size(args)?,
+            profile.sequence,
+            profile.phase,
+            profile.total_nanos,
+            profile.tx_lock_wait_nanos,
+            profile.read_validation_nanos,
+            profile.apply_write_nanos,
+            profile.commit_version_alloc_nanos,
+            profile.touched_key_shards,
+            profile.read_key_count,
+            profile.write_key_count,
+            profile.conflict_count,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}
+
+fn append_block_write_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.block_write_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,payload_integrity,sequence,total_nanos,device_spec_lookup_nanos,range_split_shard_head_read_nanos,write_intent_alloc_nanos,payload_copy_nanos,segment_write_nanos,storage_node_ids_nanos,placement_select_nanos,segment_id_alloc_nanos,grant_issue_nanos,storage_node_transport_dispatch_nanos,grant_verify_nanos,catalog_duplicate_probe_nanos,catalog_duplicate_probe_lock_wait_nanos,catalog_reserve_nanos,catalog_reserve_lock_wait_nanos,catalog_begin_nanos,catalog_begin_lock_wait_nanos,segment_store_write_nanos,segment_store_lock_wait_nanos,checksum_integrity_nanos,segment_store_insert_nanos,segment_sync_nanos,segment_sync_lock_wait_nanos,receipt_create_nanos,receipt_verify_nanos,catalog_commit_nanos,catalog_commit_lock_wait_nanos,tree_path_copy_nanos,metadata_publish_call_nanos,mark_referenced_nanos,mark_reference_evidence_nanos,mark_reference_transport_dispatch_nanos,mark_reference_verify_nanos,mark_reference_catalog_nanos,mark_reference_catalog_lock_wait_nanos,touched_shard_count,segment_count,profile_storage_node_count"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.name(),
+            args.provider,
+            args.durability,
+            args.rtt.as_micros(),
+            args.serial_rtts,
+            concurrency,
+            workload.op_size(args)?,
+            args.storage_nodes,
+            payload_integrity_name(args.payload_integrity),
+            profile.sequence,
+            profile.total_nanos,
+            profile.device_spec_lookup_nanos,
+            profile.range_split_shard_head_read_nanos,
+            profile.write_intent_alloc_nanos,
+            profile.payload_copy_nanos,
+            profile.segment_write_nanos,
+            profile.storage_node_ids_nanos,
+            profile.placement_select_nanos,
+            profile.segment_id_alloc_nanos,
+            profile.grant_issue_nanos,
+            profile.storage_node_transport_dispatch_nanos,
+            profile.grant_verify_nanos,
+            profile.catalog_duplicate_probe_nanos,
+            profile.catalog_duplicate_probe_lock_wait_nanos,
+            profile.catalog_reserve_nanos,
+            profile.catalog_reserve_lock_wait_nanos,
+            profile.catalog_begin_nanos,
+            profile.catalog_begin_lock_wait_nanos,
+            profile.segment_store_write_nanos,
+            profile.segment_store_lock_wait_nanos,
+            profile.checksum_integrity_nanos,
+            profile.segment_store_insert_nanos,
+            profile.segment_sync_nanos,
+            profile.segment_sync_lock_wait_nanos,
+            profile.receipt_create_nanos,
+            profile.receipt_verify_nanos,
+            profile.catalog_commit_nanos,
+            profile.catalog_commit_lock_wait_nanos,
+            profile.tree_path_copy_nanos,
+            profile.metadata_publish_call_nanos,
+            profile.mark_referenced_nanos,
+            profile.mark_reference_evidence_nanos,
+            profile.mark_reference_transport_dispatch_nanos,
+            profile.mark_reference_verify_nanos,
+            profile.mark_reference_catalog_nanos,
+            profile.mark_reference_catalog_lock_wait_nanos,
+            profile.touched_shard_count,
+            profile.segment_count,
+            profile.storage_node_count,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}
