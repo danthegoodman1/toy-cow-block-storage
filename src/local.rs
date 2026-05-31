@@ -2967,57 +2967,11 @@ impl LocalCoordinator {
         durability: crate::api::WriteDurability,
         payload_integrity: PayloadIntegrity,
     ) -> Result<AppendTicket> {
-        self.append_stream_segment_with_integrity(stream, data, durability, payload_integrity)
-            .map(|(ticket, _)| ticket)
-    }
-
-    fn append_stream_segment_with_integrity(
-        &self,
-        stream: &AppendStream,
-        data: &[u8],
-        durability: crate::api::WriteDurability,
-        payload_integrity: PayloadIntegrity,
-    ) -> Result<(AppendTicket, DurableSegmentPayload)> {
         if data.is_empty() {
             return Err(StorageError::invalid_argument(
                 "append payload must not be empty",
             ));
         }
-        let prepared =
-            self.prepare_append_stream_segment(stream, data.len(), durability, payload_integrity)?;
-        let segment_bytes = self.padded_append_segment_bytes(data)?;
-        self.commit_prepared_append_stream_segment(prepared, segment_bytes, payload_integrity)
-    }
-
-    fn padded_append_segment_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let data_len = u64::try_from(data.len())
-            .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
-        let block_size = u64::from(self.metadata.config.block_size);
-        let segment_blocks = blocks_for_bytes(data_len, block_size)?;
-        let segment_len = segment_blocks.checked_mul(block_size).ok_or_else(|| {
-            StorageError::invalid_argument("append stream segment byte length overflows")
-        })?;
-        let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
-            StorageError::invalid_argument("append stream segment length overflows usize")
-        })?;
-        let mut segment_bytes = Vec::with_capacity(segment_len_usize);
-        segment_bytes.extend_from_slice(data);
-        segment_bytes.resize(segment_len_usize, 0);
-        Ok(segment_bytes)
-    }
-
-    fn prepare_append_stream_segment(
-        &self,
-        stream: &AppendStream,
-        data_len: usize,
-        durability: crate::api::WriteDurability,
-        payload_integrity: PayloadIntegrity,
-    ) -> Result<PreparedAppendStreamSegment> {
-        if data_len == 0 {
-            return Err(StorageError::invalid_argument(
-                "append payload must not be empty",
-            ));
-        }
         if matches!(durability, crate::api::WriteDurability::Flushed) {
             return Err(StorageError::invalid_argument(
                 "append stream flushed durability is handled by DurableCoordinator",
@@ -3034,156 +2988,18 @@ impl LocalCoordinator {
                     counters.coordinator_write_attempts.saturating_add(1);
             },
         );
-        let data_len_u64 = u64::try_from(data_len)
+        let data_len_u64 = u64::try_from(data.len())
             .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
         let ticket_id = self.metadata.next_append_ticket_id()?;
         let ticket_range = self
             .metadata
             .reserve_append_stream_range(stream, data_len_u64)?;
-        let block_size = u64::from(self.metadata.config.block_size);
-        let segment_blocks = blocks_for_bytes(data_len_u64, block_size)?;
-        let segment_len = segment_blocks.checked_mul(block_size).ok_or_else(|| {
-            StorageError::invalid_argument("append stream segment byte length overflows")
-        })?;
-        let candidates = self.storage_nodes.storage_node_ids()?;
-        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
-        let segment_id = self.storage_nodes.allocate_segment_id()?;
-        let grant = self.issue_write_grant(WriteGrantRequest {
-            tenant: LOCAL_TENANT_ID,
-            principal: LOCAL_PRINCIPAL_ID,
-            intent: WriteGrantIntent::NativeAppendStream {
-                keyspace_id: stream.keyspace_id,
-                file_id: stream.file_id,
-                stream_id: stream.stream_id,
-                ticket_id,
-                append_offset: ticket_range.offset,
-                bytes: data_len_u64,
-                writer_epoch: stream.writer_epoch,
-            },
-            write_intent: self.next_write_intent()?,
-            segment_id,
-            storage_node,
-            max_bytes: segment_len,
-            payload_integrity,
-            durability: WriteDurability::Acknowledged,
-            expires_at: LOCAL_GRANT_EXPIRATION,
-        })?;
-        Ok(PreparedAppendStreamSegment {
-            stream: stream.clone(),
+        self.metadata.append_stream_pending_record(
+            stream,
             ticket_id,
-            range: ticket_range,
-            grant,
-        })
-    }
-
-    fn prepare_append_stream_run(
-        &self,
-        stream: &AppendStream,
-        data_len: usize,
-        durability: crate::api::WriteDurability,
-    ) -> Result<PreparedAppendStreamRun> {
-        if data_len == 0 {
-            return Err(StorageError::invalid_argument(
-                "append payload must not be empty",
-            ));
-        }
-        if matches!(durability, crate::api::WriteDurability::Flushed) {
-            return Err(StorageError::invalid_argument(
-                "append stream flushed durability is handled by DurableCoordinator",
-            ));
-        }
-        self.observability.record_with_update(
-            StorageEventKind::CoordinatorWriteStarted,
-            None,
-            None,
-            None,
-            None,
-            |counters| {
-                counters.coordinator_write_attempts =
-                    counters.coordinator_write_attempts.saturating_add(1);
-            },
-        );
-        let data_len_u64 = u64::try_from(data_len)
-            .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
-        let ticket_id = self.metadata.next_append_ticket_id()?;
-        let ticket_range = self
-            .metadata
-            .reserve_append_stream_range(stream, data_len_u64)?;
-        let candidates = self.storage_nodes.storage_node_ids()?;
-        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
-        Ok(PreparedAppendStreamRun {
-            stream: stream.clone(),
-            ticket_id,
-            range: ticket_range,
-            storage_node,
-            run_id: AppendRunId::from_raw(ticket_id.raw()),
-        })
-    }
-
-    fn commit_prepared_append_stream_segment(
-        &self,
-        prepared: PreparedAppendStreamSegment,
-        segment_bytes: Vec<u8>,
-        payload_integrity: PayloadIntegrity,
-    ) -> Result<(AppendTicket, DurableSegmentPayload)> {
-        let payload_for_durable: Arc<[u8]> = Arc::from(segment_bytes.clone());
-
-        let verified_receipt =
-            self.write_granted_segment_verified(&prepared.grant, segment_bytes)?;
-        let segment_id = verified_receipt.descriptor.segment_id;
-        let storage_node = verified_receipt.receipt.storage_node;
-        let integrity = verified_receipt.descriptor.integrity;
-        let segment_bytes = verified_receipt.descriptor.bytes;
-        if !matches!(
-            prepared.grant.intent,
-            WriteGrantIntent::NativeAppendStream { .. }
-        ) {
-            return Err(StorageError::corrupt(
-                "prepared append stream grant has wrong intent",
-            ));
-        }
-        let ticket = self.metadata.append_stream_segment_record(
-            &prepared.stream,
-            prepared.ticket_id,
-            prepared.range,
-            segment_id,
-            segment_bytes,
+            ticket_range,
+            Arc::from(data),
             payload_integrity,
-        )?;
-        Ok((
-            ticket,
-            DurableSegmentPayload {
-                segment_id,
-                storage_node,
-                integrity,
-                bytes: payload_for_durable,
-            },
-        ))
-    }
-
-    fn commit_prepared_append_stream_run(
-        &self,
-        prepared: PreparedAppendStreamRun,
-        run: AppendLogRun,
-    ) -> Result<AppendTicket> {
-        if run.run_id != prepared.run_id
-            || run.storage_node != prepared.storage_node
-            || run.stream_id != prepared.stream.stream_id
-            || run.writer_epoch != prepared.stream.writer_epoch
-            || run.keyspace_id != prepared.stream.keyspace_id
-            || run.file_id != prepared.stream.file_id
-            || run.file_offset_start != prepared.range.offset
-            || run.payload_len != prepared.range.len
-        {
-            return Err(StorageError::corrupt(
-                "append run manifest disagrees with prepared stream range",
-            ));
-        }
-        self.metadata.append_stream_run_record(
-            &prepared.stream,
-            prepared.ticket_id,
-            prepared.range,
-            run,
         )
     }
 
@@ -3313,6 +3129,76 @@ impl LocalCoordinator {
             replacement,
         )?;
         Ok(true)
+    }
+
+    fn prepare_append_stream_run(
+        &self,
+        stream: &AppendStream,
+        data_len: usize,
+        durability: crate::api::WriteDurability,
+    ) -> Result<PreparedAppendStreamRun> {
+        if data_len == 0 {
+            return Err(StorageError::invalid_argument(
+                "append payload must not be empty",
+            ));
+        }
+        if matches!(durability, crate::api::WriteDurability::Flushed) {
+            return Err(StorageError::invalid_argument(
+                "append stream flushed durability is handled by DurableCoordinator",
+            ));
+        }
+        self.observability.record_with_update(
+            StorageEventKind::CoordinatorWriteStarted,
+            None,
+            None,
+            None,
+            None,
+            |counters| {
+                counters.coordinator_write_attempts =
+                    counters.coordinator_write_attempts.saturating_add(1);
+            },
+        );
+        let data_len_u64 = u64::try_from(data_len)
+            .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?;
+        let ticket_id = self.metadata.next_append_ticket_id()?;
+        let range = self
+            .metadata
+            .reserve_append_stream_range(stream, data_len_u64)?;
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        Ok(PreparedAppendStreamRun {
+            stream: stream.clone(),
+            ticket_id,
+            range,
+            storage_node,
+            run_id: AppendRunId::from_raw(ticket_id.raw()),
+        })
+    }
+
+    fn commit_prepared_append_stream_run(
+        &self,
+        prepared: PreparedAppendStreamRun,
+        run: AppendLogRun,
+    ) -> Result<AppendTicket> {
+        if run.run_id != prepared.run_id
+            || run.storage_node != prepared.storage_node
+            || run.stream_id != prepared.stream.stream_id
+            || run.writer_epoch != prepared.stream.writer_epoch
+            || run.keyspace_id != prepared.stream.keyspace_id
+            || run.file_id != prepared.stream.file_id
+            || run.file_offset_start != prepared.range.offset
+            || run.payload_len != prepared.range.len
+        {
+            return Err(StorageError::corrupt(
+                "append run manifest disagrees with prepared stream range",
+            ));
+        }
+        self.metadata.append_stream_run_record(
+            &prepared.stream,
+            prepared.ticket_id,
+            prepared.range,
+            run,
+        )
     }
 
     pub fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
@@ -7004,21 +6890,22 @@ impl DurableSqliteStore {
         )
     }
 
-    fn append_run_payload_unsynced(
+    fn append_run_payload_chunks_unsynced(
         &self,
-        payload: DurableAppendRunPayload,
+        payload: DurableAppendRunChunkPayload,
         pending_base: Option<&PendingDataLogAppend>,
     ) -> Result<(AppendLogRun, PendingDataLogAppend, DataLogAppendProfile)> {
-        let payload_bytes = u64::try_from(payload.bytes.len())
-            .map_err(|_| StorageError::invalid_argument("payload length overflows u64"))?;
+        let payload_bytes = payload.chunks.iter().try_fold(0_u64, |total, chunk| {
+            total
+                .checked_add(usize_to_u64(chunk.len()))
+                .ok_or_else(|| StorageError::invalid_argument("payload length overflows u64"))
+        })?;
         if payload_bytes == 0 {
             return Err(StorageError::invalid_argument(
                 "append run payload must not be empty",
             ));
         }
-        let record_len = (DATA_LOG_HEADER_LEN as u64)
-            .checked_add(payload_bytes)
-            .ok_or_else(|| StorageError::invalid_argument("data-log record length overflows"))?;
+        let record_len = payload_bytes;
         let mut append = PendingDataLogAppend::default();
         let mut profile = DataLogAppendProfile::default();
         let storage_node = payload.storage_node;
@@ -7077,16 +6964,16 @@ impl DurableSqliteStore {
 
         let record_offset = active.total_bytes;
         let started = Instant::now();
-        let record =
-            encode_append_run_data_log_record(payload.run_id, payload.integrity, &payload.bytes)?;
+        let integrity =
+            segment_payload_integrity_chunks(payload.payload_integrity, &payload.chunks);
         profile.encode_nanos = duration_nanos_u64(started.elapsed());
         let started = Instant::now();
-        file.write_all(&record).map_err(fs_error)?;
+        for chunk in &payload.chunks {
+            file.write_all(chunk).map_err(fs_error)?;
+        }
         profile.write_nanos = duration_nanos_u64(started.elapsed());
 
-        let payload_offset = record_offset
-            .checked_add(DATA_LOG_HEADER_LEN as u64)
-            .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
+        let payload_offset = record_offset;
         let new_total = record_offset
             .checked_add(record_len)
             .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
@@ -7117,7 +7004,7 @@ impl DurableSqliteStore {
             log_id: active.log_id,
             log_payload_offset: payload_offset,
             log_record_bytes: record_len,
-            integrity: payload.integrity,
+            integrity,
         };
         run.validate()?;
         Ok((run, append, profile))
@@ -7131,36 +7018,6 @@ impl DurableSqliteStore {
         run.validate()?;
         let path = data_log_path(&self.paths.data_dir, run.storage_node, run.log_id);
         let mut file = File::open(&path).map_err(fs_error)?;
-        if !matches!(
-            (run.integrity, verification),
-            (SegmentPayloadIntegrity::Unchecked, _) | (_, ReadVerification::Skip)
-        ) {
-            let record_offset = run
-                .log_payload_offset
-                .checked_sub(DATA_LOG_HEADER_LEN as u64);
-            if let Some(record_offset) = record_offset {
-                let record_len = (DATA_LOG_HEADER_LEN as u64)
-                    .checked_add(run.payload_len)
-                    .ok_or_else(|| StorageError::corrupt("append run record length overflows"))?;
-                let record_len = usize::try_from(record_len).map_err(|_| {
-                    StorageError::corrupt("append run record length overflows usize")
-                })?;
-                file.seek(SeekFrom::Start(record_offset))
-                    .map_err(fs_error)?;
-                let mut record = vec![0; record_len];
-                file.read_exact(&mut record).map_err(fs_error)?;
-                let data = decode_append_run_data_log_record(&record)?;
-                if data.run_id != run.run_id
-                    || data.bytes.len() as u64 != run.payload_len
-                    || data.integrity != run.integrity
-                {
-                    return Err(StorageError::corrupt(
-                        "append-run data-log record disagrees with manifest",
-                    ));
-                }
-                return Ok(data.bytes);
-            }
-        }
         file.seek(SeekFrom::Start(run.log_payload_offset))
             .map_err(fs_error)?;
         let len = usize::try_from(run.payload_len)
@@ -7998,6 +7855,7 @@ struct DataLogSegmentData {
     bytes: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DataLogAppendRunData {
     run_id: AppendRunId,
@@ -8008,7 +7866,10 @@ struct DataLogAppendRunData {
 #[derive(Debug, Clone)]
 enum DataLogRecordData {
     Segment(DataLogSegmentData),
+    #[cfg(test)]
     AppendRun(DataLogAppendRunData),
+    #[cfg(not(test))]
+    AppendRun,
 }
 
 fn encode_row<T: DurableCodec>(value: &T) -> Result<Vec<u8>> {
@@ -10206,6 +10067,7 @@ fn encode_data_log_record(
     encode_typed_data_log_record(DATA_LOG_KIND_SEGMENT, segment_id.raw(), integrity, bytes)
 }
 
+#[cfg(test)]
 fn encode_append_run_data_log_record(
     run_id: AppendRunId,
     integrity: SegmentPayloadIntegrity,
@@ -10220,14 +10082,25 @@ fn encode_typed_data_log_record(
     integrity: SegmentPayloadIntegrity,
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
+    let payload_len = u64::try_from(bytes.len())
+        .map_err(|_| StorageError::invalid_argument("data-log payload length overflows u64"))?;
+    let mut out = encode_typed_data_log_header(kind, identity, integrity, payload_len)?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn encode_typed_data_log_header(
+    kind: u8,
+    identity: u128,
+    integrity: SegmentPayloadIntegrity,
+    payload_len: u64,
+) -> Result<Vec<u8>> {
     if !matches!(kind, DATA_LOG_KIND_SEGMENT | DATA_LOG_KIND_APPEND_RUN) {
         return Err(StorageError::invalid_argument(
             "unknown data-log record kind",
         ));
     }
-    let payload_len = u64::try_from(bytes.len())
-        .map_err(|_| StorageError::invalid_argument("data-log payload length overflows u64"))?;
-    let mut out = Vec::with_capacity(DATA_LOG_HEADER_LEN + bytes.len());
+    let mut out = Vec::with_capacity(DATA_LOG_HEADER_LEN);
     out.extend_from_slice(DATA_LOG_MAGIC);
     out.extend_from_slice(&DATA_LOG_VERSION.to_be_bytes());
     out.push(kind);
@@ -10243,7 +10116,6 @@ fn encode_typed_data_log_record(
             out.extend_from_slice(&0_u64.to_be_bytes());
         }
     }
-    out.extend_from_slice(bytes);
     Ok(out)
 }
 
@@ -10311,11 +10183,20 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogRecordData> {
             integrity,
             bytes,
         })),
-        DATA_LOG_KIND_APPEND_RUN => Ok(DataLogRecordData::AppendRun(DataLogAppendRunData {
-            run_id: AppendRunId::from_raw(identity),
-            integrity,
-            bytes,
-        })),
+        DATA_LOG_KIND_APPEND_RUN => {
+            #[cfg(test)]
+            {
+                Ok(DataLogRecordData::AppendRun(DataLogAppendRunData {
+                    run_id: AppendRunId::from_raw(identity),
+                    integrity,
+                    bytes,
+                }))
+            }
+            #[cfg(not(test))]
+            {
+                Ok(DataLogRecordData::AppendRun)
+            }
+        }
         _ => Err(StorageError::corrupt("invalid data-log record kind")),
     }
 }
@@ -10323,12 +10204,18 @@ fn decode_data_log_record(record: &[u8]) -> Result<DataLogRecordData> {
 fn decode_segment_data_log_record(record: &[u8]) -> Result<DataLogSegmentData> {
     match decode_data_log_record(record)? {
         DataLogRecordData::Segment(data) => Ok(data),
+        #[cfg(test)]
         DataLogRecordData::AppendRun(_) => Err(StorageError::corrupt(
+            "expected segment data-log record, found append-run record",
+        )),
+        #[cfg(not(test))]
+        DataLogRecordData::AppendRun => Err(StorageError::corrupt(
             "expected segment data-log record, found append-run record",
         )),
     }
 }
 
+#[cfg(test)]
 fn decode_append_run_data_log_record(record: &[u8]) -> Result<DataLogAppendRunData> {
     match decode_data_log_record(record)? {
         DataLogRecordData::AppendRun(data) => Ok(data),
@@ -11304,6 +11191,266 @@ impl DurableCoordinator {
         Ok(())
     }
 
+    fn materialize_pending_append_stream_flush_plan(
+        &self,
+        plan: &AppendStreamFlushPlan,
+        pending_base: &PendingDataLogAppend,
+    ) -> Result<(
+        AppendStreamFlushPlan,
+        PendingDataLogAppend,
+        DataLogAppendProfile,
+    )> {
+        if plan.batch.records.is_empty() {
+            return Ok((
+                plan.clone(),
+                PendingDataLogAppend::default(),
+                DataLogAppendProfile::default(),
+            ));
+        }
+        if plan
+            .batch
+            .records
+            .iter()
+            .all(AppendStreamSegment::is_durable_backing)
+        {
+            if let Some(coalesced) = self.coalesce_raw_append_run_flush_plan(plan)? {
+                return Ok((
+                    coalesced,
+                    PendingDataLogAppend::default(),
+                    DataLogAppendProfile::default(),
+                ));
+            }
+            return Ok((
+                plan.clone(),
+                PendingDataLogAppend::default(),
+                DataLogAppendProfile::default(),
+            ));
+        }
+        if !plan
+            .batch
+            .records
+            .iter()
+            .all(|record| matches!(record.backing, AppendStreamSegmentBacking::Pending { .. }))
+        {
+            return Err(StorageError::conflict(
+                "append stream flush batch cannot mix pending and durable records",
+            ));
+        }
+
+        let first = plan
+            .batch
+            .records
+            .first()
+            .ok_or_else(|| StorageError::corrupt("append stream flush batch is empty"))?;
+        let mut expected = first.offset;
+        let mut chunks = Vec::with_capacity(plan.batch.records.len());
+        let mut payload_integrity = PayloadIntegrity::Verified;
+        for record in &plan.batch.records {
+            if record.offset != expected {
+                return Err(StorageError::conflict(
+                    "append stream flush batch must be contiguous",
+                ));
+            }
+            expected = record.end_exclusive()?;
+            match &record.backing {
+                AppendStreamSegmentBacking::Pending {
+                    bytes: record_bytes,
+                    payload_integrity: record_integrity,
+                } => {
+                    if *record_integrity == PayloadIntegrity::Unchecked {
+                        payload_integrity = PayloadIntegrity::Unchecked;
+                    }
+                    chunks.push(Arc::clone(record_bytes));
+                }
+                AppendStreamSegmentBacking::Segment { .. }
+                | AppendStreamSegmentBacking::AppendRun { .. } => {
+                    return Err(StorageError::conflict(
+                        "append stream flush batch must contain only pending records",
+                    ));
+                }
+            }
+        }
+        if expected != plan.batch.durable_through {
+            return Err(StorageError::conflict(
+                "append stream flush batch durable high-water is not contiguous",
+            ));
+        }
+
+        let candidates = self.local.storage_nodes.storage_node_ids()?;
+        let storage_node =
+            PlacementPolicy::choose_storage_node(&self.local.storage_nodes, &candidates)?;
+        let payload = DurableAppendRunChunkPayload {
+            run_id: AppendRunId::from_raw(first.ticket_id.raw()),
+            storage_node,
+            stream_id: plan.stream.stream_id,
+            writer_epoch: plan.stream.writer_epoch,
+            keyspace_id: plan.stream.keyspace_id,
+            file_id: plan.stream.file_id,
+            file_offset_start: first.offset,
+            payload_integrity,
+            chunks,
+        };
+        let (run, append, profile) = self
+            .durable
+            .append_run_payload_chunks_unsynced(payload, Some(pending_base))?;
+        let run_bytes = run.payload_len;
+        let replacement = AppendStreamSegment {
+            ticket_id: first.ticket_id,
+            offset: first.offset,
+            len: run.payload_len,
+            backing: AppendStreamSegmentBacking::AppendRun { run },
+        };
+        self.local.metadata.replace_append_stream_records(
+            &plan.stream,
+            first.offset,
+            expected,
+            replacement.clone(),
+        )?;
+        Ok((
+            AppendStreamFlushPlan {
+                stream: plan.stream.clone(),
+                batch: AppendStreamFlushBatch {
+                    records: vec![replacement],
+                    durable_through: expected,
+                    segment_bytes: run_bytes,
+                },
+            },
+            append,
+            profile,
+        ))
+    }
+
+    fn coalesce_raw_append_run_flush_plan(
+        &self,
+        plan: &AppendStreamFlushPlan,
+    ) -> Result<Option<AppendStreamFlushPlan>> {
+        if plan.batch.records.len() <= 1 {
+            return Ok(None);
+        }
+        let mut records = plan.batch.records.clone();
+        records.sort_by_key(|record| record.offset);
+        let first = records
+            .first()
+            .ok_or_else(|| StorageError::corrupt("append stream flush batch is empty"))?;
+        let first_run = first
+            .append_run()
+            .ok_or_else(|| StorageError::conflict("append stream record is not append-run"))?;
+        if first_run.log_record_bytes != first_run.payload_len {
+            return Ok(None);
+        }
+
+        let mut expected_file_offset = first.offset;
+        let mut expected_log_offset = first_run.log_payload_offset;
+        let mut total_len = 0_u64;
+        let mut integrity = first_run.integrity;
+        for (index, record) in records.iter().enumerate() {
+            let run = record
+                .append_run()
+                .ok_or_else(|| StorageError::conflict("append stream record is not append-run"))?;
+            if run.log_record_bytes != run.payload_len
+                || run.storage_node != first_run.storage_node
+                || run.stream_id != first_run.stream_id
+                || run.writer_epoch != first_run.writer_epoch
+                || run.keyspace_id != first_run.keyspace_id
+                || run.file_id != first_run.file_id
+                || run.log_id != first_run.log_id
+                || record.offset != expected_file_offset
+                || run.file_offset_start != expected_file_offset
+                || run.log_payload_offset != expected_log_offset
+            {
+                return Ok(None);
+            }
+            if index != 0 {
+                integrity =
+                    combine_segment_payload_integrity(integrity, run.integrity, run.payload_len)?;
+            }
+            total_len = total_len
+                .checked_add(run.payload_len)
+                .ok_or_else(|| StorageError::invalid_argument("append run length overflows"))?;
+            expected_file_offset = expected_file_offset
+                .checked_add(run.payload_len)
+                .ok_or_else(|| {
+                    StorageError::invalid_argument("append run file offset overflows")
+                })?;
+            expected_log_offset = expected_log_offset
+                .checked_add(run.payload_len)
+                .ok_or_else(|| StorageError::invalid_argument("append run log offset overflows"))?;
+        }
+        if expected_file_offset != plan.batch.durable_through {
+            return Ok(None);
+        }
+
+        let run = AppendLogRun {
+            run_id: first_run.run_id,
+            storage_node: first_run.storage_node,
+            stream_id: first_run.stream_id,
+            writer_epoch: first_run.writer_epoch,
+            keyspace_id: first_run.keyspace_id,
+            file_id: first_run.file_id,
+            file_offset_start: first_run.file_offset_start,
+            payload_len: total_len,
+            log_id: first_run.log_id,
+            log_payload_offset: first_run.log_payload_offset,
+            log_record_bytes: total_len,
+            integrity,
+        };
+        run.validate()?;
+        let replacement = AppendStreamSegment {
+            ticket_id: first.ticket_id,
+            offset: first.offset,
+            len: total_len,
+            backing: AppendStreamSegmentBacking::AppendRun { run },
+        };
+        self.local.metadata.replace_append_stream_records(
+            &plan.stream,
+            first.offset,
+            expected_file_offset,
+            replacement.clone(),
+        )?;
+        Ok(Some(AppendStreamFlushPlan {
+            stream: plan.stream.clone(),
+            batch: AppendStreamFlushBatch {
+                records: vec![replacement],
+                durable_through: expected_file_offset,
+                segment_bytes: total_len,
+            },
+        }))
+    }
+
+    fn materialize_pending_append_stream_flush_plans(
+        &self,
+        plans: &[AppendStreamFlushPlan],
+    ) -> Result<(
+        Vec<AppendStreamFlushPlan>,
+        PendingDataLogAppend,
+        DataLogAppendProfile,
+    )> {
+        let base = lock(&self.pending_stream_data_log_append)?.clone();
+        let mut pending_base = base;
+        let mut materialized_append = PendingDataLogAppend::default();
+        let mut materialized_profile = DataLogAppendProfile::default();
+        let mut materialized_plans = Vec::with_capacity(plans.len());
+
+        for plan in plans {
+            let (plan, append, profile) =
+                self.materialize_pending_append_stream_flush_plan(plan, &pending_base)?;
+            pending_base.merge(append.clone());
+            materialized_append.merge(append);
+            materialized_profile.merge(profile);
+            materialized_plans.push(plan);
+        }
+
+        if !materialized_append.is_empty() {
+            lock(&self.pending_stream_data_log_append)?.merge(materialized_append.clone());
+        }
+
+        Ok((
+            materialized_plans,
+            materialized_append,
+            materialized_profile,
+        ))
+    }
+
     fn persist_one_available_append_stream_batch(&self) -> Result<bool> {
         let total_started = Instant::now();
         let _persist_guard = lock(&self.persist_lock)?;
@@ -11317,6 +11464,8 @@ impl DurableCoordinator {
         if plans.is_empty() {
             return Ok(false);
         }
+        let (plans, materialized_append, materialized_profile) =
+            self.materialize_pending_append_stream_flush_plans(&plans)?;
         let segment_ids: BTreeSet<_> = plans
             .iter()
             .flat_map(|plan| {
@@ -11358,11 +11507,35 @@ impl DurableCoordinator {
         let mut pending_stream_append = pending_stream.selected_segments(&missing_pending);
         pending_stream_append.merge(pending_stream.selected_log_refs(&run_log_refs));
         drop(pending_stream);
+        pending_stream_append.merge(materialized_append);
         let pending_segment_ids = pending_stream_append.segment_ids();
         if pending_segment_ids != missing_pending {
             return Err(StorageError::corrupt(
                 "stream flush references data that was not ingested into the stream log",
             ));
+        }
+        let mut pending_log_refs = pending_stream_append.log_refs();
+        let missing_log_refs: Vec<_> = run_log_refs
+            .difference(&pending_log_refs)
+            .copied()
+            .collect();
+        for log_ref in missing_log_refs {
+            let path = data_log_path(
+                &self.durable.paths.data_dir,
+                log_ref.storage_node,
+                log_ref.log_id,
+            );
+            let total_bytes = path.metadata().map_err(fs_error)?.len();
+            pending_stream_append.logs.insert(
+                log_ref,
+                PendingDataLogManifest {
+                    storage_node: log_ref.storage_node,
+                    log_id: log_ref.log_id,
+                    state: STREAM_DATA_LOG_STATE_ACTIVE,
+                    total_bytes,
+                },
+            );
+            pending_log_refs.insert(log_ref);
         }
         let nodes = self.local.selected_state_for_segment_ids(&segment_ids)?;
         let cursor = self.local.durable_export_cursor()?;
@@ -11393,6 +11566,16 @@ impl DurableCoordinator {
                 .mark_append_stream_durable_through(&plan.stream, plan.batch.durable_through)?;
         }
 
+        profile.data_log_encode_nanos = profile
+            .data_log_encode_nanos
+            .saturating_add(materialized_profile.encode_nanos);
+        profile.data_log_write_nanos = profile
+            .data_log_write_nanos
+            .saturating_add(materialized_profile.write_nanos);
+        profile.data_log_append_sync_nanos = profile
+            .data_log_append_sync_nanos
+            .saturating_add(materialized_profile.encode_nanos)
+            .saturating_add(materialized_profile.write_nanos);
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.new_segment_count = profile.new_segment_count.saturating_add(new_run_count);
@@ -11930,8 +12113,7 @@ impl DurableCoordinator {
                 crate::api::WriteDurability::Acknowledged,
             )
             .and_then(|prepared| {
-                let payload_bytes: Arc<[u8]> = Arc::from(data.to_vec());
-                let payload = DurableAppendRunPayload {
+                let payload = DurableAppendRunChunkPayload {
                     run_id: prepared.run_id,
                     storage_node: prepared.storage_node,
                     stream_id: prepared.stream.stream_id,
@@ -11939,13 +12121,13 @@ impl DurableCoordinator {
                     keyspace_id: prepared.stream.keyspace_id,
                     file_id: prepared.stream.file_id,
                     file_offset_start: prepared.range.offset,
-                    integrity: segment_payload_integrity(payload_integrity, &payload_bytes),
-                    bytes: payload_bytes,
+                    payload_integrity,
+                    chunks: vec![Arc::from(data)],
                 };
                 let pending_base = lock(&self.pending_stream_data_log_append)?.clone();
                 let (run, append, _) = self
                     .durable
-                    .append_run_payload_unsynced(payload, Some(&pending_base))?;
+                    .append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
                 let appended_log_refs = append.log_refs();
                 lock(&self.pending_stream_data_log_append)?.merge(append);
                 let commit = self.local.commit_prepared_append_stream_run(prepared, run);
@@ -12597,7 +12779,7 @@ enum AppendStreamStatus {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum AppendStreamSegmentBacking {
     Pending {
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
         payload_integrity: PayloadIntegrity,
     },
     Segment {
@@ -12629,14 +12811,6 @@ struct AppendStreamFlushBatch {
 struct AppendStreamFlushPlan {
     stream: AppendStream,
     batch: AppendStreamFlushBatch,
-}
-
-#[derive(Debug, Clone)]
-struct PreparedAppendStreamSegment {
-    stream: AppendStream,
-    ticket_id: AppendTicketId,
-    range: ByteRange,
-    grant: WriteGrant,
 }
 
 #[derive(Debug, Clone)]
@@ -13249,7 +13423,7 @@ impl InMemoryMetadataPlane {
         stream: &AppendStream,
         ticket_id: AppendTicketId,
         range: ByteRange,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
         payload_integrity: PayloadIntegrity,
     ) -> Result<AppendTicket> {
         if range.len == 0 {
@@ -13280,57 +13454,6 @@ impl InMemoryMetadataPlane {
             len: range.len,
             backing: AppendStreamSegmentBacking::Pending {
                 bytes,
-                payload_integrity,
-            },
-        });
-        Ok(AppendTicket {
-            keyspace_id: stream.keyspace_id,
-            file_id: stream.file_id,
-            stream_id: stream.stream_id,
-            ticket_id,
-            writer_epoch: stream.writer_epoch,
-            range,
-        })
-    }
-
-    pub fn append_stream_segment_record(
-        &self,
-        stream: &AppendStream,
-        ticket_id: AppendTicketId,
-        range: ByteRange,
-        segment_id: SegmentId,
-        segment_bytes: u64,
-        payload_integrity: PayloadIntegrity,
-    ) -> Result<AppendTicket> {
-        if range.len == 0 {
-            return Err(StorageError::invalid_argument(
-                "append payload must not be empty",
-            ));
-        }
-        if segment_bytes < range.len {
-            return Err(StorageError::invalid_argument(
-                "append stream segment bytes must cover append range",
-            ));
-        }
-        let mut inner = lock(&self.inner)?;
-        Self::file_head_locked(&inner, stream.keyspace_id, stream.file_id)?;
-        let state = inner
-            .append_streams
-            .get_mut(&stream.stream_id)
-            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
-        state.validate_token(stream)?;
-        if range.end_exclusive()? > state.reserved_tail {
-            return Err(StorageError::conflict(
-                "append stream record exceeds reserved tail",
-            ));
-        }
-        state.records.push(AppendStreamSegment {
-            ticket_id,
-            offset: range.offset,
-            len: range.len,
-            backing: AppendStreamSegmentBacking::Segment {
-                segment_id,
-                segment_bytes,
                 payload_integrity,
             },
         });
@@ -15549,7 +15672,7 @@ struct DurableSegmentPayload {
 }
 
 #[derive(Debug)]
-struct DurableAppendRunPayload {
+struct DurableAppendRunChunkPayload {
     run_id: AppendRunId,
     storage_node: StorageNodeId,
     stream_id: AppendStreamId,
@@ -15557,8 +15680,8 @@ struct DurableAppendRunPayload {
     keyspace_id: KeyspaceId,
     file_id: FileId,
     file_offset_start: u64,
-    integrity: SegmentPayloadIntegrity,
-    bytes: Arc<[u8]>,
+    payload_integrity: PayloadIntegrity,
+    chunks: Vec<Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -21311,10 +21434,50 @@ fn data_log_checksum(bytes: &[u8]) -> u64 {
     u64::from(crc32c::crc32c(bytes))
 }
 
+fn data_log_checksum_chunks(chunks: &[Arc<[u8]>]) -> u64 {
+    let mut checksum = 0_u32;
+    for chunk in chunks {
+        checksum = crc32c::crc32c_append(checksum, chunk);
+    }
+    u64::from(checksum)
+}
+
 fn segment_payload_integrity(mode: PayloadIntegrity, bytes: &[u8]) -> SegmentPayloadIntegrity {
     match mode {
         PayloadIntegrity::Verified => SegmentPayloadIntegrity::Crc32c(data_log_checksum(bytes)),
         PayloadIntegrity::Unchecked => SegmentPayloadIntegrity::Unchecked,
+    }
+}
+
+fn segment_payload_integrity_chunks(
+    mode: PayloadIntegrity,
+    chunks: &[Arc<[u8]>],
+) -> SegmentPayloadIntegrity {
+    match mode {
+        PayloadIntegrity::Verified => {
+            SegmentPayloadIntegrity::Crc32c(data_log_checksum_chunks(chunks))
+        }
+        PayloadIntegrity::Unchecked => SegmentPayloadIntegrity::Unchecked,
+    }
+}
+
+fn combine_segment_payload_integrity(
+    left: SegmentPayloadIntegrity,
+    right: SegmentPayloadIntegrity,
+    right_len: u64,
+) -> Result<SegmentPayloadIntegrity> {
+    match (left, right) {
+        (SegmentPayloadIntegrity::Unchecked, _) | (_, SegmentPayloadIntegrity::Unchecked) => {
+            Ok(SegmentPayloadIntegrity::Unchecked)
+        }
+        (SegmentPayloadIntegrity::Crc32c(left), SegmentPayloadIntegrity::Crc32c(right)) => {
+            let right_len = usize::try_from(right_len).map_err(|_| {
+                StorageError::invalid_argument("checksum combine length overflows usize")
+            })?;
+            Ok(SegmentPayloadIntegrity::Crc32c(u64::from(
+                crc32c::crc32c_combine(left as u32, right as u32, right_len),
+            )))
+        }
     }
 }
 
@@ -24495,7 +24658,7 @@ mod tests {
 
     #[test]
     fn durable_acknowledged_append_stream_ingests_private_data_without_cataloging_before_flush() {
-        let root = durable_temp_dir("stream-ack-private-data-log-before-flush");
+        let root = durable_temp_dir("stream-ack-private-memory-before-flush");
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
         let keyspace_id = store
@@ -24522,7 +24685,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(data_log_path(&root.join("data"), cfg.storage_node, 1).exists());
+        assert!(
+            data_log_path(&root.join("data"), cfg.storage_node, 1).exists(),
+            "acknowledged stream ingest should append raw bytes to a private storage-node log"
+        );
         assert!(store.durable.data_log_rows_for_test().unwrap().is_empty());
 
         drop(store);
@@ -24581,6 +24747,63 @@ mod tests {
                 .sum::<u64>(),
             total_bytes
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_append_stream_flush_collapses_many_appends_into_one_run_extent() {
+        let root = durable_temp_dir("stream-flush-collapses-appends");
+        let cfg = LocalStoreConfig {
+            file_root_blocks: 16 * 1024,
+            metadata_leaf_blocks: 16 * 1024,
+            ..config()
+        };
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        let one_mib = vec![73; 1024 * 1024];
+        for _ in 0..16 {
+            store
+                .append_stream(&stream, &one_mib, WriteDurability::Acknowledged)
+                .unwrap();
+        }
+
+        let mark = store.flush_append_stream(&stream).unwrap();
+        assert_eq!(mark.durable_through, 16 * 1024 * 1024);
+        store.publish_append_stream(&stream, &mark).unwrap();
+
+        let run_extents = file_run_extents(&store.metadata(), keyspace_id, file_id);
+        assert_eq!(
+            run_extents.len(),
+            1,
+            "one bounded flush group should publish one run extent, not one extent per append"
+        );
+        assert_eq!(run_extents[0].payload_len, 16 * 1024 * 1024);
+
+        let mut bytes = vec![0; one_mib.len()];
+        store
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(15 * 1024 * 1024, one_mib.len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, one_mib);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -25890,8 +26113,7 @@ mod tests {
         let cfg = config();
         let store = DurableCoordinator::open(&root, cfg).unwrap();
         let bytes = repeated_blocks(1, 33);
-        let integrity = segment_payload_integrity(PayloadIntegrity::Verified, &bytes);
-        let payload = DurableAppendRunPayload {
+        let payload = DurableAppendRunChunkPayload {
             run_id: AppendRunId::from_raw(77),
             storage_node: cfg.storage_node,
             stream_id: AppendStreamId::from_raw(88),
@@ -25899,13 +26121,13 @@ mod tests {
             keyspace_id: KeyspaceId::from_raw(4),
             file_id: FileId::from_raw(5),
             file_offset_start: 4096,
-            integrity,
-            bytes: Arc::from(bytes.clone()),
+            payload_integrity: PayloadIntegrity::Verified,
+            chunks: vec![Arc::from(bytes.clone())],
         };
 
         let (run, pending, profile) = store
             .durable
-            .append_run_payload_unsynced(payload, None)
+            .append_run_payload_chunks_unsynced(payload, None)
             .unwrap();
         assert_eq!(run.run_id, AppendRunId::from_raw(77));
         assert_eq!(run.file_offset_start, 4096);
