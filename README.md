@@ -9,7 +9,11 @@ The simple performance rule is: when you are writing a large stream, batch on
 the caller side and append large buffers into an append stream. Appended bytes
 become durable at explicit stream flush boundaries and become visible to readers
 only when the stream is published, so data ingest can stay sequential while file
-metadata moves at coarser checkpoints.
+metadata moves at coarser checkpoints. A flush is private durability for the
+holder of the stream token; publish is the only globally discoverable boundary.
+Failover that needs unpublished bytes must persist the `AppendStream` and
+`DurableAppendMark` outside the storage layer. A replacement without that bearer
+authority opens a fresh stream at the last visible file head.
 
 ## Two Public APIs
 
@@ -371,6 +375,7 @@ cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --war
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
 cargo run --release --bin loadbench -- --provider durable --durability ack --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-stream --rtt-us 200 --stream-flush-mib 2 --stream-publish-mib 128
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,16,64 --files 128 --storage-nodes 4 --workloads native-file-batch --rtt-us 200
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16,64 --workloads block-metadata --rtt-us 200 --durable-profile-csv target/loadbench/block-metadata/profile.csv
 ```
 
@@ -404,6 +409,9 @@ how many bytes crossed the stream durability boundary and the reader-visible
 publish boundary during the run. A short run with a large publish interval can
 show high ingest throughput and low published throughput simply because it ends
 with private-but-valid stream data still waiting for the next publish boundary.
+That private durable data is resumable only by the matching stream token and
+durable mark; normal file lookup and new append stream open observe only the
+published head.
 
 The normal native write and append workloads partition files by worker so the
 happy-path rows measure throughput across independent file lanes instead of
@@ -419,6 +427,15 @@ lanes, then includes the stream flush+publish path. With
 touch one catalog shard row, how much time is spent waiting on metadata publish
 locks, and whether the remaining ceiling is SQLite/persist work rather than
 logical keyspace convergence.
+
+Use the `native-file-batch` alias when diagnosing client-sized random-write
+commit boundaries. It compares one-write controls with 4KiB batches at 16, 256,
+and 4096 writes, a 1MiB x 16 batch, overwrite-collapse batches, and a
+16MiB fsync-interval simulation. `--native-file-batch-ops`,
+`--native-file-batch-bytes`, `--native-file-batch-overlap`, and
+`--native-file-batch-fsync-mib` can override the default shapes. Treat
+batch rows as commit operations: `success_iops` is batch commits per second,
+while `mbps` is submitted client payload per second.
 
 For durable-provider tail analysis, add `--durable-profile-csv <path>` to append
 one row per physical persist. The profile breaks total persist time into lock

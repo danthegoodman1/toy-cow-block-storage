@@ -17,16 +17,16 @@ an atomic file batch commit:
 commit_file_batch(keyspace_id, file_id, writes[], durability) -> FileCommit
 ```
 
-`write_file_at(file, offset, bytes, durability)` becomes only the one-write
-convenience case:
+`NativeFile::write_at(offset, bytes)` remains only the one-write convenience
+case:
 
 ```text
-write_file_at(file, offset, bytes, durability)
-  = commit_file_batch(file, [{ offset, bytes }], durability)
+NativeFile::write_at(offset, bytes)
+  = NativeFile::commit_batch([{ offset, bytes }])
 ```
 
 Storage internals should have one real random-write implementation. No separate
-legacy `write_at` path, no compatibility wrapper, and no tombstone API.
+legacy one-write storage path, no compatibility wrapper, and no tombstone API.
 
 This plan is the native-file sibling of
 `docs/block-write-commit-boundary-plan.md`: clients own batching policy;
@@ -50,14 +50,14 @@ Replace ordinary random writes with:
 commit_file_batch(keyspace_id, file_id, writes[], durability) -> FileCommit
 ```
 
-Optional helper only:
+Public helper only:
 
 ```text
-write_file_at(keyspace_id, file_id, offset, bytes, durability)
+NativeFile::write_at(offset, bytes)
 ```
 
-The helper may remain in a client/adapter layer for ergonomics, but it must call
-the same one-write batch path. The storage layer should not maintain two
+The helper remains in the client/file-handle layer for ergonomics, but it must
+call the same one-write batch path. The storage layer should not maintain two
 separate random-write implementations.
 
 ## Client Responsibilities
@@ -182,7 +182,7 @@ Correctness tests:
 
 - one batch with multiple writes becomes visible atomically;
 - overlapping writes in one batch resolve by request order;
-- single-write batch exactly matches current `write_file_at` behavior;
+- single-write batch exactly matches public `NativeFile::write_at` behavior;
 - failed metadata publish leaves old file version visible;
 - same-file stale version fence fails cleanly;
 - other files in the same keyspace do not conflict;
@@ -342,10 +342,9 @@ flush, visible commit, metadata publish, or payload integrity.
 
 - No append-stream API rewrite in this phase.
 - No POSIX work in this phase.
-- No second storage path for `write_file_at`.
+- No second storage path for one-write native file commits.
 - No fake/null providers for performance claims.
 - No durable format compatibility shim.
 - No client-side replica or storage-node placement.
 - No weakening of CoW, PITR, data-before-metadata ordering, keyspace snapshot
   semantics, or append-stream fencing.
-

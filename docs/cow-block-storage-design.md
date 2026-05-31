@@ -1244,22 +1244,25 @@ Invariants:
 - The file version changes only through committed metadata updates.
 - The file root is separate from block device shard roots.
 
-### Native File Write
+### Native File Batch Commit
 
-A native file write is a byte-offset mutation against one file inside a
-keyspace. It can overwrite existing bytes or extend the file from the current
-end, but v1 rejects sparse writes beyond EOF. The local segment store remains
-block-aligned internally; unaligned file writes are implemented by copying the
-affected logical blocks into a fresh immutable segment and publishing a new file
-root.
+An ordinary native file write is represented internally as an atomic
+`commit_file_batch` against one file inside a keyspace. Public client adapters
+may expose one-write helpers, but storage internals keep a single random-write
+primitive. A batch can overwrite existing bytes or extend the file from the
+current end, but v1 rejects sparse writes beyond EOF. Overlapping writes inside
+one batch resolve by request order before metadata publication. The local segment store remains
+block-aligned internally; unaligned file ranges are implemented by copying the
+affected logical blocks into fresh immutable segments and publishing a new file
+root once for the collapsed batch.
 
 Invariants:
 
-- A successful write advances the file version atomically with the containing
-  keyspace catalog shard.
-- Writes are fenced by the committed file version observed by the metadata
+- A successful batch advances the file version atomically with the containing
+  keyspace catalog shard exactly once.
+- Batches are fenced by the committed file version observed by the metadata
   plane.
-- Failed writes leave the previous file version readable.
+- Failed batches leave the previous file version readable.
 - Segment/block alignment is not exposed to native callers.
 
 ### Append Streams, Durable Marks, And Visible Publish
@@ -1270,16 +1273,34 @@ to file readers when they are ingested. A stream flush makes private bytes
 durable through a returned high-water mark, and a publish converts a durable
 range into visible file metadata in one file-version transition.
 
+The production failover model is token-based, not name-based. `AppendStream` is
+bearer authority for one private stream, and `DurableAppendMark` is meaningful
+only with that matching stream token. There is no first-class registry that lets
+a replacement writer discover flushed private bytes by logical file name. A
+replacement writer can resume or publish flushed-but-unpublished bytes only if
+the failover control plane persisted the stream token and durable mark. Without
+that authority it must open a new stream, which fences the old stream and starts
+at the last visible file head.
+
+This keeps the storage contract simple: publish is the only globally
+discoverable append boundary. WAL-like users that require another process to
+recover by file name must publish at their desired recovery interval. Users that
+want private durable checkpoints may flush more often, but those checkpoints are
+private to the stream authority until publish succeeds.
+
 Invariants:
 
 - Append streams carry `keyspace_id`, `file_id`, `stream_id`, `base_version`,
   `visible_base_size`, and `writer_epoch`.
 - Append tickets identify the private byte range accepted by a stream append;
   they are diagnostic evidence, not metadata publish authority.
+- `append_stream` success is an acknowledged private ingest. It is not
+  restart-resumable until `flush_append_stream` succeeds.
 - `flush_append_stream` persists private append records and returns a durable
-  mark, but does not advance the visible file head.
+  mark, but does not advance the visible file head or make the bytes globally
+  discoverable.
 - `publish_append_stream` may only reference private records covered by a
-  durable mark.
+  durable mark and is the globally durable, visible, file-version boundary.
 - A stale stream cannot ingest, flush, or publish private data.
 - Opening a new stream or committing a same-file `write_at` fences the previous
   active stream for that file.

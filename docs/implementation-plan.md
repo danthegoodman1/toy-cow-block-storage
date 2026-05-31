@@ -58,8 +58,9 @@ Deliverables:
 - [x] Public `NativeKeyspaceClient` trait for native keyspace create/info,
   file create/info/append-stream open, keyspace checkpoint, snapshot, and
   restore.
-- [x] Public `NativeFile` trait for native file reads, byte writes, append
-  streams, append ingest, stream flush, stream publish, abort, flush, and info.
+- [x] Public `NativeFile` trait for native file reads, atomic file write
+  batches with a one-write helper, append streams, append ingest, stream flush,
+  stream publish, abort, flush, and info.
 - [x] `BlockServer` actor boundary.
 - [x] `BlockTransport` request/response boundary.
 - [x] `NativeServer` actor boundary.
@@ -99,8 +100,8 @@ Exit gate:
   IDs, shard counts, or commit assembly details.
 - [x] Native file requests do not flow through or depend on block-device logical
   range metadata.
-- [x] The documented public contract treats successful writes as atomic at
-  request granularity.
+- [x] The documented public contract treats successful block writes and native
+  file write batches as atomic at request granularity.
 - [x] The documented native contract treats successful append publishes as
   atomic at file-version granularity and fenced by append-stream writer epoch.
 - [x] Provider contracts state the minimal guarantees an in-memory, local
@@ -1334,6 +1335,9 @@ Deliverables:
   in one metadata transition.
 - [x] Reopen restores visible heads and resumable private stream state while
   ignoring unflushed bytes.
+- [x] Flushed private stream state is failover-resumable only by a holder of the
+  stream token and durable mark; publish is the only globally discoverable
+  append boundary.
 - [x] GC roots include active/resumable private stream ranges and stop
   protecting fenced, aborted, expired, superseded, or fully published private
   ranges.

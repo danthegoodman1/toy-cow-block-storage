@@ -45,6 +45,12 @@ pub struct FileInfo {
     pub version: FileVersion,
 }
 
+/// Bearer authority for one active native append stream.
+///
+/// The stream token is the only authority that can flush or publish
+/// flushed-but-unpublished private bytes. Implementations must not provide
+/// implicit resume by file name or keyspace path: opening a new stream for the
+/// same file is writer takeover at the visible file head and fences this token.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendStream {
     pub keyspace_id: KeyspaceId,
@@ -55,6 +61,10 @@ pub struct AppendStream {
     pub visible_base_size: u64,
 }
 
+/// Diagnostic receipt for bytes accepted into a private append stream.
+///
+/// A ticket proves the in-process stream accepted a byte range, but it is not
+/// publish authority and is not a restart-resume token.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendTicket {
     pub keyspace_id: KeyspaceId,
@@ -65,6 +75,11 @@ pub struct AppendTicket {
     pub range: ByteRange,
 }
 
+/// Durable private high-water mark for an append stream.
+///
+/// The mark is meaningful only with the matching `AppendStream` bearer token.
+/// It makes bytes restart-resumable by that token, but not visible or
+/// discoverable through normal file metadata.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DurableAppendMark {
     pub keyspace_id: KeyspaceId,
@@ -94,6 +109,26 @@ pub struct FileWriteCommit {
     pub durability: WriteDurability,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileBatchWrite {
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl FileBatchWrite {
+    pub fn new(offset: u64, bytes: Vec<u8>) -> Self {
+        Self { offset, bytes }
+    }
+
+    pub fn byte_range(&self) -> Result<ByteRange> {
+        let len = u64::try_from(self.bytes.len())
+            .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
+        let range = ByteRange::new(self.offset, len);
+        range.end_exclusive()?;
+        Ok(range)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NativeOperation {
     CreateKeyspace,
@@ -101,7 +136,7 @@ pub enum NativeOperation {
     CreateFile,
     FileInfo,
     Read,
-    Write,
+    CommitFileBatch,
     OpenAppendStream,
     AppendStream,
     FlushAppendStream,
@@ -124,6 +159,11 @@ pub enum NativeOperation {
 /// - Successful writes are atomic file-version transitions.
 /// - Append streams separate durable ingest from visible publish: durable
 ///   private bytes remain invisible until `publish_append_stream` succeeds.
+/// - Flushed private bytes are recoverable after restart only by a holder of
+///   the matching stream token and durable mark.
+/// - Publish is the only globally discoverable append boundary: a replacement
+///   writer that does not possess the stream token must open a new stream from
+///   the latest visible file head.
 /// - Stale append stream tokens fail without exposing partial file contents.
 /// - Reads observe the latest visible file root/version in this keyspace.
 /// - Failed writes and publishes leave the previous visible file version
@@ -153,19 +193,36 @@ pub trait NativeFile: Send + Sync {
 
     /// Write bytes at an arbitrary file offset.
     ///
-    /// Success means the byte payload is durable and committed as one visible
-    /// file-version transition. Any active append stream for this same file is
-    /// fenced before the write can publish.
+    /// This is the one-write convenience case for `commit_batch`.
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<FileWriteCommit> {
         self.write_at_with_integrity(offset, data, PayloadIntegrity::Verified)
     }
 
-    /// Write bytes at an arbitrary file offset with an explicit payload
-    /// integrity policy.
+    /// Write bytes at an arbitrary file offset with an explicit payload integrity
+    /// policy.
     fn write_at_with_integrity(
         &self,
         offset: u64,
         data: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<FileWriteCommit> {
+        let writes = [FileBatchWrite::new(offset, data.to_vec())];
+        self.commit_batch_with_integrity(&writes, payload_integrity)
+    }
+
+    /// Atomically commit a set of arbitrary file writes as one visible
+    /// file-version transition.
+    ///
+    /// Overlapping writes resolve by request order. Any active append stream for
+    /// this same file is fenced before the batch can publish.
+    fn commit_batch(&self, writes: &[FileBatchWrite]) -> Result<FileWriteCommit> {
+        self.commit_batch_with_integrity(writes, PayloadIntegrity::Verified)
+    }
+
+    /// Commit a file write batch with an explicit payload integrity policy.
+    fn commit_batch_with_integrity(
+        &self,
+        writes: &[FileBatchWrite],
         payload_integrity: PayloadIntegrity,
     ) -> Result<FileWriteCommit>;
 
@@ -179,7 +236,9 @@ pub trait NativeFile: Send + Sync {
     ///
     /// Success reserves a monotonically increasing byte range in the stream and
     /// stores the bytes privately. Readers do not see the bytes until a later
-    /// publish. A zero-length append is invalid.
+    /// publish. This is an acknowledged/private state: it is not
+    /// restart-resumable until `flush_append_stream` succeeds. A zero-length
+    /// append is invalid.
     fn append_stream(&self, stream: &AppendStream, data: &[u8]) -> Result<AppendTicket> {
         self.append_stream_with_integrity(stream, data, PayloadIntegrity::Verified)
     }
@@ -195,11 +254,17 @@ pub trait NativeFile: Send + Sync {
     /// Make private stream bytes durable through the returned high-water mark.
     ///
     /// Success does not advance visible file metadata. The returned mark can be
-    /// used by `publish_append_stream`.
+    /// used with the matching stream token by the same writer, or by a failover
+    /// replacement that persisted that token, to call `publish_append_stream`
+    /// after restart.
     fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark>;
 
     /// Publish durable private stream bytes as one visible file-version
     /// transition.
+    ///
+    /// Success is the globally durable/discoverable boundary for append data:
+    /// reads, file stats, snapshots, forks, restores, and replacement writers
+    /// observe the new visible file head.
     fn publish_append_stream(
         &self,
         stream: &AppendStream,
@@ -270,11 +335,10 @@ pub enum NativeRequest {
         range: ByteRange,
         verification: ReadVerification,
     },
-    Write {
+    CommitFileBatch {
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        offset: u64,
-        bytes: Vec<u8>,
+        writes: Vec<FileBatchWrite>,
         payload_integrity: PayloadIntegrity,
         durability: WriteDurability,
     },
@@ -330,7 +394,7 @@ impl NativeRequest {
             Self::CreateFile { .. } => NativeOperation::CreateFile,
             Self::FileInfo { .. } => NativeOperation::FileInfo,
             Self::Read { .. } => NativeOperation::Read,
-            Self::Write { .. } => NativeOperation::Write,
+            Self::CommitFileBatch { .. } => NativeOperation::CommitFileBatch,
             Self::OpenAppendStream { .. } => NativeOperation::OpenAppendStream,
             Self::AppendStream { .. } => NativeOperation::AppendStream,
             Self::FlushAppendStream { .. } => NativeOperation::FlushAppendStream,
@@ -349,7 +413,7 @@ impl NativeRequest {
             | Self::CreateFile { keyspace_id, .. }
             | Self::FileInfo { keyspace_id, .. }
             | Self::Read { keyspace_id, .. }
-            | Self::Write { keyspace_id, .. }
+            | Self::CommitFileBatch { keyspace_id, .. }
             | Self::OpenAppendStream { keyspace_id, .. }
             | Self::AppendStream { keyspace_id, .. }
             | Self::FlushAppendStream { keyspace_id, .. }
@@ -368,7 +432,7 @@ impl NativeRequest {
         match self {
             Self::FileInfo { file_id, .. }
             | Self::Read { file_id, .. }
-            | Self::Write { file_id, .. }
+            | Self::CommitFileBatch { file_id, .. }
             | Self::OpenAppendStream { file_id, .. }
             | Self::AppendStream { file_id, .. }
             | Self::FlushAppendStream { file_id, .. }
@@ -387,11 +451,19 @@ impl NativeRequest {
     pub fn byte_range(&self) -> Result<Option<ByteRange>> {
         match self {
             Self::Read { range, .. } => Ok(Some(*range)),
-            Self::Write { offset, bytes, .. } => {
-                let len = u64::try_from(bytes.len()).map_err(|_| {
-                    StorageError::invalid_argument("write byte length overflows u64")
-                })?;
-                Ok(Some(ByteRange::new(*offset, len)))
+            Self::CommitFileBatch { writes, .. } => {
+                let mut start = u64::MAX;
+                let mut end = 0u64;
+                for write in writes {
+                    let range = write.byte_range()?;
+                    start = start.min(range.offset);
+                    end = end.max(range.end_exclusive()?);
+                }
+                if start == u64::MAX {
+                    Ok(None)
+                } else {
+                    Ok(Some(ByteRange::new(start, end - start)))
+                }
             }
             Self::AppendStream { stream, bytes, .. } => {
                 let len = u64::try_from(bytes.len()).map_err(|_| {
@@ -430,7 +502,7 @@ impl NativeRequest {
             | Self::KeyspaceInfo { .. }
             | Self::FileInfo { .. }
             | Self::Read { .. }
-            | Self::Write { .. }
+            | Self::CommitFileBatch { .. }
             | Self::OpenAppendStream { .. }
             | Self::AppendStream { .. }
             | Self::FlushAppendStream { .. }
@@ -450,11 +522,15 @@ impl NativeRequest {
             Self::CreateFile { .. } => Err(StorageError::invalid_argument(
                 "create-file request does not target an existing file",
             )),
-            Self::Write { offset, bytes, .. } => {
-                let len = u64::try_from(bytes.len()).map_err(|_| {
-                    StorageError::invalid_argument("write byte length overflows u64")
-                })?;
-                ByteRange::new(*offset, len).end_exclusive()?;
+            Self::CommitFileBatch { writes, .. } => {
+                if writes.is_empty() {
+                    return Err(StorageError::invalid_argument(
+                        "native file batch must not be empty",
+                    ));
+                }
+                for write in writes {
+                    write.byte_range()?;
+                }
                 Ok(())
             }
             Self::AppendStream {
@@ -532,7 +608,7 @@ pub enum NativeResponse {
     FileCreated(FileId),
     FileInfo(FileInfo),
     Read(ReadResponse),
-    Write(FileWriteCommit),
+    FileBatchCommitted(FileWriteCommit),
     AppendStreamOpened(AppendStream),
     AppendTicket(AppendTicket),
     DurableAppendMark(DurableAppendMark),
@@ -634,18 +710,20 @@ mod tests {
         assert_eq!(request.operation(), NativeOperation::OpenAppendStream);
         assert_eq!(request.target_keyspace_id(), Some(keyspace_id));
         assert_eq!(request.target_file_id(), Some(file_id));
-        let write = NativeRequest::Write {
+        let write = NativeRequest::CommitFileBatch {
             keyspace_id,
             file_id,
-            offset: 16,
-            bytes: vec![1, 2, 3],
+            writes: vec![
+                FileBatchWrite::new(16, vec![1, 2, 3]),
+                FileBatchWrite::new(32, vec![4]),
+            ],
             payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
-        assert_eq!(write.operation(), NativeOperation::Write);
+        assert_eq!(write.operation(), NativeOperation::CommitFileBatch);
         assert_eq!(write.target_keyspace_id(), Some(keyspace_id));
         assert_eq!(write.target_file_id(), Some(file_id));
-        assert_eq!(write.byte_range().unwrap(), Some(ByteRange::new(16, 3)));
+        assert_eq!(write.byte_range().unwrap(), Some(ByteRange::new(16, 17)));
         assert_eq!(
             NativeRequest::CreateKeyspace {
                 request: CreateKeyspaceRequest { name: None },
@@ -725,24 +803,31 @@ mod tests {
     }
 
     #[test]
-    fn write_validation_allows_empty_noop_and_rejects_overflow() {
+    fn batch_validation_allows_empty_write_noop_and_rejects_empty_batch_and_overflow() {
         let keyspace_id = KeyspaceId::from_raw(5);
         let file_id = FileId::from_raw(7);
-        let empty = NativeRequest::Write {
+        let empty_write = NativeRequest::CommitFileBatch {
             keyspace_id,
             file_id,
-            offset: 9,
-            bytes: Vec::new(),
+            writes: vec![FileBatchWrite::new(9, Vec::new())],
             payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };
-        assert!(empty.validate_for_existing_file().is_ok());
+        assert!(empty_write.validate_for_existing_file().is_ok());
 
-        let overflowing = NativeRequest::Write {
+        let empty_batch = NativeRequest::CommitFileBatch {
             keyspace_id,
             file_id,
-            offset: u64::MAX,
-            bytes: vec![1],
+            writes: Vec::new(),
+            payload_integrity: PayloadIntegrity::Verified,
+            durability: WriteDurability::Acknowledged,
+        };
+        assert!(empty_batch.validate_for_existing_file().is_err());
+
+        let overflowing = NativeRequest::CommitFileBatch {
+            keyspace_id,
+            file_id,
+            writes: vec![FileBatchWrite::new(u64::MAX, vec![1])],
             payload_integrity: PayloadIntegrity::Verified,
             durability: WriteDurability::Acknowledged,
         };

@@ -16,9 +16,9 @@ use toy_cow_block_storage::provider::{
 use toy_cow_block_storage::{
     AppendStream, AppendTicket, ByteRange, CreateDeviceRequest, CreateFileRequest,
     CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableAppendMark, DurableCoordinator,
-    DurableDataLogPolicy, DurablePersistProfile, FileId, FileSpec, FlushResult, KeyspaceId,
-    LocalCoordinator, LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile, PayloadIntegrity,
-    ReadVerification, Result, StorageError, StorageNodeId, TxnBlockCoordinator,
+    DurableDataLogPolicy, DurablePersistProfile, FileBatchWrite, FileId, FileSpec, FlushResult,
+    KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile,
+    PayloadIntegrity, ReadVerification, Result, StorageError, StorageNodeId, TxnBlockCoordinator,
     TxnBlockWriteProfile, WriteDurability,
 };
 
@@ -76,6 +76,10 @@ struct Args {
     block_write_profile_csv: Option<PathBuf>,
     stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
+    native_file_batch_ops: Option<usize>,
+    native_file_batch_bytes: Option<usize>,
+    native_file_batch_overlap: Option<NativeFileBatchOverlap>,
+    native_file_batch_fsync_bytes: u64,
     payload_integrity: PayloadIntegrity,
     read_verification: ReadVerification,
 }
@@ -103,6 +107,10 @@ impl Args {
             block_write_profile_csv: None,
             stream_flush_bytes: None,
             stream_publish_bytes: None,
+            native_file_batch_ops: None,
+            native_file_batch_bytes: None,
+            native_file_batch_overlap: None,
+            native_file_batch_fsync_bytes: 16 * 1024 * 1024,
             payload_integrity: PayloadIntegrity::Verified,
             read_verification: ReadVerification::Default,
         };
@@ -171,6 +179,27 @@ impl Args {
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
                     args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
+                }
+                "--native-file-batch-ops" => {
+                    args.native_file_batch_ops = Some(parse_next(&mut raw, flag.as_str())?);
+                }
+                "--native-file-batch-bytes" => {
+                    args.native_file_batch_bytes = Some(parse_next(&mut raw, flag.as_str())?);
+                }
+                "--native-file-batch-overlap" => {
+                    args.native_file_batch_overlap = Some(parse_next(&mut raw, flag.as_str())?);
+                }
+                "--native-file-batch-fsync-mib" => {
+                    let mib: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.native_file_batch_fsync_bytes =
+                        mib_to_bytes(mib, "--native-file-batch-fsync-mib")?;
+                }
+                "--native-file-batch-fsync-ms" => {
+                    let _: u64 = parse_next(&mut raw, flag.as_str())?;
+                }
+                "--native-client-overlay" => {
+                    let value: String = parse_next(&mut raw, flag.as_str())?;
+                    parse_on_off(&value, "--native-client-overlay")?;
                 }
                 "--payload-integrity" => {
                     let value: String = parse_next(&mut raw, "--payload-integrity")?;
@@ -261,7 +290,7 @@ options:\n\
                                            default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch, append-stream, block-metadata, native-metadata\n\
+                                           aliases: north-star, append-batch, append-stream, block-metadata, native-metadata, native-file-batch\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-same-shard-contended,\n\
                                            block-write-4k-same-shard-serialized,\n\
@@ -273,6 +302,12 @@ options:\n\
                                            native-write-4k, native-write-4k-same-file,\n\
                                            native-write-4k-file-lanes, native-write-1m,\n\
                                            native-write-4m, native-write-32m,\n\
+                                           native-file-batch-4k-16ops,\n\
+                                           native-file-batch-4k-256ops,\n\
+                                           native-file-batch-4k-4096ops,\n\
+                                           native-file-batch-1m-16ops,\n\
+                                           native-file-batch-overwrite-collapse,\n\
+                                           native-file-batch-fsync-interval,\n\
                                            native-append-4k, native-append-4k-same-file,\n\
                                            native-append-4k-file-lanes, native-append-1m,\n\
                                            native-append-4m, native-append-32m,\n\
@@ -301,6 +336,13 @@ options:\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --stream-flush-mib N                     flush append streams after N MiB per stream; 2-4 is latency-first\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
+  --native-file-batch-ops N                override writes per native file batch workload\n\
+  --native-file-batch-bytes N              override bytes per write inside native file batch workloads\n\
+  --native-file-batch-overlap sequential|random|overwrite-hotset\n\
+                                           native file batch offset shape\n\
+  --native-file-batch-fsync-mib N          native fsync-interval dirty threshold, default: 16\n\
+  --native-file-batch-fsync-ms N           accepted for adapter policy simulations; not modeled yet\n\
+  --native-client-overlay on|off           accepted for future read-your-writes adapter tests\n\
   --payload-integrity verified|unchecked   write payload integrity, default: verified\n\
   --read-verification default|require-verified|skip\n\
                                            read verification policy, default: default\n\
@@ -365,6 +407,16 @@ fn parse_read_verification(value: &str) -> Result<ReadVerification> {
     }
 }
 
+fn parse_on_off(value: &str, flag: &str) -> Result<bool> {
+    match value {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        _ => Err(StorageError::invalid_argument(format!(
+            "{flag} must be on or off"
+        ))),
+    }
+}
+
 fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
     let mut workloads = Vec::new();
     for part in value.split(',') {
@@ -374,10 +426,40 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
             "append-stream" => workloads.extend(Workload::append_stream_suite()),
             "block-metadata" => workloads.extend(Workload::block_metadata_suite()),
             "native-metadata" => workloads.extend(Workload::native_metadata_suite()),
+            "native-file-batch" => workloads.extend(Workload::native_file_batch_suite()),
             _ => workloads.push(Workload::from_str(part)?),
         }
     }
     Ok(workloads)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFileBatchOverlap {
+    Sequential,
+    Random,
+    OverwriteHotset,
+}
+
+impl FromStr for NativeFileBatchOverlap {
+    type Err = StorageError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "sequential" => Ok(Self::Sequential),
+            "random" => Ok(Self::Random),
+            "overwrite-hotset" => Ok(Self::OverwriteHotset),
+            _ => Err(StorageError::invalid_argument(format!(
+                "unknown native file batch overlap mode {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeFileBatchSpec {
+    ops: usize,
+    write_bytes: usize,
+    overlap: NativeFileBatchOverlap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,6 +590,12 @@ enum Workload {
     NativeWrite1m,
     NativeWrite4m,
     NativeWrite32m,
+    NativeFileBatch4k16Ops,
+    NativeFileBatch4k256Ops,
+    NativeFileBatch4k4096Ops,
+    NativeFileBatch1m16Ops,
+    NativeFileBatchOverwriteCollapse,
+    NativeFileBatchFsyncInterval,
     NativeAppend4k,
     NativeAppend4kSameFile,
     NativeAppend4kFileLanes,
@@ -590,6 +678,20 @@ impl Workload {
         ]
     }
 
+    fn native_file_batch_suite() -> Vec<Self> {
+        vec![
+            Self::NativeWrite4k,
+            Self::NativeWrite1m,
+            Self::NativeFileBatch4k16Ops,
+            Self::NativeFileBatch4k256Ops,
+            Self::NativeFileBatch4k4096Ops,
+            Self::NativeFileBatch1m16Ops,
+            Self::NativeFileBatchOverwriteCollapse,
+            Self::NativeFileBatchFsyncInterval,
+            Self::NativeStreamFlushPublish1m,
+        ]
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::BlockWrite4k => "block-write-4k",
@@ -608,6 +710,12 @@ impl Workload {
             Self::NativeWrite1m => "native-write-1m",
             Self::NativeWrite4m => "native-write-4m",
             Self::NativeWrite32m => "native-write-32m",
+            Self::NativeFileBatch4k16Ops => "native-file-batch-4k-16ops",
+            Self::NativeFileBatch4k256Ops => "native-file-batch-4k-256ops",
+            Self::NativeFileBatch4k4096Ops => "native-file-batch-4k-4096ops",
+            Self::NativeFileBatch1m16Ops => "native-file-batch-1m-16ops",
+            Self::NativeFileBatchOverwriteCollapse => "native-file-batch-overwrite-collapse",
+            Self::NativeFileBatchFsyncInterval => "native-file-batch-fsync-interval",
             Self::NativeAppend4k => "native-append-4k",
             Self::NativeAppend4kSameFile => "native-append-4k-same-file",
             Self::NativeAppend4kFileLanes => "native-append-4k-file-lanes",
@@ -626,8 +734,14 @@ impl Workload {
         }
     }
 
-    fn op_size(self) -> usize {
-        match self {
+    fn op_size(self, args: &Args) -> Result<usize> {
+        if self.is_native_file_batch() {
+            let spec = self.native_file_batch_spec(args)?;
+            return spec.ops.checked_mul(spec.write_bytes).ok_or_else(|| {
+                StorageError::invalid_argument("native file batch op size overflows usize")
+            });
+        }
+        Ok(match self {
             Self::BlockWrite1m
             | Self::BlockWrite1mShardLanes
             | Self::BlockWrite1mDeviceLanes
@@ -659,7 +773,13 @@ impl Workload {
             | Self::NativeAppend4kSameFile
             | Self::NativeAppend4kFileLanes
             | Self::NativeHotAppend4k => 4096,
-        }
+            Self::NativeFileBatch4k16Ops
+            | Self::NativeFileBatch4k256Ops
+            | Self::NativeFileBatch4k4096Ops
+            | Self::NativeFileBatch1m16Ops
+            | Self::NativeFileBatchOverwriteCollapse
+            | Self::NativeFileBatchFsyncInterval => unreachable!(),
+        })
     }
 
     fn is_read(self) -> bool {
@@ -676,6 +796,61 @@ impl Workload {
                 | Self::NativeWrite4m
                 | Self::NativeWrite32m
         )
+    }
+
+    fn is_native_file_batch(self) -> bool {
+        matches!(
+            self,
+            Self::NativeFileBatch4k16Ops
+                | Self::NativeFileBatch4k256Ops
+                | Self::NativeFileBatch4k4096Ops
+                | Self::NativeFileBatch1m16Ops
+                | Self::NativeFileBatchOverwriteCollapse
+                | Self::NativeFileBatchFsyncInterval
+        )
+    }
+
+    fn native_file_batch_spec(self, args: &Args) -> Result<NativeFileBatchSpec> {
+        let (ops, write_bytes, overlap) = match self {
+            Self::NativeFileBatch4k16Ops => (16, 4096, NativeFileBatchOverlap::Sequential),
+            Self::NativeFileBatch4k256Ops => (256, 4096, NativeFileBatchOverlap::Sequential),
+            Self::NativeFileBatch4k4096Ops => (4096, 4096, NativeFileBatchOverlap::Sequential),
+            Self::NativeFileBatch1m16Ops => (16, 1024 * 1024, NativeFileBatchOverlap::Sequential),
+            Self::NativeFileBatchOverwriteCollapse => {
+                (256, 4096, NativeFileBatchOverlap::OverwriteHotset)
+            }
+            Self::NativeFileBatchFsyncInterval => {
+                let write_bytes = 4096usize;
+                let fsync_bytes =
+                    usize::try_from(args.native_file_batch_fsync_bytes).map_err(|_| {
+                        StorageError::invalid_argument(
+                            "native file batch fsync bytes overflow usize",
+                        )
+                    })?;
+                (
+                    (fsync_bytes / write_bytes).max(1),
+                    write_bytes,
+                    NativeFileBatchOverlap::Sequential,
+                )
+            }
+            _ => {
+                return Err(StorageError::invalid_argument(
+                    "workload is not a native file batch workload",
+                ));
+            }
+        };
+        let ops = args.native_file_batch_ops.unwrap_or(ops);
+        let write_bytes = args.native_file_batch_bytes.unwrap_or(write_bytes);
+        if ops == 0 || write_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "native file batch ops and bytes must be greater than zero",
+            ));
+        }
+        Ok(NativeFileBatchSpec {
+            ops,
+            write_bytes,
+            overlap: args.native_file_batch_overlap.unwrap_or(overlap),
+        })
     }
 
     fn is_native_append(self) -> bool {
@@ -772,6 +947,12 @@ impl FromStr for Workload {
             "native-write-1m" => Ok(Self::NativeWrite1m),
             "native-write-4m" => Ok(Self::NativeWrite4m),
             "native-write-32m" => Ok(Self::NativeWrite32m),
+            "native-file-batch-4k-16ops" => Ok(Self::NativeFileBatch4k16Ops),
+            "native-file-batch-4k-256ops" => Ok(Self::NativeFileBatch4k256Ops),
+            "native-file-batch-4k-4096ops" => Ok(Self::NativeFileBatch4k4096Ops),
+            "native-file-batch-1m-16ops" => Ok(Self::NativeFileBatch1m16Ops),
+            "native-file-batch-overwrite-collapse" => Ok(Self::NativeFileBatchOverwriteCollapse),
+            "native-file-batch-fsync-interval" => Ok(Self::NativeFileBatchFsyncInterval),
             "native-append-4k" => Ok(Self::NativeAppend4k),
             "native-append-4k-same-file" => Ok(Self::NativeAppend4kSameFile),
             "native-append-4k-file-lanes" => Ok(Self::NativeAppend4kFileLanes),
@@ -963,29 +1144,26 @@ impl BenchStore {
         }
     }
 
-    fn write_file_at(
+    fn commit_file_batch(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        offset: u64,
-        data: &[u8],
+        writes: &[FileBatchWrite],
         durability: WriteDurability,
         payload_integrity: PayloadIntegrity,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => store.write_file_at_with_integrity(
+            Self::Local(store) => store.commit_file_batch_with_integrity(
                 keyspace_id,
                 file_id,
-                offset,
-                data,
+                writes,
                 durability,
                 payload_integrity,
             ),
-            Self::Durable(store) => store.write_file_at_with_integrity(
+            Self::Durable(store) => store.commit_file_batch_with_integrity(
                 keyspace_id,
                 file_id,
-                offset,
-                data,
+                writes,
                 durability,
                 payload_integrity,
             ),
@@ -1182,7 +1360,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     report.concurrency = concurrency;
     report.rtt_us = args.rtt.as_micros();
     report.serial_rtts = args.serial_rtts;
-    report.op_size = workload.op_size();
+    report.op_size = workload.op_size(args)?;
 
     if matches!(args.provider, ProviderKind::Durable) {
         let _ = fs::remove_dir_all(&root);
@@ -1230,7 +1408,7 @@ fn append_profile_csv(
             args.rtt.as_micros(),
             args.serial_rtts,
             concurrency,
-            workload.op_size(),
+            workload.op_size(args)?,
             profile.sequence,
             profile.total_nanos,
             profile.lock_wait_nanos,
@@ -1299,7 +1477,7 @@ fn append_metadata_profile_csv(
             args.rtt.as_micros(),
             args.serial_rtts,
             concurrency,
-            workload.op_size(),
+            workload.op_size(args)?,
             profile.sequence,
             profile.phase,
             profile.total_nanos,
@@ -1356,7 +1534,7 @@ fn append_block_write_profile_csv(
             args.rtt.as_micros(),
             args.serial_rtts,
             concurrency,
-            workload.op_size(),
+            workload.op_size(args)?,
             args.storage_nodes,
             payload_integrity_name(args.payload_integrity),
             profile.sequence,
@@ -1411,7 +1589,7 @@ fn setup_context(
     concurrency: usize,
     store: BenchStore,
 ) -> Result<BenchContext> {
-    let op_size = workload.op_size();
+    let op_size = workload.op_size(args)?;
     let payload = Arc::new(make_payload(op_size));
     let target = if workload.is_block() {
         let device_count = if workload.is_block_device_lanes() {
@@ -1459,11 +1637,10 @@ fn setup_context(
                 },
             )?;
             if matches!(workload, Workload::NativeRead4k) {
-                store.write_file_at(
+                store.commit_file_batch(
                     keyspace_id,
                     file_id,
-                    0,
-                    &payload,
+                    &[FileBatchWrite::new(0, payload.as_ref().clone())],
                     WriteDurability::Flushed,
                     args.payload_integrity,
                 )?;
@@ -1524,6 +1701,11 @@ fn execute_load(
         samples_per_worker: args.samples_per_worker,
         stream_flush_bytes: args.stream_flush_bytes,
         stream_publish_bytes: args.stream_publish_bytes,
+        native_file_batch: if workload.is_native_file_batch() {
+            Some(workload.native_file_batch_spec(args)?)
+        } else {
+            None
+        },
         payload_integrity: args.payload_integrity,
         read_verification: args.read_verification,
     };
@@ -1562,6 +1744,7 @@ struct WorkerConfig {
     samples_per_worker: usize,
     stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
+    native_file_batch: Option<NativeFileBatchSpec>,
     payload_integrity: PayloadIntegrity,
     read_verification: ReadVerification,
 }
@@ -1758,6 +1941,77 @@ fn apply_modeled_delay(delay: Duration, mode: DelayMode) {
             }
         }
     }
+}
+
+fn build_native_file_batch_writes(
+    spec: NativeFileBatchSpec,
+    op_index: u64,
+    payload: &[u8],
+    rng: &mut Lcg,
+) -> Result<Vec<FileBatchWrite>> {
+    let batch_bytes = spec.ops.checked_mul(spec.write_bytes).ok_or_else(|| {
+        StorageError::invalid_argument("native file batch payload size overflows usize")
+    })?;
+    if batch_bytes > payload.len() {
+        return Err(StorageError::invalid_argument(
+            "native file batch payload is smaller than requested writes",
+        ));
+    }
+    let batch_bytes_u64 = u64::try_from(batch_bytes).map_err(|_| {
+        StorageError::invalid_argument("native file batch payload size overflows u64")
+    })?;
+    if batch_bytes_u64 > DEFAULT_FILE_CAPACITY_BYTES {
+        return Err(StorageError::invalid_argument(
+            "native file batch exceeds file root capacity",
+        ));
+    }
+    let base = op_index
+        .checked_mul(batch_bytes_u64)
+        .ok_or_else(|| StorageError::invalid_argument("native file batch offset overflows"))?
+        % DEFAULT_FILE_CAPACITY_BYTES;
+    let base = if base
+        .checked_add(batch_bytes_u64)
+        .is_none_or(|end| end > DEFAULT_FILE_CAPACITY_BYTES)
+    {
+        0
+    } else {
+        base
+    };
+    let mut writes = Vec::with_capacity(spec.ops);
+    for index in 0..spec.ops {
+        let payload_start = index.checked_mul(spec.write_bytes).ok_or_else(|| {
+            StorageError::invalid_argument("native file batch payload offset overflows")
+        })?;
+        let payload_end = payload_start
+            .checked_add(spec.write_bytes)
+            .ok_or_else(|| StorageError::invalid_argument("native file batch payload overflows"))?;
+        let offset = match spec.overlap {
+            NativeFileBatchOverlap::Sequential => {
+                base + u64::try_from(payload_start).map_err(|_| {
+                    StorageError::invalid_argument("native file batch offset overflows u64")
+                })?
+            }
+            NativeFileBatchOverlap::OverwriteHotset => 0,
+            NativeFileBatchOverlap::Random if op_index == 0 => {
+                base + u64::try_from(payload_start).map_err(|_| {
+                    StorageError::invalid_argument("native file batch offset overflows u64")
+                })?
+            }
+            NativeFileBatchOverlap::Random => {
+                let slots = (batch_bytes / spec.write_bytes).max(1);
+                let slot = rng.below(slots as u64) as usize;
+                base + u64::try_from(slot.checked_mul(spec.write_bytes).ok_or_else(|| {
+                    StorageError::invalid_argument("native file batch random offset overflows")
+                })?)
+                .map_err(|_| StorageError::invalid_argument("native file batch offset overflow"))?
+            }
+        };
+        writes.push(FileBatchWrite::new(
+            offset,
+            payload[payload_start..payload_end].to_vec(),
+        ));
+    }
+    Ok(writes)
 }
 
 fn run_one_op(
@@ -1998,11 +2252,31 @@ fn run_one_op(
             let file_id = files[0];
             context
                 .store
-                .write_file_at(
+                .commit_file_batch(
                     *keyspace_id,
                     file_id,
-                    0,
-                    &context.payload,
+                    &[FileBatchWrite::new(0, context.payload.as_ref().clone())],
+                    durability,
+                    config.payload_integrity,
+                )
+                .map(|_| OpProgress::default())
+        }
+        (Target::Native { keyspace_id, files }, workload) if workload.is_native_file_batch() => {
+            let spec = config
+                .native_file_batch
+                .ok_or_else(|| StorageError::corrupt("missing native file batch spec"))?;
+            let file_index = worker as usize % files.len();
+            let file_id = files[file_index];
+            let op_index = state.native_file_op;
+            state.native_file_op = state.native_file_op.saturating_add(1);
+            state.last_native_file_index = Some(file_index);
+            let writes = build_native_file_batch_writes(spec, op_index, &context.payload, rng)?;
+            context
+                .store
+                .commit_file_batch(
+                    *keyspace_id,
+                    file_id,
+                    &writes,
                     durability,
                     config.payload_integrity,
                 )
@@ -2013,11 +2287,10 @@ fn run_one_op(
             let file_id = files[file_index];
             context
                 .store
-                .write_file_at(
+                .commit_file_batch(
                     *keyspace_id,
                     file_id,
-                    0,
-                    &context.payload,
+                    &[FileBatchWrite::new(0, context.payload.as_ref().clone())],
                     durability,
                     config.payload_integrity,
                 )
@@ -2601,6 +2874,17 @@ mod tests {
         assert!(suite.contains(&Workload::NativeWrite4kFileLanes));
         assert!(suite.contains(&Workload::NativeAppend4kSameFile));
         assert!(suite.contains(&Workload::NativeAppend4kFileLanes));
+    }
+
+    #[test]
+    fn native_file_batch_suite_names_client_commit_shapes() {
+        let suite = parse_workloads("native-file-batch").unwrap();
+        assert!(suite.contains(&Workload::NativeFileBatch4k16Ops));
+        assert!(suite.contains(&Workload::NativeFileBatch4k256Ops));
+        assert!(suite.contains(&Workload::NativeFileBatch4k4096Ops));
+        assert!(suite.contains(&Workload::NativeFileBatch1m16Ops));
+        assert!(suite.contains(&Workload::NativeFileBatchOverwriteCollapse));
+        assert!(suite.contains(&Workload::NativeFileBatchFsyncInterval));
     }
 
     #[test]

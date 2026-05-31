@@ -28,8 +28,8 @@ use crate::api::{
 use crate::error::{Result, StorageError};
 use crate::extent::{
     AppendPublishCommit, AppendStream, AppendTicket, CreateFileRequest, CreateKeyspaceRequest,
-    DurableAppendMark, FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo, NativeFile,
-    NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope, NativeResponse,
+    DurableAppendMark, FileBatchWrite, FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo,
+    NativeFile, NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope, NativeResponse,
     NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
 };
 use crate::id::{
@@ -69,6 +69,7 @@ const LOCAL_GRANT_EPOCH: GrantEpoch = GrantEpoch::from_raw(1);
 const LOCAL_GRANT_EXPIRATION: LogicalDeadline = LogicalDeadline::from_raw(u64::MAX);
 const LOCAL_STORAGE_NODE_INCARNATION: ServerIncarnation = ServerIncarnation::from_raw(1);
 const DEFAULT_OBSERVABILITY_EVENT_CAPACITY: usize = 1024;
+const DEFAULT_NATIVE_FILE_BATCH_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LocalCatalogOpProfile {
@@ -3403,46 +3404,38 @@ impl LocalCoordinator {
         self.metadata.abort_append_stream(stream)
     }
 
-    pub fn write_file_at(
+    pub fn commit_file_batch(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        offset: u64,
-        data: &[u8],
+        writes: &[FileBatchWrite],
         durability: crate::api::WriteDurability,
     ) -> Result<FileWriteCommit> {
-        self.write_file_at_with_integrity(
+        self.commit_file_batch_with_integrity(
             keyspace_id,
             file_id,
-            offset,
-            data,
+            writes,
             durability,
             PayloadIntegrity::Verified,
         )
     }
 
-    pub fn write_file_at_with_integrity(
+    pub fn commit_file_batch_with_integrity(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        offset: u64,
-        data: &[u8],
+        writes: &[FileBatchWrite],
         durability: crate::api::WriteDurability,
         payload_integrity: PayloadIntegrity,
     ) -> Result<FileWriteCommit> {
-        let data_len = u64::try_from(data.len())
-            .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
-        let range = ByteRange::new(offset, data_len);
-        let end = range.end_exclusive()?;
         let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        let (collapsed, range, new_size) = collapse_native_file_batch_writes(
+            writes,
+            head.size,
+            DEFAULT_NATIVE_FILE_BATCH_MAX_BYTES,
+        )?;
 
-        if offset > head.size {
-            return Err(StorageError::invalid_argument(
-                "native file write cannot create a sparse gap",
-            ));
-        }
-
-        if data.is_empty() {
+        if collapsed.is_empty() {
             return Ok(FileWriteCommit {
                 keyspace_id,
                 file_id,
@@ -3464,117 +3457,73 @@ impl LocalCoordinator {
             },
         );
 
-        let owner = MappingOwner::NativeKeyspace(keyspace_id);
         let block_size = u64::from(self.metadata.config.block_size);
-        let first_block = offset / block_size;
-        let requested_start = first_block
-            .checked_mul(block_size)
-            .ok_or_else(|| StorageError::invalid_argument("native write range overflows"))?;
-        let segment_blocks = blocks_for_bytes(end - requested_start, block_size)?;
-        let write_range = crate::api::BlockRange::new(
-            BlockIndex::from_raw(first_block),
-            BlockCount::from_raw(segment_blocks),
-        );
         let root = self.metadata.get_metadata_node(head.root)?;
-        if !root.covered_range.contains_range(write_range)? {
-            return Err(StorageError::invalid_argument(
-                "native file write exceeds file root coverage",
-            ));
+        let groups = native_batch_segment_groups(&collapsed, block_size)?;
+        let mut edits = Vec::with_capacity(groups.len());
+        for group in groups {
+            let first_block = group.start / block_size;
+            let segment_len = group.end.checked_sub(group.start).ok_or_else(|| {
+                StorageError::invalid_argument("native batch segment range underflows")
+            })?;
+            let segment_blocks = blocks_for_bytes(segment_len, block_size)?;
+            let write_range = crate::api::BlockRange::new(
+                BlockIndex::from_raw(first_block),
+                BlockCount::from_raw(segment_blocks),
+            );
+            if !root.covered_range.contains_range(write_range)? {
+                return Err(StorageError::invalid_argument(
+                    "native file batch exceeds file root coverage",
+                ));
+            }
+            let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
+                StorageError::invalid_argument("native batch segment length overflows usize")
+            })?;
+            let mut segment_bytes = vec![0; segment_len_usize];
+            if group.start < head.size {
+                self.read_metadata_node(&root, write_range, block_size, &mut segment_bytes)?;
+                let preserved_len = head.size.saturating_sub(group.start).min(segment_len);
+                let preserved_range = ByteRange::new(group.start, preserved_len);
+                let run_extents =
+                    self.run_extents_for_file_read(keyspace_id, file_id, preserved_range)?;
+                self.read_append_run_extents_from_memory(
+                    &run_extents,
+                    ByteRange::new(group.start, segment_len),
+                    &mut segment_bytes,
+                    ReadVerification::Default,
+                )?;
+            }
+            overlay_native_batch_writes(
+                group.start,
+                &collapsed[group.first_write..group.last_write],
+                &mut segment_bytes,
+            )?;
+            let segment_range = ByteRange::new(group.start, segment_len);
+            let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
+                WriteGrantIntent::NativeWrite {
+                    keyspace_id,
+                    file_id,
+                    range: segment_range,
+                    base_version: head.version,
+                },
+                self.next_write_intent()?,
+                segment_bytes,
+                durability,
+                payload_integrity,
+            )?;
+            edits.push(NativeFileReceiptEdit {
+                range: write_range,
+                receipt: verified_receipt,
+            });
         }
 
-        let segment_len = segment_blocks.checked_mul(block_size).ok_or_else(|| {
-            StorageError::invalid_argument("native write segment length overflows")
-        })?;
-        let segment_len_usize = usize::try_from(segment_len).map_err(|_| {
-            StorageError::invalid_argument("native write segment length overflows usize")
-        })?;
-        let segment_bytes =
-            if offset.is_multiple_of(block_size) && data_len.is_multiple_of(block_size) {
-                data.to_vec()
-            } else {
-                let mut bytes = vec![0; segment_len_usize];
-                self.read_metadata_node(&root, write_range, block_size, &mut bytes)?;
-                if requested_start < head.size {
-                    let preserved_len = head.size.saturating_sub(requested_start).min(segment_len);
-                    let preserved_range = ByteRange::new(requested_start, preserved_len);
-                    let run_extents =
-                        self.run_extents_for_file_read(keyspace_id, file_id, preserved_range)?;
-                    self.read_append_run_extents_from_memory(
-                        &run_extents,
-                        ByteRange::new(requested_start, segment_len),
-                        &mut bytes,
-                        ReadVerification::Default,
-                    )?;
-                }
-                let write_offset = usize::try_from(offset - requested_start).map_err(|_| {
-                    StorageError::invalid_argument("native write segment offset overflows usize")
-                })?;
-                let write_len = usize::try_from(data_len).map_err(|_| {
-                    StorageError::invalid_argument("native write length overflows usize")
-                })?;
-                let write_end = write_offset
-                    .checked_add(write_len)
-                    .ok_or_else(|| StorageError::invalid_argument("native write end overflows"))?;
-                let target = bytes.get_mut(write_offset..write_end).ok_or_else(|| {
-                    StorageError::corrupt("native write segment range does not cover payload")
-                })?;
-                target.copy_from_slice(data);
-                bytes
-            };
-
-        let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
-            WriteGrantIntent::NativeWrite {
-                keyspace_id,
-                file_id,
-                range,
-                base_version: head.version,
-            },
-            self.next_write_intent()?,
-            segment_bytes,
-            durability,
-            payload_integrity,
-        )?;
-        let edit = TreeRangeEdit {
-            range: write_range,
-            replacement: Some(SegmentReplacement {
-                segment_id: verified_receipt.descriptor.segment_id,
-                segment_base: write_range.start,
-            }),
-        };
-        let new_root = self
-            .replace_tree_range_with_receipts(
-                head.root,
-                edit,
-                std::slice::from_ref(&verified_receipt),
-            )?
-            .root;
-        let new_size = head.size.max(end);
-
-        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
-            owner,
-            fence: MetadataFence::FileVersion(head.version),
-            updates: vec![RootUpdate::FileRoot {
-                file_id,
-                old_root: head.root,
-                new_root,
-                new_size,
-            }],
-        })?;
-        self.storage_nodes.mark_segment_referenced(
-            verified_receipt.receipt(),
-            commit_group.commit_seq,
-            self.authority.as_ref(),
-        )?;
-        self.metadata
-            .invalidate_append_streams_for_file(keyspace_id, file_id)?;
-        let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
-
-        Ok(FileWriteCommit {
+        self.publish_native_file_receipt_edits(NativeFileReceiptPublish {
             keyspace_id,
             file_id,
-            range,
-            version: committed.version,
-            commit_seq: committed.latest_commit,
+            base_version: head.version,
+            committed_range: range,
+            new_size,
+            edits,
             durability,
         })
     }
@@ -4258,6 +4207,102 @@ impl LocalCoordinator {
         })
     }
 
+    fn publish_native_file_receipt_edits(
+        &self,
+        publish: NativeFileReceiptPublish,
+    ) -> Result<FileWriteCommit> {
+        if publish.edits.is_empty() {
+            let head = self
+                .metadata
+                .get_file_head(publish.keyspace_id, publish.file_id)?;
+            if head.version != publish.base_version {
+                return Err(StorageError::conflict("stale native file version"));
+            }
+            return Ok(FileWriteCommit {
+                keyspace_id: publish.keyspace_id,
+                file_id: publish.file_id,
+                range: publish.committed_range,
+                version: head.version,
+                commit_seq: head.latest_commit,
+                durability: publish.durability,
+            });
+        }
+
+        let head = self
+            .metadata
+            .get_file_head(publish.keyspace_id, publish.file_id)?;
+        if head.version != publish.base_version {
+            return Err(StorageError::conflict("stale native file version"));
+        }
+        let root = self.metadata.get_metadata_node(head.root)?;
+        let block_size = u64::from(self.metadata.config.block_size);
+        let mut new_root = head.root;
+        for edit in &publish.edits {
+            if !root.covered_range.contains_range(edit.range)? {
+                return Err(StorageError::invalid_argument(
+                    "native file batch exceeds file root coverage",
+                ));
+            }
+            let expected_segment_bytes = edit
+                .range
+                .blocks
+                .raw()
+                .checked_mul(block_size)
+                .ok_or_else(|| {
+                    StorageError::invalid_argument("native write segment length overflows")
+                })?;
+            if edit.receipt.descriptor.bytes != expected_segment_bytes {
+                return Err(StorageError::conflict(
+                    "native write receipt byte count does not match metadata intent",
+                ));
+            }
+            new_root = self
+                .replace_tree_range_with_receipts(
+                    new_root,
+                    TreeRangeEdit {
+                        range: edit.range,
+                        replacement: Some(SegmentReplacement {
+                            segment_id: edit.receipt.descriptor.segment_id,
+                            segment_base: edit.range.start,
+                        }),
+                    },
+                    std::slice::from_ref(&edit.receipt),
+                )?
+                .root;
+        }
+
+        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
+            owner: MappingOwner::NativeKeyspace(publish.keyspace_id),
+            fence: MetadataFence::FileVersion(publish.base_version),
+            updates: vec![RootUpdate::FileRoot {
+                file_id: publish.file_id,
+                old_root: head.root,
+                new_root,
+                new_size: publish.new_size,
+            }],
+        })?;
+        for edit in &publish.edits {
+            self.storage_nodes.mark_segment_referenced(
+                edit.receipt.receipt(),
+                commit_group.commit_seq,
+                self.authority.as_ref(),
+            )?;
+        }
+        self.metadata
+            .invalidate_append_streams_for_file(publish.keyspace_id, publish.file_id)?;
+        let committed = self
+            .metadata
+            .get_file_head(publish.keyspace_id, publish.file_id)?;
+        Ok(FileWriteCommit {
+            keyspace_id: publish.keyspace_id,
+            file_id: publish.file_id,
+            range: publish.committed_range,
+            version: committed.version,
+            commit_seq: committed.latest_commit,
+            durability: publish.durability,
+        })
+    }
+
     pub fn submit_native_write_receipt(
         &self,
         grant: &WriteGrant,
@@ -4291,10 +4336,6 @@ impl LocalCoordinator {
                 "receipt owner does not match native keyspace intent",
             ));
         }
-        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
-        if head.version != base_version {
-            return Err(StorageError::conflict("stale native file version"));
-        }
         let end = range.end_exclusive()?;
         let block_size = u64::from(self.metadata.config.block_size);
         let first_block = range.offset / block_size;
@@ -4306,58 +4347,18 @@ impl LocalCoordinator {
             BlockIndex::from_raw(first_block),
             BlockCount::from_raw(segment_blocks),
         );
-        let root = self.metadata.get_metadata_node(head.root)?;
-        if !root.covered_range.contains_range(write_range)? {
-            return Err(StorageError::invalid_argument(
-                "native file write exceeds file root coverage",
-            ));
-        }
-        let expected_segment_bytes = segment_blocks.checked_mul(block_size).ok_or_else(|| {
-            StorageError::invalid_argument("native write segment length overflows")
-        })?;
-        if verified.descriptor.bytes != expected_segment_bytes {
-            return Err(StorageError::conflict(
-                "native write receipt byte count does not match metadata intent",
-            ));
-        }
-        let new_root = self
-            .replace_tree_range_with_receipts(
-                head.root,
-                TreeRangeEdit {
-                    range: write_range,
-                    replacement: Some(SegmentReplacement {
-                        segment_id: verified.descriptor.segment_id,
-                        segment_base: write_range.start,
-                    }),
-                },
-                std::slice::from_ref(&verified),
-            )?
-            .root;
+        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
         let new_size = head.size.max(end);
-        let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
-            owner: MappingOwner::NativeKeyspace(keyspace_id),
-            fence: MetadataFence::FileVersion(base_version),
-            updates: vec![RootUpdate::FileRoot {
-                file_id,
-                old_root: head.root,
-                new_root,
-                new_size,
-            }],
-        })?;
-        self.storage_nodes.mark_segment_referenced(
-            &receipt,
-            commit_group.commit_seq,
-            self.authority.as_ref(),
-        )?;
-        self.metadata
-            .invalidate_append_streams_for_file(keyspace_id, file_id)?;
-        let committed = self.metadata.get_file_head(keyspace_id, file_id)?;
-        Ok(FileWriteCommit {
+        self.publish_native_file_receipt_edits(NativeFileReceiptPublish {
             keyspace_id,
             file_id,
-            range,
-            version: committed.version,
-            commit_seq: committed.latest_commit,
+            base_version,
+            committed_range: range,
+            new_size,
+            edits: vec![NativeFileReceiptEdit {
+                range: write_range,
+                receipt: verified,
+            }],
             durability: receipt.durability,
         })
     }
@@ -12496,46 +12497,47 @@ impl DurableCoordinator {
         result
     }
 
-    pub fn write_file_at(
+    pub fn commit_file_batch(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        offset: u64,
-        data: &[u8],
+        writes: &[FileBatchWrite],
         durability: crate::api::WriteDurability,
     ) -> Result<FileWriteCommit> {
-        self.write_file_at_with_integrity(
+        self.commit_file_batch_with_integrity(
             keyspace_id,
             file_id,
-            offset,
-            data,
+            writes,
             durability,
             PayloadIntegrity::Verified,
         )
     }
 
-    pub fn write_file_at_with_integrity(
+    pub fn commit_file_batch_with_integrity(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
-        offset: u64,
-        data: &[u8],
+        writes: &[FileBatchWrite],
         durability: crate::api::WriteDurability,
         payload_integrity: PayloadIntegrity,
     ) -> Result<FileWriteCommit> {
         let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
         let admission = self.admit_write(
-            u64::try_from(data.len())
-                .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
+            writes.iter().try_fold(0u64, |total, write| {
+                total
+                    .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
+                        StorageError::invalid_argument("write byte length overflows u64")
+                    })?)
+                    .ok_or_else(|| StorageError::invalid_argument("write byte length overflows"))
+            })?,
             flushed,
         )?;
         let result = self
             .local
-            .write_file_at_with_integrity(
+            .commit_file_batch_with_integrity(
                 keyspace_id,
                 file_id,
-                offset,
-                data,
+                writes,
                 durability,
                 payload_integrity,
             )
@@ -12877,6 +12879,47 @@ struct TreeRangeEdit {
 struct TreeEditResult {
     root: MetadataNodeId,
     changed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NativeFileReceiptEdit {
+    range: crate::api::BlockRange,
+    receipt: VerifiedSegmentReceipt,
+}
+
+#[derive(Debug, Clone)]
+struct NativeFileReceiptPublish {
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    base_version: FileVersion,
+    committed_range: ByteRange,
+    new_size: u64,
+    edits: Vec<NativeFileReceiptEdit>,
+    durability: WriteDurability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollapsedFileWrite {
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+impl CollapsedFileWrite {
+    fn end(&self) -> Result<u64> {
+        self.offset
+            .checked_add(u64::try_from(self.bytes.len()).map_err(|_| {
+                StorageError::invalid_argument("native batch write length overflows u64")
+            })?)
+            .ok_or_else(|| StorageError::invalid_argument("native batch write range overflows"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeBatchSegmentGroup {
+    start: u64,
+    end: u64,
+    first_write: usize,
+    last_write: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13792,19 +13835,6 @@ impl InMemoryMetadataPlane {
         })
     }
 
-    fn active_append_stream_id_locked(
-        inner: &MetadataInner,
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-    ) -> Option<AppendStreamId> {
-        inner.append_streams.iter().find_map(|(stream_id, stream)| {
-            (stream.keyspace_id == keyspace_id
-                && stream.file_id == file_id
-                && stream.status == AppendStreamStatus::Active)
-                .then_some(*stream_id)
-        })
-    }
-
     pub fn open_append_stream(
         &self,
         keyspace_id: KeyspaceId,
@@ -13819,20 +13849,31 @@ impl InMemoryMetadataPlane {
             .get(&key)
             .copied()
             .unwrap_or_else(|| WriterEpoch::from_raw(0));
-        let active_stream_id = Self::active_append_stream_id_locked(&inner, keyspace_id, file_id);
-        let current_epoch = active_stream_id
-            .and_then(|active_id| inner.append_streams.get(&active_id))
-            .map(|stream| stream.writer_epoch)
+        let current_epoch = inner
+            .append_streams
+            .values()
+            .filter(|stream| {
+                stream.keyspace_id == keyspace_id
+                    && stream.file_id == file_id
+                    && stream.status == AppendStreamStatus::Active
+            })
+            .map(|stream| stream.writer_epoch.raw())
+            .chain(std::iter::once(persisted_epoch.raw()))
+            .max()
+            .map(WriterEpoch::from_raw)
             .unwrap_or(persisted_epoch);
         let writer_epoch = current_epoch
             .raw()
             .checked_add(1)
             .map(WriterEpoch::from_raw)
             .ok_or_else(|| StorageError::conflict("writer epoch overflow"))?;
-        if let Some(active_id) = active_stream_id
-            && let Some(active_stream) = inner.append_streams.get_mut(&active_id)
-        {
-            active_stream.status = AppendStreamStatus::Fenced;
+        for active_stream in inner.append_streams.values_mut() {
+            if active_stream.keyspace_id == keyspace_id
+                && active_stream.file_id == file_id
+                && active_stream.status == AppendStreamStatus::Active
+            {
+                active_stream.status = AppendStreamStatus::Fenced;
+            }
         }
         inner.file_writer_epochs.insert(key, writer_epoch);
         let stream = AppendStreamState {
@@ -17215,19 +17256,17 @@ impl NativeServer for LocalNativeServer {
                     )?;
                     Ok(NativeResponse::Read(ReadResponse { bytes }))
                 }
-                NativeRequest::Write {
+                NativeRequest::CommitFileBatch {
                     keyspace_id,
                     file_id,
-                    offset,
-                    bytes,
+                    writes,
                     payload_integrity,
                     durability,
-                } => Ok(NativeResponse::Write(
-                    self.store.write_file_at_with_integrity(
+                } => Ok(NativeResponse::FileBatchCommitted(
+                    self.store.commit_file_batch_with_integrity(
                         keyspace_id,
                         file_id,
-                        offset,
-                        &bytes,
+                        &writes,
                         durability,
                         payload_integrity,
                     )?,
@@ -19391,28 +19430,28 @@ impl NativeFile for LocalNativeFile {
         }
     }
 
-    fn write_at_with_integrity(
+    fn commit_batch_with_integrity(
         &self,
-        offset: u64,
-        data: &[u8],
+        writes: &[FileBatchWrite],
         payload_integrity: PayloadIntegrity,
     ) -> Result<FileWriteCommit> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::Write {
+            NativeRequest::CommitFileBatch {
                 keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
-                offset,
-                bytes: data.to_vec(),
+                writes: writes.to_vec(),
                 payload_integrity,
                 durability: crate::api::WriteDurability::Acknowledged,
             },
         ))?;
         match response.response {
-            NativeResponse::Write(commit) => Ok(commit),
-            _ => Err(StorageError::corrupt("unexpected native-write response")),
+            NativeResponse::FileBatchCommitted(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt(
+                "unexpected native-file-batch response",
+            )),
         }
     }
 
@@ -21575,6 +21614,20 @@ impl DurableCodec for FileWriteCommit {
     }
 }
 
+impl DurableCodec for FileBatchWrite {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.offset.encode(out)?;
+        self.bytes.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            offset: u64::decode(input)?,
+            bytes: Vec::decode(input)?,
+        })
+    }
+}
+
 impl DurableCodec for AppendStreamStatus {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         match self {
@@ -21690,19 +21743,17 @@ impl DurableCodec for NativeRequest {
                 range.encode(out)?;
                 verification.encode(out)
             }
-            Self::Write {
+            Self::CommitFileBatch {
                 keyspace_id,
                 file_id,
-                offset,
-                bytes,
+                writes,
                 payload_integrity,
                 durability,
             } => {
                 6u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
-                offset.encode(out)?;
-                bytes.encode(out)?;
+                writes.encode(out)?;
                 payload_integrity.encode(out)?;
                 durability.encode(out)
             }
@@ -21807,11 +21858,10 @@ impl DurableCodec for NativeRequest {
                 range: ByteRange::decode(input)?,
                 verification: ReadVerification::decode(input)?,
             }),
-            6 => Ok(Self::Write {
+            6 => Ok(Self::CommitFileBatch {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
-                offset: u64::decode(input)?,
-                bytes: Vec::decode(input)?,
+                writes: Vec::decode(input)?,
                 payload_integrity: PayloadIntegrity::decode(input)?,
                 durability: WriteDurability::decode(input)?,
             }),
@@ -21885,7 +21935,7 @@ impl DurableCodec for NativeResponse {
                 5u8.encode(out)?;
                 read.encode(out)
             }
-            Self::Write(commit) => {
+            Self::FileBatchCommitted(commit) => {
                 6u8.encode(out)?;
                 commit.encode(out)
             }
@@ -21932,7 +21982,7 @@ impl DurableCodec for NativeResponse {
             3 => Ok(Self::FileCreated(FileId::decode(input)?)),
             4 => Ok(Self::FileInfo(FileInfo::decode(input)?)),
             5 => Ok(Self::Read(ReadResponse::decode(input)?)),
-            6 => Ok(Self::Write(FileWriteCommit::decode(input)?)),
+            6 => Ok(Self::FileBatchCommitted(FileWriteCommit::decode(input)?)),
             7 => Ok(Self::AppendStreamOpened(AppendStream::decode(input)?)),
             8 => Ok(Self::AppendTicket(AppendTicket::decode(input)?)),
             9 => Ok(Self::DurableAppendMark(DurableAppendMark::decode(input)?)),
@@ -22367,6 +22417,165 @@ fn blocks_for_bytes(bytes: u64, block_size: u64) -> Result<u64> {
         .checked_add(block_size - 1)
         .map(|adjusted| adjusted / block_size)
         .ok_or_else(|| StorageError::invalid_argument("byte count overflows block count"))
+}
+
+fn collapse_native_file_batch_writes(
+    writes: &[FileBatchWrite],
+    base_size: u64,
+    max_batch_bytes: u64,
+) -> Result<(Vec<CollapsedFileWrite>, ByteRange, u64)> {
+    if writes.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "native file batch must not be empty",
+        ));
+    }
+
+    let mut collapsed = Vec::<CollapsedFileWrite>::new();
+    let mut running_size = base_size;
+    let mut total_bytes = 0u64;
+    let mut first_offset = None;
+
+    for write in writes {
+        let range = write.byte_range()?;
+        first_offset.get_or_insert(range.offset);
+        let end = range.end_exclusive()?;
+        if range.offset > running_size {
+            return Err(StorageError::invalid_argument(
+                "native file batch cannot create a sparse gap",
+            ));
+        }
+        running_size = running_size.max(end);
+        if write.bytes.is_empty() {
+            continue;
+        }
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
+                StorageError::invalid_argument("native file batch byte length overflows u64")
+            })?)
+            .ok_or_else(|| {
+                StorageError::invalid_argument("native file batch byte length overflows")
+            })?;
+        if total_bytes > max_batch_bytes {
+            return Err(StorageError::invalid_argument(
+                "native file batch exceeds maximum payload bytes",
+            ));
+        }
+        insert_collapsed_file_write(&mut collapsed, write.offset, write.bytes.clone())?;
+    }
+
+    if collapsed.is_empty() {
+        return Ok((
+            collapsed,
+            ByteRange::new(first_offset.unwrap_or(base_size), 0),
+            base_size,
+        ));
+    }
+
+    let start = collapsed
+        .first()
+        .ok_or_else(|| StorageError::corrupt("missing collapsed file write"))?
+        .offset;
+    let end = collapsed
+        .last()
+        .ok_or_else(|| StorageError::corrupt("missing collapsed file write"))?
+        .end()?;
+    Ok((collapsed, ByteRange::new(start, end - start), running_size))
+}
+
+fn insert_collapsed_file_write(
+    collapsed: &mut Vec<CollapsedFileWrite>,
+    offset: u64,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    let len = u64::try_from(bytes.len())
+        .map_err(|_| StorageError::invalid_argument("native file batch length overflows u64"))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| StorageError::invalid_argument("native file batch range overflows"))?;
+    let mut next = Vec::with_capacity(collapsed.len() + 1);
+    for existing in collapsed.drain(..) {
+        let existing_start = existing.offset;
+        let existing_end = existing.end()?;
+        if existing_end <= offset || existing_start >= end {
+            next.push(existing);
+            continue;
+        }
+        if existing_start < offset {
+            let keep_len = usize::try_from(offset - existing_start).map_err(|_| {
+                StorageError::invalid_argument("native file batch left split overflows usize")
+            })?;
+            next.push(CollapsedFileWrite {
+                offset: existing_start,
+                bytes: existing.bytes[..keep_len].to_vec(),
+            });
+        }
+        if existing_end > end {
+            let keep_start = usize::try_from(end - existing_start).map_err(|_| {
+                StorageError::invalid_argument("native file batch right split overflows usize")
+            })?;
+            next.push(CollapsedFileWrite {
+                offset: end,
+                bytes: existing.bytes[keep_start..].to_vec(),
+            });
+        }
+    }
+    next.push(CollapsedFileWrite { offset, bytes });
+    next.sort_by_key(|write| write.offset);
+    *collapsed = next;
+    Ok(())
+}
+
+fn native_batch_segment_groups(
+    writes: &[CollapsedFileWrite],
+    block_size: u64,
+) -> Result<Vec<NativeBatchSegmentGroup>> {
+    let mut groups: Vec<NativeBatchSegmentGroup> = Vec::new();
+    for (index, write) in writes.iter().enumerate() {
+        let write_end = write.end()?;
+        let group_start = (write.offset / block_size)
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("native batch group overflows"))?;
+        let group_blocks = blocks_for_bytes(write_end - group_start, block_size)?;
+        let group_end = group_start
+            .checked_add(group_blocks.checked_mul(block_size).ok_or_else(|| {
+                StorageError::invalid_argument("native batch group length overflows")
+            })?)
+            .ok_or_else(|| StorageError::invalid_argument("native batch group end overflows"))?;
+        if let Some(last) = groups.last_mut()
+            && group_start <= last.end
+        {
+            last.end = last.end.max(group_end);
+            last.last_write = index + 1;
+            continue;
+        }
+        groups.push(NativeBatchSegmentGroup {
+            start: group_start,
+            end: group_end,
+            first_write: index,
+            last_write: index + 1,
+        });
+    }
+    Ok(groups)
+}
+
+fn overlay_native_batch_writes(
+    group_start: u64,
+    writes: &[CollapsedFileWrite],
+    bytes: &mut [u8],
+) -> Result<()> {
+    for write in writes {
+        let start = usize::try_from(write.offset - group_start).map_err(|_| {
+            StorageError::invalid_argument("native batch write offset overflows usize")
+        })?;
+        let end = start
+            .checked_add(write.bytes.len())
+            .ok_or_else(|| StorageError::invalid_argument("native batch write end overflows"))?;
+        let target = bytes.get_mut(start..end).ok_or_else(|| {
+            StorageError::corrupt("native batch segment range does not cover payload")
+        })?;
+        target.copy_from_slice(&write.bytes);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -23014,11 +23223,10 @@ mod tests {
             offset: u64,
             data: &[u8],
         ) -> Result<FileWriteCommit> {
-            self.write_file_at(
+            self.commit_file_batch(
                 keyspace_id,
                 file_id,
-                offset,
-                data,
+                &[FileBatchWrite::new(offset, data.to_vec())],
                 WriteDurability::Acknowledged,
             )
         }
@@ -23110,7 +23318,12 @@ mod tests {
             offset: u64,
             data: &[u8],
         ) -> Result<FileWriteCommit> {
-            self.write_file_at(keyspace_id, file_id, offset, data, WriteDurability::Flushed)
+            self.commit_file_batch(
+                keyspace_id,
+                file_id,
+                &[FileBatchWrite::new(offset, data.to_vec())],
+                WriteDurability::Flushed,
+            )
         }
 
         fn append_file_for_conformance(
@@ -25158,20 +25371,18 @@ mod tests {
             .unwrap();
         store.enable_persist_profiling(8).unwrap();
         let first = store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 file_id,
-                0,
-                b"first",
+                &[FileBatchWrite::new(0, b"first".to_vec())],
                 WriteDurability::Acknowledged,
             )
             .unwrap();
         let second = store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 file_id,
-                0,
-                b"later",
+                &[FileBatchWrite::new(0, b"later".to_vec())],
                 WriteDurability::Acknowledged,
             )
             .unwrap();
@@ -25223,20 +25434,18 @@ mod tests {
             .unwrap();
         store.enable_persist_profiling(8).unwrap();
         let first = store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 file_id,
-                0,
-                b"first",
+                &[FileBatchWrite::new(0, b"first".to_vec())],
                 WriteDurability::Acknowledged,
             )
             .unwrap();
         let second = store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 file_id,
-                0,
-                b"later",
+                &[FileBatchWrite::new(0, b"later".to_vec())],
                 WriteDurability::Acknowledged,
             )
             .unwrap();
@@ -26391,7 +26600,12 @@ mod tests {
 
         let store = DurableCoordinator::open(&root, cfg).unwrap();
         store
-            .write_file_at(keyspace_id, file_a_id, 0, b"aaaa", WriteDurability::Flushed)
+            .commit_file_batch(
+                keyspace_id,
+                file_a_id,
+                &[FileBatchWrite::new(0, b"aaaa".to_vec())],
+                WriteDurability::Flushed,
+            )
             .unwrap();
         drop(store);
         let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
@@ -26413,7 +26627,12 @@ mod tests {
 
         let store = DurableCoordinator::open(&root, cfg).unwrap();
         store
-            .write_file_at(keyspace_id, file_b_id, 0, b"bbbb", WriteDurability::Flushed)
+            .commit_file_batch(
+                keyspace_id,
+                file_b_id,
+                &[FileBatchWrite::new(0, b"bbbb".to_vec())],
+                WriteDurability::Flushed,
+            )
             .unwrap();
         drop(store);
         let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
@@ -27483,11 +27702,10 @@ mod tests {
             )
             .unwrap();
         store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 file_id,
-                0,
-                &repeated_blocks(1, 5),
+                &[FileBatchWrite::new(0, repeated_blocks(1, 5))],
                 WriteDurability::Flushed,
             )
             .unwrap();
@@ -27581,11 +27799,10 @@ mod tests {
             .unwrap();
         let payload = repeated_blocks(1, 45);
         store
-            .write_file_at_with_integrity(
+            .commit_file_batch_with_integrity(
                 keyspace_id,
                 file_id,
-                0,
-                &payload,
+                &[FileBatchWrite::new(0, payload.clone())],
                 WriteDurability::Flushed,
                 PayloadIntegrity::Unchecked,
             )
@@ -29082,11 +29299,10 @@ mod tests {
             .append_stream(&stream, b"private", WriteDurability::Acknowledged)
             .unwrap();
         store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 other_file,
-                0,
-                b"other",
+                &[FileBatchWrite::new(0, b"other".to_vec())],
                 WriteDurability::Flushed,
             )
             .unwrap();
@@ -29188,6 +29404,153 @@ mod tests {
             )
             .unwrap();
         assert_eq!(visible, b"private");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_flushed_stream_resume_requires_matching_bearer_token() {
+        let root = durable_temp_dir("native-stream-token-authority");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        append_durable_store_once(
+            &store,
+            keyspace_id,
+            file_id,
+            b"base",
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(&stream, b"private", WriteDurability::Acknowledged)
+            .unwrap();
+        let mark = store.flush_append_stream(&stream).unwrap();
+        assert_eq!(mark.durable_through, b"baseprivate".len() as u64);
+        assert_eq!(
+            store
+                .metadata()
+                .get_file_head(keyspace_id, file_id)
+                .unwrap()
+                .size,
+            b"base".len() as u64
+        );
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut forged_stream = stream.clone();
+        forged_stream.stream_id = AppendStreamId::from_raw(stream.stream_id.raw() + 1);
+        assert!(
+            reopened
+                .publish_append_stream(&forged_stream, &mark)
+                .is_err(),
+            "logical file identity alone must not resume private durable bytes"
+        );
+        let mut forged_mark = mark.clone();
+        forged_mark.stream_id = forged_stream.stream_id;
+        assert!(
+            reopened
+                .publish_append_stream(&stream, &forged_mark)
+                .is_err(),
+            "durable marks are bound to the original stream token"
+        );
+
+        reopened.publish_append_stream(&stream, &mark).unwrap();
+        let mut bytes = vec![0; b"baseprivate".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, bytes.len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"baseprivate");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_takeover_without_stream_token_starts_from_visible_head() {
+        let root = durable_temp_dir("native-stream-takeover-visible-head");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        append_durable_store_once(
+            &store,
+            keyspace_id,
+            file_id,
+            b"base",
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+        let old = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(&old, b"old-private", WriteDurability::Acknowledged)
+            .unwrap();
+        let old_mark = store.flush_append_stream(&old).unwrap();
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let fresh = reopened.open_append_stream(keyspace_id, file_id).unwrap();
+        assert_eq!(fresh.visible_base_size, b"base".len() as u64);
+        assert!(fresh.writer_epoch.raw() > old.writer_epoch.raw());
+        assert_eq!(
+            reopened
+                .metadata()
+                .state_inner()
+                .unwrap()
+                .append_streams
+                .get(&old.stream_id)
+                .unwrap()
+                .status,
+            AppendStreamStatus::Fenced
+        );
+        assert!(
+            reopened.publish_append_stream(&old, &old_mark).is_err(),
+            "opening a replacement stream fences the old private durable stream"
+        );
+        append_durable_store_with_stream(&reopened, &fresh, b"new", WriteDurability::Acknowledged)
+            .unwrap();
+
+        let mut bytes = vec![0; b"basenew".len()];
+        reopened
+            .read_file(
+                keyspace_id,
+                file_id,
+                ByteRange::new(0, bytes.len() as u64),
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"basenew");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -29368,7 +29731,12 @@ mod tests {
             )
             .unwrap();
         store
-            .write_file_at(keyspace_id, file_a, 0, b"before", WriteDurability::Flushed)
+            .commit_file_batch(
+                keyspace_id,
+                file_a,
+                &[FileBatchWrite::new(0, b"before".to_vec())],
+                WriteDurability::Flushed,
+            )
             .unwrap();
         let keyspace_checkpoint = store.checkpoint_keyspace(keyspace_id).unwrap();
         let snapshot_keyspace = store
@@ -29381,7 +29749,12 @@ mod tests {
             )
             .unwrap();
         store
-            .write_file_at(keyspace_id, file_a, 0, b"after!", WriteDurability::Flushed)
+            .commit_file_batch(
+                keyspace_id,
+                file_a,
+                &[FileBatchWrite::new(0, b"after!".to_vec())],
+                WriteDurability::Flushed,
+            )
             .unwrap();
         append_durable_store_once(
             &store,
@@ -30188,11 +30561,10 @@ mod tests {
             RequestId::from_raw(5),
             ClientEpoch::from_raw(1),
             None,
-            NativeRequest::Write {
+            NativeRequest::CommitFileBatch {
                 keyspace_id,
                 file_id,
-                offset: 0,
-                bytes: b"native".to_vec(),
+                writes: vec![FileBatchWrite::new(0, b"native".to_vec())],
                 payload_integrity: PayloadIntegrity::Verified,
                 durability: WriteDurability::Acknowledged,
             },
@@ -32073,6 +32445,112 @@ mod tests {
         let mut snapshot = vec![0; 11];
         snapshot_file.read_at(0, &mut snapshot).unwrap();
         assert_eq!(snapshot.as_slice(), b"hello world");
+    }
+
+    #[test]
+    fn native_file_batch_commit_collapses_overlaps_and_advances_once() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+
+        let commit = file
+            .commit_batch(&[
+                FileBatchWrite::new(0, b"abcd".to_vec()),
+                FileBatchWrite::new(4, b"efgh".to_vec()),
+                FileBatchWrite::new(2, b"ZZ".to_vec()),
+            ])
+            .unwrap();
+
+        assert_eq!(commit.range, ByteRange::new(0, 8));
+        assert_eq!(commit.version, FileVersion::from_raw(1));
+        assert_eq!(file.info().unwrap().version, FileVersion::from_raw(1));
+        let mut bytes = vec![0; 8];
+        file.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes.as_slice(), b"abZZefgh");
+    }
+
+    #[test]
+    fn native_file_batch_commit_is_the_single_write_helper_path() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_id, file) = create_local_file(&client, keyspace_id);
+
+        let helper = file.write_at(0, b"hello").unwrap();
+        let batch = file
+            .commit_batch(&[FileBatchWrite::new(5, b" world".to_vec())])
+            .unwrap();
+
+        assert_eq!(helper.version, FileVersion::from_raw(1));
+        assert_eq!(batch.version, FileVersion::from_raw(2));
+        let mut bytes = vec![0; 11];
+        file.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes.as_slice(), b"hello world");
+    }
+
+    #[test]
+    fn native_file_batch_commit_invalidates_only_same_file_append_streams() {
+        let store = LocalCoordinator::with_config(config()).unwrap();
+        let client = create_native_client(&store);
+        let keyspace_id = create_local_keyspace(&client);
+        let (_file_a_id, file_a) = create_local_file(&client, keyspace_id);
+        let (_file_b_id, file_b) = create_local_file(&client, keyspace_id);
+
+        let stale_a = file_a.open_append_stream().unwrap();
+        let live_b = file_b.open_append_stream().unwrap();
+        file_a
+            .commit_batch(&[FileBatchWrite::new(0, b"base".to_vec())])
+            .unwrap();
+
+        assert!(append_native_file_with_stream(&file_a, &stale_a, b"x").is_err());
+        append_native_file_with_stream(&file_b, &live_b, b"b").unwrap();
+
+        let mut file_b_bytes = vec![0; 1];
+        file_b.read_at(0, &mut file_b_bytes).unwrap();
+        assert_eq!(file_b_bytes, b"b");
+    }
+
+    #[test]
+    fn durable_native_file_batch_commit_survives_reopen() {
+        let root = durable_temp_dir("native-file-batch-reopen");
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let keyspace_id = store
+            .create_keyspace(CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            })
+            .unwrap();
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some("file".to_string()),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .commit_file_batch(
+                keyspace_id,
+                file_id,
+                &[
+                    FileBatchWrite::new(0, b"left".to_vec()),
+                    FileBatchWrite::new(4, b"right".to_vec()),
+                ],
+                WriteDurability::Flushed,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+        let mut bytes = vec![0; 9];
+        reopened
+            .read_file(keyspace_id, file_id, ByteRange::new(0, 9), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes.as_slice(), b"leftright");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

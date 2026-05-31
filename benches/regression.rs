@@ -24,8 +24,8 @@ use toy_cow_block_storage::provider::{
 use toy_cow_block_storage::sim::SeededRng;
 use toy_cow_block_storage::{
     AppendStream, AppendStreamId, BlockClient, BlockDevice, BlockRequest, ByteRange, DeviceId,
-    DeviceSpec, FileId, ForkRequest, KeyspaceId, NativeFile, NativeKeyspaceClient, NativeRequest,
-    PayloadIntegrity, RestorePoint, WriteDurability, WriterEpoch,
+    DeviceSpec, FileBatchWrite, FileId, ForkRequest, KeyspaceId, NativeFile, NativeKeyspaceClient,
+    NativeRequest, PayloadIntegrity, RestorePoint, WriteDurability, WriterEpoch,
 };
 
 fn bench_byte_range_validation(c: &mut Criterion) {
@@ -768,8 +768,8 @@ fn bench_local_native_large_append(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_local_native_write_at(c: &mut Criterion) {
-    c.bench_function("local_native_write_at", |b| {
+fn bench_local_native_commit_file_batch(c: &mut Criterion) {
+    c.bench_function("local_native_commit_file_batch", |b| {
         b.iter_batched(
             || {
                 let store = LocalCoordinator::new();
@@ -794,11 +794,10 @@ fn bench_local_native_write_at(c: &mut Criterion) {
             },
             |(store, keyspace_id, file_id, bytes)| {
                 store
-                    .write_file_at(
+                    .commit_file_batch(
                         black_box(keyspace_id),
                         black_box(file_id),
-                        black_box(0),
-                        black_box(&bytes),
+                        black_box(&[FileBatchWrite::new(0, bytes)]),
                         WriteDurability::Acknowledged,
                     )
                     .unwrap()
@@ -1120,11 +1119,10 @@ fn bench_native_append_validation(c: &mut Criterion) {
 }
 
 fn bench_native_write_validation(c: &mut Criterion) {
-    let request = NativeRequest::Write {
+    let request = NativeRequest::CommitFileBatch {
         keyspace_id: KeyspaceId::from_raw(5),
         file_id: FileId::from_raw(9),
-        offset: 128,
-        bytes: vec![0; 64 * 4096],
+        writes: vec![FileBatchWrite::new(128, vec![0; 64 * 4096])],
         payload_integrity: PayloadIntegrity::Verified,
         durability: WriteDurability::Acknowledged,
     };
@@ -1221,11 +1219,10 @@ fn bench_native_keyspace_scaling(c: &mut Criterion) {
         let alternate = files[(file_count / 2 + 1) % file_count];
         let payload = vec![3; 4096];
         store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 target,
-                0,
-                &payload,
+                &[FileBatchWrite::new(0, payload.clone())],
                 WriteDurability::Acknowledged,
             )
             .unwrap();
@@ -1263,16 +1260,15 @@ fn bench_native_keyspace_scaling(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("write_at_4k", file_count),
+            BenchmarkId::new("commit_file_batch_4k", file_count),
             &file_count,
             |b, _| {
                 b.iter(|| {
                     store
-                        .write_file_at(
+                        .commit_file_batch(
                             black_box(keyspace_id),
                             black_box(target),
-                            black_box(0),
-                            black_box(&payload),
+                            black_box(&[FileBatchWrite::new(0, payload.clone())]),
                             WriteDurability::Acknowledged,
                         )
                         .unwrap()
@@ -1334,37 +1330,34 @@ fn bench_native_alignment_paths(c: &mut Criterion) {
     let aligned = vec![1; 4096];
     let unaligned = vec![2; 17];
     store
-        .write_file_at(
+        .commit_file_batch(
             keyspace_id,
             file_id,
-            0,
-            &aligned,
+            &[FileBatchWrite::new(0, aligned.clone())],
             WriteDurability::Acknowledged,
         )
         .unwrap();
 
-    group.bench_function("write_aligned_4k", |b| {
+    group.bench_function("commit_batch_aligned_4k", |b| {
         b.iter(|| {
             store
-                .write_file_at(
+                .commit_file_batch(
                     black_box(keyspace_id),
                     black_box(file_id),
-                    black_box(0),
-                    black_box(&aligned),
+                    black_box(&[FileBatchWrite::new(0, aligned.clone())]),
                     WriteDurability::Acknowledged,
                 )
                 .unwrap()
         })
     });
 
-    group.bench_function("write_unaligned_partial_block", |b| {
+    group.bench_function("commit_batch_unaligned_partial_block", |b| {
         b.iter(|| {
             store
-                .write_file_at(
+                .commit_file_batch(
                     black_box(keyspace_id),
                     black_box(file_id),
-                    black_box(1),
-                    black_box(&unaligned),
+                    black_box(&[FileBatchWrite::new(1, unaligned.clone())]),
                     WriteDurability::Acknowledged,
                 )
                 .unwrap()
@@ -1521,11 +1514,10 @@ fn bench_native_concurrent_batches(c: &mut Criterion) {
                     let payload = &payload;
                     scope.spawn(move || {
                         store
-                            .write_file_at(
+                            .commit_file_batch(
                                 keyspace_id,
                                 file_id,
-                                0,
-                                payload,
+                                &[FileBatchWrite::new(0, payload.as_slice().to_vec())],
                                 WriteDurability::Acknowledged,
                             )
                             .unwrap();
@@ -1544,11 +1536,10 @@ fn bench_native_concurrent_batches(c: &mut Criterion) {
                     let payload = &payload;
                     handles.push(scope.spawn(move || {
                         store
-                            .write_file_at(
+                            .commit_file_batch(
                                 keyspace_id,
                                 conflict_file,
-                                0,
-                                payload,
+                                &[FileBatchWrite::new(0, payload.as_slice().to_vec())],
                                 WriteDurability::Acknowledged,
                             )
                             .is_ok()
@@ -1718,11 +1709,10 @@ fn seed_durable_native_history_with_durability(
 ) {
     for block in 0..writes {
         store
-            .write_file_at(
+            .commit_file_batch(
                 keyspace_id,
                 file_id,
-                block * 4096,
-                &[block as u8; 4096],
+                &[FileBatchWrite::new(block * 4096, vec![block as u8; 4096])],
                 durability,
             )
             .unwrap();
@@ -2398,7 +2388,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("native_write_at_4k_acknowledged_fresh", |b| {
+    group.bench_function("native_commit_file_batch_4k_acknowledged_fresh", |b| {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-write-ack-fresh");
@@ -2407,11 +2397,10 @@ fn bench_durable_provider(c: &mut Criterion) {
                 let payload = vec![4; 4096];
                 let started = Instant::now();
                 store
-                    .write_file_at(
+                    .commit_file_batch(
                         black_box(keyspace_id),
                         black_box(file_id),
-                        black_box(0),
-                        black_box(&payload),
+                        black_box(&[FileBatchWrite::new(0, payload)]),
                         WriteDurability::Acknowledged,
                     )
                     .unwrap();
@@ -2422,7 +2411,7 @@ fn bench_durable_provider(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("native_write_at_4k_flushed_fresh", |b| {
+    group.bench_function("native_commit_file_batch_4k_flushed_fresh", |b| {
         b.iter_custom(|iters| {
             elapsed_durable_iters(iters, || {
                 let root = durable_bench_root("native-write-flushed-fresh");
@@ -2431,11 +2420,10 @@ fn bench_durable_provider(c: &mut Criterion) {
                 let payload = vec![4; 4096];
                 let started = Instant::now();
                 store
-                    .write_file_at(
+                    .commit_file_batch(
                         black_box(keyspace_id),
                         black_box(file_id),
-                        black_box(0),
-                        black_box(&payload),
+                        black_box(&[FileBatchWrite::new(0, payload)]),
                         WriteDurability::Flushed,
                     )
                     .unwrap();
@@ -2464,36 +2452,38 @@ fn bench_durable_provider(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("native_write_at_4k_flushed_after_32_flushed_writes", |b| {
-        b.iter_custom(|iters| {
-            elapsed_durable_iters(iters, || {
-                let root = durable_bench_root("native-write-flushed-after-32");
-                let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
-                let (keyspace_id, file_id) = create_durable_native_file(&store);
-                seed_durable_native_history_with_durability(
-                    &store,
-                    keyspace_id,
-                    file_id,
-                    32,
-                    WriteDurability::Flushed,
-                );
-                let payload = vec![8; 4096];
-                let started = Instant::now();
-                store
-                    .write_file_at(
-                        black_box(keyspace_id),
-                        black_box(file_id),
-                        black_box(0),
-                        black_box(&payload),
+    group.bench_function(
+        "native_commit_file_batch_4k_flushed_after_32_flushed_writes",
+        |b| {
+            b.iter_custom(|iters| {
+                elapsed_durable_iters(iters, || {
+                    let root = durable_bench_root("native-write-flushed-after-32");
+                    let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
+                    let (keyspace_id, file_id) = create_durable_native_file(&store);
+                    seed_durable_native_history_with_durability(
+                        &store,
+                        keyspace_id,
+                        file_id,
+                        32,
                         WriteDurability::Flushed,
-                    )
-                    .unwrap();
-                let elapsed = started.elapsed();
-                cleanup_durable_bench_root(&root);
-                black_box(elapsed)
+                    );
+                    let payload = vec![8; 4096];
+                    let started = Instant::now();
+                    store
+                        .commit_file_batch(
+                            black_box(keyspace_id),
+                            black_box(file_id),
+                            black_box(&[FileBatchWrite::new(0, payload)]),
+                            WriteDurability::Flushed,
+                        )
+                        .unwrap();
+                    let elapsed = started.elapsed();
+                    cleanup_durable_bench_root(&root);
+                    black_box(elapsed)
+                })
             })
-        })
-    });
+        },
+    );
 
     group.bench_function("native_append_4k_acknowledged_fresh", |b| {
         b.iter_custom(|iters| {
@@ -2547,6 +2537,6 @@ fn bench_durable_provider(c: &mut Criterion) {
 criterion_group! {
     name = regression;
     config = Criterion::default().noise_threshold(0.05);
-    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_grant_receipt_flow, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_large_append, bench_local_native_write_at, bench_local_native_stale_stream_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
+    targets = bench_byte_range_validation, bench_block_request_validation, bench_native_append_validation, bench_native_write_validation, bench_block_range_helpers, bench_metadata_leaf_validation, bench_in_memory_metadata_node_lookup, bench_in_memory_segment_read, bench_local_empty_device_read, bench_local_read_by_mapping_count, bench_local_single_shard_write, bench_local_grant_receipt_flow, bench_local_multi_node_placement, bench_local_single_shard_write_by_tree_depth, bench_local_multi_shard_atomic_write, bench_local_native_append, bench_local_native_large_append, bench_local_native_commit_file_batch, bench_local_native_stale_stream_rejection, bench_local_fork_vs_device_size, bench_local_checkpoint_restore, bench_local_native_keyspace_checkpoint_restore, bench_roots_for_gc_with_deleted_retention, bench_metadata_gc_mark_traversal, bench_seeded_rng, bench_native_keyspace_scaling, bench_native_alignment_paths, bench_native_snapshot_restore_root_copy, bench_native_concurrent_batches, bench_durable_provider
 }
 criterion_main!(regression);

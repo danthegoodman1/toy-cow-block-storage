@@ -36,6 +36,7 @@ The north-star outcome is:
 
 - append ingest is cheap and mostly independent of metadata service latency;
 - durability is a stream-private high-water, not a reader-visible file update;
+- private durability is bearer-token resumability, not logical-name discovery;
 - publish is metadata-only and scales with durable run count;
 - file metadata contains a small number of large extents per publish;
 - GC treats private durable stream data as a first-class root only while the
@@ -74,6 +75,13 @@ durable mark       = stream-private recovery boundary
 publish            = reader-visible file boundary
 ```
 
+There is intentionally no durable stream registry or resume-by-logical-name API
+in this model. A failover replacement can resume flushed private bytes only if
+it has the matching `AppendStream` token and `DurableAppendMark`. A replacement
+without that authority opens a fresh stream, fences the old stream, and starts
+at the visible file head. WAL-like users that need recovery by file name must
+publish at the interval they want to make globally recoverable.
+
 A 128 MiB append made from 128 one-MiB client calls should become one durable
 stream run when the physical log range is contiguous, and then one visible file
 extent at publish time:
@@ -104,6 +112,8 @@ Same-file rules:
 - same-file `write_at` fences the active stream;
 - other files in the same keyspace do not affect the stream;
 - new writers start from the visible file head, not private durable bytes.
+- flushed private data is recoverable only by the matching stream token and
+  durable mark; publish is the first globally discoverable boundary.
 
 The metadata service tracks:
 
