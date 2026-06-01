@@ -28,7 +28,11 @@ pub struct DurablePersistProfile {
     pub data_log_encode_nanos: u64,
     pub data_log_write_nanos: u64,
     pub data_log_file_sync_nanos: u64,
+    pub data_log_file_sync_sum_nanos: u64,
+    pub data_log_file_sync_max_nanos: u64,
     pub data_log_dir_sync_nanos: u64,
+    pub data_log_files_synced: u64,
+    pub data_log_sync_bytes: u64,
     pub node_catalog_publish_nanos: u64,
     pub node_catalog_manifest_lock_wait_nanos: u64,
     pub node_catalog_manifest_row_sync_nanos: u64,
@@ -219,7 +223,11 @@ pub(super) struct DataLogAppendProfile {
     encode_nanos: u64,
     write_nanos: u64,
     file_sync_nanos: u64,
+    file_sync_sum_nanos: u64,
+    file_sync_max_nanos: u64,
     dir_sync_nanos: u64,
+    files_synced: u64,
+    sync_bytes: u64,
 }
 
 impl DataLogAppendProfile {
@@ -227,8 +235,46 @@ impl DataLogAppendProfile {
         self.encode_nanos = self.encode_nanos.saturating_add(other.encode_nanos);
         self.write_nanos = self.write_nanos.saturating_add(other.write_nanos);
         self.file_sync_nanos = self.file_sync_nanos.saturating_add(other.file_sync_nanos);
+        self.file_sync_sum_nanos = self
+            .file_sync_sum_nanos
+            .saturating_add(other.file_sync_sum_nanos);
+        self.file_sync_max_nanos = self.file_sync_max_nanos.max(other.file_sync_max_nanos);
         self.dir_sync_nanos = self.dir_sync_nanos.saturating_add(other.dir_sync_nanos);
+        self.files_synced = self.files_synced.saturating_add(other.files_synced);
+        self.sync_bytes = self.sync_bytes.saturating_add(other.sync_bytes);
     }
+}
+
+#[derive(Debug)]
+pub(super) struct DataLogFileToSync {
+    file: File,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DataLogFileSyncProfile {
+    files_synced: u64,
+    sync_bytes: u64,
+    sync_sum_nanos: u64,
+    sync_max_nanos: u64,
+}
+
+impl DataLogFileSyncProfile {
+    fn record_file(&mut self, bytes: u64, nanos: u64) {
+        self.files_synced = self.files_synced.saturating_add(1);
+        self.sync_bytes = self.sync_bytes.saturating_add(bytes);
+        self.sync_sum_nanos = self.sync_sum_nanos.saturating_add(nanos);
+        self.sync_max_nanos = self.sync_max_nanos.max(nanos);
+    }
+}
+
+fn data_log_file_to_sync(file: File, bytes: u64) -> DataLogFileToSync {
+    DataLogFileToSync { file, bytes }
+}
+
+fn data_log_file_to_sync_with_metadata(file: File) -> Result<DataLogFileToSync> {
+    let bytes = file.metadata().map_err(fs_error)?.len();
+    Ok(DataLogFileToSync { file, bytes })
 }
 
 #[derive(Debug)]
@@ -966,7 +1012,11 @@ impl DurableSqliteStore {
                 data_log_encode_nanos: data_log_profile.encode_nanos,
                 data_log_write_nanos: data_log_profile.write_nanos,
                 data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+                data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
+                data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
                 data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
+                data_log_files_synced: data_log_profile.files_synced,
+                data_log_sync_bytes: data_log_profile.sync_bytes,
                 node_catalog_publish_nanos,
                 node_catalog_manifest_lock_wait_nanos: catalog_profile
                     .manifest_lock_wait_nanos,
@@ -1356,7 +1406,11 @@ impl DurableSqliteStore {
             data_log_encode_nanos: data_log_profile.encode_nanos,
             data_log_write_nanos: data_log_profile.write_nanos,
             data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
             data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
+            data_log_files_synced: data_log_profile.files_synced,
+            data_log_sync_bytes: data_log_profile.sync_bytes,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1447,7 +1501,11 @@ impl DurableSqliteStore {
             data_log_encode_nanos: data_log_profile.encode_nanos,
             data_log_write_nanos: data_log_profile.write_nanos,
             data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
             data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
+            data_log_files_synced: data_log_profile.files_synced,
+            data_log_sync_bytes: data_log_profile.sync_bytes,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1664,7 +1722,7 @@ impl DurableSqliteStore {
         }
 
         let mut active_logs = BTreeMap::new();
-        let mut open_log: Option<(DurableDataLogRef, File)> = None;
+        let mut open_log: Option<(DurableDataLogRef, File, u64)> = None;
         let mut files_to_sync = Vec::new();
         let mut synced_dirs = BTreeSet::new();
         let mut profile = DataLogAppendProfile::default();
@@ -1731,11 +1789,11 @@ impl DurableSqliteStore {
                 storage_node,
                 log_id: active.log_id,
             };
-            if open_log.as_ref().map(|(log_ref, _)| *log_ref) != Some(log_ref) {
-                if let Some((_, file)) = open_log.take()
+            if open_log.as_ref().map(|(log_ref, _, _)| *log_ref) != Some(log_ref) {
+                if let Some((_, file, bytes)) = open_log.take()
                     && sync_mode == DataLogSyncMode::Sync
                 {
-                    files_to_sync.push(file);
+                    files_to_sync.push(data_log_file_to_sync(file, bytes));
                 }
                 let data_dir_existed = data_dir.exists();
                 fs::create_dir_all(&data_dir).map_err(fs_error)?;
@@ -1759,11 +1817,11 @@ impl DurableSqliteStore {
                 if !existed {
                     synced_dirs.insert(storage_node);
                 }
-                open_log = Some((log_ref, file));
+                open_log = Some((log_ref, file, active.total_bytes));
             }
 
             let offset = active.total_bytes;
-            let Some((_, file)) = open_log.as_mut() else {
+            let Some((_, file, open_log_bytes)) = open_log.as_mut() else {
                 return Err(StorageError::conflict("data-log writer was not opened"));
             };
             let started = Instant::now();
@@ -1783,6 +1841,7 @@ impl DurableSqliteStore {
                 .checked_add(record_len)
                 .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
             active.total_bytes = new_total;
+            *open_log_bytes = new_total;
             append.logs.insert(
                 log_ref,
                 PendingDataLogManifest {
@@ -1803,17 +1862,27 @@ impl DurableSqliteStore {
                 integrity,
             });
         }
-        if let Some((_, file)) = open_log.take()
+        if let Some((_, file, bytes)) = open_log.take()
             && sync_mode == DataLogSyncMode::Sync
         {
-            files_to_sync.push(file);
+            files_to_sync.push(data_log_file_to_sync(file, bytes));
         }
         if sync_mode == DataLogSyncMode::Sync {
             let started = Instant::now();
-            sync_data_log_files(files_to_sync)?;
+            let sync_profile = sync_data_log_files(files_to_sync)?;
             profile.file_sync_nanos = profile
                 .file_sync_nanos
                 .saturating_add(duration_nanos_u64(started.elapsed()));
+            profile.file_sync_sum_nanos = profile
+                .file_sync_sum_nanos
+                .saturating_add(sync_profile.sync_sum_nanos);
+            profile.file_sync_max_nanos = profile
+                .file_sync_max_nanos
+                .max(sync_profile.sync_max_nanos);
+            profile.files_synced = profile
+                .files_synced
+                .saturating_add(sync_profile.files_synced);
+            profile.sync_bytes = profile.sync_bytes.saturating_add(sync_profile.sync_bytes);
             for storage_node in synced_dirs {
                 let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
                 let started = Instant::now();
@@ -1870,21 +1939,37 @@ impl DurableSqliteStore {
         appended: &PendingDataLogAppend,
     ) -> Result<DataLogAppendProfile> {
         let mut profile = DataLogAppendProfile::default();
-        let log_refs = appended.log_refs();
-        if log_refs.is_empty() {
+        if appended.logs.is_empty() && appended.sealed_logs.is_empty() {
             return Ok(profile);
         }
 
-        let mut files = Vec::with_capacity(log_refs.len());
+        let mut files = Vec::with_capacity(appended.logs.len() + appended.sealed_logs.len());
         let mut storage_nodes = BTreeSet::new();
-        for log_ref in log_refs {
+        for (log_ref, manifest) in &appended.logs {
             storage_nodes.insert(log_ref.storage_node);
             let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
-            files.push(File::open(&path).map_err(fs_error)?);
+            files.push(data_log_file_to_sync(
+                File::open(&path).map_err(fs_error)?,
+                manifest.total_bytes,
+            ));
+        }
+        for log_ref in &appended.sealed_logs {
+            if appended.logs.contains_key(log_ref) {
+                continue;
+            }
+            storage_nodes.insert(log_ref.storage_node);
+            let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
+            files.push(data_log_file_to_sync_with_metadata(
+                File::open(&path).map_err(fs_error)?,
+            )?);
         }
         let started = Instant::now();
-        sync_data_log_files(files)?;
+        let sync_profile = sync_data_log_files(files)?;
         profile.file_sync_nanos = duration_nanos_u64(started.elapsed());
+        profile.file_sync_sum_nanos = sync_profile.sync_sum_nanos;
+        profile.file_sync_max_nanos = sync_profile.sync_max_nanos;
+        profile.files_synced = sync_profile.files_synced;
+        profile.sync_bytes = sync_profile.sync_bytes;
         let started = Instant::now();
         sync_dir(&self.paths.data_dir)?;
         for storage_node in storage_nodes {

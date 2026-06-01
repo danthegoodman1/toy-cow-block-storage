@@ -1046,24 +1046,34 @@ pub(super) fn delete_data_log(data_dir: &Path, log_ref: DurableDataLogRef) -> Re
     }
 }
 
-pub(super) fn sync_data_log_files(files: Vec<File>) -> Result<()> {
+pub(super) fn sync_data_log_files(
+    files: Vec<DataLogFileToSync>,
+) -> Result<DataLogFileSyncProfile> {
+    let mut profile = DataLogFileSyncProfile::default();
     if files.len() <= 1 {
         if let Some(file) = files.into_iter().next() {
-            file.sync_data().map_err(fs_error)?;
+            let started = Instant::now();
+            file.file.sync_data().map_err(fs_error)?;
+            profile.record_file(file.bytes, duration_nanos_u64(started.elapsed()));
         }
-        return Ok(());
+        return Ok(profile);
     }
 
     let mut handles = Vec::with_capacity(files.len());
     for file in files {
-        handles.push(thread::spawn(move || file.sync_data().map_err(fs_error)));
+        handles.push(thread::spawn(move || {
+            let started = Instant::now();
+            file.file.sync_data().map_err(fs_error)?;
+            Ok::<_, StorageError>((file.bytes, duration_nanos_u64(started.elapsed())))
+        }));
     }
     for handle in handles {
-        handle
+        let (bytes, nanos) = handle
             .join()
             .map_err(|_| StorageError::unavailable("data-log sync worker panicked"))??;
+        profile.record_file(bytes, nanos);
     }
-    Ok(())
+    Ok(profile)
 }
 
 pub(super) fn sync_pending_data_logs(
@@ -1083,11 +1093,17 @@ pub(super) fn sync_pending_data_logs(
     }
     for log_ref in logs {
         let path = data_log_path(data_dir, log_ref.storage_node, log_ref.log_id);
-        files.push(File::open(&path).map_err(fs_error)?);
+        files.push(data_log_file_to_sync_with_metadata(
+            File::open(&path).map_err(fs_error)?,
+        )?);
     }
     let started = Instant::now();
-    sync_data_log_files(files)?;
+    let sync_profile = sync_data_log_files(files)?;
     profile.file_sync_nanos = duration_nanos_u64(started.elapsed());
+    profile.file_sync_sum_nanos = sync_profile.sync_sum_nanos;
+    profile.file_sync_max_nanos = sync_profile.sync_max_nanos;
+    profile.files_synced = sync_profile.files_synced;
+    profile.sync_bytes = sync_profile.sync_bytes;
     for storage_node in storage_nodes {
         let started = Instant::now();
         sync_dir(&node_data_log_dir(data_dir, storage_node))?;
@@ -1645,4 +1661,3 @@ pub(super) fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
         )
     })
 }
-

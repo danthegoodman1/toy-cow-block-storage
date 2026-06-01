@@ -3367,6 +3367,8 @@ fn durable_append_stream_publish_delta_does_not_reappend_flushed_payloads() {
     let flush_profiles = store.drain_persist_profiles(8).unwrap();
     assert_eq!(flush_profiles.len(), 1);
     assert_eq!(flush_profiles[0].new_segment_bytes, 4096);
+    assert!(flush_profiles[0].data_log_files_synced > 0);
+    assert!(flush_profiles[0].data_log_file_sync_max_nanos > 0);
     assert!(flush_profiles[0].node_catalog_manifest_rows > 0);
     assert_eq!(flush_profiles[0].node_catalog_placement_rows, 0);
     assert_eq!(flush_profiles[0].node_catalog_segment_rows, 0);
@@ -3810,6 +3812,11 @@ fn durable_persist_profiling_is_opt_in_and_records_physical_persists() {
     assert!(profile.data_log_encode_nanos > 0);
     assert!(profile.data_log_write_nanos > 0);
     assert!(profile.data_log_file_sync_nanos > 0);
+    assert!(profile.data_log_file_sync_sum_nanos > 0);
+    assert!(profile.data_log_file_sync_max_nanos > 0);
+    assert!(profile.data_log_file_sync_sum_nanos >= profile.data_log_file_sync_max_nanos);
+    assert!(profile.data_log_files_synced > 0);
+    assert!(profile.data_log_sync_bytes > 0);
     assert_eq!(profile.new_segment_count, 1);
     assert_eq!(profile.new_segment_bytes, 4096);
     assert!(profile.touched_node_count > 0);
