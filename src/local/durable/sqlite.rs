@@ -30,6 +30,16 @@ pub struct DurablePersistProfile {
     pub data_log_file_sync_nanos: u64,
     pub data_log_dir_sync_nanos: u64,
     pub node_catalog_publish_nanos: u64,
+    pub node_catalog_manifest_lock_wait_nanos: u64,
+    pub node_catalog_manifest_row_sync_nanos: u64,
+    pub node_catalog_manifest_commit_nanos: u64,
+    pub node_catalog_segment_lock_wait_nanos: u64,
+    pub node_catalog_segment_row_sync_nanos: u64,
+    pub node_catalog_segment_commit_nanos: u64,
+    pub node_catalog_manifest_rows: u64,
+    pub node_catalog_sealed_rows: u64,
+    pub node_catalog_placement_rows: u64,
+    pub node_catalog_segment_rows: u64,
     pub root_sqlite_row_sync_nanos: u64,
     pub root_sqlite_commit_nanos: u64,
     pub new_segment_count: u64,
@@ -40,6 +50,59 @@ pub struct DurablePersistProfile {
     pub touched_manifest_rows: u64,
     pub commit_rows_written: u64,
     pub durable_commit_high_water: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NodeCatalogPublishProfile {
+    manifest_lock_wait_nanos: u64,
+    manifest_row_sync_nanos: u64,
+    manifest_commit_nanos: u64,
+    segment_lock_wait_nanos: u64,
+    segment_row_sync_nanos: u64,
+    segment_commit_nanos: u64,
+    manifest_rows: u64,
+    sealed_rows: u64,
+    placement_rows: u64,
+    segment_rows: u64,
+    manifest_touched_nodes: u64,
+    segment_touched_nodes: u64,
+}
+
+impl NodeCatalogPublishProfile {
+    fn merge(&mut self, other: Self) {
+        self.manifest_lock_wait_nanos = self
+            .manifest_lock_wait_nanos
+            .saturating_add(other.manifest_lock_wait_nanos);
+        self.manifest_row_sync_nanos = self
+            .manifest_row_sync_nanos
+            .saturating_add(other.manifest_row_sync_nanos);
+        self.manifest_commit_nanos = self
+            .manifest_commit_nanos
+            .saturating_add(other.manifest_commit_nanos);
+        self.segment_lock_wait_nanos = self
+            .segment_lock_wait_nanos
+            .saturating_add(other.segment_lock_wait_nanos);
+        self.segment_row_sync_nanos = self
+            .segment_row_sync_nanos
+            .saturating_add(other.segment_row_sync_nanos);
+        self.segment_commit_nanos = self
+            .segment_commit_nanos
+            .saturating_add(other.segment_commit_nanos);
+        self.manifest_rows = self.manifest_rows.saturating_add(other.manifest_rows);
+        self.sealed_rows = self.sealed_rows.saturating_add(other.sealed_rows);
+        self.placement_rows = self.placement_rows.saturating_add(other.placement_rows);
+        self.segment_rows = self.segment_rows.saturating_add(other.segment_rows);
+        self.manifest_touched_nodes = self
+            .manifest_touched_nodes
+            .saturating_add(other.manifest_touched_nodes);
+        self.segment_touched_nodes = self
+            .segment_touched_nodes
+            .saturating_add(other.segment_touched_nodes);
+    }
+
+    fn touched_node_count(self) -> u64 {
+        self.manifest_touched_nodes.max(self.segment_touched_nodes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -874,7 +937,7 @@ impl DurableSqliteStore {
         let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
 
         let started = Instant::now();
-        let touched_node_count = self.persist_node_catalog_publish(
+        let catalog_profile = self.persist_node_catalog_publish(
             image,
             previous_segments,
             current_segments,
@@ -905,11 +968,22 @@ impl DurableSqliteStore {
                 data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
                 data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
                 node_catalog_publish_nanos,
+                node_catalog_manifest_lock_wait_nanos: catalog_profile
+                    .manifest_lock_wait_nanos,
+                node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
+                node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
+                node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
+                node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
+                node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
+                node_catalog_manifest_rows: catalog_profile.manifest_rows,
+                node_catalog_sealed_rows: catalog_profile.sealed_rows,
+                node_catalog_placement_rows: catalog_profile.placement_rows,
+                node_catalog_segment_rows: catalog_profile.segment_rows,
                 root_sqlite_row_sync_nanos,
                 root_sqlite_commit_nanos,
                 new_segment_count,
                 new_segment_bytes,
-                touched_node_count,
+                touched_node_count: catalog_profile.touched_node_count(),
                 durable_commit_high_water: image.metadata.next_commit_seq.saturating_sub(1),
                 ..DurablePersistProfile::default()
             },
@@ -923,7 +997,7 @@ impl DurableSqliteStore {
         current_segments: &BTreeSet<SegmentId>,
         appended: PendingDataLogAppend,
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
-    ) -> Result<u64> {
+    ) -> Result<NodeCatalogPublishProfile> {
         let removed_segment_ids: Vec<_> = previous_segments
             .difference(current_segments)
             .copied()
@@ -977,19 +1051,25 @@ impl DurableSqliteStore {
             .map(|placement| placement.segment_id)
             .collect();
 
-        let mut touched_node_count = 0_u64;
+        let mut profile = NodeCatalogPublishProfile::default();
         for (ordinal, node_id) in image.storage_nodes.node_order.iter().enumerate() {
             let node = image.storage_nodes.nodes.get(node_id).ok_or_else(|| {
                 StorageError::corrupt("storage node order references missing node")
             })?;
+            let lock_started = Instant::now();
             let mut conn = self.node_catalogs.lock(*node_id)?;
+            profile.segment_lock_wait_nanos = profile
+                .segment_lock_wait_nanos
+                .saturating_add(duration_nanos_u64(lock_started.elapsed()));
             let tx = conn.transaction().map_err(sqlite_error)?;
+            let row_started = Instant::now();
             for log in appended
                 .logs
                 .values()
                 .filter(|log| log.storage_node == *node_id)
             {
                 persist_data_log_manifest(&tx, log)?;
+                profile.manifest_rows = profile.manifest_rows.saturating_add(1);
             }
             for log_ref in appended
                 .sealed_logs
@@ -997,10 +1077,12 @@ impl DurableSqliteStore {
                 .filter(|log_ref| log_ref.storage_node == *node_id)
             {
                 seal_data_log_manifest(&tx, *log_ref)?;
+                profile.sealed_rows = profile.sealed_rows.saturating_add(1);
             }
             if let Some(placements) = dead_placements.get(node_id) {
                 for placement in placements {
                     mark_placement_dead(&tx, placement)?;
+                    profile.placement_rows = profile.placement_rows.saturating_add(1);
                 }
             }
             for placement in appended
@@ -1009,6 +1091,7 @@ impl DurableSqliteStore {
                 .filter(|placement| placement.storage_node == *node_id)
             {
                 persist_segment_placement(&tx, placement)?;
+                profile.placement_rows = profile.placement_rows.saturating_add(1);
             }
             let catalog_sync = if incremental_catalog_sync {
                 changed_segments_by_node
@@ -1018,6 +1101,11 @@ impl DurableSqliteStore {
             } else {
                 SegmentCatalogSync::Full
             };
+            profile.segment_rows = profile.segment_rows.saturating_add(match &catalog_sync {
+                SegmentCatalogSync::Full => usize_to_u64(node.segment_catalog.entries.len()),
+                SegmentCatalogSync::Only(segment_ids) => usize_to_u64(segment_ids.len()),
+                SegmentCatalogSync::Skip => 0,
+            });
             sync_node_catalog_state_for_node(
                 &tx,
                 ordinal,
@@ -1026,10 +1114,17 @@ impl DurableSqliteStore {
                 catalog_sync,
                 &pre_root_pending_segments,
             )?;
+            profile.segment_row_sync_nanos = profile
+                .segment_row_sync_nanos
+                .saturating_add(duration_nanos_u64(row_started.elapsed()));
+            let commit_started = Instant::now();
             tx.commit().map_err(sqlite_error)?;
-            touched_node_count = touched_node_count.saturating_add(1);
+            profile.segment_commit_nanos = profile
+                .segment_commit_nanos
+                .saturating_add(duration_nanos_u64(commit_started.elapsed()));
+            profile.segment_touched_nodes = profile.segment_touched_nodes.saturating_add(1);
         }
-        Ok(touched_node_count)
+        Ok(profile)
     }
 
     fn persist_selected_node_catalog_publish(
@@ -1038,8 +1133,8 @@ impl DurableSqliteStore {
         segment_ids: &BTreeSet<SegmentId>,
         appended: PendingDataLogAppend,
         pre_root_pending_segments: &BTreeSet<SegmentId>,
-    ) -> Result<u64> {
-        let mut touched_node_count = 0_u64;
+    ) -> Result<NodeCatalogPublishProfile> {
+        let mut profile = NodeCatalogPublishProfile::default();
         for (node_id, (ordinal, node)) in nodes {
             let node_segment_ids: BTreeSet<_> = segment_ids
                 .iter()
@@ -1050,14 +1145,20 @@ impl DurableSqliteStore {
                 continue;
             }
 
+            let lock_started = Instant::now();
             let mut conn = self.node_catalogs.lock(*node_id)?;
+            profile.segment_lock_wait_nanos = profile
+                .segment_lock_wait_nanos
+                .saturating_add(duration_nanos_u64(lock_started.elapsed()));
             let tx = conn.transaction().map_err(sqlite_error)?;
+            let row_started = Instant::now();
             for log in appended
                 .logs
                 .values()
                 .filter(|log| log.storage_node == *node_id)
             {
                 persist_data_log_manifest(&tx, log)?;
+                profile.manifest_rows = profile.manifest_rows.saturating_add(1);
             }
             for log_ref in appended
                 .sealed_logs
@@ -1065,6 +1166,7 @@ impl DurableSqliteStore {
                 .filter(|log_ref| log_ref.storage_node == *node_id)
             {
                 seal_data_log_manifest(&tx, *log_ref)?;
+                profile.sealed_rows = profile.sealed_rows.saturating_add(1);
             }
             for placement in appended
                 .placements
@@ -1072,7 +1174,11 @@ impl DurableSqliteStore {
                 .filter(|placement| placement.storage_node == *node_id)
             {
                 persist_segment_placement(&tx, placement)?;
+                profile.placement_rows = profile.placement_rows.saturating_add(1);
             }
+            profile.segment_rows = profile
+                .segment_rows
+                .saturating_add(usize_to_u64(node_segment_ids.len()));
             sync_node_catalog_state_for_node(
                 &tx,
                 *ordinal,
@@ -1081,13 +1187,64 @@ impl DurableSqliteStore {
                 SegmentCatalogSync::Only(&node_segment_ids),
                 pre_root_pending_segments,
             )?;
+            profile.segment_row_sync_nanos = profile
+                .segment_row_sync_nanos
+                .saturating_add(duration_nanos_u64(row_started.elapsed()));
+            let commit_started = Instant::now();
             tx.commit().map_err(sqlite_error)?;
-            touched_node_count = touched_node_count.saturating_add(1);
+            profile.segment_commit_nanos = profile
+                .segment_commit_nanos
+                .saturating_add(duration_nanos_u64(commit_started.elapsed()));
+            profile.segment_touched_nodes = profile.segment_touched_nodes.saturating_add(1);
         }
-        Ok(touched_node_count)
+        Ok(profile)
     }
 
-    fn persist_data_log_manifests_only(&self, appended: &PendingDataLogAppend) -> Result<u64> {
+    fn persist_data_log_manifests_for_node(
+        node_catalogs: &NodeCatalogs,
+        storage_node: StorageNodeId,
+        appended: &PendingDataLogAppend,
+    ) -> Result<NodeCatalogPublishProfile> {
+        let mut profile = NodeCatalogPublishProfile::default();
+        let lock_started = Instant::now();
+        let mut conn = node_catalogs.lock(storage_node)?;
+        profile.manifest_lock_wait_nanos = profile
+            .manifest_lock_wait_nanos
+            .saturating_add(duration_nanos_u64(lock_started.elapsed()));
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let row_started = Instant::now();
+        for log in appended
+            .logs
+            .values()
+            .filter(|log| log.storage_node == storage_node)
+        {
+            persist_data_log_manifest(&tx, log)?;
+            profile.manifest_rows = profile.manifest_rows.saturating_add(1);
+        }
+        for log_ref in appended
+            .sealed_logs
+            .iter()
+            .filter(|log_ref| log_ref.storage_node == storage_node)
+        {
+            seal_data_log_manifest(&tx, *log_ref)?;
+            profile.sealed_rows = profile.sealed_rows.saturating_add(1);
+        }
+        profile.manifest_row_sync_nanos = profile
+            .manifest_row_sync_nanos
+            .saturating_add(duration_nanos_u64(row_started.elapsed()));
+        let commit_started = Instant::now();
+        tx.commit().map_err(sqlite_error)?;
+        profile.manifest_commit_nanos = profile
+            .manifest_commit_nanos
+            .saturating_add(duration_nanos_u64(commit_started.elapsed()));
+        profile.manifest_touched_nodes = profile.manifest_touched_nodes.saturating_add(1);
+        Ok(profile)
+    }
+
+    fn persist_data_log_manifests_only(
+        &self,
+        appended: &PendingDataLogAppend,
+    ) -> Result<NodeCatalogPublishProfile> {
         let mut touched = BTreeSet::new();
         for log in appended.logs.values() {
             touched.insert(log.storage_node);
@@ -1095,26 +1252,41 @@ impl DurableSqliteStore {
         for log_ref in &appended.sealed_logs {
             touched.insert(log_ref.storage_node);
         }
-        for storage_node in touched.iter().copied() {
-            let mut conn = self.node_catalogs.lock(storage_node)?;
-            let tx = conn.transaction().map_err(sqlite_error)?;
-            for log in appended
-                .logs
-                .values()
-                .filter(|log| log.storage_node == storage_node)
-            {
-                persist_data_log_manifest(&tx, log)?;
+
+        if touched.len() <= 1 {
+            let mut profile = NodeCatalogPublishProfile::default();
+            for storage_node in touched.iter().copied() {
+                profile.merge(Self::persist_data_log_manifests_for_node(
+                    self.node_catalogs.as_ref(),
+                    storage_node,
+                    appended,
+                )?);
             }
-            for log_ref in appended
-                .sealed_logs
-                .iter()
-                .filter(|log_ref| log_ref.storage_node == storage_node)
-            {
-                seal_data_log_manifest(&tx, *log_ref)?;
-            }
-            tx.commit().map_err(sqlite_error)?;
+            return Ok(profile);
         }
-        Ok(usize_to_u64(touched.len()))
+
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for storage_node in touched.iter().copied() {
+                let node_catalogs = Arc::clone(&self.node_catalogs);
+                handles.push(scope.spawn(move || {
+                    Self::persist_data_log_manifests_for_node(
+                        node_catalogs.as_ref(),
+                        storage_node,
+                        appended,
+                    )
+                }));
+            }
+
+            let mut profile = NodeCatalogPublishProfile::default();
+            for handle in handles {
+                let node_profile = handle.join().map_err(|_| {
+                    StorageError::unavailable("node catalog manifest publish worker panicked")
+                })??;
+                profile.merge(node_profile);
+            }
+            Ok(profile)
+        })
     }
 
     fn persist_preingested_append_stream_flush(
@@ -1151,14 +1323,13 @@ impl DurableSqliteStore {
         let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
 
         let started = Instant::now();
-        let manifest_touched = self.persist_data_log_manifests_only(&appended)?;
-        let catalog_touched = self.persist_selected_node_catalog_publish(
+        let mut catalog_profile = self.persist_data_log_manifests_only(&appended)?;
+        catalog_profile.merge(self.persist_selected_node_catalog_publish(
             nodes,
             segment_ids,
             appended.clone(),
             segment_ids,
-        )?;
-        let touched_node_count = manifest_touched.max(catalog_touched);
+        )?);
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
         let sqlite_lock_started = Instant::now();
@@ -1187,11 +1358,21 @@ impl DurableSqliteStore {
             data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
             data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
             node_catalog_publish_nanos,
+            node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
+            node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
+            node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
+            node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
+            node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
+            node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
+            node_catalog_manifest_rows: catalog_profile.manifest_rows,
+            node_catalog_sealed_rows: catalog_profile.sealed_rows,
+            node_catalog_placement_rows: catalog_profile.placement_rows,
+            node_catalog_segment_rows: catalog_profile.segment_rows,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
             new_segment_count,
             new_segment_bytes,
-            touched_node_count,
+            touched_node_count: catalog_profile.touched_node_count(),
             durable_commit_high_water: stream_cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()
         })
@@ -1239,7 +1420,7 @@ impl DurableSqliteStore {
         let pre_root_pending_segments = appended.segment_ids();
 
         let started = Instant::now();
-        let touched_node_count = self.persist_selected_node_catalog_publish(
+        let catalog_profile = self.persist_selected_node_catalog_publish(
             nodes,
             changed_segments,
             appended,
@@ -1268,11 +1449,21 @@ impl DurableSqliteStore {
             data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
             data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
             node_catalog_publish_nanos,
+            node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
+            node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
+            node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
+            node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
+            node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
+            node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
+            node_catalog_manifest_rows: catalog_profile.manifest_rows,
+            node_catalog_sealed_rows: catalog_profile.sealed_rows,
+            node_catalog_placement_rows: catalog_profile.placement_rows,
+            node_catalog_segment_rows: catalog_profile.segment_rows,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
             new_segment_count,
             new_segment_bytes,
-            touched_node_count,
+            touched_node_count: catalog_profile.touched_node_count(),
             durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()
         })
@@ -2080,4 +2271,3 @@ impl DurableSqliteStore {
         self.placement_for_segment(segment_id)
     }
 }
-

@@ -23,14 +23,14 @@ fn append_profile_csv(
     if write_header {
         writeln!(
             file,
-            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_dir_sync_nanos,node_catalog_publish_nanos,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water"
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water"
         )
         .map_err(fs_error)?;
     }
     for profile in profiles {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             workload.name(),
             args.provider,
             args.durability,
@@ -51,6 +51,16 @@ fn append_profile_csv(
             profile.data_log_file_sync_nanos,
             profile.data_log_dir_sync_nanos,
             profile.node_catalog_publish_nanos,
+            profile.node_catalog_manifest_lock_wait_nanos,
+            profile.node_catalog_manifest_row_sync_nanos,
+            profile.node_catalog_manifest_commit_nanos,
+            profile.node_catalog_segment_lock_wait_nanos,
+            profile.node_catalog_segment_row_sync_nanos,
+            profile.node_catalog_segment_commit_nanos,
+            profile.node_catalog_manifest_rows,
+            profile.node_catalog_sealed_rows,
+            profile.node_catalog_placement_rows,
+            profile.node_catalog_segment_rows,
             profile.root_sqlite_row_sync_nanos,
             profile.root_sqlite_commit_nanos,
             profile.new_segment_count,

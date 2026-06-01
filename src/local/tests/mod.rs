@@ -3367,6 +3367,9 @@ fn durable_append_stream_publish_delta_does_not_reappend_flushed_payloads() {
     let flush_profiles = store.drain_persist_profiles(8).unwrap();
     assert_eq!(flush_profiles.len(), 1);
     assert_eq!(flush_profiles[0].new_segment_bytes, 4096);
+    assert!(flush_profiles[0].node_catalog_manifest_rows > 0);
+    assert_eq!(flush_profiles[0].node_catalog_placement_rows, 0);
+    assert_eq!(flush_profiles[0].node_catalog_segment_rows, 0);
 
     store.publish_append_stream(&stream, &mark).unwrap();
     let publish_profiles = store.drain_persist_profiles(8).unwrap();
