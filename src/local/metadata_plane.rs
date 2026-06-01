@@ -754,6 +754,11 @@ impl InMemoryMetadataPlane {
         Ok(())
     }
 
+    fn set_next_commit_seq_for_replay(&self, next_commit_seq: CommitSeq) -> Result<()> {
+        lock(&self.inner)?.next_commit_seq = next_commit_seq.raw();
+        Ok(())
+    }
+
     pub fn allocate_metadata_node(
         &self,
         covered_range: crate::api::BlockRange,

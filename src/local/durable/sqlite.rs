@@ -722,6 +722,14 @@ impl DurableSqliteStore {
             );
             CREATE INDEX IF NOT EXISTS idx_shard_commits_order
               ON shard_commits(commit_seq, ordinal);
+            CREATE TABLE IF NOT EXISTS block_delta_commits (
+              row_key TEXT PRIMARY KEY,
+              device_id TEXT NOT NULL,
+              commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_block_delta_commits_order
+              ON block_delta_commits(commit_seq, row_key);
             CREATE TABLE IF NOT EXISTS keyspace_commits (
               row_key TEXT PRIMARY KEY,
               commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
@@ -834,7 +842,30 @@ impl DurableSqliteStore {
         };
         validate_row_native_state(&image)?;
         self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
-        Ok(Some(LocalCoordinator::from_durable_state(image)?))
+        let local = LocalCoordinator::from_durable_state(image)?;
+        let deltas = load_block_delta_commits_since(&conn, cursor.next_commit_seq)?;
+        let delta_segment_ids: BTreeSet<_> = deltas
+            .iter()
+            .flat_map(|delta| delta.segment_ids())
+            .collect();
+        local.replay_block_delta_commits(&deltas)?;
+        if !delta_segment_ids.is_empty() {
+            let (image, _, _) = local.state_for_durable_persist(&BTreeSet::new())?;
+            let mut repairs = BTreeMap::<StorageNodeId, BTreeSet<SegmentId>>::new();
+            for segment_id in delta_segment_ids {
+                let storage_node = durable_state_storage_node_for_catalog_segment(
+                    &image,
+                    segment_id,
+                )
+                .ok_or_else(|| {
+                    StorageError::corrupt("block delta segment missing catalog after replay")
+                })?;
+                repairs.entry(storage_node).or_default().insert(segment_id);
+            }
+            self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
+        }
+        let _ = local.drain_events(usize::MAX)?;
+        Ok(Some(local))
     }
 
     fn export_cursor(&self) -> Result<Option<DurableExportCursor>> {
@@ -999,6 +1030,10 @@ impl DurableSqliteStore {
         let tx = conn.transaction().map_err(sqlite_error)?;
         let started = Instant::now();
         persist_row_native_state(&tx, previous_cursor.as_ref(), image)?;
+        prune_block_delta_commits_through(
+            &tx,
+            CommitSeq::from_raw(image.metadata.next_commit_seq.saturating_sub(1)),
+        )?;
         let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
         let started = Instant::now();
         tx.commit().map_err(sqlite_error)?;
@@ -1525,6 +1560,122 @@ impl DurableSqliteStore {
             durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()
         })
+    }
+
+    fn persist_block_delta_commits(
+        &self,
+        deltas: &[BlockDeltaCommit],
+        nodes: &SelectedStorageNodeState,
+        segment_ids: &BTreeSet<SegmentId>,
+        segments: Vec<DurableSegmentPayload>,
+    ) -> Result<DurablePersistProfile> {
+        let total_started = Instant::now();
+        #[cfg(test)]
+        {
+            let delay = *lock(&self.persist_delay)?;
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable persist failure",
+                ));
+            }
+        }
+        if deltas.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "block delta persist requires at least one commit",
+            ));
+        }
+
+        let new_segment_count = usize_to_u64(segments.len());
+        let new_segment_bytes = segments
+            .iter()
+            .map(|segment| usize_to_u64(segment.bytes.len()))
+            .fold(0_u64, u64::saturating_add);
+
+        let started = Instant::now();
+        let (appended, data_log_profile, data_log_append_sync_nanos) = if segments.is_empty() {
+            (
+                PendingDataLogAppend::default(),
+                DataLogAppendProfile::default(),
+                0,
+            )
+        } else {
+            let (appended, profile) =
+                self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?;
+            (appended, profile, duration_nanos_u64(started.elapsed()))
+        };
+        let pre_root_pending_segments = appended.segment_ids();
+
+        let started = Instant::now();
+        let catalog_profile = self.persist_selected_node_catalog_publish(
+            nodes,
+            segment_ids,
+            appended,
+            &pre_root_pending_segments,
+        )?;
+        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
+
+        let sqlite_lock_started = Instant::now();
+        let mut conn = lock(&self.conn)?;
+        let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let started = Instant::now();
+        for delta in deltas {
+            persist_block_delta_commit(&tx, delta)?;
+        }
+        let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
+        tx.commit().map_err(sqlite_error)?;
+        let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
+        let durable_commit_high_water = deltas
+            .iter()
+            .map(|delta| delta.commit_seq.raw())
+            .max()
+            .unwrap_or_default();
+
+        Ok(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            data_log_append_sync_nanos,
+            sqlite_lock_wait_nanos,
+            data_log_encode_nanos: data_log_profile.encode_nanos,
+            data_log_write_nanos: data_log_profile.write_nanos,
+            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
+            data_log_files_synced: data_log_profile.files_synced,
+            data_log_sync_bytes: data_log_profile.sync_bytes,
+            node_catalog_publish_nanos,
+            node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
+            node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
+            node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
+            node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
+            node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
+            node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
+            node_catalog_manifest_rows: catalog_profile.manifest_rows,
+            node_catalog_sealed_rows: catalog_profile.sealed_rows,
+            node_catalog_placement_rows: catalog_profile.placement_rows,
+            node_catalog_segment_rows: catalog_profile.segment_rows,
+            root_sqlite_row_sync_nanos,
+            root_sqlite_commit_nanos,
+            new_segment_count,
+            new_segment_bytes,
+            touched_node_count: catalog_profile.touched_node_count(),
+            durable_commit_high_water,
+            ..DurablePersistProfile::default()
+        })
+    }
+
+    fn has_block_delta_commits(&self) -> Result<bool> {
+        let conn = lock(&self.conn)?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM block_delta_commits", [], |row| {
+                row.get(0)
+            })
+            .map_err(sqlite_error)?;
+        Ok(count > 0)
     }
 
     fn append_segments(

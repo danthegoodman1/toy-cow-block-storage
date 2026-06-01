@@ -270,7 +270,7 @@ options:\n\
                                            default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch, append-stream, block-metadata, block-batch, native-metadata, native-file-batch\n\
+                                           aliases: north-star, append-batch, append-stream, block-metadata, block-batch, block-writeback, native-metadata, native-file-batch\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-same-shard-contended,\n\
                                            block-write-4k-same-shard-serialized,\n\
@@ -285,6 +285,10 @@ options:\n\
                                            block-batch-1m-128ops,\n\
                                            block-batch-overwrite-collapse,\n\
                                            block-batch-fsync-interval,\n\
+                                           block-writeback-fsync-1m,\n\
+                                           block-writeback-fsync-2m,\n\
+                                           block-writeback-fsync-4m,\n\
+                                           block-writeback-fsync-16m,\n\
                                            native-read-4k,\n\
                                            native-write-4k, native-write-4k-same-file,\n\
                                            native-write-4k-file-lanes, native-write-1m,\n\
@@ -421,6 +425,7 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
             "append-stream" => workloads.extend(Workload::append_stream_suite()),
             "block-metadata" => workloads.extend(Workload::block_metadata_suite()),
             "block-batch" => workloads.extend(Workload::block_batch_suite()),
+            "block-writeback" => workloads.extend(Workload::block_writeback_suite()),
             "native-metadata" => workloads.extend(Workload::native_metadata_suite()),
             "native-file-batch" => workloads.extend(Workload::native_file_batch_suite()),
             _ => workloads.push(Workload::from_str(part)?),

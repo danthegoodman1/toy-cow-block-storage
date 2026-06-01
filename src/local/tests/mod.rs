@@ -4109,7 +4109,7 @@ fn durable_sqlite_uses_row_native_metadata_without_current_state_blob() {
 }
 
 #[test]
-fn durable_sqlite_stores_block_heads_as_per_shard_rows() {
+fn durable_sqlite_stores_block_flushes_as_delta_rows_until_checkpoint() {
     let root = durable_temp_dir("per-shard-device-heads");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -4173,9 +4173,15 @@ fn durable_sqlite_stores_block_heads_as_per_shard_rows() {
     let after_first = device_shard_payloads_for_test(&conn);
     assert_eq!(
         changed_payload_count(&initial_shards, &after_first),
-        1,
-        "a single-shard write should update one shard-head row"
+        0,
+        "a flushed block delta should not rewrite checkpoint shard-head rows"
     );
+    let first_delta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM block_delta_commits", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(first_delta_count, 1);
     drop(conn);
 
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -4191,10 +4197,16 @@ fn durable_sqlite_stores_block_heads_as_per_shard_rows() {
     let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
     let after_second = device_shard_payloads_for_test(&conn);
     assert_eq!(
-        changed_payload_count(&after_first, &after_second),
-        1,
-        "an independent shard write should update only its shard-head row"
+        changed_payload_count(&initial_shards, &after_second),
+        0,
+        "uncheckpointed block deltas should leave shard-head rows stable"
     );
+    let second_delta_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM block_delta_commits", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(second_delta_count, 2);
     drop(conn);
 
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -4204,6 +4216,119 @@ fn durable_sqlite_stores_block_heads_as_per_shard_rows() {
         .unwrap();
     assert_eq!(&buf[0..4096], repeated_blocks(1, 1).as_slice());
     assert_eq!(&buf[8 * 4096..9 * 4096], repeated_blocks(1, 2).as_slice());
+    reopened.checkpoint(device_id).unwrap();
+    drop(reopened);
+
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    let after_checkpoint = device_shard_payloads_for_test(&conn);
+    assert_eq!(
+        changed_payload_count(&initial_shards, &after_checkpoint),
+        2,
+        "checkpoint should fold both dirty shard roots"
+    );
+    let delta_count_after_checkpoint: i64 = conn
+        .query_row("SELECT COUNT(*) FROM block_delta_commits", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(delta_count_after_checkpoint, 0);
+    drop(conn);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_sqlite_rejects_corrupt_block_delta_payload() {
+    let root = durable_temp_dir("block-delta-corrupt-payload");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(1, 44),
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    drop(store);
+
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    conn.execute("UPDATE block_delta_commits SET payload = x'ff'", [])
+        .unwrap();
+    drop(conn);
+
+    assert!(DurableCoordinator::open(&root, cfg).is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_native_flush_after_block_ack_falls_back_to_full_persist() {
+    let root = durable_temp_dir("block-native-gap-full-persist");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(1, 45),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, b"native".to_vec())],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut block = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut block)
+        .unwrap();
+    assert_eq!(block, repeated_blocks(1, 45));
+    let mut file = vec![0; b"native".len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, b"native".len() as u64),
+            &mut file,
+        )
+        .unwrap();
+    assert_eq!(file, b"native");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -4667,6 +4792,7 @@ fn durable_sqlite_rejects_missing_row_native_head_root() {
             WriteDurability::Flushed,
         )
         .unwrap();
+    store.checkpoint(device_id).unwrap();
     let head = store.metadata().get_head(device_id).unwrap();
     drop(store);
 
@@ -4742,6 +4868,7 @@ fn durable_sqlite_rejects_corrupt_row_native_payload() {
             WriteDurability::Flushed,
         )
         .unwrap();
+    store.checkpoint(device_id).unwrap();
     let head = store.metadata().get_head(device_id).unwrap();
     drop(store);
 
@@ -4787,6 +4914,7 @@ fn durable_sqlite_rejects_missing_row_native_timeline_root() {
             WriteDurability::Flushed,
         )
         .unwrap();
+    store.checkpoint(device_id).unwrap();
     let current = store.metadata().get_head(device_id).unwrap();
     drop(store);
 
@@ -5672,9 +5800,15 @@ fn durable_data_log_compaction_honors_pitr_retention_until_gc_releases_segment()
             WriteDurability::Flushed,
         )
         .unwrap();
+    assert_eq!(block_delta_commit_count(&root), 2);
 
     let retained = RetentionPolicy::expire_deleted_immediately().with_pitr_grace_commits(10);
     store.run_metadata_custodian(retained).unwrap();
+    assert_eq!(
+        block_delta_commit_count(&root),
+        0,
+        "durable GC should fold block delta rows before sweeping metadata"
+    );
     store.run_storage_node_custodian(&BTreeSet::new()).unwrap();
     let retained_report = store
         .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
@@ -5697,6 +5831,14 @@ fn durable_data_log_compaction_honors_pitr_retention_until_gc_releases_segment()
     assert!(expired_report.deleted_logs.contains(&old_log));
     assert!(!data_log_path(&root.join("data"), old_log.storage_node, old_log.log_id).exists());
     assert!(store.durable.placement_for_test(old_segment_id).is_err());
+    drop(store);
+
+    let reopened = DurableCoordinator::open_with_data_log_policy(&root, cfg, policy).unwrap();
+    let mut bytes = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, repeated_blocks(1, 2));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -12166,6 +12308,14 @@ fn device_shard_payloads_for_test(conn: &Connection) -> BTreeMap<String, Vec<u8>
         out.insert(row.get(0).unwrap(), row.get(1).unwrap());
     }
     out
+}
+
+fn block_delta_commit_count(root: &Path) -> i64 {
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM block_delta_commits", [], |row| {
+        row.get(0)
+    })
+    .unwrap()
 }
 
 fn keyspace_shard_payloads_for_test(conn: &Connection) -> BTreeMap<String, Vec<u8>> {

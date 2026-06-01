@@ -14,6 +14,12 @@ struct BlockBatchShardEdit {
     receipt: VerifiedSegmentReceipt,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct BlockBatchCommitWithDelta {
+    commit: BlockBatchCommit,
+    delta: Option<BlockDeltaCommit>,
+}
+
 /// In-process coordinator that owns request orchestration across metadata and
 /// storage-node roles.
 #[derive(Debug, Clone)]
@@ -1208,6 +1214,16 @@ impl LocalCoordinator {
         writes: &[BlockBatchWrite],
         durability: crate::api::WriteDurability,
     ) -> Result<BlockBatchCommit> {
+        self.commit_block_batch_with_delta(device_id, writes, durability)
+            .map(|committed| committed.commit)
+    }
+
+    fn commit_block_batch_with_delta(
+        &self,
+        device_id: DeviceId,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<BlockBatchCommitWithDelta> {
         let info = self.metadata.device_info(device_id)?;
         let collapsed = collapse_block_batch_writes(writes, &info.spec, DEFAULT_BLOCK_BATCH_MAX_BYTES)?;
         self.observability.record_with_update(
@@ -1283,10 +1299,11 @@ impl LocalCoordinator {
         }
 
         let mut updates = Vec::with_capacity(shard_edits.len());
+        let mut delta_entries = Vec::new();
         for (shard_id, mut shard) in shard_edits {
             shard.edits.sort_by_key(|edit| edit.range.start.raw());
             let mut root = shard.old_root;
-            for edit in shard.edits {
+            for edit in &shard.edits {
                 root = self
                     .replace_tree_range_with_receipts(
                         root,
@@ -1300,6 +1317,12 @@ impl LocalCoordinator {
                         &segment_receipts,
                     )?
                     .root;
+                delta_entries.push(BlockDeltaEntry {
+                    shard_id,
+                    range: edit.range,
+                    segment_id: edit.receipt.descriptor.segment_id,
+                    segment_offset: BlockIndex::from_raw(0),
+                });
             }
             if root != shard.old_root {
                 updates.push(RootUpdate::BlockShard(ShardRootUpdate {
@@ -1310,15 +1333,33 @@ impl LocalCoordinator {
             }
         }
         if updates.is_empty() {
-            return Ok(BlockBatchCommit {
-                device_id,
-                commit_seq: info.latest_commit,
-                write_count: usize_to_u64(writes.len()),
-                collapsed_range_count: usize_to_u64(collapsed.len()),
-                committed_bytes: 0,
-                durability,
+            return Ok(BlockBatchCommitWithDelta {
+                commit: BlockBatchCommit {
+                    device_id,
+                    commit_seq: info.latest_commit,
+                    write_count: usize_to_u64(writes.len()),
+                    collapsed_range_count: usize_to_u64(collapsed.len()),
+                    committed_bytes: 0,
+                    durability,
+                },
+                delta: None,
             });
         }
+
+        if delta_entries.is_empty() {
+            return Ok(BlockBatchCommitWithDelta {
+                commit: BlockBatchCommit {
+                    device_id,
+                    commit_seq: info.latest_commit,
+                    write_count: usize_to_u64(writes.len()),
+                    collapsed_range_count: usize_to_u64(collapsed.len()),
+                    committed_bytes: 0,
+                    durability,
+                },
+                delta: None,
+            });
+        }
+
         let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner,
             fence: MetadataFence::DeviceGeneration(current.generation),
@@ -1337,14 +1378,123 @@ impl LocalCoordinator {
             .iter()
             .map(|write| usize_to_u64(write.bytes.len()))
             .fold(0u64, u64::saturating_add);
-        Ok(BlockBatchCommit {
-            device_id,
-            commit_seq: commit_group.commit_seq,
-            write_count: usize_to_u64(writes.len()),
-            collapsed_range_count: usize_to_u64(collapsed.len()),
-            committed_bytes,
-            durability,
+        Ok(BlockBatchCommitWithDelta {
+            commit: BlockBatchCommit {
+                device_id,
+                commit_seq: commit_group.commit_seq,
+                write_count: usize_to_u64(writes.len()),
+                collapsed_range_count: usize_to_u64(collapsed.len()),
+                committed_bytes,
+                durability,
+            },
+            delta: Some(BlockDeltaCommit {
+                device_id,
+                commit_seq: commit_group.commit_seq,
+                write_count: usize_to_u64(writes.len()),
+                collapsed_range_count: usize_to_u64(collapsed.len()),
+                committed_bytes,
+                entries: delta_entries,
+            }),
         })
+    }
+
+    fn replay_block_delta_commits(&self, commits: &[BlockDeltaCommit]) -> Result<()> {
+        let mut commits = commits.to_vec();
+        commits.sort_by_key(|commit| commit.commit_seq.raw());
+        for commit in commits {
+            self.replay_block_delta_commit(&commit)?;
+        }
+        Ok(())
+    }
+
+    fn replay_block_delta_commit(&self, commit: &BlockDeltaCommit) -> Result<()> {
+        if commit.entries.is_empty() {
+            return Err(StorageError::corrupt("block delta commit has no entries"));
+        }
+        let current = self.metadata.get_head(commit.device_id)?;
+        self.metadata
+            .set_next_commit_seq_for_replay(commit.commit_seq)?;
+
+        let mut receipts = BTreeMap::new();
+        for segment_id in commit.segment_ids() {
+            let receipt = self.storage_nodes.receipt_for_segment(segment_id)?;
+            receipts.insert(segment_id, self.authority.verify_segment_receipt(&receipt)?);
+        }
+        let all_receipts: Vec<_> = receipts.values().cloned().collect();
+
+        let mut by_shard = BTreeMap::<ShardId, Vec<BlockDeltaEntry>>::new();
+        for entry in &commit.entries {
+            by_shard
+                .entry(entry.shard_id)
+                .or_default()
+                .push(entry.clone());
+        }
+
+        let mut updates = Vec::with_capacity(by_shard.len());
+        for (shard_id, mut entries) in by_shard {
+            entries.sort_by_key(|entry| entry.range.start.raw());
+            let shard_index = usize::try_from(shard_id.raw())
+                .map_err(|_| StorageError::corrupt("block delta shard id overflows usize"))?;
+            let mut root = *current
+                .shard_roots
+                .get(shard_index)
+                .ok_or_else(|| StorageError::corrupt("block delta shard is outside device"))?;
+            let old_root = root;
+            for entry in entries {
+                let Some(segment_base_raw) = entry
+                    .range
+                    .start
+                    .raw()
+                    .checked_sub(entry.segment_offset.raw())
+                else {
+                    return Err(StorageError::corrupt(
+                        "block delta segment offset exceeds logical start",
+                    ));
+                };
+                root = self
+                    .replace_tree_range_with_receipts(
+                        root,
+                        TreeRangeEdit {
+                            range: entry.range,
+                            replacement: Some(SegmentReplacement {
+                                segment_id: entry.segment_id,
+                                segment_base: BlockIndex::from_raw(segment_base_raw),
+                            }),
+                        },
+                        &all_receipts,
+                    )?
+                    .root;
+            }
+            if root != old_root {
+                updates.push(RootUpdate::BlockShard(ShardRootUpdate {
+                    shard_id,
+                    old_root,
+                    new_root: root,
+                }));
+            }
+        }
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let group = self.publish_commit_group_observed(CommitGroupIntent {
+            owner: MappingOwner::BlockDevice(commit.device_id),
+            fence: MetadataFence::DeviceGeneration(current.generation),
+            updates,
+        })?;
+        if group.commit_seq != commit.commit_seq {
+            return Err(StorageError::corrupt(
+                "block delta replay produced unexpected commit sequence",
+            ));
+        }
+        for receipt in receipts.values() {
+            self.storage_nodes.mark_segment_referenced(
+                receipt.receipt(),
+                commit.commit_seq,
+                self.authority.as_ref(),
+            )?;
+        }
+        Ok(())
     }
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {

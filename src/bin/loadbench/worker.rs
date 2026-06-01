@@ -127,6 +127,7 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
 #[derive(Default)]
 struct WorkerState {
     stream_append: Option<StreamAppendState>,
+    block_writeback: BlockWritebackState,
     block_batch_op: u64,
     next_stream_file_index: Option<usize>,
     native_file_op: u64,
@@ -155,6 +156,45 @@ struct StreamAppendState {
     durable_offset: u64,
     published_offset: u64,
     durable_mark: Option<DurableAppendMark>,
+}
+
+#[derive(Default)]
+struct BlockWritebackState {
+    writes: Vec<BlockBatchWrite>,
+    dirty_bytes: u64,
+}
+
+impl BlockWritebackState {
+    fn is_empty(&self) -> bool {
+        self.writes.is_empty()
+    }
+
+    fn dirty_bytes(&self) -> u64 {
+        self.dirty_bytes
+    }
+
+    fn clear(&mut self) {
+        self.writes.clear();
+        self.dirty_bytes = 0;
+    }
+
+    fn push_write(
+        &mut self,
+        offset: u64,
+        bytes: &[u8],
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.dirty_bytes = self.dirty_bytes.saturating_add(bytes.len() as u64);
+        self.writes.push(BlockBatchWrite {
+            offset,
+            bytes: bytes.to_vec(),
+            payload_integrity,
+        });
+        Ok(())
+    }
 }
 
 fn advance_stream_lane(state: &mut WorkerState, files_len: usize) {
@@ -207,6 +247,12 @@ fn prepare_for_timed_op(
     state: &mut WorkerState,
     config: &WorkerConfig,
 ) -> Result<()> {
+    if let Target::Block { logical_blocks, .. } = &context.target
+        && let Some(dirty_bytes) = config.workload.block_writeback_fsync_bytes()
+    {
+        fill_block_writeback_dirty(context, worker, state, config, *logical_blocks, dirty_bytes)?;
+        return Ok(());
+    }
     if !config.workload.is_native_stream_publish_preflushed() {
         return Ok(());
     }
@@ -459,6 +505,72 @@ fn build_block_batch_writes(
     Ok(writes)
 }
 
+fn block_writeback_start_block(
+    worker: u64,
+    concurrency: usize,
+    logical_blocks: u64,
+    dirty_bytes: u64,
+) -> Result<u64> {
+    if dirty_bytes == 0 {
+        return Err(StorageError::invalid_argument(
+            "writeback dirty window must be greater than zero",
+        ));
+    }
+    if !dirty_bytes.is_multiple_of(u64::from(BLOCK_SIZE)) {
+        return Err(StorageError::invalid_argument(
+            "writeback dirty window must be block aligned",
+        ));
+    }
+    let dirty_blocks = dirty_bytes / u64::from(BLOCK_SIZE);
+    if dirty_blocks > logical_blocks {
+        return Err(StorageError::invalid_argument(
+            "writeback dirty window exceeds logical device size",
+        ));
+    }
+    let (start, _) = block_batch_lane(worker, concurrency, logical_blocks, dirty_blocks.max(1));
+    Ok(start.min(logical_blocks - dirty_blocks))
+}
+
+fn fill_block_writeback_dirty(
+    context: &BenchContext,
+    worker: u64,
+    state: &mut WorkerState,
+    config: &WorkerConfig,
+    logical_blocks: u64,
+    dirty_bytes: u64,
+) -> Result<()> {
+    if state.block_writeback.dirty_bytes() == dirty_bytes {
+        return Ok(());
+    }
+    let dirty_bytes_usize = usize::try_from(dirty_bytes)
+        .map_err(|_| StorageError::invalid_argument("writeback dirty bytes overflow usize"))?;
+    if context.payload.len() < dirty_bytes_usize {
+        return Err(StorageError::invalid_argument(
+            "writeback payload is smaller than dirty window",
+        ));
+    }
+    let start_block =
+        block_writeback_start_block(worker, config.concurrency, logical_blocks, dirty_bytes)?;
+    state.block_writeback.clear();
+    let mut payload_offset = 0usize;
+    while payload_offset < dirty_bytes_usize {
+        let offset = start_block
+            .checked_mul(u64::from(BLOCK_SIZE))
+            .and_then(|base| base.checked_add(payload_offset as u64))
+            .ok_or_else(|| StorageError::invalid_argument("writeback byte offset overflows"))?;
+        let next = payload_offset + BLOCK_SIZE as usize;
+        state
+            .block_writeback
+            .push_write(
+                offset,
+                &context.payload[payload_offset..next],
+                config.payload_integrity,
+            )?;
+        payload_offset = next;
+    }
+    Ok(())
+}
+
 fn run_one_op(
     context: &BenchContext,
     worker: u64,
@@ -472,6 +584,41 @@ fn run_one_op(
     let durability = config.durability.write_durability();
 
     match (&context.target, workload) {
+        (
+            Target::Block {
+                device_id,
+                ..
+            },
+            workload,
+        ) if workload.block_writeback_fsync_bytes().is_some() => {
+            if state.block_writeback.is_empty() {
+                return Err(StorageError::corrupt(
+                    "writeback fsync workload has no dirty ranges",
+                ));
+            }
+            let dirty_bytes = state.block_writeback.dirty_bytes();
+            let dirty_range_count = state.block_writeback.writes.len();
+            let started = config.block_batch_profiles_enabled.then(Instant::now);
+            let commit = context.store.commit_block_batch(
+                *device_id,
+                &state.block_writeback.writes,
+                WriteDurability::Acknowledged,
+            )?;
+            context.store.flush_device(*device_id)?;
+            state.block_writeback.clear();
+            let block_batch_profile = started.map(|started| BlockBatchOpProfile {
+                total_nanos: started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                batch_operation_count: dirty_range_count as u64,
+                collapsed_range_count: commit.collapsed_range_count,
+                requested_bytes: dirty_bytes,
+                committed_bytes: commit.committed_bytes,
+            });
+            Ok(OpProgress {
+                durable_bytes: commit.committed_bytes,
+                published_bytes: commit.committed_bytes,
+                block_batch_profile,
+            })
+        }
         (
             Target::Block {
                 device_id,
@@ -990,6 +1137,9 @@ fn maybe_flush(
     worker: u64,
     state: &mut WorkerState,
 ) -> Result<OpProgress> {
+    if workload.is_block_writeback() {
+        return Ok(OpProgress::default());
+    }
     let DurabilityMode::AckFlushEvery(every) = durability else {
         return Ok(OpProgress::default());
     };

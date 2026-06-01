@@ -110,6 +110,38 @@ mod tests {
     }
 
     #[test]
+    fn block_writeback_suite_names_client_writeback_shapes() {
+        let suite = parse_workloads("block-writeback").unwrap();
+        assert_eq!(
+            suite,
+            vec![
+                Workload::BlockWritebackFsync1m,
+                Workload::BlockWritebackFsync2m,
+                Workload::BlockWritebackFsync4m,
+                Workload::BlockWritebackFsync16m,
+            ]
+        );
+        assert!(Workload::from_str("block-writeback-write-4k").is_err());
+        assert!(Workload::from_str("block-writeback-read-4k").is_err());
+    }
+
+    #[test]
+    fn block_writeback_state_stages_fsync_writes_without_claiming_local_iops() {
+        let mut state = BlockWritebackState::default();
+        state
+            .push_write(0, &[1; 4096], PayloadIntegrity::Verified)
+            .unwrap();
+        state
+            .push_write(4096, &[2; 4096], PayloadIntegrity::Verified)
+            .unwrap();
+
+        assert_eq!(state.dirty_bytes(), 8192);
+        assert_eq!(state.writes.len(), 2);
+        assert_eq!(state.writes[0].offset, 0);
+        assert_eq!(state.writes[1].offset, 4096);
+    }
+
+    #[test]
     fn integrity_flags_parse_explicit_modes() {
         assert_eq!(
             parse_payload_integrity("unchecked").unwrap(),

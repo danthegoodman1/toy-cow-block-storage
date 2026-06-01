@@ -144,14 +144,18 @@ observed device generation. The number of shards is fixed for a device lineage
 in v1. A later format may change that, but only by updating this spec and the
 deterministic tests in the same change.
 
-Durable providers store this logical device head as a stable device manifest
-plus one mutable row per shard head. The manifest records device identity and
-fixed shard shape; per-shard rows record the current root, generation, and
-latest commit for that shard. Reopen reconstructs the logical `DeviceHead` by
-combining the manifest with all shard rows. This keeps the physical metadata
-convergence point aligned with the logical fence: same-shard writes still
-contend on the same shard row, while same-device different-shard writes no
-longer rewrite one whole-device head payload.
+Durable providers store checkpointed block heads as a stable device manifest
+plus one mutable row per shard head. Flushed block writes do not need to fold
+into those rows before returning: they may be recorded as ordered durable block
+delta rows that reference already-durable segment payloads. Reopen reconstructs
+the logical `DeviceHead` by loading the checkpoint rows and replaying retained
+block deltas above the checkpoint high-water. Checkpointing folds those deltas
+into immutable CoW shard roots and prunes covered delta rows. This keeps
+`flush_device` as a replayable durability boundary while preserving CoW shard
+roots as the compact long-term representation for fork, PITR, validation, and
+GC. Durable metadata GC folds outstanding block deltas before sweeping so the
+delta replay chain never references segment payloads that storage-node
+compaction has reclaimed.
 
 The logical state of a live native file is:
 

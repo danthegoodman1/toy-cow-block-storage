@@ -67,7 +67,7 @@ fn setup_context(
             })?);
         }
         let device_id = devices[0];
-        let hot_blocks = if workload.is_read() {
+        let hot_blocks = if matches!(workload, Workload::BlockRead4k) {
             seed_block_read_workload(&store, device_id, args, &payload)?
         } else {
             args.device_blocks

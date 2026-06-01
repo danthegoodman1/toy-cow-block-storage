@@ -1480,11 +1480,13 @@ pre-SQLite convergence, or the shared SQLite/persist path.
 
 Deliverables:
 
-- [x] Durable block heads are stored as `device_manifests` plus
+- [x] Durable block checkpoints are stored as `device_manifests` plus
   `device_shard_heads`, with matching deleted-device tables.
-- [x] Reopen reconstructs the logical `DeviceHead` from per-shard rows.
-- [x] Single-shard writes update one shard-head row while leaving the device
-  manifest unchanged.
+- [x] Reopen reconstructs the logical `DeviceHead` from per-shard checkpoint
+  rows plus replayed durable block delta rows.
+- [x] Flushed block writes append replayable block delta rows; explicit
+  checkpoint/full persist folds them into shard-head rows while leaving the
+  device manifest unchanged.
 - [x] `loadbench` has a `block-metadata` alias covering same-shard contended,
   same-shard serialized, same-device/different-shard, and different-device
   block writes.

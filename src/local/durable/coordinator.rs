@@ -5,6 +5,7 @@ pub struct DurableCoordinator {
     local: LocalCoordinator,
     durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
+    pending_block_deltas: Arc<Mutex<Vec<BlockDeltaCommit>>>,
     pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     pending_stream_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<Mutex<()>>>>>,
@@ -103,6 +104,7 @@ impl DurableCoordinator {
             local,
             durable,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
+            pending_block_deltas: Arc::new(Mutex::new(Vec::new())),
             pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             pending_stream_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -193,6 +195,178 @@ impl DurableCoordinator {
         profile.touched_manifest_rows = summary.touched_manifest_rows;
         profile.commit_rows_written = summary.commit_rows_written;
         Ok(())
+    }
+
+    fn record_pending_block_delta(&self, delta: Option<BlockDeltaCommit>) -> Result<()> {
+        if let Some(delta) = delta {
+            lock(&self.pending_block_deltas)?.push(delta);
+        }
+        Ok(())
+    }
+
+    fn prune_pending_block_deltas_through(&self, durable_through: CommitSeq) -> Result<()> {
+        lock(&self.pending_block_deltas)?
+            .retain(|delta| delta.commit_seq.raw() > durable_through.raw());
+        Ok(())
+    }
+
+    fn has_pending_block_delta_in_range(
+        &self,
+        first_commit: u64,
+        target_commit: CommitSeq,
+    ) -> Result<bool> {
+        Ok(lock(&self.pending_block_deltas)?.iter().any(|delta| {
+            delta.commit_seq.raw() >= first_commit
+                && delta.commit_seq.raw() <= target_commit.raw()
+        }))
+    }
+
+    fn contiguous_pending_block_deltas(
+        &self,
+        durable_through: CommitSeq,
+        target: CommitSeq,
+    ) -> Result<Option<Vec<BlockDeltaCommit>>> {
+        if durable_through.raw() >= target.raw() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut pending = lock(&self.pending_block_deltas)?.clone();
+        pending.sort_by_key(|delta| delta.commit_seq.raw());
+        let mut next = durable_through
+            .raw()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("durable block delta sequence overflows"))?;
+        let mut selected = Vec::new();
+        for delta in pending {
+            let seq = delta.commit_seq.raw();
+            if seq < next {
+                continue;
+            }
+            if seq > target.raw() {
+                break;
+            }
+            if seq != next {
+                return Ok(None);
+            }
+            selected.push(delta);
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("durable block delta sequence overflows"))?;
+        }
+        if next == target.raw().saturating_add(1) {
+            Ok(Some(selected))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn persist_block_deltas_until(&self, required: CommitSeq) -> Result<()> {
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            state.requested_through = state.requested_through.max(required);
+            if state.durable_through >= required {
+                return Ok(());
+            }
+            if !state.in_flight {
+                let target_commit = state.requested_through;
+                state.in_flight = true;
+                drop(state);
+                let result = self.persist_block_deltas_physical(Instant::now(), target_commit);
+                let mut state = lock(&self.persist_coordinator.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.saturating_add(1);
+                let generation = state.generation;
+                match result {
+                    Ok(durable_through) => {
+                        state.durable_through = state.durable_through.max(durable_through);
+                        state.requested_through =
+                            state.requested_through.max(state.durable_through);
+                        state.last_error = None;
+                        self.persist_coordinator.cvar.notify_all();
+                        if state.durable_through >= required {
+                            return Ok(());
+                        }
+                        return Err(StorageError::conflict(
+                            "durable block delta persist did not reach required commit sequence",
+                        ));
+                    }
+                    Err(error) => {
+                        state.last_error = Some((generation, error.clone()));
+                        self.persist_coordinator.cvar.notify_all();
+                        return Err(error);
+                    }
+                }
+            }
+
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+            }
+            if state.durable_through >= required {
+                return Ok(());
+            }
+            if state.generation != generation
+                && let Some((error_generation, error)) = &state.last_error
+                && *error_generation == state.generation
+            {
+                return Err(error.clone());
+            }
+        }
+    }
+
+    fn persist_block_deltas_physical(
+        &self,
+        total_started: Instant,
+        minimum_target: CommitSeq,
+    ) -> Result<CommitSeq> {
+        let (durable_through, target_commit) = {
+            let state = lock(&self.persist_coordinator.inner)?;
+            (
+                state.durable_through,
+                state.requested_through.max(minimum_target),
+            )
+        };
+        let Some(deltas) = self.contiguous_pending_block_deltas(durable_through, target_commit)?
+        else {
+            return self.persist_physical(total_started, None, Some(target_commit));
+        };
+        if deltas.is_empty() {
+            return Ok(durable_through);
+        }
+        self.persist_block_delta_batch(total_started, deltas)
+    }
+
+    fn persist_block_delta_batch(
+        &self,
+        total_started: Instant,
+        deltas: Vec<BlockDeltaCommit>,
+    ) -> Result<CommitSeq> {
+        let _persist_guard = lock(&self.persist_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
+        let snapshot_started = Instant::now();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let mut segment_ids = BTreeSet::new();
+        for delta in &deltas {
+            segment_ids.extend(delta.segment_ids());
+        }
+        let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+        let new_segments: Vec<_> = payloads
+            .into_iter()
+            .filter(|payload| !previous_segments.contains(&payload.segment_id))
+            .collect();
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+
+        let mut profile =
+            self.durable
+                .persist_block_delta_commits(&deltas, &nodes, &segment_ids, new_segments)?;
+        let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+        lock(&self.persisted_segments)?.extend(segment_ids);
+        self.prune_pending_block_deltas_through(durable_through)?;
+        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.attach_metadata_publish_profile(&mut profile)?;
+        self.record_persist_profile(profile)?;
+        Ok(durable_through)
     }
 
     fn persist_until(&self, required: CommitSeq) -> Result<()> {
@@ -289,6 +463,17 @@ impl DurableCoordinator {
         self.persist_now_with_catalog_changes(None)
     }
 
+    fn has_unfolded_block_deltas(&self) -> Result<bool> {
+        Ok(!lock(&self.pending_block_deltas)?.is_empty() || self.durable.has_block_delta_commits()?)
+    }
+
+    fn fold_block_deltas_before_gc(&self) -> Result<()> {
+        if self.has_unfolded_block_deltas()? {
+            self.persist_now()?;
+        }
+        Ok(())
+    }
+
     fn persist_physical(
         &self,
         total_started: Instant,
@@ -310,6 +495,10 @@ impl DurableCoordinator {
         if pending_append.is_empty()
             && let (Some(target_commit), Some(previous_cursor)) =
                 (target_commit, previous_cursor.as_ref())
+            && !self.has_pending_block_delta_in_range(
+                previous_cursor.next_commit_seq,
+                target_commit,
+            )?
             && let Some(delta) = self
                 .local
                 .native_metadata_delta_through(target_commit, previous_cursor)?
@@ -361,6 +550,7 @@ impl DurableCoordinator {
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+        self.prune_pending_block_deltas_through(durable_through)?;
         self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_through)
@@ -976,10 +1166,12 @@ impl DurableCoordinator {
         let admission = self.admit_write(total_bytes, flushed)?;
         let result = self
             .local
-            .commit_block_batch(device_id, writes, durability)
-            .and_then(|commit| {
+            .commit_block_batch_with_delta(device_id, writes, durability)
+            .and_then(|committed| {
+                let commit = committed.commit;
+                self.record_pending_block_delta(committed.delta)?;
                 if flushed {
-                    self.persist_until(commit.commit_seq)?;
+                    self.persist_block_deltas_until(commit.commit_seq)?;
                 }
                 Ok(commit)
             });
@@ -1268,7 +1460,7 @@ impl DurableCoordinator {
 
     pub fn flush_device(&self, device_id: DeviceId) -> Result<FlushResult> {
         let info = self.local.metadata.device_info(device_id)?;
-        self.persist_until(info.latest_commit)?;
+        self.persist_block_deltas_until(info.latest_commit)?;
         Ok(FlushResult {
             device_id,
             durable_through: info.latest_commit,
@@ -1296,6 +1488,7 @@ impl DurableCoordinator {
         &self,
         policy: RetentionPolicy,
     ) -> Result<MetadataCustodianReport> {
+        self.fold_block_deltas_before_gc()?;
         let result = self.local.run_metadata_custodian(policy);
         let changed = result.as_ref().ok().map(|report| {
             report

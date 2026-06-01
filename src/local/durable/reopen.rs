@@ -124,6 +124,48 @@ pub(super) fn load_payload_rows(
     Ok(out)
 }
 
+pub(super) fn load_block_delta_commits_since(
+    conn: &Connection,
+    next_commit_seq: u64,
+) -> Result<Vec<BlockDeltaCommit>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT row_key, device_id, commit_seq, payload
+             FROM block_delta_commits
+             WHERE commit_seq >= ?1
+             ORDER BY commit_seq, row_key",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt
+        .query(params![u64_to_i64(next_commit_seq)?])
+        .map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let row_key: String = row.get(0).map_err(sqlite_error)?;
+        let device_id: String = row.get(1).map_err(sqlite_error)?;
+        let commit_seq: i64 = row.get(2).map_err(sqlite_error)?;
+        let payload: Vec<u8> = row.get(3).map_err(sqlite_error)?;
+        let delta: BlockDeltaCommit = decode_row(&payload)?;
+        if row_key != delta.row_key() {
+            return Err(StorageError::corrupt(
+                "block delta row key disagrees with payload",
+            ));
+        }
+        if device_id != delta.device_id.raw().to_string() {
+            return Err(StorageError::corrupt(
+                "block delta device id disagrees with payload",
+            ));
+        }
+        if i64_to_u64(commit_seq).map_err(sqlite_error)? != delta.commit_seq.raw() {
+            return Err(StorageError::corrupt(
+                "block delta commit sequence disagrees with payload",
+            ));
+        }
+        out.push(delta);
+    }
+    Ok(out)
+}
+
 pub(super) fn load_device_specs(conn: &Connection) -> Result<BTreeMap<DeviceId, crate::api::DeviceSpec>> {
     let mut out = BTreeMap::new();
     for (key, payload) in load_payload_rows(conn, "device_specs", "device_id", "device_id")? {

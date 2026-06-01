@@ -377,6 +377,7 @@ cargo run --release --bin loadbench -- --provider durable --durability ack-flush
 cargo run --release --bin loadbench -- --provider durable --durability ack --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-stream --rtt-us 200 --stream-flush-mib 2 --stream-publish-mib 128
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,16,64 --files 128 --storage-nodes 4 --workloads native-file-batch --rtt-us 200
 cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16,64 --workloads block-metadata --rtt-us 200 --durable-profile-csv target/loadbench/block-metadata/profile.csv
+cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --storage-nodes 4 --workloads block-writeback --rtt-us 200 --block-batch-profile-csv target/loadbench/block-writeback/block-batch.csv
 ```
 
 `loadbench` is the north-star integration benchmark: it exercises the public
@@ -394,6 +395,13 @@ with intentional flush queueing.
 Use the `*-shard-lanes` block write workloads when the goal is happy-path
 throughput. The plain random block write workloads are intentionally allowed to
 collide at high concurrency and are better read as conflict behavior controls.
+Use the `block-writeback` alias when modeling the block-device work caused by a
+filesystem or mount fsync. Each `block-writeback-fsync-*` row pre-fills a
+filesystem-like dirty 4KiB window, then times `commit_block_batch` plus
+`flush_device`. These rows are storage-boundary measurements, not local
+page-cache write/read IOPS. On the durable provider, `flush_device` records
+replayable block delta rows and durable segment payloads; explicit checkpoints
+fold those deltas into checkpointed CoW shard-head rows.
 Use the `block-metadata` alias when diagnosing block metadata convergence. It
 separates same-shard contention, same-device/different-shard writes, and
 different-device writes. With `--durable-profile-csv`, the profile rows also

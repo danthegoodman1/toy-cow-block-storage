@@ -184,6 +184,10 @@ enum Workload {
     BlockBatch1m128Ops,
     BlockBatchOverwriteCollapse,
     BlockBatchFsyncInterval,
+    BlockWritebackFsync1m,
+    BlockWritebackFsync2m,
+    BlockWritebackFsync4m,
+    BlockWritebackFsync16m,
     NativeRead4k,
     NativeWrite4k,
     NativeWrite4kSameFile,
@@ -283,6 +287,15 @@ impl Workload {
         ]
     }
 
+    fn block_writeback_suite() -> Vec<Self> {
+        vec![
+            Self::BlockWritebackFsync1m,
+            Self::BlockWritebackFsync2m,
+            Self::BlockWritebackFsync4m,
+            Self::BlockWritebackFsync16m,
+        ]
+    }
+
     fn native_metadata_suite() -> Vec<Self> {
         vec![
             Self::NativeWrite4kSameFile,
@@ -325,6 +338,10 @@ impl Workload {
             Self::BlockBatch1m128Ops => "block-batch-1m-128ops",
             Self::BlockBatchOverwriteCollapse => "block-batch-overwrite-collapse",
             Self::BlockBatchFsyncInterval => "block-batch-fsync-interval",
+            Self::BlockWritebackFsync1m => "block-writeback-fsync-1m",
+            Self::BlockWritebackFsync2m => "block-writeback-fsync-2m",
+            Self::BlockWritebackFsync4m => "block-writeback-fsync-4m",
+            Self::BlockWritebackFsync16m => "block-writeback-fsync-16m",
             Self::NativeRead4k => "native-read-4k",
             Self::NativeWrite4k => "native-write-4k",
             Self::NativeWrite4kSameFile => "native-write-4k-same-file",
@@ -361,6 +378,11 @@ impl Workload {
             let spec = self.block_batch_spec(args)?;
             return spec.ops.checked_mul(spec.write_bytes).ok_or_else(|| {
                 StorageError::invalid_argument("block batch op size overflows usize")
+            });
+        }
+        if let Some(bytes) = self.block_writeback_fsync_bytes() {
+            return usize::try_from(bytes).map_err(|_| {
+                StorageError::invalid_argument("block writeback op size overflows usize")
             });
         }
         if self.is_native_file_batch() {
@@ -413,7 +435,11 @@ impl Workload {
             | Self::BlockBatch1m16Ops
             | Self::BlockBatch1m128Ops
             | Self::BlockBatchOverwriteCollapse
-            | Self::BlockBatchFsyncInterval => unreachable!(),
+            | Self::BlockBatchFsyncInterval
+            | Self::BlockWritebackFsync1m
+            | Self::BlockWritebackFsync2m
+            | Self::BlockWritebackFsync4m
+            | Self::BlockWritebackFsync16m => unreachable!(),
         })
     }
 
@@ -456,6 +482,26 @@ impl Workload {
                 | Self::BlockBatchOverwriteCollapse
                 | Self::BlockBatchFsyncInterval
         )
+    }
+
+    fn is_block_writeback(self) -> bool {
+        matches!(
+            self,
+            Self::BlockWritebackFsync1m
+                | Self::BlockWritebackFsync2m
+                | Self::BlockWritebackFsync4m
+                | Self::BlockWritebackFsync16m
+        )
+    }
+
+    fn block_writeback_fsync_bytes(self) -> Option<u64> {
+        match self {
+            Self::BlockWritebackFsync1m => Some(1024 * 1024),
+            Self::BlockWritebackFsync2m => Some(2 * 1024 * 1024),
+            Self::BlockWritebackFsync4m => Some(4 * 1024 * 1024),
+            Self::BlockWritebackFsync16m => Some(16 * 1024 * 1024),
+            _ => None,
+        }
     }
 
     fn block_batch_spec(self, args: &Args) -> Result<BlockBatchSpec> {
@@ -617,6 +663,10 @@ impl Workload {
                 | Self::BlockBatch1m128Ops
                 | Self::BlockBatchOverwriteCollapse
                 | Self::BlockBatchFsyncInterval
+                | Self::BlockWritebackFsync1m
+                | Self::BlockWritebackFsync2m
+                | Self::BlockWritebackFsync4m
+                | Self::BlockWritebackFsync16m
         )
     }
 
@@ -649,6 +699,10 @@ impl FromStr for Workload {
             "block-batch-1m-128ops" => Ok(Self::BlockBatch1m128Ops),
             "block-batch-overwrite-collapse" => Ok(Self::BlockBatchOverwriteCollapse),
             "block-batch-fsync-interval" => Ok(Self::BlockBatchFsyncInterval),
+            "block-writeback-fsync-1m" => Ok(Self::BlockWritebackFsync1m),
+            "block-writeback-fsync-2m" => Ok(Self::BlockWritebackFsync2m),
+            "block-writeback-fsync-4m" => Ok(Self::BlockWritebackFsync4m),
+            "block-writeback-fsync-16m" => Ok(Self::BlockWritebackFsync16m),
             "native-read-4k" => Ok(Self::NativeRead4k),
             "native-write-4k" => Ok(Self::NativeWrite4k),
             "native-write-4k-same-file" => Ok(Self::NativeWrite4kSameFile),
