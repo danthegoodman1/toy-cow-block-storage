@@ -31,8 +31,19 @@ The primary API should be a one-shot batch commit:
 commit_block_batch(device_id, writes[], durability) -> DeviceCommit
 ```
 
-For very large or resumable writeback windows, add an optional staged session
-API later:
+This plan should be implemented in the narrow order that proves the core win
+first:
+
+1. baseline the current per-operation block write path;
+2. add the one-shot local `commit_block_batch` model;
+3. add durable one-shot batch persistence;
+4. add loadbench/client writeback simulation and compare against the baseline.
+
+The long-lived staged session API is explicitly deferred. Do not implement it
+unless the one-shot batch benchmarks show that large or resumable writeback
+windows still need a private durable-but-not-visible boundary.
+
+If needed later, the optional session API would look like:
 
 ```text
 open_block_batch_session(device_id) -> BlockBatchSession
@@ -255,40 +266,7 @@ Success signal:
 - large batches approach storage-node sequential-log throughput;
 - 4KiB-heavy batches reduce tail by amortizing metadata publish cost.
 
-## Stage 3: Optional Long-Lived Batch Session
-
-Only implement this if Stage 2 shows one-shot batches are not enough for large
-writeback windows or resumability.
-
-Deliverables:
-
-- session token and durable private state;
-- `stage_block_batch`;
-- `flush_block_batch_session`;
-- `commit_block_batch_session`;
-- `abort_block_batch_session`;
-- GC roots for flushed private-but-not-visible data.
-
-Correctness tests:
-
-- staged writes are invisible to normal reads;
-- flushed staged writes are resumable by token after reopen;
-- commit makes exactly marked ranges visible;
-- abort/fence releases unpublished private data for GC;
-- same-shard external commits can invalidate stale session commits;
-- different-shard external commits do not invalidate untouched staged shards.
-
-Benchmark after this stage under
-`target/loadbench/block-commit-boundary-stage3/`.
-
-Success signal:
-
-- stage/write ingest approaches memory/log append speed;
-- flush throughput approaches sequential data-log throughput;
-- commit cost scales with touched shards and collapsed ranges, not staged call
-  count.
-
-## Stage 4: Loadbench And Client Writeback Simulation
+## Stage 3: Loadbench And Client Writeback Simulation
 
 Update `loadbench` so the batch model is measured directly.
 
@@ -303,7 +281,7 @@ Add workloads:
 - `block-batch-fsync-interval`
 - alias: `block-batch`
 
-If Stage 3 lands, add:
+If the deferred Stage 4 session API lands later, add:
 
 - `block-session-stage-1m`
 - `block-session-flush-1m`
@@ -325,7 +303,7 @@ replacement lands. Once the public contract changes, remove old-path benchmark
 aliases that no longer represent the real API.
 
 Benchmark after this stage under
-`target/loadbench/block-commit-boundary-stage4/`.
+`target/loadbench/block-commit-boundary-stage3/`.
 
 Compare:
 
@@ -335,6 +313,40 @@ Compare:
 - fsync-interval simulation;
 - native file-lane write control;
 - native stream ingest/flush/publish control.
+
+## Stage 4: Deferred Optional Long-Lived Batch Session
+
+Do not implement this stage in the initial commit-boundary pass. Revisit it
+only if Stage 3 shows that one-shot batches are not enough for large writeback
+windows or resumability.
+
+Deliverables:
+
+- session token and durable private state;
+- `stage_block_batch`;
+- `flush_block_batch_session`;
+- `commit_block_batch_session`;
+- `abort_block_batch_session`;
+- GC roots for flushed private-but-not-visible data.
+
+Correctness tests:
+
+- staged writes are invisible to normal reads;
+- flushed staged writes are resumable by token after reopen;
+- commit makes exactly marked ranges visible;
+- abort/fence releases unpublished private data for GC;
+- same-shard external commits can invalidate stale session commits;
+- different-shard external commits do not invalidate untouched staged shards.
+
+Benchmark after this stage under
+`target/loadbench/block-commit-boundary-stage4/`.
+
+Success signal:
+
+- stage/write ingest approaches memory/log append speed;
+- flush throughput approaches sequential data-log throughput;
+- commit cost scales with touched shards and collapsed ranges, not staged call
+  count.
 
 ## Required Profile Fields
 
@@ -385,7 +397,7 @@ docker compose exec dev cargo doc --no-deps
 docker compose exec dev cargo bench --bench regression -- --test
 ```
 
-After the final stage, produce a 200us RTT comparison table:
+After Stage 3, produce a 200us RTT comparison table:
 
 - old per-op block write baseline;
 - block batch 4KiB at 16/256/4096 operations;
@@ -399,6 +411,9 @@ Report IOPS, MB/s, p50/p90/p99/max, errors, profile phase p50/p90/p99, and
 whether the remaining ceiling is client batching policy, data ingest, durable
 flush, visible commit, metadata publish, or payload integrity.
 
+Stage 4 should remain out of scope unless that comparison shows a concrete gap
+that one-shot batches cannot address cleanly.
+
 ## Non-Goals
 
 - No POSIX work in this phase.
@@ -410,4 +425,3 @@ flush, visible commit, metadata publish, or payload integrity.
   same-shard conflict behavior.
 - No requirement that normal readers observe another client's uncommitted dirty
   ranges.
-
