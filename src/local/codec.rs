@@ -1540,6 +1540,44 @@ impl DurableCodec for WriteCommit {
     }
 }
 
+impl DurableCodec for BlockBatchWrite {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.offset.encode(out)?;
+        self.bytes.encode(out)?;
+        self.payload_integrity.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            offset: u64::decode(input)?,
+            bytes: Vec::decode(input)?,
+            payload_integrity: PayloadIntegrity::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for BlockBatchCommit {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.commit_seq.encode(out)?;
+        self.write_count.encode(out)?;
+        self.collapsed_range_count.encode(out)?;
+        self.committed_bytes.encode(out)?;
+        self.durability.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            commit_seq: CommitSeq::decode(input)?,
+            write_count: u64::decode(input)?,
+            collapsed_range_count: u64::decode(input)?,
+            committed_bytes: u64::decode(input)?,
+            durability: WriteDurability::decode(input)?,
+        })
+    }
+}
+
 impl DurableCodec for FlushResult {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.device_id.encode(out)?;
@@ -1629,6 +1667,16 @@ impl DurableCodec for BlockRequest {
                 payload_integrity.encode(out)?;
                 durability.encode(out)
             }
+            Self::CommitBatch {
+                device_id,
+                writes,
+                durability,
+            } => {
+                11u8.encode(out)?;
+                device_id.encode(out)?;
+                writes.encode(out)?;
+                durability.encode(out)
+            }
             Self::Flush { device_id, scope } => {
                 5u8.encode(out)?;
                 device_id.encode(out)?;
@@ -1681,6 +1729,11 @@ impl DurableCodec for BlockRequest {
                 payload_integrity: PayloadIntegrity::decode(input)?,
                 durability: WriteDurability::decode(input)?,
             }),
+            11 => Ok(Self::CommitBatch {
+                device_id: DeviceId::decode(input)?,
+                writes: Vec::decode(input)?,
+                durability: WriteDurability::decode(input)?,
+            }),
             5 => Ok(Self::Flush {
                 device_id: DeviceId::decode(input)?,
                 scope: FlushScope::decode(input)?,
@@ -1728,6 +1781,10 @@ impl DurableCodec for BlockResponse {
                 4u8.encode(out)?;
                 commit.encode(out)
             }
+            Self::BatchCommitted(commit) => {
+                9u8.encode(out)?;
+                commit.encode(out)
+            }
             Self::Flush(flush) => {
                 5u8.encode(out)?;
                 flush.encode(out)
@@ -1753,6 +1810,7 @@ impl DurableCodec for BlockResponse {
             2 => Ok(Self::Info(DeviceInfo::decode(input)?)),
             3 => Ok(Self::Read(ReadResponse::decode(input)?)),
             4 => Ok(Self::Write(WriteCommit::decode(input)?)),
+            9 => Ok(Self::BatchCommitted(BlockBatchCommit::decode(input)?)),
             5 => Ok(Self::Flush(FlushResult::decode(input)?)),
             6 => Ok(Self::Forked(DeviceId::decode(input)?)),
             7 => Ok(Self::Restored(DeviceId::decode(input)?)),

@@ -50,6 +50,15 @@ impl Lcg {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BlockBatchOpProfile {
+    total_nanos: u64,
+    batch_operation_count: u64,
+    collapsed_range_count: u64,
+    requested_bytes: u64,
+    committed_bytes: u64,
+}
+
 #[derive(Debug)]
 struct WorkerReport {
     attempts: u64,
@@ -62,6 +71,7 @@ struct WorkerReport {
     latency_seen: u64,
     latencies: Vec<u64>,
     sample_limit: usize,
+    block_batch_profiles: Vec<BlockBatchOpProfile>,
 }
 
 impl WorkerReport {
@@ -77,6 +87,7 @@ impl WorkerReport {
             latency_seen: 0,
             latencies: Vec::with_capacity(sample_limit.min(1024)),
             sample_limit,
+            block_batch_profiles: Vec::new(),
         }
     }
 
@@ -84,8 +95,7 @@ impl WorkerReport {
         &mut self,
         latency_nanos: u64,
         bytes: u64,
-        durable_bytes: u64,
-        published_bytes: u64,
+        progress: OpProgress,
         success: bool,
         rng: &mut Lcg,
     ) {
@@ -95,8 +105,15 @@ impl WorkerReport {
         if success {
             self.successes = self.successes.saturating_add(1);
             self.bytes = self.bytes.saturating_add(bytes);
-            self.durable_bytes = self.durable_bytes.saturating_add(durable_bytes);
-            self.published_bytes = self.published_bytes.saturating_add(published_bytes);
+            self.durable_bytes = self
+                .durable_bytes
+                .saturating_add(progress.durable_bytes);
+            self.published_bytes = self
+                .published_bytes
+                .saturating_add(progress.published_bytes);
+            if let Some(profile) = progress.block_batch_profile {
+                self.block_batch_profiles.push(profile);
+            }
         } else {
             self.errors = self.errors.saturating_add(1);
         }
@@ -128,6 +145,7 @@ struct BenchReport {
     bytes: u64,
     durable_bytes: u64,
     published_bytes: u64,
+    block_batch_profiles: Vec<BlockBatchOpProfile>,
     p50_nanos: u64,
     p90_nanos: u64,
     p99_nanos: u64,
@@ -146,6 +164,7 @@ impl BenchReport {
         let mut published_bytes = 0_u64;
         let mut max_nanos = 0_u64;
         let mut samples = Vec::new();
+        let mut block_batch_profiles = Vec::new();
 
         for worker in workers {
             attempts = attempts.saturating_add(worker.attempts);
@@ -156,6 +175,7 @@ impl BenchReport {
             published_bytes = published_bytes.saturating_add(worker.published_bytes);
             max_nanos = max_nanos.max(worker.max_latency_nanos);
             samples.extend(worker.latencies);
+            block_batch_profiles.extend(worker.block_batch_profiles);
         }
         samples.sort_unstable();
 
@@ -174,6 +194,7 @@ impl BenchReport {
             bytes,
             durable_bytes,
             published_bytes,
+            block_batch_profiles,
             p50_nanos: percentile(&samples, 0.50),
             p90_nanos: percentile(&samples, 0.90),
             p99_nanos: percentile(&samples, 0.99),

@@ -1,6 +1,6 @@
 # Block Write Commit Boundary Plan
 
-Status: draft  
+Status: implemented through Stage 3; Stage 4 deferred pending evidence
 Project: `toy-cow-block-storage`
 
 ## Summary
@@ -413,6 +413,37 @@ flush, visible commit, metadata publish, or payload integrity.
 
 Stage 4 should remain out of scope unless that comparison shows a concrete gap
 that one-shot batches cannot address cleanly.
+
+## Stage 3 Evidence
+
+Stage 3 raw output is saved under
+`target/loadbench/block-commit-boundary-stage3/`.
+
+The implemented `block-batch` suite measures one-shot `commit_block_batch`
+directly and records per-batch profile rows with requested operation count,
+collapsed range count, requested bytes, committed bytes, and commit-call
+latency. Durable runs pair those rows with `--durable-profile-csv` so data-log
+sync, node-catalog publish, root SQLite publish, persist-lock wait, and touched
+metadata counts remain visible.
+
+Initial verified durable runs at 200us modeled RTT show that one-shot batches do
+remove the old per-operation metadata publish amplification:
+
+- 4KiB one-op block writes remain single-digit MiB/s because every call still
+  publishes and flushes one tiny visible update.
+- 4KiB batches improve with batch size: 16-op batches reach tens to low
+  hundreds of MiB/s, 256-op batches reach hundreds of MiB/s to roughly 1GiB/s,
+  and 4096-op batches reach roughly 1.0-1.7GiB/s depending concurrency.
+- 16MiB one-shot batches land in the same range whether built from 4096 4KiB
+  writes or 16 1MiB writes, which confirms range collapse is doing the intended
+  simplification before metadata path-copy.
+- 128MiB one-shot batches improve total throughput but have high per-call
+  latency and memory pressure, so they are useful as a diagnostic upper bound,
+  not as a default client writeback window.
+- At high concurrency, durable persist-lock wait and data-log sync grouping are
+  now the visible tail sources. Stage 4 block sessions are still deferred; the
+  next decision should come from whether the client wants smaller fsync latency
+  or larger writeback throughput.
 
 ## Non-Goals
 

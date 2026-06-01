@@ -2,6 +2,18 @@ pub(super) type InMemoryAppendRunLogKey = (StorageNodeId, u64);
 pub(super) type InMemoryAppendRunLogs = BTreeMap<InMemoryAppendRunLogKey, Vec<u8>>;
 pub(super) type AppendStreamLaneMap = BTreeMap<AppendStreamId, Arc<Mutex<()>>>;
 
+#[derive(Debug)]
+struct BlockBatchShardEdits {
+    old_root: MetadataNodeId,
+    edits: Vec<BlockBatchShardEdit>,
+}
+
+#[derive(Debug)]
+struct BlockBatchShardEdit {
+    range: BlockRange,
+    receipt: VerifiedSegmentReceipt,
+}
+
 /// In-process coordinator that owns request orchestration across metadata and
 /// storage-node roles.
 #[derive(Debug, Clone)]
@@ -1173,6 +1185,31 @@ impl LocalCoordinator {
                 durability,
             });
         }
+        let commit = self.commit_block_batch(
+            device_id,
+            &[BlockBatchWrite {
+                offset,
+                bytes: data.to_vec(),
+                payload_integrity,
+            }],
+            durability,
+        )?;
+        Ok(WriteCommit {
+            device_id: commit.device_id,
+            commit_seq: commit.commit_seq,
+            range,
+            durability: commit.durability,
+        })
+    }
+
+    pub fn commit_block_batch(
+        &self,
+        device_id: DeviceId,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<BlockBatchCommit> {
+        let info = self.metadata.device_info(device_id)?;
+        let collapsed = collapse_block_batch_writes(writes, &info.spec, DEFAULT_BLOCK_BATCH_MAX_BYTES)?;
         self.observability.record_with_update(
             StorageEventKind::CoordinatorWriteStarted,
             None,
@@ -1186,76 +1223,102 @@ impl LocalCoordinator {
         );
 
         let block_size = u64::from(info.spec.block_size);
-        let chunks = self.split_device_range(&info, range)?;
         let owner = MappingOwner::BlockDevice(device_id);
         let write_intent = self.next_write_intent()?;
-        let mut updates = Vec::with_capacity(chunks.len());
-        let mut segment_receipts = Vec::with_capacity(chunks.len());
         let current = self.metadata.get_head(device_id)?;
+        let mut shard_edits = BTreeMap::<ShardId, BlockBatchShardEdits>::new();
+        let mut segment_receipts = Vec::new();
 
-        for chunk in chunks {
-            let chunk_offset = chunk
-                .range
-                .start
-                .raw()
-                .checked_mul(block_size)
-                .and_then(|start| start.checked_sub(offset))
-                .ok_or_else(|| StorageError::invalid_argument("write chunk offset overflows"))?;
-            let byte_start = usize::try_from(chunk_offset).map_err(|_| {
-                StorageError::invalid_argument("write chunk offset overflows usize")
-            })?;
-            let chunk_len = chunk
-                .range
-                .blocks
-                .raw()
-                .checked_mul(block_size)
-                .ok_or_else(|| StorageError::invalid_argument("write chunk length overflows"))?;
-            let byte_len = usize::try_from(chunk_len).map_err(|_| {
-                StorageError::invalid_argument("write chunk length overflows usize")
-            })?;
-            let byte_end = byte_start
-                .checked_add(byte_len)
-                .ok_or_else(|| StorageError::invalid_argument("write chunk end overflows"))?;
-            let chunk_bytes = data
-                .get(byte_start..byte_end)
-                .ok_or_else(|| StorageError::corrupt("write chunk is outside request bytes"))?;
-            let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
-                WriteGrantIntent::BlockWrite {
-                    device_id,
+        for write in &collapsed {
+            let write_range = write.byte_range()?;
+            let chunks = self.split_device_range(&info, write_range)?;
+            for chunk in chunks {
+                let chunk_range = block_range_to_byte_range(chunk.range, block_size)?;
+                let chunk_offset = chunk_range
+                    .offset
+                    .checked_sub(write.offset)
+                    .ok_or_else(|| StorageError::invalid_argument("write chunk underflows"))?;
+                let byte_start = usize::try_from(chunk_offset).map_err(|_| {
+                    StorageError::invalid_argument("write chunk offset overflows usize")
+                })?;
+                let byte_len = usize::try_from(chunk_range.len).map_err(|_| {
+                    StorageError::invalid_argument("write chunk length overflows usize")
+                })?;
+                let byte_end = byte_start
+                    .checked_add(byte_len)
+                    .ok_or_else(|| StorageError::invalid_argument("write chunk end overflows"))?;
+                let chunk_bytes = write.bytes.get(byte_start..byte_end).ok_or_else(|| {
+                    StorageError::corrupt("write chunk is outside collapsed batch bytes")
+                })?;
+                let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
+                    WriteGrantIntent::BlockWrite {
+                        device_id,
+                        range: chunk.range,
+                        fence: current.generation,
+                        shard_id: chunk.shard_id,
+                        old_root: chunk.old_root,
+                    },
+                    write_intent,
+                    chunk_bytes.to_vec(),
+                    durability,
+                    write.payload_integrity,
+                )?;
+                let shard_edit = shard_edits.entry(chunk.shard_id).or_insert_with(|| {
+                    BlockBatchShardEdits {
+                        old_root: chunk.old_root,
+                        edits: Vec::new(),
+                    }
+                });
+                if shard_edit.old_root != chunk.old_root {
+                    return Err(StorageError::conflict(
+                        "block batch observed inconsistent shard roots",
+                    ));
+                }
+                shard_edit.edits.push(BlockBatchShardEdit {
                     range: chunk.range,
-                    fence: current.generation,
-                    shard_id: chunk.shard_id,
-                    old_root: chunk.old_root,
-                },
-                write_intent,
-                chunk_bytes.to_vec(),
-                durability,
-                payload_integrity,
-            )?;
-            let segment_id = verified_receipt.descriptor.segment_id;
-
-            let edit = TreeRangeEdit {
-                range: chunk.range,
-                replacement: Some(SegmentReplacement {
-                    segment_id,
-                    segment_base: chunk.range.start,
-                }),
-            };
-            let new_root = self
-                .replace_tree_range_with_receipts(
-                    chunk.old_root,
-                    edit,
-                    std::slice::from_ref(&verified_receipt),
-                )?
-                .root;
-            segment_receipts.push(verified_receipt);
-            updates.push(RootUpdate::BlockShard(ShardRootUpdate {
-                shard_id: chunk.shard_id,
-                old_root: chunk.old_root,
-                new_root,
-            }));
+                    receipt: verified_receipt.clone(),
+                });
+                segment_receipts.push(verified_receipt);
+            }
         }
 
+        let mut updates = Vec::with_capacity(shard_edits.len());
+        for (shard_id, mut shard) in shard_edits {
+            shard.edits.sort_by_key(|edit| edit.range.start.raw());
+            let mut root = shard.old_root;
+            for edit in shard.edits {
+                root = self
+                    .replace_tree_range_with_receipts(
+                        root,
+                        TreeRangeEdit {
+                            range: edit.range,
+                            replacement: Some(SegmentReplacement {
+                                segment_id: edit.receipt.descriptor.segment_id,
+                                segment_base: edit.range.start,
+                            }),
+                        },
+                        &segment_receipts,
+                    )?
+                    .root;
+            }
+            if root != shard.old_root {
+                updates.push(RootUpdate::BlockShard(ShardRootUpdate {
+                    shard_id,
+                    old_root: shard.old_root,
+                    new_root: root,
+                }));
+            }
+        }
+        if updates.is_empty() {
+            return Ok(BlockBatchCommit {
+                device_id,
+                commit_seq: info.latest_commit,
+                write_count: usize_to_u64(writes.len()),
+                collapsed_range_count: usize_to_u64(collapsed.len()),
+                committed_bytes: 0,
+                durability,
+            });
+        }
         let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner,
             fence: MetadataFence::DeviceGeneration(current.generation),
@@ -1270,10 +1333,16 @@ impl LocalCoordinator {
             )?;
         }
 
-        Ok(WriteCommit {
+        let committed_bytes = collapsed
+            .iter()
+            .map(|write| usize_to_u64(write.bytes.len()))
+            .fold(0u64, u64::saturating_add);
+        Ok(BlockBatchCommit {
             device_id,
             commit_seq: commit_group.commit_seq,
-            range,
+            write_count: usize_to_u64(writes.len()),
+            collapsed_range_count: usize_to_u64(collapsed.len()),
+            committed_bytes,
             durability,
         })
     }

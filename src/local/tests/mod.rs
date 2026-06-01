@@ -1,5 +1,8 @@
 use super::*;
-use crate::api::{BlockRequest, CreateDeviceRequest, DeviceSpec, FlushScope, WriteDurability};
+use crate::api::{
+    BlockBatchWrite, BlockRequest, CreateDeviceRequest, DeviceSpec, FlushScope, PayloadIntegrity,
+    WriteDurability,
+};
 use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileSpec};
 use crate::id::{ClientEpoch, LogicalDeadline, ShardId, WriteIntentId};
 use crate::object::{LeafEntry, ShardRootUpdate};
@@ -2493,6 +2496,79 @@ fn durable_provider_reopens_committed_block_contents_and_restore_points() {
         )
         .unwrap();
     assert_eq!(restored_after_restart, repeated_blocks(2, 3));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_batch_commit_survives_reopen_and_pitr() {
+    let root = durable_temp_dir("block-batch-restart");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("durable-batch".to_string()),
+        })
+        .unwrap();
+    store
+        .commit_block_batch(
+            device_id,
+            &[
+                BlockBatchWrite {
+                    offset: 0,
+                    bytes: repeated_blocks(1, 21),
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+                BlockBatchWrite {
+                    offset: 8 * 4096,
+                    bytes: repeated_blocks(1, 22),
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+            ],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    let checkpoint = store.checkpoint(device_id).unwrap();
+    store
+        .commit_block_batch(
+            device_id,
+            &[BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(1, 23),
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut current = vec![0; 9 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 9 * 4096), &mut current)
+        .unwrap();
+    assert_eq!(&current[0..4096], repeated_blocks(1, 23).as_slice());
+    assert_eq!(
+        &current[8 * 4096..9 * 4096],
+        repeated_blocks(1, 22).as_slice()
+    );
+
+    let restored = reopened
+        .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+        .unwrap();
+    let mut restored_bytes = vec![0; 9 * 4096];
+    reopened
+        .read_device(restored, ByteRange::new(0, 9 * 4096), &mut restored_bytes)
+        .unwrap();
+    assert_eq!(&restored_bytes[0..4096], repeated_blocks(1, 21).as_slice());
+    assert_eq!(
+        &restored_bytes[8 * 4096..9 * 4096],
+        repeated_blocks(1, 22).as_slice()
+    );
+    drop(reopened);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -9727,6 +9803,161 @@ fn discard_removes_mapping_and_write_zeroes_reads_as_zeroes() {
         &actual[6 * 4096..8 * 4096],
         repeated_blocks(2, 8).as_slice()
     );
+}
+
+#[test]
+fn block_batch_commit_publishes_multiple_writes_atomically() {
+    let store = LocalCoordinator::with_config(config()).unwrap();
+    let device = create_local_device(&store, 16);
+
+    let commit = device
+        .commit_batch(&[
+            BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(1, 3),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+            BlockBatchWrite {
+                offset: 8 * 4096,
+                bytes: repeated_blocks(1, 9),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(commit.write_count, 2);
+    assert_eq!(commit.collapsed_range_count, 2);
+    assert_eq!(commit.committed_bytes, 2 * 4096);
+    let info = device.info().unwrap();
+    assert_eq!(info.latest_commit, commit.commit_seq);
+
+    let mut actual = vec![0; 16 * 4096];
+    device.read_at(0, &mut actual).unwrap();
+    assert_eq!(&actual[0..4096], repeated_blocks(1, 3).as_slice());
+    assert_eq!(
+        &actual[8 * 4096..9 * 4096],
+        repeated_blocks(1, 9).as_slice()
+    );
+    assert_eq!(&actual[4096..8 * 4096], vec![0; 7 * 4096].as_slice());
+}
+
+#[test]
+fn block_batch_commit_collapses_overlaps_by_request_order() {
+    let store = LocalCoordinator::with_config(config()).unwrap();
+    let device = create_local_device(&store, 8);
+
+    let commit = device
+        .commit_batch(&[
+            BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(2, 1),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+            BlockBatchWrite {
+                offset: 4096,
+                bytes: repeated_blocks(1, 7),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(commit.write_count, 2);
+    assert_eq!(commit.collapsed_range_count, 1);
+    assert_eq!(commit.committed_bytes, 2 * 4096);
+    let mut actual = vec![0; 3 * 4096];
+    device.read_at(0, &mut actual).unwrap();
+    assert_eq!(&actual[0..4096], repeated_blocks(1, 1).as_slice());
+    assert_eq!(&actual[4096..2 * 4096], repeated_blocks(1, 7).as_slice());
+    assert_eq!(
+        &actual[2 * 4096..3 * 4096],
+        repeated_blocks(1, 0).as_slice()
+    );
+}
+
+#[test]
+fn block_batch_commit_publishes_multi_shard_update_in_one_commit_group() {
+    let store = LocalCoordinator::with_config(config()).unwrap();
+    let head = store.metadata().create_device(device_request()).unwrap();
+
+    let commit = store
+        .commit_block_batch(
+            head.device_id,
+            &[
+                BlockBatchWrite {
+                    offset: 0,
+                    bytes: repeated_blocks(1, 4),
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+                BlockBatchWrite {
+                    offset: 8 * 4096,
+                    bytes: repeated_blocks(1, 5),
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+            ],
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+
+    let inner = store.metadata().state_inner().unwrap();
+    let group = inner.commit_groups.values().last().unwrap();
+    assert_eq!(group.commit_seq, commit.commit_seq);
+    assert_eq!(group.updates.len(), 2);
+    let shard_commits: Vec<_> = inner
+        .shard_commits
+        .iter()
+        .filter(|shard| shard.commit_seq == commit.commit_seq)
+        .collect();
+    assert_eq!(shard_commits.len(), 2);
+}
+
+#[test]
+fn block_batch_publish_failure_keeps_old_roots_and_pending_segments() {
+    let store = LocalCoordinator::with_config(config()).unwrap();
+    let head = store.metadata().create_device(device_request()).unwrap();
+    let original = store.metadata().get_head(head.device_id).unwrap();
+    store
+        .metadata()
+        .set_next_commit_seq_for_test(u64::MAX)
+        .unwrap();
+
+    let failed = store.commit_block_batch(
+        head.device_id,
+        &[
+            BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(1, 11),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+            BlockBatchWrite {
+                offset: 8 * 4096,
+                bytes: repeated_blocks(1, 12),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+        ],
+        WriteDurability::Acknowledged,
+    );
+
+    assert!(failed.is_err());
+    assert_eq!(store.metadata().get_head(head.device_id).unwrap(), original);
+    assert_eq!(
+        store
+            .segment_catalog()
+            .state(SegmentId::from_raw(1))
+            .unwrap(),
+        SegmentLifecycleState::DurablePendingMetadata
+    );
+    assert_eq!(
+        store
+            .segment_catalog()
+            .state(SegmentId::from_raw(2))
+            .unwrap(),
+        SegmentLifecycleState::DurablePendingMetadata
+    );
+    let mut buf = vec![1; 2 * 4096];
+    store
+        .read_device(head.device_id, ByteRange::new(0, 2 * 4096), &mut buf)
+        .unwrap();
+    assert_eq!(buf, vec![0; 2 * 4096]);
 }
 
 #[test]

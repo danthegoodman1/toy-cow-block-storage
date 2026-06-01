@@ -224,3 +224,53 @@ fn append_block_write_profile_csv(
     }
     Ok(())
 }
+
+fn append_block_batch_profile_csv(
+    args: &Args,
+    report: &BenchReport,
+) -> Result<()> {
+    let Some(path) = &args.block_batch_profile_csv else {
+        return Ok(());
+    };
+    if report.block_batch_profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,payload_integrity,total_nanos,batch_operation_count,collapsed_range_count,requested_bytes,committed_bytes"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in &report.block_batch_profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            report.workload.name(),
+            report.provider,
+            report.durability,
+            report.rtt_us,
+            report.serial_rtts,
+            report.concurrency,
+            report.op_size,
+            args.storage_nodes,
+            payload_integrity_name(args.payload_integrity),
+            profile.total_nanos,
+            profile.batch_operation_count,
+            profile.collapsed_range_count,
+            profile.requested_bytes,
+            profile.committed_bytes,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}

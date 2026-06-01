@@ -110,6 +110,7 @@ pub enum BlockOperation {
     Info,
     Read,
     Write,
+    CommitBatch,
     Flush,
     WriteZeroes,
     Discard,
@@ -262,6 +263,41 @@ pub struct WriteCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockBatchWrite {
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub payload_integrity: PayloadIntegrity,
+}
+
+impl BlockBatchWrite {
+    pub fn byte_range(&self) -> Result<ByteRange> {
+        let len = u64::try_from(self.bytes.len())
+            .map_err(|_| StorageError::invalid_argument("batch write byte length overflows u64"))?;
+        Ok(ByteRange::new(self.offset, len))
+    }
+
+    pub fn validate_for_device(&self, spec: &DeviceSpec) -> Result<()> {
+        let range = self.byte_range()?;
+        if range.len == 0 {
+            return Err(StorageError::invalid_argument(
+                "batch write must contain at least one byte",
+            ));
+        }
+        range.validate_for_device(spec)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockBatchCommit {
+    pub device_id: DeviceId,
+    pub commit_seq: CommitSeq,
+    pub write_count: u64,
+    pub collapsed_range_count: u64,
+    pub committed_bytes: u64,
+    pub durability: WriteDurability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FlushResult {
     pub device_id: DeviceId,
     pub durable_through: CommitSeq,
@@ -339,13 +375,47 @@ pub trait BlockDevice: Send + Sync {
         self.write_at_with_integrity(offset, data, PayloadIntegrity::Verified)
     }
 
+    /// Commit a caller-owned dirty range batch atomically.
+    ///
+    /// Implementations must collapse overlapping ranges by request order,
+    /// persist payloads before visible metadata when durability requires it,
+    /// and publish one atomic copy-on-write metadata transition for the
+    /// collapsed batch. A failed commit must not expose any partial range.
+    fn commit_batch(&self, writes: &[BlockBatchWrite]) -> Result<BlockBatchCommit>;
+
     /// Write bytes with an explicit payload integrity policy.
     fn write_at_with_integrity(
         &self,
         offset: u64,
         data: &[u8],
         payload_integrity: PayloadIntegrity,
-    ) -> Result<WriteCommit>;
+    ) -> Result<WriteCommit> {
+        let range = ByteRange::new(
+            offset,
+            u64::try_from(data.len())
+                .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
+        );
+        if data.is_empty() {
+            let info = self.info()?;
+            return Ok(WriteCommit {
+                device_id: self.device_id(),
+                commit_seq: info.latest_commit,
+                range,
+                durability: WriteDurability::Acknowledged,
+            });
+        }
+        let commit = self.commit_batch(&[BlockBatchWrite {
+            offset,
+            bytes: data.to_vec(),
+            payload_integrity,
+        }])?;
+        Ok(WriteCommit {
+            device_id: commit.device_id,
+            commit_seq: commit.commit_seq,
+            range,
+            durability: commit.durability,
+        })
+    }
 
     /// Flush previously acknowledged writes for this device.
     ///
@@ -424,6 +494,11 @@ pub enum BlockRequest {
         payload_integrity: PayloadIntegrity,
         durability: WriteDurability,
     },
+    CommitBatch {
+        device_id: DeviceId,
+        writes: Vec<BlockBatchWrite>,
+        durability: WriteDurability,
+    },
     Flush {
         device_id: DeviceId,
         scope: FlushScope,
@@ -456,6 +531,7 @@ impl BlockRequest {
             Self::Info { .. } => BlockOperation::Info,
             Self::Read { .. } => BlockOperation::Read,
             Self::Write { .. } => BlockOperation::Write,
+            Self::CommitBatch { .. } => BlockOperation::CommitBatch,
             Self::Flush { .. } => BlockOperation::Flush,
             Self::WriteZeroes { .. } => BlockOperation::WriteZeroes,
             Self::Discard { .. } => BlockOperation::Discard,
@@ -470,6 +546,7 @@ impl BlockRequest {
             Self::Info { device_id }
             | Self::Read { device_id, .. }
             | Self::Write { device_id, .. }
+            | Self::CommitBatch { device_id, .. }
             | Self::Flush { device_id, .. }
             | Self::WriteZeroes { device_id, .. }
             | Self::Discard { device_id, .. }
@@ -490,6 +567,7 @@ impl BlockRequest {
                 })?;
                 Ok(Some(ByteRange::new(*offset, len)))
             }
+            Self::CommitBatch { .. } => Ok(None),
             Self::Create { .. }
             | Self::Info { .. }
             | Self::Flush { .. }
@@ -506,6 +584,7 @@ impl BlockRequest {
             | Self::Read { .. }
             | Self::Write { .. }
             | Self::Flush { .. }
+            | Self::CommitBatch { .. }
             | Self::WriteZeroes { .. }
             | Self::Discard { .. }
             | Self::Fork { .. }
@@ -532,6 +611,17 @@ impl BlockRequest {
                 }
                 Ok(())
             }
+            Self::CommitBatch { writes, .. } => {
+                if writes.is_empty() {
+                    return Err(StorageError::invalid_argument(
+                        "block batch must contain at least one write",
+                    ));
+                }
+                for write in writes {
+                    write.validate_for_device(spec)?;
+                }
+                Ok(())
+            }
             Self::Info { .. }
             | Self::Flush { .. }
             | Self::Fork { .. }
@@ -552,6 +642,7 @@ pub enum BlockResponse {
     Info(DeviceInfo),
     Read(ReadResponse),
     Write(WriteCommit),
+    BatchCommitted(BlockBatchCommit),
     Flush(FlushResult),
     Forked(DeviceId),
     Restored(DeviceId),
@@ -862,6 +953,18 @@ mod tests {
             write.byte_range().unwrap(),
             Some(ByteRange::new(4096, 8192))
         );
+
+        let batch = BlockRequest::CommitBatch {
+            device_id: DeviceId::from_raw(1),
+            writes: vec![BlockBatchWrite {
+                offset: 0,
+                bytes: vec![0; 4096],
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            durability: WriteDurability::Acknowledged,
+        };
+        assert_eq!(batch.operation(), BlockOperation::CommitBatch);
+        assert_eq!(batch.byte_range().unwrap(), None);
     }
 
     #[test]
@@ -891,6 +994,24 @@ mod tests {
             verification: ReadVerification::Default,
         };
         assert!(past_end.validate_for_existing_device(&spec).is_err());
+
+        let batch = BlockRequest::CommitBatch {
+            device_id: DeviceId::from_raw(1),
+            writes: vec![BlockBatchWrite {
+                offset: 0,
+                bytes: vec![0; 4096],
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            durability: WriteDurability::Acknowledged,
+        };
+        assert!(batch.validate_for_existing_device(&spec).is_ok());
+
+        let empty_batch = BlockRequest::CommitBatch {
+            device_id: DeviceId::from_raw(1),
+            writes: Vec::new(),
+            durability: WriteDurability::Acknowledged,
+        };
+        assert!(empty_batch.validate_for_existing_device(&spec).is_err());
     }
 
     #[test]

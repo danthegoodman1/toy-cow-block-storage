@@ -18,8 +18,13 @@ struct Args {
     durable_profile_csv: Option<PathBuf>,
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
+    block_batch_profile_csv: Option<PathBuf>,
     stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
+    block_batch_ops: Option<usize>,
+    block_batch_bytes: Option<usize>,
+    block_batch_overlap: Option<BlockBatchOverlap>,
+    block_batch_fsync_bytes: u64,
     native_file_batch_ops: Option<usize>,
     native_file_batch_bytes: Option<usize>,
     native_file_batch_overlap: Option<NativeFileBatchOverlap>,
@@ -49,8 +54,13 @@ impl Args {
             durable_profile_csv: None,
             metadata_profile_csv: None,
             block_write_profile_csv: None,
+            block_batch_profile_csv: None,
             stream_flush_bytes: None,
             stream_publish_bytes: None,
+            block_batch_ops: None,
+            block_batch_bytes: None,
+            block_batch_overlap: None,
+            block_batch_fsync_bytes: 128 * 1024 * 1024,
             native_file_batch_ops: None,
             native_file_batch_bytes: None,
             native_file_batch_overlap: None,
@@ -116,6 +126,12 @@ impl Args {
                         "--block-write-profile-csv",
                     )?));
                 }
+                "--block-batch-profile-csv" => {
+                    args.block_batch_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--block-batch-profile-csv",
+                    )?));
+                }
                 "--stream-flush-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-flush-mib")?;
                     args.stream_flush_bytes = Some(mib_to_bytes(mib, "--stream-flush-mib")?);
@@ -123,6 +139,26 @@ impl Args {
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
                     args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
+                }
+                "--block-batch-ops" => {
+                    args.block_batch_ops = Some(parse_next(&mut raw, flag.as_str())?);
+                }
+                "--block-batch-bytes" => {
+                    args.block_batch_bytes = Some(parse_next(&mut raw, flag.as_str())?);
+                }
+                "--block-batch-overlap" => {
+                    args.block_batch_overlap = Some(parse_next(&mut raw, flag.as_str())?);
+                }
+                "--block-batch-fsync-mib" => {
+                    let mib: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.block_batch_fsync_bytes = mib_to_bytes(mib, "--block-batch-fsync-mib")?;
+                }
+                "--block-batch-fsync-ms" => {
+                    let _: u64 = parse_next(&mut raw, flag.as_str())?;
+                }
+                "--block-client-overlay" => {
+                    let value: String = parse_next(&mut raw, flag.as_str())?;
+                    parse_on_off(&value, "--block-client-overlay")?;
                 }
                 "--native-file-batch-ops" => {
                     args.native_file_batch_ops = Some(parse_next(&mut raw, flag.as_str())?);
@@ -234,7 +270,7 @@ options:\n\
                                            default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch, append-stream, block-metadata, native-metadata, native-file-batch\n\
+                                           aliases: north-star, append-batch, append-stream, block-metadata, block-batch, native-metadata, native-file-batch\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-same-shard-contended,\n\
                                            block-write-4k-same-shard-serialized,\n\
@@ -242,6 +278,13 @@ options:\n\
                                            block-write-4k-device-lanes, block-read-4k,\n\
                                            block-write-1m, block-write-1m-shard-lanes,\n\
                                            block-write-1m-device-lanes,\n\
+                                           block-batch-4k-16ops,\n\
+                                           block-batch-4k-256ops,\n\
+                                           block-batch-4k-4096ops,\n\
+                                           block-batch-1m-16ops,\n\
+                                           block-batch-1m-128ops,\n\
+                                           block-batch-overwrite-collapse,\n\
+                                           block-batch-fsync-interval,\n\
                                            native-read-4k,\n\
                                            native-write-4k, native-write-4k-same-file,\n\
                                            native-write-4k-file-lanes, native-write-1m,\n\
@@ -278,8 +321,16 @@ options:\n\
   --durable-profile-csv PATH               append durable persist profiles to CSV\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
+  --block-batch-profile-csv PATH           append block batch commit profiles to CSV\n\
   --stream-flush-mib N                     flush append streams after N MiB per stream; 2-4 is latency-first\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
+  --block-batch-ops N                      override writes per block batch workload\n\
+  --block-batch-bytes N                    override bytes per write inside block batch workloads\n\
+  --block-batch-overlap sequential|random|overwrite-hotset\n\
+                                           block batch offset shape\n\
+  --block-batch-fsync-mib N                block fsync-interval dirty threshold, default: 128\n\
+  --block-batch-fsync-ms N                 accepted for adapter policy simulations; not modeled yet\n\
+  --block-client-overlay on|off            accepted for future read-your-writes adapter tests\n\
   --native-file-batch-ops N                override writes per native file batch workload\n\
   --native-file-batch-bytes N              override bytes per write inside native file batch workloads\n\
   --native-file-batch-overlap sequential|random|overwrite-hotset\n\
@@ -369,6 +420,7 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
             "append-batch" => workloads.extend(Workload::append_batch_suite()),
             "append-stream" => workloads.extend(Workload::append_stream_suite()),
             "block-metadata" => workloads.extend(Workload::block_metadata_suite()),
+            "block-batch" => workloads.extend(Workload::block_batch_suite()),
             "native-metadata" => workloads.extend(Workload::native_metadata_suite()),
             "native-file-batch" => workloads.extend(Workload::native_file_batch_suite()),
             _ => workloads.push(Workload::from_str(part)?),
@@ -376,4 +428,3 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
     }
     Ok(workloads)
 }
-

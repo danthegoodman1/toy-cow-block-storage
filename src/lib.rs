@@ -18,11 +18,11 @@ pub mod provider;
 pub mod sim;
 
 pub use api::{
-    BlockClient, BlockDevice, BlockOperation, BlockRange, BlockRequest, BlockRequestEnvelope,
-    BlockResponse, BlockResponseEnvelope, BlockServer, BlockTransport, ByteRange,
-    CreateDeviceRequest, DeleteResult, DeviceInfo, DeviceSpec, FlushResult, FlushScope,
-    ForkRequest, PayloadIntegrity, ReadResponse, ReadVerification, RestorePoint, WriteCommit,
-    WriteDurability,
+    BlockBatchCommit, BlockBatchWrite, BlockClient, BlockDevice, BlockOperation, BlockRange,
+    BlockRequest, BlockRequestEnvelope, BlockResponse, BlockResponseEnvelope, BlockServer,
+    BlockTransport, ByteRange, CreateDeviceRequest, DeleteResult, DeviceInfo, DeviceSpec,
+    FlushResult, FlushScope, ForkRequest, PayloadIntegrity, ReadResponse, ReadVerification,
+    RestorePoint, WriteCommit, WriteDurability,
 };
 pub use error::{Result, StorageError};
 pub use extent::{

@@ -47,6 +47,13 @@ pub(super) struct CollapsedFileWrite {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CollapsedBlockWrite {
+    offset: u64,
+    bytes: Vec<u8>,
+    payload_integrity: PayloadIntegrity,
+}
+
 impl CollapsedFileWrite {
     fn end(&self) -> Result<u64> {
         self.offset
@@ -54,6 +61,25 @@ impl CollapsedFileWrite {
                 StorageError::invalid_argument("native batch write length overflows u64")
             })?)
             .ok_or_else(|| StorageError::invalid_argument("native batch write range overflows"))
+    }
+}
+
+impl CollapsedBlockWrite {
+    fn byte_range(&self) -> Result<ByteRange> {
+        Ok(ByteRange::new(
+            self.offset,
+            u64::try_from(self.bytes.len()).map_err(|_| {
+                StorageError::invalid_argument("block batch write length overflows u64")
+            })?,
+        ))
+    }
+
+    fn end(&self) -> Result<u64> {
+        self.offset
+            .checked_add(u64::try_from(self.bytes.len()).map_err(|_| {
+                StorageError::invalid_argument("block batch write length overflows u64")
+            })?)
+            .ok_or_else(|| StorageError::invalid_argument("block batch write range overflows"))
     }
 }
 
@@ -539,6 +565,113 @@ pub(super) fn insert_collapsed_file_write(
     Ok(())
 }
 
+pub(super) fn collapse_block_batch_writes(
+    writes: &[BlockBatchWrite],
+    spec: &DeviceSpec,
+    max_batch_bytes: u64,
+) -> Result<Vec<CollapsedBlockWrite>> {
+    if writes.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "block batch must not be empty",
+        ));
+    }
+
+    let mut collapsed = Vec::<CollapsedBlockWrite>::new();
+    let mut total_bytes = 0u64;
+    for write in writes {
+        write.validate_for_device(spec)?;
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
+                StorageError::invalid_argument("block batch byte length overflows u64")
+            })?)
+            .ok_or_else(|| StorageError::invalid_argument("block batch byte length overflows"))?;
+        if total_bytes > max_batch_bytes {
+            return Err(StorageError::invalid_argument(
+                "block batch exceeds maximum payload bytes",
+            ));
+        }
+        insert_collapsed_block_write(
+            &mut collapsed,
+            write.offset,
+            write.bytes.clone(),
+            write.payload_integrity,
+        )?;
+    }
+    if collapsed.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "block batch must contain at least one non-empty write",
+        ));
+    }
+    Ok(collapsed)
+}
+
+fn insert_collapsed_block_write(
+    collapsed: &mut Vec<CollapsedBlockWrite>,
+    offset: u64,
+    bytes: Vec<u8>,
+    payload_integrity: PayloadIntegrity,
+) -> Result<()> {
+    let len = u64::try_from(bytes.len())
+        .map_err(|_| StorageError::invalid_argument("block batch length overflows u64"))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| StorageError::invalid_argument("block batch range overflows"))?;
+    let mut next = Vec::with_capacity(collapsed.len() + 1);
+    for existing in collapsed.drain(..) {
+        let existing_start = existing.offset;
+        let existing_end = existing.end()?;
+        if existing_end <= offset || existing_start >= end {
+            next.push(existing);
+            continue;
+        }
+        if existing_start < offset {
+            let keep_len = usize::try_from(offset - existing_start).map_err(|_| {
+                StorageError::invalid_argument("block batch left split overflows usize")
+            })?;
+            next.push(CollapsedBlockWrite {
+                offset: existing_start,
+                bytes: existing.bytes[..keep_len].to_vec(),
+                payload_integrity: existing.payload_integrity,
+            });
+        }
+        if existing_end > end {
+            let keep_start = usize::try_from(end - existing_start).map_err(|_| {
+                StorageError::invalid_argument("block batch right split overflows usize")
+            })?;
+            next.push(CollapsedBlockWrite {
+                offset: end,
+                bytes: existing.bytes[keep_start..].to_vec(),
+                payload_integrity: existing.payload_integrity,
+            });
+        }
+    }
+    next.push(CollapsedBlockWrite {
+        offset,
+        bytes,
+        payload_integrity,
+    });
+    next.sort_by_key(|write| write.offset);
+    *collapsed = coalesce_adjacent_block_writes(next)?;
+    Ok(())
+}
+
+fn coalesce_adjacent_block_writes(
+    writes: Vec<CollapsedBlockWrite>,
+) -> Result<Vec<CollapsedBlockWrite>> {
+    let mut coalesced: Vec<CollapsedBlockWrite> = Vec::new();
+    for write in writes {
+        if let Some(last) = coalesced.last_mut()
+            && last.payload_integrity == write.payload_integrity
+            && last.end()? == write.offset
+        {
+            last.bytes.extend_from_slice(&write.bytes);
+            continue;
+        }
+        coalesced.push(write);
+    }
+    Ok(coalesced)
+}
+
 pub(super) fn native_batch_segment_groups(
     writes: &[CollapsedFileWrite],
     block_size: u64,
@@ -591,4 +724,3 @@ pub(super) fn overlay_native_batch_writes(
     }
     Ok(())
 }
-

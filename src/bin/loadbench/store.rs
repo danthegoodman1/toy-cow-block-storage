@@ -133,6 +133,21 @@ impl BenchStore {
         .map(|_| ())
     }
 
+    fn commit_block_batch(
+        &self,
+        device_id: DeviceId,
+        writes: &[BlockBatchWrite],
+        durability: WriteDurability,
+    ) -> Result<toy_cow_block_storage::BlockBatchCommit> {
+        match self {
+            Self::Local(store) => store.commit_block_batch(device_id, writes, durability),
+            Self::Durable(store) => store.commit_block_batch(device_id, writes, durability),
+            Self::Txn(_) => Err(StorageError::unsupported(
+                "txn metadata provider does not implement block batch loadbench workloads",
+            )),
+        }
+    }
+
     fn read_device(
         &self,
         device_id: DeviceId,

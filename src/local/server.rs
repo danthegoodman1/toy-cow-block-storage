@@ -121,6 +121,13 @@ impl BlockServer for LocalBlockServer {
                         payload_integrity,
                     )?,
                 )),
+                BlockRequest::CommitBatch {
+                    device_id,
+                    writes,
+                    durability,
+                } => Ok(BlockResponse::BatchCommitted(
+                    self.store.commit_block_batch(device_id, &writes, durability)?,
+                )),
                 BlockRequest::WriteZeroes { device_id, range } => Ok(BlockResponse::Write(
                     self.store
                         .write_zeroes(device_id, range.offset, range.len)?,

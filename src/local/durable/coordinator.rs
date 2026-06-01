@@ -196,7 +196,6 @@ impl DurableCoordinator {
     }
 
     fn persist_until(&self, required: CommitSeq) -> Result<()> {
-        let total_started = Instant::now();
         loop {
             let mut state = lock(&self.persist_coordinator.inner)?;
             state.requested_through = state.requested_through.max(required);
@@ -207,7 +206,7 @@ impl DurableCoordinator {
                 let target_commit = state.requested_through;
                 state.in_flight = true;
                 drop(state);
-                let result = self.persist_physical(total_started, None, Some(target_commit));
+                let result = self.persist_physical(Instant::now(), None, Some(target_commit));
                 let mut state = lock(&self.persist_coordinator.inner)?;
                 state.in_flight = false;
                 state.generation = state.generation.saturating_add(1);
@@ -934,15 +933,50 @@ impl DurableCoordinator {
         durability: crate::api::WriteDurability,
         payload_integrity: PayloadIntegrity,
     ) -> Result<WriteCommit> {
-        let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
-        let admission = self.admit_write(
-            u64::try_from(data.len())
-                .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
-            flushed,
+        let len = u64::try_from(data.len())
+            .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
+        let range = ByteRange::new(offset, len);
+        if data.is_empty() {
+            let commit = self
+                .local
+                .write_device_with_integrity(device_id, offset, data, durability, payload_integrity)?;
+            return Ok(commit);
+        }
+        let commit = self.commit_block_batch(
+            device_id,
+            &[BlockBatchWrite {
+                offset,
+                bytes: data.to_vec(),
+                payload_integrity,
+            }],
+            durability,
         )?;
+        Ok(WriteCommit {
+            device_id: commit.device_id,
+            commit_seq: commit.commit_seq,
+            range,
+            durability: commit.durability,
+        })
+    }
+
+    pub fn commit_block_batch(
+        &self,
+        device_id: DeviceId,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<BlockBatchCommit> {
+        let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
+        let total_bytes = writes.iter().try_fold(0u64, |total, write| {
+            total
+                .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
+                    StorageError::invalid_argument("block batch byte length overflows u64")
+                })?)
+                .ok_or_else(|| StorageError::invalid_argument("block batch byte length overflows"))
+        })?;
+        let admission = self.admit_write(total_bytes, flushed)?;
         let result = self
             .local
-            .write_device_with_integrity(device_id, offset, data, durability, payload_integrity)
+            .commit_block_batch(device_id, writes, durability)
             .and_then(|commit| {
                 if flushed {
                     self.persist_until(commit.commit_seq)?;

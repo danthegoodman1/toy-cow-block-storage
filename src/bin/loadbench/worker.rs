@@ -23,6 +23,12 @@ fn execute_load(
         } else {
             None
         },
+        block_batch: if workload.is_block_batch() {
+            Some(workload.block_batch_spec(args)?)
+        } else {
+            None
+        },
+        block_batch_profiles_enabled: args.block_batch_profile_csv.is_some(),
         payload_integrity: args.payload_integrity,
         read_verification: args.read_verification,
     };
@@ -62,6 +68,8 @@ struct WorkerConfig {
     stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
     native_file_batch: Option<NativeFileBatchSpec>,
+    block_batch: Option<BlockBatchSpec>,
+    block_batch_profiles_enabled: bool,
     payload_integrity: PayloadIntegrity,
     read_verification: ReadVerification,
 }
@@ -107,8 +115,7 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
         report.record(
             latency_nanos,
             context.op_size as u64,
-            progress.durable_bytes,
-            progress.published_bytes,
+            progress,
             result.is_ok(),
             &mut rng,
         );
@@ -120,6 +127,7 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
 #[derive(Default)]
 struct WorkerState {
     stream_append: Option<StreamAppendState>,
+    block_batch_op: u64,
     next_stream_file_index: Option<usize>,
     native_file_op: u64,
     last_native_file_index: Option<usize>,
@@ -239,12 +247,16 @@ fn prepare_for_timed_op(
 struct OpProgress {
     durable_bytes: u64,
     published_bytes: u64,
+    block_batch_profile: Option<BlockBatchOpProfile>,
 }
 
 impl OpProgress {
     fn merge(&mut self, other: Self) {
         self.durable_bytes = self.durable_bytes.saturating_add(other.durable_bytes);
         self.published_bytes = self.published_bytes.saturating_add(other.published_bytes);
+        if self.block_batch_profile.is_none() {
+            self.block_batch_profile = other.block_batch_profile;
+        }
     }
 }
 
@@ -327,6 +339,122 @@ fn build_native_file_batch_writes(
             offset,
             payload[payload_start..payload_end].to_vec(),
         ));
+    }
+    Ok(writes)
+}
+
+fn block_batch_lane(
+    worker: u64,
+    concurrency: usize,
+    logical_blocks: u64,
+    batch_blocks: u64,
+) -> (u64, u64) {
+    let max_lanes = logical_blocks.checked_div(batch_blocks.max(1)).unwrap_or(0);
+    let lane_count = (concurrency as u64).min(max_lanes).max(1);
+    let lane = worker % lane_count;
+    let start = logical_blocks.saturating_mul(lane) / lane_count;
+    let end = logical_blocks.saturating_mul(lane + 1) / lane_count;
+    (start, end.max(start.saturating_add(batch_blocks)))
+}
+
+struct BlockBatchBuild<'a> {
+    spec: BlockBatchSpec,
+    worker: u64,
+    concurrency: usize,
+    logical_blocks: u64,
+    op_index: u64,
+    payload: &'a [u8],
+    payload_integrity: PayloadIntegrity,
+}
+
+fn build_block_batch_writes(
+    input: BlockBatchBuild<'_>,
+    rng: &mut Lcg,
+) -> Result<Vec<BlockBatchWrite>> {
+    let BlockBatchBuild {
+        spec,
+        worker,
+        concurrency,
+        logical_blocks,
+        op_index,
+        payload,
+        payload_integrity,
+    } = input;
+    let batch_bytes = spec.ops.checked_mul(spec.write_bytes).ok_or_else(|| {
+        StorageError::invalid_argument("block batch payload size overflows usize")
+    })?;
+    if batch_bytes > payload.len() {
+        return Err(StorageError::invalid_argument(
+            "block batch payload is smaller than requested writes",
+        ));
+    }
+    let write_blocks = (u64::try_from(spec.write_bytes)
+        .map_err(|_| StorageError::invalid_argument("block batch write bytes overflow u64"))?
+        / u64::from(BLOCK_SIZE))
+    .max(1);
+    let batch_blocks = u64::try_from(spec.ops)
+        .map_err(|_| StorageError::invalid_argument("block batch op count overflow u64"))?
+        .checked_mul(write_blocks)
+        .ok_or_else(|| StorageError::invalid_argument("block batch block count overflows"))?;
+    if batch_blocks > logical_blocks {
+        return Err(StorageError::invalid_argument(
+            "block batch exceeds logical device size",
+        ));
+    }
+    let (lane_start, lane_end) = block_batch_lane(worker, concurrency, logical_blocks, batch_blocks);
+    let lane_span = lane_end.saturating_sub(lane_start).min(logical_blocks - lane_start);
+    let usable_blocks = lane_span.saturating_sub(batch_blocks);
+    let step_blocks = write_blocks.max(1);
+    let slots = usable_blocks
+        .checked_div(step_blocks)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let start_block = lane_start
+        + op_index
+            .wrapping_mul(batch_blocks)
+            .checked_div(step_blocks)
+            .unwrap_or(0)
+            .wrapping_rem(slots.max(1))
+            .saturating_mul(step_blocks);
+
+    let mut writes = Vec::with_capacity(spec.ops);
+    for index in 0..spec.ops {
+        let payload_start = index
+            .checked_mul(spec.write_bytes)
+            .ok_or_else(|| StorageError::invalid_argument("block batch payload offset overflows"))?;
+        let payload_end = payload_start
+            .checked_add(spec.write_bytes)
+            .ok_or_else(|| StorageError::invalid_argument("block batch payload end overflows"))?;
+        let write_block = match spec.overlap {
+            BlockBatchOverlap::Sequential => start_block
+                .checked_add(
+                    u64::try_from(index)
+                        .map_err(|_| StorageError::invalid_argument("block batch index overflow"))?
+                        .saturating_mul(write_blocks),
+                )
+                .ok_or_else(|| StorageError::invalid_argument("block batch offset overflows"))?,
+            BlockBatchOverlap::OverwriteHotset => start_block,
+            BlockBatchOverlap::Random if op_index == 0 => start_block
+                .checked_add(
+                    u64::try_from(index)
+                        .map_err(|_| StorageError::invalid_argument("block batch index overflow"))?
+                        .saturating_mul(write_blocks),
+                )
+                .ok_or_else(|| StorageError::invalid_argument("block batch offset overflows"))?,
+            BlockBatchOverlap::Random => {
+                let slot = rng.below(spec.ops as u64);
+                start_block
+                    .checked_add(slot.saturating_mul(write_blocks))
+                    .ok_or_else(|| StorageError::invalid_argument("block batch offset overflows"))?
+            }
+        };
+        writes.push(BlockBatchWrite {
+            offset: write_block
+                .checked_mul(u64::from(BLOCK_SIZE))
+                .ok_or_else(|| StorageError::invalid_argument("block batch byte offset overflows"))?,
+            bytes: payload[payload_start..payload_end].to_vec(),
+            payload_integrity,
+        });
     }
     Ok(writes)
 }
@@ -564,6 +692,48 @@ fn run_one_op(
                     config.read_verification,
                 )
                 .map(|_| OpProgress::default())
+        }
+        (
+            Target::Block {
+                device_id,
+                logical_blocks,
+                ..
+            },
+            workload,
+        ) if workload.is_block_batch() => {
+            let spec = config
+                .block_batch
+                .ok_or_else(|| StorageError::corrupt("missing block batch spec"))?;
+            let op_index = state.block_batch_op;
+            state.block_batch_op = state.block_batch_op.saturating_add(1);
+            let writes = build_block_batch_writes(
+                BlockBatchBuild {
+                    spec,
+                    worker,
+                    concurrency,
+                    logical_blocks: *logical_blocks,
+                    op_index,
+                    payload: context.payload.as_ref(),
+                    payload_integrity: config.payload_integrity,
+                },
+                rng,
+            )?;
+            let started = config.block_batch_profiles_enabled.then(Instant::now);
+            let commit = context
+                .store
+                .commit_block_batch(*device_id, &writes, durability)?;
+            let block_batch_profile = started.map(|started| BlockBatchOpProfile {
+                total_nanos: started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                batch_operation_count: commit.write_count,
+                collapsed_range_count: commit.collapsed_range_count,
+                requested_bytes: context.op_size as u64,
+                committed_bytes: commit.committed_bytes,
+            });
+            Ok(OpProgress {
+                durable_bytes: 0,
+                published_bytes: commit.committed_bytes,
+                block_batch_profile,
+            })
         }
         (Target::Native { keyspace_id, files }, Workload::NativeWrite4kSameFile) => {
             let file_id = files[0];
@@ -851,6 +1021,7 @@ fn maybe_flush(
                 return Ok(OpProgress {
                     durable_bytes: durable_through.saturating_sub(previous_durable),
                     published_bytes: 0,
+                    block_batch_profile: None,
                 });
             }
             Ok(OpProgress::default())

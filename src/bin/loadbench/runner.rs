@@ -24,9 +24,6 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
         let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
     }
     let mut report = execute_load(args, workload, concurrency, context, args.duration)?;
-    append_profile_csv(args, workload, concurrency, &profile_store)?;
-    append_metadata_profile_csv(args, workload, concurrency, &profile_store)?;
-    append_block_write_profile_csv(args, workload, concurrency, &profile_store)?;
     report.provider = args.provider;
     report.durability = args.durability;
     report.workload = workload;
@@ -34,6 +31,10 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     report.rtt_us = args.rtt.as_micros();
     report.serial_rtts = args.serial_rtts;
     report.op_size = workload.op_size(args)?;
+    append_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_metadata_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_block_write_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_block_batch_profile_csv(args, &report)?;
 
     if matches!(args.provider, ProviderKind::Durable) {
         let _ = fs::remove_dir_all(&root);

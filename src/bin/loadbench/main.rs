@@ -14,7 +14,7 @@ use toy_cow_block_storage::provider::{
     MetadataPlane,
 };
 use toy_cow_block_storage::{
-    AppendStream, AppendTicket, ByteRange, CreateDeviceRequest, CreateFileRequest,
+    AppendStream, AppendTicket, BlockBatchWrite, ByteRange, CreateDeviceRequest, CreateFileRequest,
     CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableAppendMark, DurableCoordinator,
     DurableDataLogPolicy, DurablePersistProfile, FileBatchWrite, FileId, FileSpec, FlushResult,
     KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile,

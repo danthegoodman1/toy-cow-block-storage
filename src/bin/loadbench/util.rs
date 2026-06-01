@@ -98,6 +98,18 @@ mod tests {
     }
 
     #[test]
+    fn block_batch_suite_names_commit_boundary_shapes() {
+        let suite = parse_workloads("block-batch").unwrap();
+        assert!(suite.contains(&Workload::BlockBatch4k16Ops));
+        assert!(suite.contains(&Workload::BlockBatch4k256Ops));
+        assert!(suite.contains(&Workload::BlockBatch4k4096Ops));
+        assert!(suite.contains(&Workload::BlockBatch1m16Ops));
+        assert!(suite.contains(&Workload::BlockBatch1m128Ops));
+        assert!(suite.contains(&Workload::BlockBatchOverwriteCollapse));
+        assert!(suite.contains(&Workload::BlockBatchFsyncInterval));
+    }
+
+    #[test]
     fn integrity_flags_parse_explicit_modes() {
         assert_eq!(
             parse_payload_integrity("unchecked").unwrap(),
@@ -117,8 +129,28 @@ mod tests {
         let mut second = WorkerReport::new(8);
         let mut rng = Lcg::new(1);
 
-        first.record(10, 100, 64, 32, true, &mut rng);
-        second.record(20, 200, 128, 96, true, &mut rng);
+        first.record(
+            10,
+            100,
+            OpProgress {
+                durable_bytes: 64,
+                published_bytes: 32,
+                block_batch_profile: None,
+            },
+            true,
+            &mut rng,
+        );
+        second.record(
+            20,
+            200,
+            OpProgress {
+                durable_bytes: 128,
+                published_bytes: 96,
+                block_batch_profile: None,
+            },
+            true,
+            &mut rng,
+        );
 
         let report = BenchReport::from_workers(Duration::from_secs(1), vec![first, second]);
         assert_eq!(report.bytes, 300);

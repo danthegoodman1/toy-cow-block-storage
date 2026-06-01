@@ -28,6 +28,35 @@ struct NativeFileBatchSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockBatchOverlap {
+    Sequential,
+    Random,
+    OverwriteHotset,
+}
+
+impl FromStr for BlockBatchOverlap {
+    type Err = StorageError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "sequential" => Ok(Self::Sequential),
+            "random" => Ok(Self::Random),
+            "overwrite-hotset" => Ok(Self::OverwriteHotset),
+            _ => Err(StorageError::invalid_argument(format!(
+                "unknown block batch overlap mode {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockBatchSpec {
+    ops: usize,
+    write_bytes: usize,
+    overlap: BlockBatchOverlap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderKind {
     Local,
     Durable,
@@ -148,6 +177,13 @@ enum Workload {
     BlockWrite1m,
     BlockWrite1mShardLanes,
     BlockWrite1mDeviceLanes,
+    BlockBatch4k16Ops,
+    BlockBatch4k256Ops,
+    BlockBatch4k4096Ops,
+    BlockBatch1m16Ops,
+    BlockBatch1m128Ops,
+    BlockBatchOverwriteCollapse,
+    BlockBatchFsyncInterval,
     NativeRead4k,
     NativeWrite4k,
     NativeWrite4kSameFile,
@@ -233,6 +269,20 @@ impl Workload {
         ]
     }
 
+    fn block_batch_suite() -> Vec<Self> {
+        vec![
+            Self::BlockWrite4kShardLanes,
+            Self::BlockWrite1mShardLanes,
+            Self::BlockBatch4k16Ops,
+            Self::BlockBatch4k256Ops,
+            Self::BlockBatch4k4096Ops,
+            Self::BlockBatch1m16Ops,
+            Self::BlockBatch1m128Ops,
+            Self::BlockBatchOverwriteCollapse,
+            Self::BlockBatchFsyncInterval,
+        ]
+    }
+
     fn native_metadata_suite() -> Vec<Self> {
         vec![
             Self::NativeWrite4kSameFile,
@@ -268,6 +318,13 @@ impl Workload {
             Self::BlockWrite1m => "block-write-1m",
             Self::BlockWrite1mShardLanes => "block-write-1m-shard-lanes",
             Self::BlockWrite1mDeviceLanes => "block-write-1m-device-lanes",
+            Self::BlockBatch4k16Ops => "block-batch-4k-16ops",
+            Self::BlockBatch4k256Ops => "block-batch-4k-256ops",
+            Self::BlockBatch4k4096Ops => "block-batch-4k-4096ops",
+            Self::BlockBatch1m16Ops => "block-batch-1m-16ops",
+            Self::BlockBatch1m128Ops => "block-batch-1m-128ops",
+            Self::BlockBatchOverwriteCollapse => "block-batch-overwrite-collapse",
+            Self::BlockBatchFsyncInterval => "block-batch-fsync-interval",
             Self::NativeRead4k => "native-read-4k",
             Self::NativeWrite4k => "native-write-4k",
             Self::NativeWrite4kSameFile => "native-write-4k-same-file",
@@ -300,6 +357,12 @@ impl Workload {
     }
 
     fn op_size(self, args: &Args) -> Result<usize> {
+        if self.is_block_batch() {
+            let spec = self.block_batch_spec(args)?;
+            return spec.ops.checked_mul(spec.write_bytes).ok_or_else(|| {
+                StorageError::invalid_argument("block batch op size overflows usize")
+            });
+        }
         if self.is_native_file_batch() {
             let spec = self.native_file_batch_spec(args)?;
             return spec.ops.checked_mul(spec.write_bytes).ok_or_else(|| {
@@ -343,7 +406,14 @@ impl Workload {
             | Self::NativeFileBatch4k4096Ops
             | Self::NativeFileBatch1m16Ops
             | Self::NativeFileBatchOverwriteCollapse
-            | Self::NativeFileBatchFsyncInterval => unreachable!(),
+            | Self::NativeFileBatchFsyncInterval
+            | Self::BlockBatch4k16Ops
+            | Self::BlockBatch4k256Ops
+            | Self::BlockBatch4k4096Ops
+            | Self::BlockBatch1m16Ops
+            | Self::BlockBatch1m128Ops
+            | Self::BlockBatchOverwriteCollapse
+            | Self::BlockBatchFsyncInterval => unreachable!(),
         })
     }
 
@@ -373,6 +443,66 @@ impl Workload {
                 | Self::NativeFileBatchOverwriteCollapse
                 | Self::NativeFileBatchFsyncInterval
         )
+    }
+
+    fn is_block_batch(self) -> bool {
+        matches!(
+            self,
+            Self::BlockBatch4k16Ops
+                | Self::BlockBatch4k256Ops
+                | Self::BlockBatch4k4096Ops
+                | Self::BlockBatch1m16Ops
+                | Self::BlockBatch1m128Ops
+                | Self::BlockBatchOverwriteCollapse
+                | Self::BlockBatchFsyncInterval
+        )
+    }
+
+    fn block_batch_spec(self, args: &Args) -> Result<BlockBatchSpec> {
+        let (ops, write_bytes, overlap) = match self {
+            Self::BlockBatch4k16Ops => (16, 4096, BlockBatchOverlap::Sequential),
+            Self::BlockBatch4k256Ops => (256, 4096, BlockBatchOverlap::Sequential),
+            Self::BlockBatch4k4096Ops => (4096, 4096, BlockBatchOverlap::Sequential),
+            Self::BlockBatch1m16Ops => (16, 1024 * 1024, BlockBatchOverlap::Sequential),
+            Self::BlockBatch1m128Ops => (128, 1024 * 1024, BlockBatchOverlap::Sequential),
+            Self::BlockBatchOverwriteCollapse => (256, 4096, BlockBatchOverlap::OverwriteHotset),
+            Self::BlockBatchFsyncInterval => {
+                let write_bytes = 4096usize;
+                let fsync_bytes = usize::try_from(args.block_batch_fsync_bytes).map_err(|_| {
+                    StorageError::invalid_argument("block batch fsync bytes overflow usize")
+                })?;
+                (
+                    (fsync_bytes / write_bytes).max(1),
+                    write_bytes,
+                    BlockBatchOverlap::Sequential,
+                )
+            }
+            _ => {
+                return Err(StorageError::invalid_argument(
+                    "workload is not a block batch workload",
+                ));
+            }
+        };
+        let ops = args.block_batch_ops.unwrap_or(ops);
+        let write_bytes = args.block_batch_bytes.unwrap_or(write_bytes);
+        if ops == 0 || write_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "block batch ops and bytes must be greater than zero",
+            ));
+        }
+        let write_bytes_u64 = u64::try_from(write_bytes).map_err(|_| {
+            StorageError::invalid_argument("block batch write bytes overflow u64")
+        })?;
+        if write_bytes_u64 % u64::from(BLOCK_SIZE) != 0 {
+            return Err(StorageError::invalid_argument(
+                "block batch write bytes must be block aligned",
+            ));
+        }
+        Ok(BlockBatchSpec {
+            ops,
+            write_bytes,
+            overlap: args.block_batch_overlap.unwrap_or(overlap),
+        })
     }
 
     fn native_file_batch_spec(self, args: &Args) -> Result<NativeFileBatchSpec> {
@@ -480,6 +610,13 @@ impl Workload {
                 | Self::BlockWrite1m
                 | Self::BlockWrite1mShardLanes
                 | Self::BlockWrite1mDeviceLanes
+                | Self::BlockBatch4k16Ops
+                | Self::BlockBatch4k256Ops
+                | Self::BlockBatch4k4096Ops
+                | Self::BlockBatch1m16Ops
+                | Self::BlockBatch1m128Ops
+                | Self::BlockBatchOverwriteCollapse
+                | Self::BlockBatchFsyncInterval
         )
     }
 
@@ -505,6 +642,13 @@ impl FromStr for Workload {
             "block-write-1m" => Ok(Self::BlockWrite1m),
             "block-write-1m-shard-lanes" => Ok(Self::BlockWrite1mShardLanes),
             "block-write-1m-device-lanes" => Ok(Self::BlockWrite1mDeviceLanes),
+            "block-batch-4k-16ops" => Ok(Self::BlockBatch4k16Ops),
+            "block-batch-4k-256ops" => Ok(Self::BlockBatch4k256Ops),
+            "block-batch-4k-4096ops" => Ok(Self::BlockBatch4k4096Ops),
+            "block-batch-1m-16ops" => Ok(Self::BlockBatch1m16Ops),
+            "block-batch-1m-128ops" => Ok(Self::BlockBatch1m128Ops),
+            "block-batch-overwrite-collapse" => Ok(Self::BlockBatchOverwriteCollapse),
+            "block-batch-fsync-interval" => Ok(Self::BlockBatchFsyncInterval),
             "native-read-4k" => Ok(Self::NativeRead4k),
             "native-write-4k" => Ok(Self::NativeWrite4k),
             "native-write-4k-same-file" => Ok(Self::NativeWrite4kSameFile),
@@ -539,4 +683,3 @@ impl FromStr for Workload {
         }
     }
 }
-

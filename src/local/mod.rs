@@ -20,10 +20,11 @@ use std::time::Instant;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::api::{
-    BlockClient, BlockDevice, BlockRequest, BlockRequestEnvelope, BlockResponse,
-    BlockResponseEnvelope, BlockServer, BlockTransport, ByteRange, CreateDeviceRequest,
-    DeleteResult, DeviceInfo, FlushResult, FlushScope, ForkRequest, PayloadIntegrity, ReadResponse,
-    ReadVerification, RestorePoint, WriteCommit, WriteDurability,
+    BlockBatchCommit, BlockBatchWrite, BlockClient, BlockDevice, BlockRange, BlockRequest,
+    BlockRequestEnvelope, BlockResponse, BlockResponseEnvelope, BlockServer, BlockTransport,
+    ByteRange, CreateDeviceRequest, DeleteResult, DeviceInfo, DeviceSpec, FlushResult, FlushScope,
+    ForkRequest, PayloadIntegrity, ReadResponse, ReadVerification, RestorePoint, WriteCommit,
+    WriteDurability,
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
@@ -107,4 +108,5 @@ const LOCAL_GRANT_EPOCH: GrantEpoch = GrantEpoch::from_raw(1);
 const LOCAL_GRANT_EXPIRATION: LogicalDeadline = LogicalDeadline::from_raw(u64::MAX);
 const LOCAL_STORAGE_NODE_INCARNATION: ServerIncarnation = ServerIncarnation::from_raw(1);
 const DEFAULT_OBSERVABILITY_EVENT_CAPACITY: usize = 1024;
+const DEFAULT_BLOCK_BATCH_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_NATIVE_FILE_BATCH_MAX_BYTES: u64 = 32 * 1024 * 1024;

@@ -135,21 +135,47 @@ impl BlockDevice for LocalBlockDevice {
         data: &[u8],
         payload_integrity: PayloadIntegrity,
     ) -> Result<WriteCommit> {
+        let range = ByteRange::new(
+            offset,
+            u64::try_from(data.len())
+                .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?,
+        );
+        if data.is_empty() {
+            let info = self.info()?;
+            return Ok(WriteCommit {
+                device_id: self.device_id,
+                commit_seq: info.latest_commit,
+                range,
+                durability: crate::api::WriteDurability::Acknowledged,
+            });
+        }
+        let commit = self.commit_batch(&[BlockBatchWrite {
+            offset,
+            bytes: data.to_vec(),
+            payload_integrity,
+        }])?;
+        Ok(WriteCommit {
+            device_id: commit.device_id,
+            commit_seq: commit.commit_seq,
+            range,
+            durability: commit.durability,
+        })
+    }
+
+    fn commit_batch(&self, writes: &[BlockBatchWrite]) -> Result<BlockBatchCommit> {
         let response = self.transport.call(BlockRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            BlockRequest::Write {
+            BlockRequest::CommitBatch {
                 device_id: self.device_id,
-                offset,
-                bytes: data.to_vec(),
-                payload_integrity,
                 durability: crate::api::WriteDurability::Acknowledged,
+                writes: writes.to_vec(),
             },
         ))?;
         match response.response {
-            BlockResponse::Write(commit) => Ok(commit),
-            _ => Err(StorageError::corrupt("unexpected block-write response")),
+            BlockResponse::BatchCommitted(commit) => Ok(commit),
+            _ => Err(StorageError::corrupt("unexpected block-batch response")),
         }
     }
 
