@@ -715,19 +715,15 @@ impl LocalCoordinator {
         }
 
         let metadata = lock(&self.metadata.inner)?;
-        let append_stream_export = if let Some(stream) = append_stream {
+        if let Some(stream) = append_stream {
             let stream_state = metadata
                 .append_streams
                 .get(&stream.stream_id)
                 .ok_or_else(|| StorageError::conflict("stale append stream"))?;
             stream_state.validate_token(stream)?;
-            Some(stream_state.durable_export_at(stream_state.durable_through)?)
-        } else {
-            if !metadata.append_streams.is_empty() {
-                return Ok(None);
-            }
-            None
-        };
+        } else if !metadata.append_streams.is_empty() {
+            return Ok(None);
+        }
         if previous.next_gc_epoch != metadata.next_gc_epoch {
             return Ok(None);
         }
@@ -847,6 +843,28 @@ impl LocalCoordinator {
             .iter()
             .map(|commit| (commit.keyspace_id, commit.file_id))
             .collect();
+        let mut published_sizes_by_file: BTreeMap<(KeyspaceId, FileId), BTreeSet<u64>> =
+            BTreeMap::new();
+        for commit in &file_commits {
+            published_sizes_by_file
+                .entry((commit.keyspace_id, commit.file_id))
+                .or_default()
+                .insert(commit.new_size);
+        }
+        let append_streams = if append_stream.is_some() {
+            metadata
+                .append_streams
+                .values()
+                .filter(|stream| {
+                    published_sizes_by_file
+                        .get(&(stream.keyspace_id, stream.file_id))
+                        .is_some_and(|sizes| sizes.contains(&stream.published_through))
+                })
+                .map(|stream| stream.durable_export_at(stream.durable_through))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         for key in &touched_files {
             if let Some(epoch) = metadata.file_writer_epochs.get(key).copied() {
                 file_writer_epochs.push((*key, epoch));
@@ -896,7 +914,7 @@ impl LocalCoordinator {
             keyspace_roots,
             keyspace_catalog_shards,
             file_writer_epochs,
-            append_streams: append_stream_export.into_iter().collect(),
+            append_streams,
             metadata_nodes,
             referenced_segment_ids,
             commit_groups,

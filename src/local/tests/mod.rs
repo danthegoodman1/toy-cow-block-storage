@@ -3536,6 +3536,73 @@ fn durable_append_stream_publish_delta_is_target_bounded() {
 }
 
 #[test]
+fn durable_append_stream_publish_delta_does_not_wait_for_data_log_persist_lock() {
+    let root = durable_temp_dir("stream-publish-bypasses-data-log-lock");
+    let cfg = config();
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 65);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    let mark = store.flush_append_stream(&stream).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+
+    let persist_guard = lock(&store.persist_lock).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let store = Arc::clone(&store);
+        let stream = stream.clone();
+        let mark = mark.clone();
+        thread::spawn(move || {
+            let result = store.publish_append_stream(&stream, &mark);
+            tx.send(result.map(|_| ())).unwrap();
+        })
+    };
+
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("append-stream publish should not wait for the data-log persist lock")
+        .unwrap();
+    drop(persist_guard);
+    worker.join().unwrap();
+
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].new_segment_bytes, 0);
+    assert_eq!(profiles[0].data_log_append_sync_nanos, 0);
+    assert_eq!(profiles[0].lock_wait_nanos, 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_concurrent_append_stream_publish_persists_to_requested_high_water() {
     let root = durable_temp_dir("stream-publish-requested-high-water");
     let cfg = config();
@@ -3591,7 +3658,9 @@ fn durable_concurrent_append_stream_publish_persists_to_requested_high_water() {
     assert!(commit_b.commit_seq > commit_a.commit_seq);
 
     store.enable_persist_profiling(16).unwrap();
-    let persist_guard = lock(&store.persist_lock).unwrap();
+    store
+        .set_persist_delay_for_test(Some(Duration::from_millis(20)))
+        .unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(3));
     let first = {
         let store = Arc::clone(&store);
@@ -3620,10 +3689,9 @@ fn durable_concurrent_append_stream_publish_persists_to_requested_high_water() {
         })
     };
     barrier.wait();
-    thread::sleep(Duration::from_millis(20));
-    drop(persist_guard);
     first.join().unwrap().unwrap();
     second.join().unwrap().unwrap();
+    store.set_persist_delay_for_test(None).unwrap();
 
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert_eq!(

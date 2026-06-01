@@ -627,27 +627,22 @@ impl DurableCoordinator {
         changed_segments: &BTreeSet<SegmentId>,
         total_started: Instant,
     ) -> Result<CommitSeq> {
-        let _persist_guard = lock(&self.persist_lock)?;
-        let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
         let target_commit = lock(&self.persist_coordinator.inner)?
             .requested_through
             .max(minimum_target);
 
         let snapshot_started = Instant::now();
         let Some(previous_cursor) = self.durable.export_cursor()? else {
-            drop(_persist_guard);
             return self.persist_physical(total_started, None, Some(target_commit));
         };
         let pending_append = lock(&self.pending_data_log_append)?.clone();
         if !pending_append.is_empty() {
-            drop(_persist_guard);
             return self.persist_physical(total_started, None, Some(target_commit));
         }
         let Some(delta) = self
             .local
             .native_append_publish_delta_through(stream, target_commit, &previous_cursor)?
         else {
-            drop(_persist_guard);
             return self.persist_physical(total_started, None, Some(target_commit));
         };
         let previous_segments = lock(&self.persisted_segments)?.clone();
@@ -656,7 +651,6 @@ impl DurableCoordinator {
             .iter()
             .any(|segment_id| !previous_segments.contains(segment_id))
         {
-            drop(_persist_guard);
             return self.persist_physical(total_started, None, Some(target_commit));
         }
         let mut changed_segments = changed_segments.clone();
@@ -679,7 +673,7 @@ impl DurableCoordinator {
             ));
         }
 
-        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.lock_wait_nanos = 0;
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.attach_metadata_publish_profile(&mut profile)?;
