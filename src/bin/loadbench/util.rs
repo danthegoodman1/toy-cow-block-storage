@@ -126,6 +126,25 @@ mod tests {
     }
 
     #[test]
+    fn prestaged_block_writeback_suite_names_fsync_only_shapes() {
+        let suite = parse_workloads("block-writeback-prestaged").unwrap();
+        assert_eq!(
+            suite,
+            vec![
+                Workload::BlockWritebackPrestagedFsync1m,
+                Workload::BlockWritebackPrestagedFsync2m,
+                Workload::BlockWritebackPrestagedFsync4m,
+                Workload::BlockWritebackPrestagedFsync16m,
+            ]
+        );
+        assert!(Workload::BlockWritebackPrestagedFsync1m.is_block_writeback_prestaged());
+        assert_eq!(
+            Workload::from_str("block-writeback-prestaged-fsync-1m").unwrap(),
+            Workload::BlockWritebackPrestagedFsync1m
+        );
+    }
+
+    #[test]
     fn block_writeback_state_stages_fsync_writes_without_claiming_local_iops() {
         let mut state = BlockWritebackState::default();
         state
@@ -139,6 +158,7 @@ mod tests {
         assert_eq!(state.writes.len(), 2);
         assert_eq!(state.writes[0].offset, 0);
         assert_eq!(state.writes[1].offset, 4096);
+        assert!(state.staged_commit.is_none());
     }
 
     #[test]

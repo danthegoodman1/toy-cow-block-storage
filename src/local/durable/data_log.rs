@@ -17,6 +17,27 @@ impl PendingDataLogAppend {
             .collect()
     }
 
+    fn placement_count(&self) -> u64 {
+        usize_to_u64(self.placements.len())
+    }
+
+    fn placement_payload_bytes(&self) -> u64 {
+        self.placements
+            .iter()
+            .map(|placement| placement.payload_bytes)
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    fn storage_node_count(&self) -> u64 {
+        usize_to_u64(
+            self.log_refs()
+                .iter()
+                .map(|log_ref| log_ref.storage_node)
+                .collect::<BTreeSet<_>>()
+                .len(),
+        )
+    }
+
     fn selected_log_refs(&self, selected: &BTreeSet<DurableDataLogRef>) -> Self {
         let logs = self
             .logs
@@ -96,6 +117,28 @@ impl PendingDataLogAppend {
     fn retain_current_placements(&mut self, current_segments: &BTreeSet<SegmentId>) {
         self.placements
             .retain(|placement| current_segments.contains(&placement.segment_id));
+        self.prune_unreferenced_logs();
+    }
+
+    fn remove_segments(&mut self, segment_ids: &BTreeSet<SegmentId>) {
+        self.placements
+            .retain(|placement| !segment_ids.contains(&placement.segment_id));
+        self.prune_unreferenced_logs();
+    }
+
+    fn prune_unreferenced_logs(&mut self) {
+        let retained_refs: BTreeSet<_> = self
+            .placements
+            .iter()
+            .map(|placement| DurableDataLogRef {
+                storage_node: placement.storage_node,
+                log_id: placement.data_log_id,
+            })
+            .collect();
+        self.logs
+            .retain(|log_ref, _| retained_refs.contains(log_ref));
+        self.sealed_logs
+            .retain(|log_ref| retained_refs.contains(log_ref));
     }
 
     fn merge(&mut self, other: PendingDataLogAppend) {
@@ -106,6 +149,7 @@ impl PendingDataLogAppend {
                 .and_modify(|existing| {
                     existing.total_bytes = existing.total_bytes.max(manifest.total_bytes);
                     existing.state = manifest.state.clone();
+                    existing.needs_dir_sync |= manifest.needs_dir_sync;
                 })
                 .or_insert(manifest);
         }
@@ -123,6 +167,7 @@ pub(super) struct PendingDataLogManifest {
     log_id: u64,
     state: String,
     total_bytes: u64,
+    needs_dir_sync: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

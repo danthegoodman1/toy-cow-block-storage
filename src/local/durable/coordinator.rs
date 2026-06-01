@@ -7,6 +7,8 @@ pub struct DurableCoordinator {
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     pending_block_deltas: Arc<Mutex<Vec<BlockDeltaCommit>>>,
     pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
+    block_delta_staging_lock: Arc<Mutex<()>>,
+    block_delta_prestage: Arc<BlockDeltaPrestageTracker>,
     pending_stream_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<Mutex<()>>>>>,
     persist_lock: Arc<Mutex<()>>,
@@ -106,6 +108,8 @@ impl DurableCoordinator {
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             pending_block_deltas: Arc::new(Mutex::new(Vec::new())),
             pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
+            block_delta_staging_lock: Arc::new(Mutex::new(())),
+            block_delta_prestage: Arc::new(BlockDeltaPrestageTracker::new()),
             pending_stream_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_lock: Arc::new(Mutex::new(())),
@@ -210,6 +214,81 @@ impl DurableCoordinator {
         Ok(())
     }
 
+    fn begin_block_delta_prestage(&self, commit_seq: CommitSeq) -> Result<()> {
+        let mut state = lock(&self.block_delta_prestage.inner)?;
+        state.in_flight.insert(commit_seq);
+        state.failed.remove(&commit_seq);
+        Ok(())
+    }
+
+    fn finish_block_delta_prestage(&self, commit_seq: CommitSeq, result: Result<()>) -> Result<()> {
+        let mut state = lock(&self.block_delta_prestage.inner)?;
+        state.in_flight.remove(&commit_seq);
+        match result {
+            Ok(()) => {
+                state.failed.remove(&commit_seq);
+            }
+            Err(_) => {
+                state.failed.insert(commit_seq);
+            }
+        }
+        self.block_delta_prestage.cvar.notify_all();
+        Ok(())
+    }
+
+    fn wait_for_block_delta_prestage(&self, deltas: &[BlockDeltaCommit]) -> Result<u64> {
+        let selected: BTreeSet<_> = deltas.iter().map(|delta| delta.commit_seq).collect();
+        if selected.is_empty() {
+            return Ok(0);
+        }
+        let started = Instant::now();
+        let mut state = lock(&self.block_delta_prestage.inner)?;
+        while selected
+            .iter()
+            .any(|commit_seq| state.in_flight.contains(commit_seq))
+        {
+            state = wait_on_cvar(&self.block_delta_prestage.cvar, state)?;
+        }
+        Ok(duration_nanos_u64(started.elapsed()))
+    }
+
+    fn wait_for_all_block_delta_prestage(&self) -> Result<u64> {
+        let started = Instant::now();
+        let mut state = lock(&self.block_delta_prestage.inner)?;
+        while !state.in_flight.is_empty() {
+            state = wait_on_cvar(&self.block_delta_prestage.cvar, state)?;
+        }
+        Ok(duration_nanos_u64(started.elapsed()))
+    }
+
+    fn prune_block_delta_prestage_through(&self, durable_through: CommitSeq) -> Result<()> {
+        lock(&self.block_delta_prestage.inner)?
+            .failed
+            .retain(|commit_seq| commit_seq.raw() > durable_through.raw());
+        Ok(())
+    }
+
+    fn prestage_block_delta_segments(&self, delta: &BlockDeltaCommit) -> Result<()> {
+        let segment_ids = delta.segment_ids();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let pending_base = lock(&self.pending_data_log_append)?.clone();
+        let pending_segments = pending_base.segment_ids();
+        let missing_segments: BTreeSet<_> = segment_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| {
+                !previous_segments.contains(segment_id) && !pending_segments.contains(segment_id)
+            })
+            .collect();
+        if missing_segments.is_empty() {
+            return Ok(());
+        }
+        let (_, payloads) = self.local.state_for_segment_ids(&missing_segments)?;
+        let appended = self.durable.prestage_segments(payloads, &pending_base)?;
+        lock(&self.pending_data_log_append)?.merge(appended);
+        Ok(())
+    }
+
     fn has_pending_block_delta_in_range(
         &self,
         first_commit: u64,
@@ -253,6 +332,48 @@ impl DurableCoordinator {
                 .ok_or_else(|| StorageError::conflict("durable block delta sequence overflows"))?;
         }
         if next == target.raw().saturating_add(1) {
+            Ok(Some(selected))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn ready_contiguous_pending_block_deltas(
+        &self,
+        durable_through: CommitSeq,
+        target: CommitSeq,
+    ) -> Result<Option<Vec<BlockDeltaCommit>>> {
+        if durable_through.raw() >= target.raw() {
+            return Ok(Some(Vec::new()));
+        }
+        let in_flight = lock(&self.block_delta_prestage.inner)?.in_flight.clone();
+        let mut pending = lock(&self.pending_block_deltas)?.clone();
+        pending.sort_by_key(|delta| delta.commit_seq.raw());
+        let mut next = durable_through
+            .raw()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("durable block delta sequence overflows"))?;
+        let mut selected = Vec::new();
+        for delta in pending {
+            let seq = delta.commit_seq.raw();
+            if seq < next {
+                continue;
+            }
+            if seq > target.raw() {
+                break;
+            }
+            if seq != next {
+                return Ok(None);
+            }
+            if in_flight.contains(&delta.commit_seq) {
+                break;
+            }
+            selected.push(delta);
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("durable block delta sequence overflows"))?;
+        }
+        if !selected.is_empty() || next == target.raw().saturating_add(1) {
             Ok(Some(selected))
         } else {
             Ok(None)
@@ -338,30 +459,70 @@ impl DurableCoordinator {
     fn persist_block_delta_batch(
         &self,
         total_started: Instant,
-        deltas: Vec<BlockDeltaCommit>,
+        mut deltas: Vec<BlockDeltaCommit>,
     ) -> Result<CommitSeq> {
+        let mut block_delta_prestage_wait_nanos = self.wait_for_block_delta_prestage(&deltas)?;
+        let durable_before = deltas
+            .first()
+            .and_then(|delta| delta.commit_seq.raw().checked_sub(1))
+            .map(CommitSeq::from_raw)
+            .ok_or_else(|| StorageError::conflict("block delta batch has no first sequence"))?;
+        let requested_through = lock(&self.persist_coordinator.inner)?.requested_through;
+        if let Some(expanded) =
+            self.ready_contiguous_pending_block_deltas(durable_before, requested_through)?
+            && expanded.len() > deltas.len()
+        {
+            deltas = expanded;
+            block_delta_prestage_wait_nanos =
+                block_delta_prestage_wait_nanos.saturating_add(
+                    self.wait_for_block_delta_prestage(&deltas)?,
+                );
+        }
+        let block_delta_selected_count = usize_to_u64(deltas.len());
+        let block_delta_selected_bytes = deltas
+            .iter()
+            .map(|delta| delta.committed_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let lock_started = Instant::now();
         let _persist_guard = lock(&self.persist_lock)?;
-        let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let snapshot_started = Instant::now();
         let previous_segments = lock(&self.persisted_segments)?.clone();
         let mut segment_ids = BTreeSet::new();
         for delta in &deltas {
             segment_ids.extend(delta.segment_ids());
         }
+        let mut pending_append = lock(&self.pending_data_log_append)?.clone();
+        pending_append.retain_current_placements(&segment_ids);
+        let pending_segments = pending_append.segment_ids();
         let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
         let new_segments: Vec<_> = payloads
             .into_iter()
-            .filter(|payload| !previous_segments.contains(&payload.segment_id))
+            .filter(|payload| {
+                !previous_segments.contains(&payload.segment_id)
+                    && !pending_segments.contains(&payload.segment_id)
+            })
             .collect();
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
         let mut profile =
             self.durable
-                .persist_block_delta_commits(&deltas, &nodes, &segment_ids, new_segments)?;
+                .persist_block_delta_commits(
+                    &deltas,
+                    &nodes,
+                    &segment_ids,
+                    new_segments,
+                    pending_append,
+                )?;
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
-        lock(&self.persisted_segments)?.extend(segment_ids);
+        lock(&self.persisted_segments)?.extend(segment_ids.iter().copied());
+        lock(&self.pending_data_log_append)?.remove_segments(&segment_ids);
         self.prune_pending_block_deltas_through(durable_through)?;
+        self.prune_block_delta_prestage_through(durable_through)?;
         profile.lock_wait_nanos = lock_wait_nanos;
+        profile.block_delta_prestage_wait_nanos = block_delta_prestage_wait_nanos;
+        profile.block_delta_selected_count = block_delta_selected_count;
+        profile.block_delta_selected_bytes = block_delta_selected_bytes;
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.attach_metadata_publish_profile(&mut profile)?;
@@ -480,8 +641,10 @@ impl DurableCoordinator {
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
         target_commit: Option<CommitSeq>,
     ) -> Result<CommitSeq> {
+        let block_delta_prestage_wait_nanos = self.wait_for_all_block_delta_prestage()?;
+        let lock_started = Instant::now();
         let _persist_guard = lock(&self.persist_lock)?;
-        let lock_wait_nanos = duration_nanos_u64(total_started.elapsed());
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let snapshot_started = Instant::now();
         let previous_segments = lock(&self.persisted_segments)?.clone();
         let pending_append = lock(&self.pending_data_log_append)?.clone();
@@ -518,6 +681,7 @@ impl DurableCoordinator {
             lock(&self.persisted_segments)?.extend(segment_ids);
             *lock(&self.pending_data_log_append)? = PendingDataLogAppend::default();
             profile.lock_wait_nanos = lock_wait_nanos;
+            profile.block_delta_prestage_wait_nanos = block_delta_prestage_wait_nanos;
             profile.local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
             profile.total_nanos = duration_nanos_u64(total_started.elapsed());
             let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
@@ -547,6 +711,7 @@ impl DurableCoordinator {
         *lock(&self.pending_data_log_append)? = PendingDataLogAppend::default();
         let mut profile = outcome.profile;
         profile.lock_wait_nanos = lock_wait_nanos;
+        profile.block_delta_prestage_wait_nanos = block_delta_prestage_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
@@ -703,6 +868,7 @@ impl DurableCoordinator {
                     log_id: log_ref.log_id,
                     state: STREAM_DATA_LOG_STATE_ACTIVE.to_string(),
                     total_bytes,
+                    needs_dir_sync: false,
                 },
             );
             pending_log_refs.insert(log_ref);
@@ -1024,6 +1190,11 @@ impl DurableCoordinator {
         self.durable.fail_next_persist.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn fail_next_prestage_for_test(&self) {
+        self.durable.fail_next_prestage.store(true, Ordering::SeqCst);
+    }
+
     pub fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
         self.run_and_persist(|local| {
             local
@@ -1164,17 +1335,34 @@ impl DurableCoordinator {
                 .ok_or_else(|| StorageError::invalid_argument("block batch byte length overflows"))
         })?;
         let admission = self.admit_write(total_bytes, flushed)?;
-        let result = self
-            .local
-            .commit_block_batch_with_delta(device_id, writes, durability)
-            .and_then(|committed| {
-                let commit = committed.commit;
-                self.record_pending_block_delta(committed.delta)?;
-                if flushed {
+        let result = if flushed {
+            self.local
+                .commit_block_batch_with_delta(device_id, writes, durability)
+                .and_then(|committed| {
+                    let delta = committed.delta.clone();
+                    let commit = committed.commit;
+                    self.record_pending_block_delta(delta)?;
                     self.persist_block_deltas_until(commit.commit_seq)?;
+                    Ok(commit)
+                })
+        } else {
+            let committed = {
+                let _staging_guard = lock(&self.block_delta_staging_lock)?;
+                let committed =
+                    self.local
+                        .commit_block_batch_with_delta(device_id, writes, durability)?;
+                if let Some(delta) = committed.delta.clone() {
+                    self.record_pending_block_delta(Some(delta.clone()))?;
+                    self.begin_block_delta_prestage(delta.commit_seq)?;
                 }
-                Ok(commit)
-            });
+                committed
+            };
+            if let Some(delta) = committed.delta.clone() {
+                let result = self.prestage_block_delta_segments(&delta);
+                self.finish_block_delta_prestage(delta.commit_seq, result)?;
+            }
+            Ok(committed.commit)
+        };
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -1459,7 +1647,10 @@ impl DurableCoordinator {
     }
 
     pub fn flush_device(&self, device_id: DeviceId) -> Result<FlushResult> {
-        let info = self.local.metadata.device_info(device_id)?;
+        let info = {
+            let _staging_guard = lock(&self.block_delta_staging_lock)?;
+            self.local.metadata.device_info(device_id)?
+        };
         self.persist_block_deltas_until(info.latest_commit)?;
         Ok(FlushResult {
             device_id,

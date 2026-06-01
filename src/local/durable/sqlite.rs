@@ -9,6 +9,8 @@ pub(super) struct DurableSqliteStore {
     persist_delay: Arc<Mutex<Option<Duration>>>,
     #[cfg(test)]
     fail_next_persist: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_prestage: Arc<AtomicBool>,
 }
 
 /// Process-local timing for one physical durable persist.
@@ -20,6 +22,9 @@ pub struct DurablePersistProfile {
     pub sequence: u64,
     pub total_nanos: u64,
     pub lock_wait_nanos: u64,
+    pub block_delta_prestage_wait_nanos: u64,
+    pub block_delta_selected_count: u64,
+    pub block_delta_selected_bytes: u64,
     pub sqlite_lock_wait_nanos: u64,
     pub local_snapshot_nanos: u64,
     pub metadata_publish_lock_wait_nanos: u64,
@@ -33,6 +38,13 @@ pub struct DurablePersistProfile {
     pub data_log_dir_sync_nanos: u64,
     pub data_log_files_synced: u64,
     pub data_log_sync_bytes: u64,
+    pub data_log_records_written: u64,
+    pub data_log_write_bytes: u64,
+    pub data_log_prestaged_segment_count: u64,
+    pub data_log_prestaged_segment_bytes: u64,
+    pub data_log_sync_only_bytes: u64,
+    pub data_log_flush_write_bytes: u64,
+    pub data_log_sync_storage_node_count: u64,
     pub node_catalog_publish_nanos: u64,
     pub node_catalog_manifest_lock_wait_nanos: u64,
     pub node_catalog_manifest_row_sync_nanos: u64,
@@ -228,6 +240,8 @@ pub(super) struct DataLogAppendProfile {
     dir_sync_nanos: u64,
     files_synced: u64,
     sync_bytes: u64,
+    records_written: u64,
+    write_bytes: u64,
 }
 
 impl DataLogAppendProfile {
@@ -242,6 +256,8 @@ impl DataLogAppendProfile {
         self.dir_sync_nanos = self.dir_sync_nanos.saturating_add(other.dir_sync_nanos);
         self.files_synced = self.files_synced.saturating_add(other.files_synced);
         self.sync_bytes = self.sync_bytes.saturating_add(other.sync_bytes);
+        self.records_written = self.records_written.saturating_add(other.records_written);
+        self.write_bytes = self.write_bytes.saturating_add(other.write_bytes);
     }
 }
 
@@ -302,6 +318,27 @@ impl PersistCoordinator {
                 requested_through: durable_through,
                 last_error: None,
             }),
+            cvar: Condvar::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct BlockDeltaPrestageTracker {
+    inner: Mutex<BlockDeltaPrestageState>,
+    cvar: Condvar,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct BlockDeltaPrestageState {
+    in_flight: BTreeSet<CommitSeq>,
+    failed: BTreeSet<CommitSeq>,
+}
+
+impl BlockDeltaPrestageTracker {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(BlockDeltaPrestageState::default()),
             cvar: Condvar::new(),
         }
     }
@@ -399,6 +436,7 @@ pub(super) struct DataLogRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DataLogSyncMode {
     Sync,
+    NoSync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -602,6 +640,8 @@ impl DurableSqliteStore {
             persist_delay: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             fail_next_persist: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_prestage: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1052,6 +1092,8 @@ impl DurableSqliteStore {
                 data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
                 data_log_files_synced: data_log_profile.files_synced,
                 data_log_sync_bytes: data_log_profile.sync_bytes,
+                data_log_records_written: data_log_profile.records_written,
+                data_log_write_bytes: data_log_profile.write_bytes,
                 node_catalog_publish_nanos,
                 node_catalog_manifest_lock_wait_nanos: catalog_profile
                     .manifest_lock_wait_nanos,
@@ -1219,7 +1261,7 @@ impl DurableSqliteStore {
         appended: PendingDataLogAppend,
         pre_root_pending_segments: &BTreeSet<SegmentId>,
     ) -> Result<NodeCatalogPublishProfile> {
-        let mut profile = NodeCatalogPublishProfile::default();
+        let mut selected = Vec::new();
         for (node_id, (ordinal, node)) in nodes {
             let node_segment_ids: BTreeSet<_> = segment_ids
                 .iter()
@@ -1229,59 +1271,116 @@ impl DurableSqliteStore {
             if node_segment_ids.is_empty() {
                 continue;
             }
-
-            let lock_started = Instant::now();
-            let mut conn = self.node_catalogs.lock(*node_id)?;
-            profile.segment_lock_wait_nanos = profile
-                .segment_lock_wait_nanos
-                .saturating_add(duration_nanos_u64(lock_started.elapsed()));
-            let tx = conn.transaction().map_err(sqlite_error)?;
-            let row_started = Instant::now();
-            for log in appended
-                .logs
-                .values()
-                .filter(|log| log.storage_node == *node_id)
-            {
-                persist_data_log_manifest(&tx, log)?;
-                profile.manifest_rows = profile.manifest_rows.saturating_add(1);
-            }
-            for log_ref in appended
-                .sealed_logs
-                .iter()
-                .filter(|log_ref| log_ref.storage_node == *node_id)
-            {
-                seal_data_log_manifest(&tx, *log_ref)?;
-                profile.sealed_rows = profile.sealed_rows.saturating_add(1);
-            }
-            for placement in appended
-                .placements
-                .iter()
-                .filter(|placement| placement.storage_node == *node_id)
-            {
-                persist_segment_placement(&tx, placement)?;
-                profile.placement_rows = profile.placement_rows.saturating_add(1);
-            }
-            profile.segment_rows = profile
-                .segment_rows
-                .saturating_add(usize_to_u64(node_segment_ids.len()));
-            sync_node_catalog_state_for_node(
-                &tx,
-                *ordinal,
-                *node_id,
-                node,
-                SegmentCatalogSync::Only(&node_segment_ids),
-                pre_root_pending_segments,
-            )?;
-            profile.segment_row_sync_nanos = profile
-                .segment_row_sync_nanos
-                .saturating_add(duration_nanos_u64(row_started.elapsed()));
-            let commit_started = Instant::now();
-            tx.commit().map_err(sqlite_error)?;
-            profile.segment_commit_nanos = profile
-                .segment_commit_nanos
-                .saturating_add(duration_nanos_u64(commit_started.elapsed()));
-            profile.segment_touched_nodes = profile.segment_touched_nodes.saturating_add(1);
+            selected.push((*node_id, *ordinal, node, node_segment_ids));
         }
+
+        if selected.len() <= 1 {
+            let mut profile = NodeCatalogPublishProfile::default();
+            for (node_id, ordinal, node, node_segment_ids) in selected {
+                profile.merge(Self::persist_selected_node_catalog_publish_for_node(
+                    self.node_catalogs.as_ref(),
+                    node_id,
+                    ordinal,
+                    node,
+                    node_segment_ids,
+                    &appended,
+                    pre_root_pending_segments,
+                )?);
+            }
+            return Ok(profile);
+        }
+
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let appended_ref = &appended;
+            let pre_root_pending_segments_ref = pre_root_pending_segments;
+            for (node_id, ordinal, node, node_segment_ids) in selected {
+                let node_catalogs = Arc::clone(&self.node_catalogs);
+                handles.push(scope.spawn(move || {
+                    Self::persist_selected_node_catalog_publish_for_node(
+                        node_catalogs.as_ref(),
+                        node_id,
+                        ordinal,
+                        node,
+                        node_segment_ids,
+                        appended_ref,
+                        pre_root_pending_segments_ref,
+                    )
+                }));
+            }
+
+            let mut profile = NodeCatalogPublishProfile::default();
+            for handle in handles {
+                let node_profile = handle.join().map_err(|_| {
+                    StorageError::unavailable("node catalog segment publish worker panicked")
+                })??;
+                profile.merge(node_profile);
+            }
+            Ok(profile)
+        })
+    }
+
+    fn persist_selected_node_catalog_publish_for_node(
+        node_catalogs: &NodeCatalogs,
+        node_id: StorageNodeId,
+        ordinal: usize,
+        node: &StorageNodeInner,
+        node_segment_ids: BTreeSet<SegmentId>,
+        appended: &PendingDataLogAppend,
+        pre_root_pending_segments: &BTreeSet<SegmentId>,
+    ) -> Result<NodeCatalogPublishProfile> {
+        let mut profile = NodeCatalogPublishProfile::default();
+        let lock_started = Instant::now();
+        let mut conn = node_catalogs.lock(node_id)?;
+        profile.segment_lock_wait_nanos = profile
+            .segment_lock_wait_nanos
+            .saturating_add(duration_nanos_u64(lock_started.elapsed()));
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let row_started = Instant::now();
+        for log in appended
+            .logs
+            .values()
+            .filter(|log| log.storage_node == node_id)
+        {
+            persist_data_log_manifest(&tx, log)?;
+            profile.manifest_rows = profile.manifest_rows.saturating_add(1);
+        }
+        for log_ref in appended
+            .sealed_logs
+            .iter()
+            .filter(|log_ref| log_ref.storage_node == node_id)
+        {
+            seal_data_log_manifest(&tx, *log_ref)?;
+            profile.sealed_rows = profile.sealed_rows.saturating_add(1);
+        }
+        for placement in appended
+            .placements
+            .iter()
+            .filter(|placement| placement.storage_node == node_id)
+        {
+            persist_segment_placement(&tx, placement)?;
+            profile.placement_rows = profile.placement_rows.saturating_add(1);
+        }
+        profile.segment_rows = profile
+            .segment_rows
+            .saturating_add(usize_to_u64(node_segment_ids.len()));
+        sync_node_catalog_state_for_node(
+            &tx,
+            ordinal,
+            node_id,
+            node,
+            SegmentCatalogSync::Only(&node_segment_ids),
+            pre_root_pending_segments,
+        )?;
+        profile.segment_row_sync_nanos = profile
+            .segment_row_sync_nanos
+            .saturating_add(duration_nanos_u64(row_started.elapsed()));
+        let commit_started = Instant::now();
+        tx.commit().map_err(sqlite_error)?;
+        profile.segment_commit_nanos = profile
+            .segment_commit_nanos
+            .saturating_add(duration_nanos_u64(commit_started.elapsed()));
+        profile.segment_touched_nodes = profile.segment_touched_nodes.saturating_add(1);
         Ok(profile)
     }
 
@@ -1446,6 +1545,8 @@ impl DurableSqliteStore {
             data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
             data_log_files_synced: data_log_profile.files_synced,
             data_log_sync_bytes: data_log_profile.sync_bytes,
+            data_log_records_written: data_log_profile.records_written,
+            data_log_write_bytes: data_log_profile.write_bytes,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1541,6 +1642,8 @@ impl DurableSqliteStore {
             data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
             data_log_files_synced: data_log_profile.files_synced,
             data_log_sync_bytes: data_log_profile.sync_bytes,
+            data_log_records_written: data_log_profile.records_written,
+            data_log_write_bytes: data_log_profile.write_bytes,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1568,6 +1671,7 @@ impl DurableSqliteStore {
         nodes: &SelectedStorageNodeState,
         segment_ids: &BTreeSet<SegmentId>,
         segments: Vec<DurableSegmentPayload>,
+        mut pending_append: PendingDataLogAppend,
     ) -> Result<DurablePersistProfile> {
         let total_started = Instant::now();
         #[cfg(test)]
@@ -1593,26 +1697,30 @@ impl DurableSqliteStore {
             .iter()
             .map(|segment| usize_to_u64(segment.bytes.len()))
             .fold(0_u64, u64::saturating_add);
+        pending_append.retain_current_placements(segment_ids);
+        let prestaged_segment_count = pending_append.placement_count();
+        let prestaged_segment_bytes = pending_append.placement_payload_bytes();
+        let sync_only_bytes = prestaged_segment_bytes;
+        let flush_write_bytes = new_segment_bytes;
 
         let started = Instant::now();
-        let (appended, data_log_profile, data_log_append_sync_nanos) = if segments.is_empty() {
-            (
-                PendingDataLogAppend::default(),
-                DataLogAppendProfile::default(),
-                0,
-            )
-        } else {
+        let mut data_log_profile = DataLogAppendProfile::default();
+        if !segments.is_empty() {
             let (appended, profile) =
-                self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?;
-            (appended, profile, duration_nanos_u64(started.elapsed()))
-        };
-        let pre_root_pending_segments = appended.segment_ids();
+                self.append_segments_profiled(segments, DataLogSyncMode::NoSync, Some(&pending_append))?;
+            data_log_profile.merge(profile);
+            pending_append.merge(appended);
+        }
+        let sync_storage_node_count = pending_append.storage_node_count();
+        data_log_profile.merge(self.sync_pending_data_log_append(&pending_append)?);
+        let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
+        let pre_root_pending_segments = pending_append.segment_ids();
 
         let started = Instant::now();
         let catalog_profile = self.persist_selected_node_catalog_publish(
             nodes,
             segment_ids,
-            appended,
+            pending_append,
             &pre_root_pending_segments,
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
@@ -1647,6 +1755,13 @@ impl DurableSqliteStore {
             data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
             data_log_files_synced: data_log_profile.files_synced,
             data_log_sync_bytes: data_log_profile.sync_bytes,
+            data_log_records_written: data_log_profile.records_written,
+            data_log_write_bytes: data_log_profile.write_bytes,
+            data_log_prestaged_segment_count: prestaged_segment_count,
+            data_log_prestaged_segment_bytes: prestaged_segment_bytes,
+            data_log_sync_only_bytes: sync_only_bytes,
+            data_log_flush_write_bytes: flush_write_bytes,
+            data_log_sync_storage_node_count: sync_storage_node_count,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1676,6 +1791,23 @@ impl DurableSqliteStore {
             })
             .map_err(sqlite_error)?;
         Ok(count > 0)
+    }
+
+    fn prestage_segments(
+        &self,
+        segments: Vec<DurableSegmentPayload>,
+        pending_base: &PendingDataLogAppend,
+    ) -> Result<PendingDataLogAppend> {
+        #[cfg(test)]
+        {
+            if self.fail_next_prestage.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable prestage failure",
+                ));
+            }
+        }
+        self.append_segments_profiled(segments, DataLogSyncMode::NoSync, Some(pending_base))
+            .map(|(append, _)| append)
     }
 
     fn append_segments(
@@ -1724,7 +1856,7 @@ impl DurableSqliteStore {
         let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
         let active_state = stream_data_log_state(payload.stream_id);
 
-        let (mut file, log_id, record_offset, new_total) = {
+        let (mut file, log_id, record_offset, new_total, needs_dir_sync) = {
             let _allocation_guard = lock(&self.data_log_allocation_lock)?;
             let mut active = match pending_base {
                 Some(pending) => pending.active_log_for_node(
@@ -1768,6 +1900,7 @@ impl DurableSqliteStore {
 
             fs::create_dir_all(&data_dir).map_err(fs_error)?;
             let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
+            let needs_dir_sync = !path.exists();
             let file = OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -1781,7 +1914,7 @@ impl DurableSqliteStore {
             let new_total = record_offset
                 .checked_add(record_len)
                 .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
-            (file, active.log_id, record_offset, new_total)
+            (file, active.log_id, record_offset, new_total, needs_dir_sync)
         };
 
         let started = Instant::now();
@@ -1808,6 +1941,7 @@ impl DurableSqliteStore {
                 log_id,
                 state: active_state,
                 total_bytes: new_total,
+                needs_dir_sync,
             },
         );
 
@@ -1873,150 +2007,157 @@ impl DurableSqliteStore {
         }
 
         let mut active_logs = BTreeMap::new();
-        let mut open_log: Option<(DurableDataLogRef, File, u64)> = None;
+        let mut open_log: Option<(DurableDataLogRef, File, u64, bool)> = None;
         let mut files_to_sync = Vec::new();
         let mut synced_dirs = BTreeSet::new();
         let mut profile = DataLogAppendProfile::default();
-        for segment in segments {
-            let segment_id = segment.segment_id;
-            let storage_node = segment.storage_node;
-            let integrity = segment.integrity;
-            let bytes = segment.bytes;
-            let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                active_logs.entry(storage_node)
-            {
-                let pending_active = match pending_base {
-                    Some(pending) => pending.active_log_for_node(
+        {
+            let _allocation_guard = lock(&self.data_log_allocation_lock)?;
+            for segment in segments {
+                let segment_id = segment.segment_id;
+                let storage_node = segment.storage_node;
+                let integrity = segment.integrity;
+                let bytes = segment.bytes;
+                let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    active_logs.entry(storage_node)
+                {
+                    let pending_active = match pending_base {
+                        Some(pending) => pending.active_log_for_node(
+                            storage_node,
+                            &self.paths.data_dir,
+                            active_state,
+                        )?,
+                        None => None,
+                    };
+                    if let Some(active) = pending_active {
+                        entry.insert(active);
+                    } else {
+                        let node_conn = self.node_catalogs.lock(storage_node)?;
+                        entry.insert(active_data_log_with_state(
+                            &node_conn,
+                            &self.paths.data_dir,
+                            storage_node,
+                            active_state,
+                        )?);
+                    }
+                }
+                let active = active_logs
+                    .get_mut(&storage_node)
+                    .ok_or_else(|| StorageError::corrupt("active data-log row missing"))?;
+                let payload_bytes = u64::try_from(bytes.len())
+                    .map_err(|_| StorageError::invalid_argument("payload length overflows u64"))?;
+                let record_len = (DATA_LOG_HEADER_LEN as u64)
+                    .checked_add(payload_bytes)
+                    .ok_or_else(|| {
+                        StorageError::invalid_argument("data-log record length overflows")
+                    })?;
+                if active.total_bytes != 0
+                    && active
+                        .total_bytes
+                        .checked_add(record_len)
+                        .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
+                        > self.policy.target_data_log_bytes
+                {
+                    append.sealed_logs.push(DurableDataLogRef {
                         storage_node,
-                        &self.paths.data_dir,
-                        active_state,
-                    )?,
-                    None => None,
-                };
-                if let Some(active) = pending_active {
-                    entry.insert(active);
-                } else {
+                        log_id: active.log_id,
+                    });
                     let node_conn = self.node_catalogs.lock(storage_node)?;
-                    entry.insert(active_data_log_with_state(
+                    *active = next_data_log(
                         &node_conn,
                         &self.paths.data_dir,
                         storage_node,
-                        active_state,
-                    )?);
+                        active.log_id,
+                    )?;
                 }
-            }
-            let active = active_logs
-                .get_mut(&storage_node)
-                .ok_or_else(|| StorageError::corrupt("active data-log row missing"))?;
-            let payload_bytes = u64::try_from(bytes.len())
-                .map_err(|_| StorageError::invalid_argument("payload length overflows u64"))?;
-            let record_len = (DATA_LOG_HEADER_LEN as u64)
-                .checked_add(payload_bytes)
-                .ok_or_else(|| {
-                    StorageError::invalid_argument("data-log record length overflows")
-                })?;
-            if active.total_bytes != 0
-                && active
-                    .total_bytes
+
+                let log_ref = DurableDataLogRef {
+                    storage_node,
+                    log_id: active.log_id,
+                };
+                if open_log.as_ref().map(|(log_ref, _, _, _)| *log_ref) != Some(log_ref) {
+                    if let Some((_, file, bytes, _)) = open_log.take()
+                        && sync_mode == DataLogSyncMode::Sync
+                    {
+                        files_to_sync.push(data_log_file_to_sync(file, bytes));
+                    }
+                    let data_dir_existed = data_dir.exists();
+                    fs::create_dir_all(&data_dir).map_err(fs_error)?;
+                    if sync_mode == DataLogSyncMode::Sync && !data_dir_existed {
+                        let started = Instant::now();
+                        sync_dir(&self.paths.data_dir)?;
+                        profile.dir_sync_nanos = profile
+                            .dir_sync_nanos
+                            .saturating_add(duration_nanos_u64(started.elapsed()));
+                    }
+                    let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
+                    let existed = path.exists();
+                    let file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .read(true)
+                        .open(&path)
+                        .map_err(fs_error)?;
+                    let file_len = file.metadata().map_err(fs_error)?.len();
+                    active.total_bytes = active.total_bytes.max(file_len);
+                    if !existed {
+                        synced_dirs.insert(storage_node);
+                    }
+                    let needs_dir_sync = sync_mode == DataLogSyncMode::NoSync && !existed;
+                    open_log = Some((log_ref, file, active.total_bytes, needs_dir_sync));
+                }
+
+                let offset = active.total_bytes;
+                let Some((_, file, open_log_bytes, needs_dir_sync)) = open_log.as_mut() else {
+                    return Err(StorageError::conflict("data-log writer was not opened"));
+                };
+                let started = Instant::now();
+                let record = encode_data_log_record(segment_id, integrity, bytes.as_ref())?;
+                profile.encode_nanos = profile
+                    .encode_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+                let started = Instant::now();
+                file.write_all(&record).map_err(fs_error)?;
+                profile.write_nanos = profile
+                    .write_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+                profile.records_written = profile.records_written.saturating_add(1);
+                profile.write_bytes = profile.write_bytes.saturating_add(record_len);
+                let payload_offset = offset
+                    .checked_add(DATA_LOG_HEADER_LEN as u64)
+                    .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
+                let new_total = offset
                     .checked_add(record_len)
-                    .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
-                    > self.policy.target_data_log_bytes
-            {
-                append.sealed_logs.push(DurableDataLogRef {
+                    .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
+                active.total_bytes = new_total;
+                *open_log_bytes = new_total;
+                append.logs.insert(
+                    log_ref,
+                    PendingDataLogManifest {
+                        storage_node,
+                        log_id: active.log_id,
+                        state: active_state.to_string(),
+                        total_bytes: new_total,
+                        needs_dir_sync: *needs_dir_sync,
+                    },
+                );
+                append.placements.push(SegmentPlacementRow {
+                    segment_id,
                     storage_node,
-                    log_id: active.log_id,
+                    data_log_id: active.log_id,
+                    record_offset: offset,
+                    record_bytes: record_len,
+                    payload_offset,
+                    payload_bytes,
+                    integrity,
                 });
-                let node_conn = self.node_catalogs.lock(storage_node)?;
-                *active = next_data_log(
-                    &node_conn,
-                    &self.paths.data_dir,
-                    storage_node,
-                    active.log_id,
-                )?;
             }
-
-            let log_ref = DurableDataLogRef {
-                storage_node,
-                log_id: active.log_id,
-            };
-            if open_log.as_ref().map(|(log_ref, _, _)| *log_ref) != Some(log_ref) {
-                if let Some((_, file, bytes)) = open_log.take()
-                    && sync_mode == DataLogSyncMode::Sync
-                {
-                    files_to_sync.push(data_log_file_to_sync(file, bytes));
-                }
-                let data_dir_existed = data_dir.exists();
-                fs::create_dir_all(&data_dir).map_err(fs_error)?;
-                if sync_mode == DataLogSyncMode::Sync && !data_dir_existed {
-                    let started = Instant::now();
-                    sync_dir(&self.paths.data_dir)?;
-                    profile.dir_sync_nanos = profile
-                        .dir_sync_nanos
-                        .saturating_add(duration_nanos_u64(started.elapsed()));
-                }
-                let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
-                let existed = path.exists();
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .read(true)
-                    .open(&path)
-                    .map_err(fs_error)?;
-                let file_len = file.metadata().map_err(fs_error)?.len();
-                active.total_bytes = active.total_bytes.max(file_len);
-                if !existed {
-                    synced_dirs.insert(storage_node);
-                }
-                open_log = Some((log_ref, file, active.total_bytes));
+            if let Some((_, file, bytes, _)) = open_log.take()
+                && sync_mode == DataLogSyncMode::Sync
+            {
+                files_to_sync.push(data_log_file_to_sync(file, bytes));
             }
-
-            let offset = active.total_bytes;
-            let Some((_, file, open_log_bytes)) = open_log.as_mut() else {
-                return Err(StorageError::conflict("data-log writer was not opened"));
-            };
-            let started = Instant::now();
-            let record = encode_data_log_record(segment_id, integrity, bytes.as_ref())?;
-            profile.encode_nanos = profile
-                .encode_nanos
-                .saturating_add(duration_nanos_u64(started.elapsed()));
-            let started = Instant::now();
-            file.write_all(&record).map_err(fs_error)?;
-            profile.write_nanos = profile
-                .write_nanos
-                .saturating_add(duration_nanos_u64(started.elapsed()));
-            let payload_offset = offset
-                .checked_add(DATA_LOG_HEADER_LEN as u64)
-                .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
-            let new_total = offset
-                .checked_add(record_len)
-                .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
-            active.total_bytes = new_total;
-            *open_log_bytes = new_total;
-            append.logs.insert(
-                log_ref,
-                PendingDataLogManifest {
-                    storage_node,
-                    log_id: active.log_id,
-                    state: active_state.to_string(),
-                    total_bytes: new_total,
-                },
-            );
-            append.placements.push(SegmentPlacementRow {
-                segment_id,
-                storage_node,
-                data_log_id: active.log_id,
-                record_offset: offset,
-                record_bytes: record_len,
-                payload_offset,
-                payload_bytes,
-                integrity,
-            });
-        }
-        if let Some((_, file, bytes)) = open_log.take()
-            && sync_mode == DataLogSyncMode::Sync
-        {
-            files_to_sync.push(data_log_file_to_sync(file, bytes));
         }
         if sync_mode == DataLogSyncMode::Sync {
             let started = Instant::now();
@@ -2095,9 +2236,11 @@ impl DurableSqliteStore {
         }
 
         let mut files = Vec::with_capacity(appended.logs.len() + appended.sealed_logs.len());
-        let mut storage_nodes = BTreeSet::new();
+        let mut storage_nodes_needing_dir_sync = BTreeSet::new();
         for (log_ref, manifest) in &appended.logs {
-            storage_nodes.insert(log_ref.storage_node);
+            if manifest.needs_dir_sync {
+                storage_nodes_needing_dir_sync.insert(log_ref.storage_node);
+            }
             let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
             files.push(data_log_file_to_sync(
                 File::open(&path).map_err(fs_error)?,
@@ -2108,7 +2251,6 @@ impl DurableSqliteStore {
             if appended.logs.contains_key(log_ref) {
                 continue;
             }
-            storage_nodes.insert(log_ref.storage_node);
             let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
             files.push(data_log_file_to_sync_with_metadata(
                 File::open(&path).map_err(fs_error)?,
@@ -2121,12 +2263,20 @@ impl DurableSqliteStore {
         profile.file_sync_max_nanos = sync_profile.sync_max_nanos;
         profile.files_synced = sync_profile.files_synced;
         profile.sync_bytes = sync_profile.sync_bytes;
-        let started = Instant::now();
-        sync_dir(&self.paths.data_dir)?;
-        for storage_node in storage_nodes {
-            sync_dir(&node_data_log_dir(&self.paths.data_dir, storage_node))?;
+        if !storage_nodes_needing_dir_sync.is_empty() {
+            let started = Instant::now();
+            sync_dir(&self.paths.data_dir)?;
+            profile.dir_sync_nanos = profile
+                .dir_sync_nanos
+                .saturating_add(duration_nanos_u64(started.elapsed()));
         }
-        profile.dir_sync_nanos = duration_nanos_u64(started.elapsed());
+        for storage_node in storage_nodes_needing_dir_sync {
+            let started = Instant::now();
+            sync_dir(&node_data_log_dir(&self.paths.data_dir, storage_node))?;
+            profile.dir_sync_nanos = profile
+                .dir_sync_nanos
+                .saturating_add(duration_nanos_u64(started.elapsed()));
+        }
         Ok(profile)
     }
 

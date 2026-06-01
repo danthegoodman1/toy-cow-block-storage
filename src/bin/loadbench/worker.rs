@@ -162,6 +162,7 @@ struct StreamAppendState {
 struct BlockWritebackState {
     writes: Vec<BlockBatchWrite>,
     dirty_bytes: u64,
+    staged_commit: Option<BlockBatchCommit>,
 }
 
 impl BlockWritebackState {
@@ -176,6 +177,7 @@ impl BlockWritebackState {
     fn clear(&mut self) {
         self.writes.clear();
         self.dirty_bytes = 0;
+        self.staged_commit = None;
     }
 
     fn push_write(
@@ -247,10 +249,24 @@ fn prepare_for_timed_op(
     state: &mut WorkerState,
     config: &WorkerConfig,
 ) -> Result<()> {
-    if let Target::Block { logical_blocks, .. } = &context.target
+    if let Target::Block {
+        device_id,
+        logical_blocks,
+        ..
+    } = &context.target
         && let Some(dirty_bytes) = config.workload.block_writeback_fsync_bytes()
     {
         fill_block_writeback_dirty(context, worker, state, config, *logical_blocks, dirty_bytes)?;
+        if config.workload.is_block_writeback_prestaged()
+            && state.block_writeback.staged_commit.is_none()
+        {
+            let commit = context.store.commit_block_batch(
+                *device_id,
+                &state.block_writeback.writes,
+                WriteDurability::Acknowledged,
+            )?;
+            state.block_writeback.staged_commit = Some(commit);
+        }
         return Ok(());
     }
     if !config.workload.is_native_stream_publish_preflushed() {
@@ -316,6 +332,10 @@ fn apply_modeled_delay(delay: Duration, mode: DelayMode) {
             }
         }
     }
+}
+
+fn elapsed_nanos_u64(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 fn build_native_file_batch_writes(
@@ -599,15 +619,29 @@ fn run_one_op(
             let dirty_bytes = state.block_writeback.dirty_bytes();
             let dirty_range_count = state.block_writeback.writes.len();
             let started = config.block_batch_profiles_enabled.then(Instant::now);
-            let commit = context.store.commit_block_batch(
-                *device_id,
-                &state.block_writeback.writes,
-                WriteDurability::Acknowledged,
-            )?;
+            let commit_started = Instant::now();
+            let commit = if workload.is_block_writeback_prestaged() {
+                state
+                    .block_writeback
+                    .staged_commit
+                    .take()
+                    .ok_or_else(|| StorageError::corrupt("writeback fsync was not prestaged"))?
+            } else {
+                context.store.commit_block_batch(
+                    *device_id,
+                    &state.block_writeback.writes,
+                    WriteDurability::Acknowledged,
+                )?
+            };
+            let commit_nanos = elapsed_nanos_u64(commit_started);
+            let flush_started = Instant::now();
             context.store.flush_device(*device_id)?;
+            let flush_device_nanos = elapsed_nanos_u64(flush_started);
             state.block_writeback.clear();
             let block_batch_profile = started.map(|started| BlockBatchOpProfile {
-                total_nanos: started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                total_nanos: elapsed_nanos_u64(started),
+                commit_nanos,
+                flush_device_nanos,
                 batch_operation_count: dirty_range_count as u64,
                 collapsed_range_count: commit.collapsed_range_count,
                 requested_bytes: dirty_bytes,
@@ -866,11 +900,15 @@ fn run_one_op(
                 rng,
             )?;
             let started = config.block_batch_profiles_enabled.then(Instant::now);
+            let commit_started = Instant::now();
             let commit = context
                 .store
                 .commit_block_batch(*device_id, &writes, durability)?;
+            let commit_nanos = elapsed_nanos_u64(commit_started);
             let block_batch_profile = started.map(|started| BlockBatchOpProfile {
-                total_nanos: started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                total_nanos: elapsed_nanos_u64(started),
+                commit_nanos,
+                flush_device_nanos: 0,
                 batch_operation_count: commit.write_count,
                 collapsed_range_count: commit.collapsed_range_count,
                 requested_bytes: context.op_size as u64,

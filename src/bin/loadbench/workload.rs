@@ -188,6 +188,10 @@ enum Workload {
     BlockWritebackFsync2m,
     BlockWritebackFsync4m,
     BlockWritebackFsync16m,
+    BlockWritebackPrestagedFsync1m,
+    BlockWritebackPrestagedFsync2m,
+    BlockWritebackPrestagedFsync4m,
+    BlockWritebackPrestagedFsync16m,
     NativeRead4k,
     NativeWrite4k,
     NativeWrite4kSameFile,
@@ -296,6 +300,15 @@ impl Workload {
         ]
     }
 
+    fn block_writeback_prestaged_suite() -> Vec<Self> {
+        vec![
+            Self::BlockWritebackPrestagedFsync1m,
+            Self::BlockWritebackPrestagedFsync2m,
+            Self::BlockWritebackPrestagedFsync4m,
+            Self::BlockWritebackPrestagedFsync16m,
+        ]
+    }
+
     fn native_metadata_suite() -> Vec<Self> {
         vec![
             Self::NativeWrite4kSameFile,
@@ -342,6 +355,10 @@ impl Workload {
             Self::BlockWritebackFsync2m => "block-writeback-fsync-2m",
             Self::BlockWritebackFsync4m => "block-writeback-fsync-4m",
             Self::BlockWritebackFsync16m => "block-writeback-fsync-16m",
+            Self::BlockWritebackPrestagedFsync1m => "block-writeback-prestaged-fsync-1m",
+            Self::BlockWritebackPrestagedFsync2m => "block-writeback-prestaged-fsync-2m",
+            Self::BlockWritebackPrestagedFsync4m => "block-writeback-prestaged-fsync-4m",
+            Self::BlockWritebackPrestagedFsync16m => "block-writeback-prestaged-fsync-16m",
             Self::NativeRead4k => "native-read-4k",
             Self::NativeWrite4k => "native-write-4k",
             Self::NativeWrite4kSameFile => "native-write-4k-same-file",
@@ -439,7 +456,11 @@ impl Workload {
             | Self::BlockWritebackFsync1m
             | Self::BlockWritebackFsync2m
             | Self::BlockWritebackFsync4m
-            | Self::BlockWritebackFsync16m => unreachable!(),
+            | Self::BlockWritebackFsync16m
+            | Self::BlockWritebackPrestagedFsync1m
+            | Self::BlockWritebackPrestagedFsync2m
+            | Self::BlockWritebackPrestagedFsync4m
+            | Self::BlockWritebackPrestagedFsync16m => unreachable!(),
         })
     }
 
@@ -491,15 +512,37 @@ impl Workload {
                 | Self::BlockWritebackFsync2m
                 | Self::BlockWritebackFsync4m
                 | Self::BlockWritebackFsync16m
+                | Self::BlockWritebackPrestagedFsync1m
+                | Self::BlockWritebackPrestagedFsync2m
+                | Self::BlockWritebackPrestagedFsync4m
+                | Self::BlockWritebackPrestagedFsync16m
+        )
+    }
+
+    fn is_block_writeback_prestaged(self) -> bool {
+        matches!(
+            self,
+            Self::BlockWritebackPrestagedFsync1m
+                | Self::BlockWritebackPrestagedFsync2m
+                | Self::BlockWritebackPrestagedFsync4m
+                | Self::BlockWritebackPrestagedFsync16m
         )
     }
 
     fn block_writeback_fsync_bytes(self) -> Option<u64> {
         match self {
-            Self::BlockWritebackFsync1m => Some(1024 * 1024),
-            Self::BlockWritebackFsync2m => Some(2 * 1024 * 1024),
-            Self::BlockWritebackFsync4m => Some(4 * 1024 * 1024),
-            Self::BlockWritebackFsync16m => Some(16 * 1024 * 1024),
+            Self::BlockWritebackFsync1m | Self::BlockWritebackPrestagedFsync1m => {
+                Some(1024 * 1024)
+            }
+            Self::BlockWritebackFsync2m | Self::BlockWritebackPrestagedFsync2m => {
+                Some(2 * 1024 * 1024)
+            }
+            Self::BlockWritebackFsync4m | Self::BlockWritebackPrestagedFsync4m => {
+                Some(4 * 1024 * 1024)
+            }
+            Self::BlockWritebackFsync16m | Self::BlockWritebackPrestagedFsync16m => {
+                Some(16 * 1024 * 1024)
+            }
             _ => None,
         }
     }
@@ -667,6 +710,10 @@ impl Workload {
                 | Self::BlockWritebackFsync2m
                 | Self::BlockWritebackFsync4m
                 | Self::BlockWritebackFsync16m
+                | Self::BlockWritebackPrestagedFsync1m
+                | Self::BlockWritebackPrestagedFsync2m
+                | Self::BlockWritebackPrestagedFsync4m
+                | Self::BlockWritebackPrestagedFsync16m
         )
     }
 
@@ -703,6 +750,10 @@ impl FromStr for Workload {
             "block-writeback-fsync-2m" => Ok(Self::BlockWritebackFsync2m),
             "block-writeback-fsync-4m" => Ok(Self::BlockWritebackFsync4m),
             "block-writeback-fsync-16m" => Ok(Self::BlockWritebackFsync16m),
+            "block-writeback-prestaged-fsync-1m" => Ok(Self::BlockWritebackPrestagedFsync1m),
+            "block-writeback-prestaged-fsync-2m" => Ok(Self::BlockWritebackPrestagedFsync2m),
+            "block-writeback-prestaged-fsync-4m" => Ok(Self::BlockWritebackPrestagedFsync4m),
+            "block-writeback-prestaged-fsync-16m" => Ok(Self::BlockWritebackPrestagedFsync16m),
             "native-read-4k" => Ok(Self::NativeRead4k),
             "native-write-4k" => Ok(Self::NativeWrite4k),
             "native-write-4k-same-file" => Ok(Self::NativeWrite4kSameFile),

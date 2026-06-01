@@ -53,6 +53,8 @@ impl Lcg {
 #[derive(Debug, Clone, Copy)]
 struct BlockBatchOpProfile {
     total_nanos: u64,
+    commit_nanos: u64,
+    flush_device_nanos: u64,
     batch_operation_count: u64,
     collapsed_range_count: u64,
     requested_bytes: u64,

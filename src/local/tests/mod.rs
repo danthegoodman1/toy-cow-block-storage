@@ -2796,7 +2796,6 @@ fn durable_persist_until_does_not_export_later_block_commits() {
         profiles[0].durable_commit_high_water,
         first.commit_seq.raw()
     );
-    assert_eq!(profiles[0].new_segment_count, 1);
     assert!(second.commit_seq.raw() > first.commit_seq.raw());
 
     drop(store);
@@ -2941,8 +2940,8 @@ fn durable_target_persist_can_advance_to_later_native_commit_without_restart() {
 }
 
 #[test]
-fn durable_acknowledged_write_does_not_touch_data_log_before_flush() {
-    let root = durable_temp_dir("ack-no-data-log-before-flush");
+fn durable_acknowledged_write_prestages_data_log_without_cataloging_before_flush() {
+    let root = durable_temp_dir("ack-prestages-data-log-before-flush");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let device_id = store
@@ -2964,8 +2963,10 @@ fn durable_acknowledged_write_does_not_touch_data_log_before_flush() {
         .unwrap();
 
     let data_log = data_log_path(&root.join("data"), cfg.storage_node, 1);
-    assert!(!data_log.exists());
+    assert!(data_log.exists());
+    assert!(data_log.metadata().unwrap().len() > 4096);
     assert!(store.durable.data_log_rows_for_test().unwrap().is_empty());
+    assert_eq!(block_delta_commit_count(&root), 0);
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -2974,6 +2975,48 @@ fn durable_acknowledged_write_does_not_touch_data_log_before_flush() {
         .read_device(device_id, ByteRange::new(0, 4096), &mut hidden)
         .unwrap();
     assert_eq!(hidden, vec![0; 4096]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_acknowledged_block_prestage_does_not_wait_for_persist_lock() {
+    let root = durable_temp_dir("ack-block-prestage-bypasses-persist-lock");
+    let cfg = config();
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+
+    let persist_guard = lock(&store.persist_lock).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let store = Arc::clone(&store);
+        thread::spawn(move || {
+            let result = store.write_device(
+                device_id,
+                0,
+                &repeated_blocks(1, 25),
+                WriteDurability::Acknowledged,
+            );
+            tx.send(result.map(|_| ())).unwrap();
+        })
+    };
+
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("acknowledged block prestage should not wait for physical persist lock")
+        .unwrap();
+    drop(persist_guard);
+    worker.join().unwrap();
+
+    let data_log = data_log_path(&root.join("data"), cfg.storage_node, 1);
+    assert!(data_log.exists());
+    assert!(store.durable.data_log_rows_for_test().unwrap().is_empty());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3832,15 +3875,23 @@ fn durable_flush_persists_acknowledged_segment_once() {
         )
         .unwrap();
     let data_log = data_log_path(&root.join("data"), cfg.storage_node, 1);
-    assert!(!data_log.exists());
+    let preflush_len = data_log.metadata().unwrap().len();
+    assert!(preflush_len > 4096);
 
     store.flush_device(device_id).unwrap();
     let postflush_len = data_log.metadata().unwrap().len();
-    assert!(postflush_len > 4096);
+    assert_eq!(postflush_len, preflush_len);
     let profiles = store.drain_persist_profiles(8).unwrap();
     assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0].new_segment_count, 1);
-    assert_eq!(profiles[0].new_segment_bytes, 4096);
+    assert_eq!(profiles[0].new_segment_count, 0);
+    assert_eq!(profiles[0].new_segment_bytes, 0);
+    assert_eq!(profiles[0].data_log_prestaged_segment_count, 1);
+    assert_eq!(profiles[0].data_log_prestaged_segment_bytes, 4096);
+    assert_eq!(profiles[0].data_log_sync_only_bytes, 4096);
+    assert_eq!(profiles[0].data_log_flush_write_bytes, 0);
+    assert_eq!(profiles[0].data_log_records_written, 0);
+    assert_eq!(profiles[0].block_delta_selected_count, 1);
+    assert_eq!(profiles[0].block_delta_selected_bytes, 4096);
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -3849,6 +3900,147 @@ fn durable_flush_persists_acknowledged_segment_once() {
         .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
         .unwrap();
     assert_eq!(bytes, repeated_blocks(1, 22));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_prestaged_flush_skips_directory_sync_for_existing_log() {
+    let root = durable_temp_dir("block-prestage-existing-log-no-dir-sync");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    store.enable_persist_profiling(8).unwrap();
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(1, 26),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store.flush_device(device_id).unwrap();
+    let first = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(
+        first[0].data_log_dir_sync_nanos > 0,
+        "new unsynced data-log files require directory sync before metadata publish"
+    );
+
+    store
+        .write_device(
+            device_id,
+            4096,
+            &repeated_blocks(1, 27),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store.flush_device(device_id).unwrap();
+    let second = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0].data_log_dir_sync_nanos, 0,
+        "existing active data-log files should not force a directory sync on every fsync"
+    );
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; 2 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes[0..4096], repeated_blocks(1, 26));
+    assert_eq!(&bytes[4096..2 * 4096], repeated_blocks(1, 27));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_prestage_unavailable_falls_back_at_flush() {
+    let root = durable_temp_dir("block-prestage-fallback");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    store.enable_persist_profiling(8).unwrap();
+    store.fail_next_prestage_for_test();
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(1, 23),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    assert!(!data_log_path(&root.join("data"), cfg.storage_node, 1).exists());
+
+    store.flush_device(device_id).unwrap();
+    let profiles = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].new_segment_count, 1);
+    assert_eq!(profiles[0].new_segment_bytes, 4096);
+    assert_eq!(profiles[0].data_log_prestaged_segment_count, 0);
+    assert_eq!(profiles[0].data_log_flush_write_bytes, 4096);
+    assert_eq!(profiles[0].data_log_records_written, 1);
+    assert!(profiles[0].data_log_write_nanos > 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, repeated_blocks(1, 23));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn failed_flush_after_block_prestage_does_not_expose_tail_after_reopen() {
+    let root = durable_temp_dir("block-prestage-failed-flush-hidden");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(1, 24),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    assert!(data_log_path(&root.join("data"), cfg.storage_node, 1).exists());
+
+    store.fail_next_persist_for_test();
+    assert!(store.flush_device(device_id).is_err());
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![99; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, vec![0; 4096]);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3885,16 +4077,21 @@ fn durable_persist_profiling_is_opt_in_and_records_physical_persists() {
     assert_eq!(profile.sequence, 1);
     assert!(profile.total_nanos >= profile.local_snapshot_nanos);
     assert!(profile.data_log_append_sync_nanos >= profile.data_log_file_sync_nanos);
-    assert!(profile.data_log_encode_nanos > 0);
-    assert!(profile.data_log_write_nanos > 0);
+    assert_eq!(profile.data_log_encode_nanos, 0);
+    assert_eq!(profile.data_log_write_nanos, 0);
     assert!(profile.data_log_file_sync_nanos > 0);
     assert!(profile.data_log_file_sync_sum_nanos > 0);
     assert!(profile.data_log_file_sync_max_nanos > 0);
     assert!(profile.data_log_file_sync_sum_nanos >= profile.data_log_file_sync_max_nanos);
     assert!(profile.data_log_files_synced > 0);
     assert!(profile.data_log_sync_bytes > 0);
-    assert_eq!(profile.new_segment_count, 1);
-    assert_eq!(profile.new_segment_bytes, 4096);
+    assert_eq!(profile.new_segment_count, 0);
+    assert_eq!(profile.new_segment_bytes, 0);
+    assert_eq!(profile.data_log_prestaged_segment_count, 1);
+    assert_eq!(profile.data_log_prestaged_segment_bytes, 4096);
+    assert_eq!(profile.data_log_sync_only_bytes, 4096);
+    assert_eq!(profile.data_log_flush_write_bytes, 0);
+    assert_eq!(profile.data_log_records_written, 0);
     assert!(profile.touched_node_count > 0);
     assert!(profile.durable_commit_high_water >= flush.durable_through.raw());
     assert!(store.drain_persist_profiles(16).unwrap().is_empty());
@@ -3954,8 +4151,15 @@ fn durable_concurrent_flushes_coalesce_to_one_physical_persist() {
         1,
         "concurrent flush waiters should share one physical persist"
     );
-    assert_eq!(profiles[0].new_segment_count, 4);
-    assert_eq!(profiles[0].new_segment_bytes, 4 * 4096);
+    assert_eq!(profiles[0].new_segment_count, 0);
+    assert_eq!(profiles[0].new_segment_bytes, 0);
+    assert_eq!(profiles[0].data_log_prestaged_segment_count, 4);
+    assert_eq!(profiles[0].data_log_prestaged_segment_bytes, 4 * 4096);
+    assert_eq!(profiles[0].data_log_sync_only_bytes, 4 * 4096);
+    assert_eq!(profiles[0].data_log_flush_write_bytes, 0);
+    assert_eq!(profiles[0].data_log_records_written, 0);
+    assert_eq!(profiles[0].block_delta_selected_count, 4);
+    assert_eq!(profiles[0].block_delta_selected_bytes, 4 * 4096);
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
