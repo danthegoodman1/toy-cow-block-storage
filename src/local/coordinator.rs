@@ -1655,8 +1655,8 @@ impl LocalCoordinator {
         let _lane_guard = lock(&lane)?;
         let prepared =
             self.prepare_append_stream_run(stream, data.len(), WriteDurability::Acknowledged)?;
-        let run = self.append_run_payload_memory(&prepared, data, payload_integrity)?;
-        let ticket = self.commit_prepared_append_stream_run(prepared, run)?;
+        let run = self.write_append_run_payload_to_memory(&prepared, data, payload_integrity)?;
+        let ticket = self.record_prepared_append_stream_run(prepared, run)?;
         if matches!(durability, crate::api::WriteDurability::Flushed) {
             self.metadata.mark_append_stream_durable(stream)?;
         }
@@ -1710,7 +1710,7 @@ impl LocalCoordinator {
         stream_id.raw() as u64
     }
 
-    fn append_run_payload_memory(
+    fn write_append_run_payload_to_memory(
         &self,
         prepared: &PreparedAppendStreamRun,
         data: &[u8],
@@ -1746,7 +1746,7 @@ impl LocalCoordinator {
         Ok(run)
     }
 
-    fn commit_prepared_append_stream_run(
+    fn record_prepared_append_stream_run(
         &self,
         prepared: PreparedAppendStreamRun,
         run: AppendLogRun,
@@ -1764,7 +1764,7 @@ impl LocalCoordinator {
                 "append run manifest disagrees with prepared stream range",
             ));
         }
-        self.metadata.append_stream_run_record(
+        self.metadata.record_append_stream_run(
             &prepared.stream,
             prepared.ticket_id,
             prepared.range,

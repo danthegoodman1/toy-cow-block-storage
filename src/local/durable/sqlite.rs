@@ -1839,7 +1839,7 @@ impl DurableSqliteStore {
         )
     }
 
-    fn append_run_payload_chunks_unsynced(
+    fn write_append_run_payload_chunks_unsynced(
         &self,
         payload: DurableAppendRunChunkPayload,
         pending_base: Option<&PendingDataLogAppend>,

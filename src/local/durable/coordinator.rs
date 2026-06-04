@@ -1891,11 +1891,11 @@ impl DurableCoordinator {
                     let pending_base = lock(&lane.pending)?.clone();
                     let (run, append, _) = self
                         .durable
-                        .append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
+                        .write_append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
                     let appended_log_refs = append.log_refs();
                     lock(&lane.pending)?.merge(append);
-                    let commit = self.local.commit_prepared_append_stream_run(prepared, run);
-                    match commit {
+                    let record = self.local.record_prepared_append_stream_run(prepared, run);
+                    match record {
                         Ok(ticket) => Ok(ticket),
                         Err(error) => {
                             lock(&lane.pending)?.remove_log_refs(&appended_log_refs);

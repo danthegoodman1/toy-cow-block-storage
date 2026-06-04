@@ -5620,7 +5620,7 @@ fn durable_append_run_payload_writes_without_segment_placement() {
 
     let (run, pending, profile) = store
         .durable
-        .append_run_payload_chunks_unsynced(payload, None)
+        .write_append_run_payload_chunks_unsynced(payload, None)
         .unwrap();
     assert_eq!(run.run_id, AppendRunId::from_raw(77));
     assert_eq!(run.file_offset_start, 4096);

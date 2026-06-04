@@ -351,7 +351,7 @@ pub(super) struct AppendStreamState {
     durable_through: u64,
     published_through: u64,
     status: AppendStreamStatus,
-    // Commit order by stream offset; append_stream_run_record enforces it.
+    // Commit order by stream offset; record_append_stream_run enforces it.
     records: Vec<AppendStreamRunRecord>,
 }
 
@@ -970,7 +970,7 @@ impl InMemoryMetadataPlane {
         Ok(ByteRange::new(offset, len))
     }
 
-    pub fn append_stream_run_record(
+    pub fn record_append_stream_run(
         &self,
         stream: &AppendStream,
         ticket_id: AppendTicketId,
