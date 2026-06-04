@@ -556,7 +556,7 @@ impl StorageNodeRegistry {
         let found: BTreeSet<_> = payloads.iter().map(|payload| payload.segment_id).collect();
         if &found != segment_ids {
             return Err(StorageError::corrupt(
-                "stream flush references segments missing from storage-node catalogs",
+                "stream prefix persist references segments missing from storage-node catalogs",
             ));
         }
         Ok((nodes, payloads))

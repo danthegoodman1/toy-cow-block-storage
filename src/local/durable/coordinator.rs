@@ -13,7 +13,7 @@ pub struct DurableCoordinator {
     stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<Mutex<()>>>>>,
     persist_lock: Arc<Mutex<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
-    stream_flush_coordinator: Arc<StreamFlushCoordinator>,
+    stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
     maintenance_policy: MaintenancePolicy,
@@ -115,7 +115,7 @@ impl DurableCoordinator {
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_lock: Arc::new(Mutex::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
-            stream_flush_coordinator: Arc::new(StreamFlushCoordinator::new()),
+            stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
             persist_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
             maintenance_policy,
@@ -743,24 +743,28 @@ impl DurableCoordinator {
         Ok(durable_through)
     }
 
-    fn persist_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
-        let target = self.local.metadata.append_stream_flush_target(stream)?;
+    fn persist_append_stream(&self, stream: &AppendStream) -> Result<u64> {
+        let target = self.local.metadata.append_stream_prefix_persist_target(stream)?;
+        self.persist_append_stream_prefix(stream, target)
+    }
+
+    fn persist_append_stream_prefix(&self, stream: &AppendStream, target: u64) -> Result<u64> {
         let mut observed_generation = 0_u64;
         {
-            let mut state = lock(&self.stream_flush_coordinator.inner)?;
-            state.add_request(stream, target.durable_through);
+            let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
+            state.add_request(stream, target);
         }
         loop {
-            if let Some(mark) = self
+            if let Some(durable_through) = self
                 .local
                 .metadata
-                .append_stream_durable_mark_if_reached(stream, target.durable_through)?
+                .append_stream_durable_high_water_if_reached(stream, target)?
             {
-                lock(&self.stream_flush_coordinator.inner)?.release_request(stream.stream_id);
-                return Ok(mark);
+                lock(&self.stream_prefix_persist_coordinator.inner)?.release_request(stream.stream_id);
+                return Ok(durable_through);
             }
 
-            let mut state = lock(&self.stream_flush_coordinator.inner)?;
+            let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
             if let Some((error_generation, error)) = state.last_error.clone()
                 && error_generation > observed_generation
             {
@@ -774,19 +778,19 @@ impl DurableCoordinator {
 
                 let result = self.persist_append_stream_batches_until(&requests);
 
-                let mut state = lock(&self.stream_flush_coordinator.inner)?;
+                let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
                 state.in_flight = false;
                 state.generation = state.generation.saturating_add(1);
                 observed_generation = state.generation;
                 match result {
                     Ok(()) => {
                         state.last_error = None;
-                        self.stream_flush_coordinator.cvar.notify_all();
+                        self.stream_prefix_persist_coordinator.cvar.notify_all();
                     }
                     Err(error) => {
                         state.release_request(stream.stream_id);
                         state.last_error = Some((state.generation, error.clone()));
-                        self.stream_flush_coordinator.cvar.notify_all();
+                        self.stream_prefix_persist_coordinator.cvar.notify_all();
                         return Err(error);
                     }
                 }
@@ -795,26 +799,32 @@ impl DurableCoordinator {
 
             let generation = state.generation;
             while state.in_flight && state.generation == generation {
-                state = wait_on_cvar(&self.stream_flush_coordinator.cvar, state)?;
+                state = wait_on_cvar(&self.stream_prefix_persist_coordinator.cvar, state)?;
             }
             observed_generation = state.generation;
         }
     }
 
     fn persist_append_stream_batches_until(&self, requests: &[(AppendStream, u64)]) -> Result<()> {
-        for _ in 0..MAX_STREAM_FLUSH_GROUPS_PER_RUN {
+        let mut made_progress = false;
+        for _ in 0..MAX_STREAM_PREFIX_PERSIST_GROUPS_PER_RUN {
             if self.append_stream_requests_reached(requests)? {
                 return Ok(());
             }
             if !self.persist_one_append_stream_request_batch(requests)? {
                 return Err(StorageError::conflict(
-                    "append stream flush target has no persistable records",
+                    "append stream prefix persist target has no persistable records",
                 ));
             }
+            made_progress = true;
         }
-        Err(StorageError::conflict(
-            "append stream flush target exceeded bounded persist groups",
-        ))
+        if made_progress {
+            Ok(())
+        } else {
+            Err(StorageError::conflict(
+                "append stream prefix persist target has no persistable records",
+            ))
+        }
     }
 
     fn append_stream_requests_reached(&self, requests: &[(AppendStream, u64)]) -> Result<bool> {
@@ -822,7 +832,7 @@ impl DurableCoordinator {
             if self
                 .local
                 .metadata
-                .append_stream_durable_mark_if_reached(stream, *durable_through)?
+                .append_stream_durable_high_water_if_reached(stream, *durable_through)?
                 .is_none()
             {
                 return Ok(false);
@@ -843,7 +853,7 @@ impl DurableCoordinator {
         let plans = self
             .local
             .metadata
-            .append_stream_flush_plans_for(requests, MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES)?;
+            .append_stream_prefix_persist_plans_for(requests, MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES)?;
         if plans.is_empty() {
             return Ok(false);
         }
@@ -907,7 +917,7 @@ impl DurableCoordinator {
             .collect::<Result<_>>()?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
-        let mut profile = self.durable.persist_preingested_append_stream_flush(
+        let mut profile = self.durable.persist_preingested_append_stream_prefix(
             &cursor,
             &exported_streams,
             &nodes,
@@ -1576,7 +1586,7 @@ impl DurableCoordinator {
                     }
                 };
                 if flushed {
-                    self.flush_append_stream(stream)?;
+                    self.persist_append_stream(stream)?;
                 }
                 Ok(ticket)
             });
@@ -1586,20 +1596,43 @@ impl DurableCoordinator {
         result
     }
 
-    pub fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
-        self.persist_append_stream(stream)
+    pub fn submit_append_publish(
+        &self,
+        stream: &AppendStream,
+        publish_through: u64,
+    ) -> Result<AppendPublishTicket> {
+        self.local.submit_append_publish(stream, publish_through)
+    }
+
+    pub fn wait_append_publish(
+        &self,
+        ticket: &AppendPublishTicket,
+    ) -> Result<AppendPublishCommit> {
+        let state = match self.local.metadata.append_publish_ticket_status(ticket)? {
+            AppendPublishTicketStatus::Completed(commit) => return Ok(commit),
+            AppendPublishTicketStatus::Pending(state) => state,
+        };
+        let stream = state.public_stream();
+        self.persist_append_stream_prefix(&stream, ticket.publish_through)?;
+        let commit = self
+            .local
+            .wait_append_publish(ticket, WriteDurability::Flushed)?;
+        self.persist_append_stream_publish_delta(&stream, commit.commit_seq, &BTreeSet::new())?;
+        Ok(commit)
     }
 
     pub fn publish_append_stream(
         &self,
         stream: &AppendStream,
-        mark: &DurableAppendMark,
+        publish_through: u64,
     ) -> Result<AppendPublishCommit> {
-        let commit = self
-            .local
-            .publish_append_stream(stream, mark, WriteDurability::Flushed)?;
-        self.persist_append_stream_publish_delta(stream, commit.commit_seq, &BTreeSet::new())?;
-        Ok(commit)
+        let ticket = self.submit_append_publish(stream, publish_through)?;
+        self.wait_append_publish(&ticket)
+    }
+
+    pub fn release_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        self.local.release_append_stream(stream)?;
+        self.persist_now()
     }
 
     pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {

@@ -59,8 +59,8 @@ Deliverables:
   file create/info/append-stream open, keyspace checkpoint, snapshot, and
   restore.
 - [x] Public `NativeFile` trait for native file reads, atomic file write
-  batches with a one-write helper, append streams, append ingest, stream flush,
-  stream publish, abort, flush, and info.
+  batches with a one-write helper, append streams, append ingest, publish-prefix persistence,
+  stream publish, explicit release, abort, flush, and info.
 - [x] `BlockServer` actor boundary.
 - [x] `BlockTransport` request/response boundary.
 - [x] `NativeServer` actor boundary.
@@ -279,7 +279,8 @@ Exit gate:
 - [x] Table-driven tests cover beginning, middle, end, full-range, same-range,
   and cross-shard overwrites.
 - [x] Table-driven tests cover valid append publish, stale stream rejection,
-  stream stealing, invisible durable marks, restart resume, and private-data GC.
+  stream stealing, unpublished private data, restart visible-state recovery, and
+  private-data GC.
 - [x] Criterion has baseline write benchmarks.
 
 ## Phase 7: Metadata Tree Shape
@@ -689,7 +690,7 @@ Deliverables:
 - [x] Durable write-intent table with logical expiration, cancellation/failure
   evidence, and restart recovery scan.
 - [x] Durable native append stream records with restart-safe writer epochs,
-  durable marks, and stale-writer rejection after recovery.
+  publish-prefix state, and stale-writer rejection after recovery.
 - [x] Cache coherence rules for hot heads, metadata nodes, checkpoints, and
   segment descriptors after restart.
 - [x] Crash/restart tests for committed block contents, native keyspace state,
@@ -1310,10 +1311,11 @@ host/filesystem dependent.
 Status: implemented with measured tail follow-up.
 
 Replace the native append-stream storage shape with durable append runs and
-compact run-backed visible file extents. The public stream API keeps the
-durable/visible split, but the implementation must stop translating stream
-ingest into ordinary segment placement fanout. The detailed implementation plan
-lives in `docs/durable-append-run-architecture-plan.md`.
+compact run-backed visible file extents. The public stream API now makes publish
+the only append durability and visibility boundary: clients submit a publish
+prefix, the server persists any pending append-log bytes for that prefix, and
+then metadata publishes compact run-backed extents. The detailed implementation
+plan lives in `docs/durable-append-run-architecture-plan.md`.
 
 Non-goals:
 
@@ -1325,19 +1327,18 @@ Non-goals:
 
 Deliverables:
 
-- [x] Core append-run, run-range, payload-integrity, durable-mark, and
+- [x] Core append-run, run-range, payload-integrity, publish-prefix, and
   run-backed-file-extent types with deterministic validation.
 - [x] Stream ingest writes payloads once into storage-node append lanes, not
   into both append logs and ordinary segments.
-- [x] Bounded durable stream flush persists log runs and stream high-water
-  without generic full-state or generic segment publish paths.
-- [x] Visible publish converts durable stream runs into coalesced file extents
-  in one metadata transition.
-- [x] Reopen restores visible heads and resumable private stream state while
-  ignoring unflushed bytes.
-- [x] Flushed private stream state is failover-resumable only by a holder of the
-  stream token and durable mark; publish is the only globally discoverable
-  append boundary.
+- [x] Bounded internal stream-prefix persistence syncs append-log runs without
+  generic full-state or generic segment publish paths.
+- [x] Visible publish converts persisted stream prefixes into coalesced file
+  extents in one metadata transition.
+- [x] Reopen restores visible heads and ignores unpublished private stream
+  state.
+- [x] Publish is the only globally discoverable and restart-durable append
+  boundary; unpublished private state has no public recovery guarantee.
 - [x] GC roots include active/resumable private stream ranges and stop
   protecting fenced, aborted, expired, superseded, or fully published private
   ranges.
@@ -1352,7 +1353,7 @@ Exit gate:
   stream rows with one record per client append.
 - [x] Publishing 128 one-MiB appends produces one or a small deterministic
   number of visible extents when the physical run is contiguous.
-- [x] Stream flush p99 is dominated by bounded physical sync groups, not global
+- [x] Stream publish-prefix p99 is dominated by bounded physical sync groups, not global
   lock wait or metadata fanout.
 - [x] Publish profile has no payload append/sync and scales with run count.
 - [x] Fencing, restart, corruption, PITR, fork, and GC tests pass for
@@ -1363,12 +1364,13 @@ Exit gate:
 Measured checkpoint: `target/loadbench/append-run-waiter-batch-final/` has the
 200 us RTT matrix and phase profiles for the run-backed implementation. c16
 stream ingest now reaches multi-GiB/s throughput. Splitting profile rows by
-`new_segment_bytes` shows payload flush rows are dominated by bounded data-log
-sync groups: c16 `native-stream-ingest-1m` 32 MiB flush rows had lock-wait p99
+`new_segment_bytes` shows publish-prefix persistence rows are dominated by
+bounded data-log sync groups: c16 `native-stream-ingest-1m` 32 MiB persistence
+rows had lock-wait p99
 about 0 ms and file-sync p99 about 14.9 ms; c16 `native-stream-ingest-32m`
-32 MiB flush rows had lock-wait p99 below 1 ms and file-sync p99 about 13.1 ms.
+32 MiB persistence rows had lock-wait p99 below 1 ms and file-sync p99 about 13.1 ms.
 The remaining zero-byte profile tail is publish metadata queueing behind an
-in-flight data-log sync, not stream flush metadata fanout. Verified and
+in-flight data-log sync, not stream metadata fanout. Verified and
 skip-verify read measurements live under
 `target/loadbench/append-run-read-verification/` and show checksum verification
 is not a meaningful read bottleneck at 200 us RTT.

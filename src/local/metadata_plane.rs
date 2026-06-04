@@ -190,9 +190,9 @@ impl MetadataInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum AppendStreamStatus {
     Active,
+    Released,
     Fenced,
     Aborted,
-    Published,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -204,16 +204,16 @@ pub(super) struct AppendStreamRunRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AppendStreamFlushBatch {
+pub(super) struct AppendStreamPrefixPersistBatch {
     records: Vec<AppendStreamRunRecord>,
     durable_through: u64,
     payload_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AppendStreamFlushPlan {
+pub(super) struct AppendStreamPrefixPersistPlan {
     stream: AppendStream,
-    batch: AppendStreamFlushBatch,
+    batch: AppendStreamPrefixPersistBatch,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +241,44 @@ impl AppendStreamRunRecord {
 
     fn payload_bytes(&self) -> u64 {
         self.run.payload_len
+    }
+
+    fn slice(&self, start: u64, end: u64) -> Result<Option<Self>> {
+        if start >= end {
+            return Ok(None);
+        }
+        let record_end = self.end_exclusive()?;
+        if start < self.offset || end > record_end {
+            return Err(StorageError::invalid_argument(
+                "append stream record slice exceeds source record",
+            ));
+        }
+        let delta = start - self.offset;
+        let len = end - start;
+        let integrity = if start == self.offset && end == record_end {
+            self.run.integrity
+        } else {
+            SegmentPayloadIntegrity::Unchecked
+        };
+        let run = AppendLogRun {
+            file_offset_start: start,
+            payload_len: len,
+            log_payload_offset: self
+                .run
+                .log_payload_offset
+                .checked_add(delta)
+                .ok_or_else(|| StorageError::invalid_argument("append run offset overflows"))?,
+            log_record_bytes: len,
+            integrity,
+            ..self.run.clone()
+        };
+        run.validate()?;
+        Ok(Some(Self {
+            ticket_id: self.ticket_id,
+            offset: start,
+            len,
+            run,
+        }))
     }
 
     fn coalesce_with(&self, next: &Self) -> Result<Option<Self>> {
@@ -347,7 +385,7 @@ impl AppendStreamState {
             if end <= expected {
                 continue;
             }
-            if record.offset != expected {
+            if record.offset > expected {
                 break;
             }
             expected = end;
@@ -355,10 +393,42 @@ impl AppendStreamState {
         Ok(expected)
     }
 
-    fn flush_batch(&self, max_batch_bytes: u64) -> Result<AppendStreamFlushBatch> {
+    fn publish_records(&self, start: u64, end: u64) -> Result<Vec<AppendStreamRunRecord>> {
+        if start >= end {
+            return Err(StorageError::invalid_argument(
+                "append stream publish range must not be empty",
+            ));
+        }
+        let mut expected = start;
+        let mut selected = Vec::new();
+        let mut records = self.records.clone();
+        records.sort_by_key(|record| record.offset);
+        for record in records {
+            let record_end = record.end_exclusive()?;
+            if record_end <= expected {
+                continue;
+            }
+            if record.offset > expected {
+                break;
+            }
+            let slice_end = record_end.min(end);
+            if let Some(slice) = record.slice(expected, slice_end)? {
+                expected = slice.end_exclusive()?;
+                selected.push(slice);
+            }
+            if expected == end {
+                return Ok(selected);
+            }
+        }
+        Err(StorageError::conflict(
+            "append-run publish requires contiguous durable records",
+        ))
+    }
+
+    fn prefix_persist_batch(&self, max_batch_bytes: u64) -> Result<AppendStreamPrefixPersistBatch> {
         if max_batch_bytes == 0 {
             return Err(StorageError::invalid_argument(
-                "append stream flush batch byte cap must be greater than zero",
+                "append stream prefix-persist batch byte cap must be greater than zero",
             ));
         }
         let mut expected = self.durable_through;
@@ -389,7 +459,7 @@ impl AppendStreamState {
             expected = end;
             selected.push(record);
         }
-        Ok(AppendStreamFlushBatch {
+        Ok(AppendStreamPrefixPersistBatch {
             records: selected,
             durable_through: expected,
             payload_bytes,
@@ -450,6 +520,22 @@ impl AppendStreamAllocator {
     fn next_ticket_id(&mut self) -> Result<AppendTicketId> {
         self.next_raw().map(AppendTicketId::from_raw)
     }
+
+    fn next_publish_ticket_id(&mut self) -> Result<AppendPublishTicketId> {
+        self.next_raw().map(AppendPublishTicketId::from_raw)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AppendPublishTicketRecord {
+    ticket: AppendPublishTicket,
+    completed: Option<AppendPublishCommit>,
+}
+
+#[derive(Debug, Clone)]
+enum AppendPublishTicketStatus {
+    Pending(AppendStreamState),
+    Completed(AppendPublishCommit),
 }
 
 /// In-memory implementation of `MetadataPlane`.
@@ -458,6 +544,7 @@ pub struct InMemoryMetadataPlane {
     config: LocalStoreConfig,
     inner: Mutex<MetadataInner>,
     append_stream_allocator: Mutex<AppendStreamAllocator>,
+    append_publish_tickets: Mutex<BTreeMap<AppendPublishTicketId, AppendPublishTicketRecord>>,
     publish_profiler: Mutex<Option<MetadataPublishProfiler>>,
 }
 
@@ -468,6 +555,7 @@ impl InMemoryMetadataPlane {
             config,
             inner: Mutex::new(MetadataInner::new()),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
+            append_publish_tickets: Mutex::new(BTreeMap::new()),
             publish_profiler: Mutex::new(None),
         })
     }
@@ -478,6 +566,7 @@ impl InMemoryMetadataPlane {
             config,
             inner: Mutex::new(inner),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
+            append_publish_tickets: Mutex::new(BTreeMap::new()),
             publish_profiler: Mutex::new(None),
         })
     }
@@ -835,6 +924,10 @@ impl InMemoryMetadataPlane {
         lock(&self.append_stream_allocator)?.next_ticket_id()
     }
 
+    pub fn next_append_publish_ticket_id(&self) -> Result<AppendPublishTicketId> {
+        lock(&self.append_stream_allocator)?.next_publish_ticket_id()
+    }
+
     pub fn reserve_append_stream_range(
         &self,
         stream: &AppendStream,
@@ -921,7 +1014,7 @@ impl InMemoryMetadataPlane {
         })
     }
 
-    pub fn mark_append_stream_durable(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+    pub fn mark_append_stream_durable(&self, stream: &AppendStream) -> Result<u64> {
         let mut inner = lock(&self.inner)?;
         let state = inner
             .append_streams
@@ -929,36 +1022,126 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
         state.durable_through = state.contiguous_record_tail_from(state.durable_through)?;
-        Ok(DurableAppendMark {
-            keyspace_id: stream.keyspace_id,
-            file_id: stream.file_id,
-            stream_id: stream.stream_id,
-            writer_epoch: stream.writer_epoch,
-            durable_through: state.durable_through,
-        })
+        Ok(state.durable_through)
     }
 
-    fn append_stream_flush_target(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+    fn append_stream_prefix_persist_target(&self, stream: &AppendStream) -> Result<u64> {
         let inner = lock(&self.inner)?;
         let state = inner
             .append_streams
             .get(&stream.stream_id)
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
-        Ok(DurableAppendMark {
+        state.contiguous_record_tail_from(state.durable_through)
+    }
+
+    pub fn submit_append_publish(
+        &self,
+        stream: &AppendStream,
+        ticket_id: AppendPublishTicketId,
+        publish_through: u64,
+    ) -> Result<AppendPublishTicket> {
+        {
+            let inner = lock(&self.inner)?;
+            let state = inner
+                .append_streams
+                .get(&stream.stream_id)
+                .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+            state.validate_token(stream)?;
+            if publish_through <= state.published_through {
+                return Err(StorageError::invalid_argument(
+                    "append publish target must advance published stream prefix",
+                ));
+            }
+            if publish_through > state.reserved_tail {
+                return Err(StorageError::conflict(
+                    "append publish target exceeds accepted stream bytes",
+                ));
+            }
+            if publish_through > state.contiguous_record_tail_from(state.published_through)? {
+                return Err(StorageError::conflict(
+                    "append publish target exceeds contiguous stream records",
+                ));
+            }
+        }
+        let ticket = AppendPublishTicket {
             keyspace_id: stream.keyspace_id,
             file_id: stream.file_id,
             stream_id: stream.stream_id,
+            ticket_id,
             writer_epoch: stream.writer_epoch,
-            durable_through: state.contiguous_record_tail_from(state.durable_through)?,
-        })
+            publish_through,
+        };
+        let mut tickets = lock(&self.append_publish_tickets)?;
+        if tickets
+            .insert(
+                ticket_id,
+                AppendPublishTicketRecord {
+                    ticket: ticket.clone(),
+                    completed: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(StorageError::conflict("append publish ticket id reused"));
+        }
+        Ok(ticket)
     }
 
-    fn append_stream_durable_mark_if_reached(
+    fn append_publish_ticket_status(
+        &self,
+        ticket: &AppendPublishTicket,
+    ) -> Result<AppendPublishTicketStatus> {
+        let record = lock(&self.append_publish_tickets)?
+            .get(&ticket.ticket_id)
+            .cloned()
+            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
+        if record.ticket != *ticket {
+            return Err(StorageError::conflict("stale append publish ticket"));
+        }
+        if let Some(commit) = record.completed {
+            return Ok(AppendPublishTicketStatus::Completed(commit));
+        }
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&ticket.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
+        if state.keyspace_id != ticket.keyspace_id
+            || state.file_id != ticket.file_id
+            || state.stream_id != ticket.stream_id
+            || state.writer_epoch != ticket.writer_epoch
+            || state.status != AppendStreamStatus::Active
+            || ticket.publish_through <= state.published_through
+            || ticket.publish_through > state.reserved_tail
+            || ticket.publish_through > state.contiguous_record_tail_from(state.published_through)?
+        {
+            return Err(StorageError::conflict("stale append publish ticket"));
+        }
+        Ok(AppendPublishTicketStatus::Pending(state.clone()))
+    }
+
+    fn complete_append_publish_ticket(
+        &self,
+        ticket: &AppendPublishTicket,
+        commit: AppendPublishCommit,
+    ) -> Result<()> {
+        let mut tickets = lock(&self.append_publish_tickets)?;
+        let record = tickets
+            .get_mut(&ticket.ticket_id)
+            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
+        if record.ticket != *ticket {
+            return Err(StorageError::conflict("stale append publish ticket"));
+        }
+        record.completed = Some(commit);
+        Ok(())
+    }
+
+    fn append_stream_durable_high_water_if_reached(
         &self,
         stream: &AppendStream,
         durable_through: u64,
-    ) -> Result<Option<DurableAppendMark>> {
+    ) -> Result<Option<u64>> {
         let inner = lock(&self.inner)?;
         let state = inner
             .append_streams
@@ -968,20 +1151,14 @@ impl InMemoryMetadataPlane {
         if state.durable_through < durable_through {
             return Ok(None);
         }
-        Ok(Some(DurableAppendMark {
-            keyspace_id: stream.keyspace_id,
-            file_id: stream.file_id,
-            stream_id: stream.stream_id,
-            writer_epoch: stream.writer_epoch,
-            durable_through: state.durable_through,
-        }))
+        Ok(Some(state.durable_through))
     }
 
-    fn append_stream_flush_plans_for(
+    fn append_stream_prefix_persist_plans_for(
         &self,
         requests: &[(AppendStream, u64)],
         max_batch_bytes: u64,
-    ) -> Result<Vec<AppendStreamFlushPlan>> {
+    ) -> Result<Vec<AppendStreamPrefixPersistPlan>> {
         let inner = lock(&self.inner)?;
         let mut total_bytes = 0_u64;
         let mut plans = Vec::new();
@@ -996,7 +1173,7 @@ impl InMemoryMetadataPlane {
             {
                 continue;
             }
-            let batch = state.flush_batch(max_batch_bytes)?;
+            let batch = state.prefix_persist_batch(max_batch_bytes)?;
             if batch.records.is_empty() {
                 continue;
             }
@@ -1011,7 +1188,7 @@ impl InMemoryMetadataPlane {
             total_bytes = total_bytes
                 .checked_add(batch.payload_bytes)
                 .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
-            plans.push(AppendStreamFlushPlan {
+            plans.push(AppendStreamPrefixPersistPlan {
                 stream: state.public_stream(),
                 batch,
             });
@@ -1037,7 +1214,7 @@ impl InMemoryMetadataPlane {
         &self,
         stream: &AppendStream,
         durable_through: u64,
-    ) -> Result<DurableAppendMark> {
+    ) -> Result<u64> {
         let mut inner = lock(&self.inner)?;
         let state = inner
             .append_streams
@@ -1052,36 +1229,7 @@ impl InMemoryMetadataPlane {
             ));
         }
         state.durable_through = durable_through;
-        Ok(DurableAppendMark {
-            keyspace_id: stream.keyspace_id,
-            file_id: stream.file_id,
-            stream_id: stream.stream_id,
-            writer_epoch: stream.writer_epoch,
-            durable_through,
-        })
-    }
-
-    fn validate_append_stream_mark(
-        &self,
-        stream: &AppendStream,
-        mark: &DurableAppendMark,
-    ) -> Result<AppendStreamState> {
-        let inner = lock(&self.inner)?;
-        let state = inner
-            .append_streams
-            .get(&stream.stream_id)
-            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
-        state.validate_token(stream)?;
-        if mark.keyspace_id != stream.keyspace_id
-            || mark.file_id != stream.file_id
-            || mark.stream_id != stream.stream_id
-            || mark.writer_epoch != stream.writer_epoch
-            || mark.durable_through > state.durable_through
-            || mark.durable_through < state.published_through
-        {
-            return Err(StorageError::conflict("stale append stream mark"));
-        }
-        Ok(state.clone())
+        Ok(durable_through)
     }
 
     pub fn mark_append_stream_published(
@@ -1096,12 +1244,21 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
         state.published_through = durable_through;
-        state.records.retain(|record| {
-            record
-                .offset
-                .checked_add(record.len)
-                .is_none_or(|end| end > durable_through)
-        });
+        let mut retained = Vec::new();
+        for record in &state.records {
+            let record_end = record.end_exclusive()?;
+            if record_end <= durable_through {
+                continue;
+            }
+            if record.offset < durable_through {
+                if let Some(suffix) = record.slice(durable_through, record_end)? {
+                    retained.push(suffix);
+                }
+            } else {
+                retained.push(record.clone());
+            }
+        }
+        state.records = retained;
         Ok(())
     }
 
@@ -1113,6 +1270,17 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
         state.status = AppendStreamStatus::Aborted;
+        Ok(())
+    }
+
+    pub fn release_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get_mut(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        state.status = AppendStreamStatus::Released;
         Ok(())
     }
 

@@ -157,6 +157,10 @@ struct BenchReport {
 }
 
 impl BenchReport {
+    fn csv_header() -> &'static str {
+        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,durable_mbps,published_mbps,durable_bytes,published_bytes,p50_us,p90_us,p99_us,p999_us,max_us,samples"
+    }
+
     fn from_workers(elapsed: Duration, workers: Vec<WorkerReport>) -> Self {
         let mut attempts = 0_u64;
         let mut successes = 0_u64;
@@ -206,14 +210,14 @@ impl BenchReport {
         }
     }
 
-    fn print_csv(&self) {
+    fn csv_row(&self) -> String {
         let seconds = self.elapsed.as_secs_f64();
         let success_iops = self.successes as f64 / seconds;
         let attempt_iops = self.attempts as f64 / seconds;
         let mbps = self.bytes as f64 / seconds / 1_000_000.0;
         let durable_mbps = self.durable_bytes as f64 / seconds / 1_000_000.0;
         let published_mbps = self.published_bytes as f64 / seconds / 1_000_000.0;
-        println!(
+        format!(
             "{},{},{},{},{},{},{},{:.6},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
             self.workload.name(),
             self.provider,
@@ -239,7 +243,11 @@ impl BenchReport {
             nanos_to_micros(self.p999_nanos),
             nanos_to_micros(self.max_nanos),
             self.samples
-        );
+        )
+    }
+
+    fn print_csv(&self) {
+        println!("{}", self.csv_row());
     }
 }
 

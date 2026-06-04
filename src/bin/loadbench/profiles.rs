@@ -1,3 +1,23 @@
+fn append_matrix_csv(args: &Args, report: &BenchReport) -> Result<()> {
+    let Some(path) = &args.matrix_csv else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(file, "{}", BenchReport::csv_header()).map_err(fs_error)?;
+    }
+    writeln!(file, "{}", report.csv_row()).map_err(fs_error)?;
+    Ok(())
+}
+
 fn append_profile_csv(
     args: &Args,
     workload: Workload,

@@ -216,11 +216,17 @@ enum Workload {
     NativeStreamIngest1m,
     NativeStreamIngest4m,
     NativeStreamIngest32m,
-    NativeStreamAppendFlush1m,
-    NativeStreamAppendFlush4m,
-    NativeStreamAppendFlush32m,
-    NativeStreamPublishPreflushed1m,
-    NativeStreamFlushPublish1m,
+    NativeStreamPublishPrefix1m,
+    NativeStreamPublishPrefix4m,
+    NativeStreamPublishPrefix32m,
+    NativeStreamPublishServerPersisted1m,
+    NativeStreamPublishPipelined1m,
+    NativeStreamPublishInterval1m,
+    NativeStreamPublishInterval4m,
+    NativeStreamPublishInterval32m,
+    NativeStreamPublishAtEnd1m,
+    NativeStreamPublishAtEnd4m,
+    NativeStreamPublishAtEnd32m,
     NativeHotAppend4k,
 }
 
@@ -262,11 +268,11 @@ impl Workload {
             Self::NativeStreamIngest1m,
             Self::NativeStreamIngest4m,
             Self::NativeStreamIngest32m,
-            Self::NativeStreamAppendFlush1m,
-            Self::NativeStreamAppendFlush4m,
-            Self::NativeStreamAppendFlush32m,
-            Self::NativeStreamPublishPreflushed1m,
-            Self::NativeStreamFlushPublish1m,
+            Self::NativeStreamPublishPrefix1m,
+            Self::NativeStreamPublishPrefix4m,
+            Self::NativeStreamPublishPrefix32m,
+            Self::NativeStreamPublishServerPersisted1m,
+            Self::NativeStreamPublishPipelined1m,
         ]
     }
 
@@ -319,7 +325,7 @@ impl Workload {
             Self::NativeWrite4kFileLanes,
             Self::NativeAppend4kSameFile,
             Self::NativeAppend4kFileLanes,
-            Self::NativeStreamFlushPublish1m,
+            Self::NativeStreamPublishPipelined1m,
         ]
     }
 
@@ -333,7 +339,7 @@ impl Workload {
             Self::NativeFileBatch1m16Ops,
             Self::NativeFileBatchOverwriteCollapse,
             Self::NativeFileBatchFsyncInterval,
-            Self::NativeStreamFlushPublish1m,
+            Self::NativeStreamPublishPipelined1m,
         ]
     }
 
@@ -387,11 +393,19 @@ impl Workload {
             Self::NativeStreamIngest1m => "native-stream-ingest-1m",
             Self::NativeStreamIngest4m => "native-stream-ingest-4m",
             Self::NativeStreamIngest32m => "native-stream-ingest-32m",
-            Self::NativeStreamAppendFlush1m => "native-stream-append-flush-1m",
-            Self::NativeStreamAppendFlush4m => "native-stream-append-flush-4m",
-            Self::NativeStreamAppendFlush32m => "native-stream-append-flush-32m",
-            Self::NativeStreamPublishPreflushed1m => "native-stream-publish-preflushed-1m",
-            Self::NativeStreamFlushPublish1m => "native-stream-flush-publish-1m",
+            Self::NativeStreamPublishPrefix1m => "native-stream-publish-prefix-1m",
+            Self::NativeStreamPublishPrefix4m => "native-stream-publish-prefix-4m",
+            Self::NativeStreamPublishPrefix32m => "native-stream-publish-prefix-32m",
+            Self::NativeStreamPublishServerPersisted1m => {
+                "native-stream-publish-server-persisted-1m"
+            }
+            Self::NativeStreamPublishPipelined1m => "native-stream-publish-pipelined-1m",
+            Self::NativeStreamPublishInterval1m => "native-stream-publish-interval-1m",
+            Self::NativeStreamPublishInterval4m => "native-stream-publish-interval-4m",
+            Self::NativeStreamPublishInterval32m => "native-stream-publish-interval-32m",
+            Self::NativeStreamPublishAtEnd1m => "native-stream-publish-at-end-1m",
+            Self::NativeStreamPublishAtEnd4m => "native-stream-publish-at-end-4m",
+            Self::NativeStreamPublishAtEnd32m => "native-stream-publish-at-end-32m",
             Self::NativeHotAppend4k => "native-hot-append-4k",
         }
     }
@@ -423,17 +437,23 @@ impl Workload {
             | Self::NativeWrite1m
             | Self::NativeAppend1m
             | Self::NativeStreamIngest1m
-            | Self::NativeStreamAppendFlush1m
-            | Self::NativeStreamPublishPreflushed1m
-            | Self::NativeStreamFlushPublish1m => 1024 * 1024,
+            | Self::NativeStreamPublishPrefix1m
+            | Self::NativeStreamPublishServerPersisted1m
+            | Self::NativeStreamPublishPipelined1m
+            | Self::NativeStreamPublishInterval1m
+            | Self::NativeStreamPublishAtEnd1m => 1024 * 1024,
             Self::NativeWrite4m
             | Self::NativeAppend4m
             | Self::NativeStreamIngest4m
-            | Self::NativeStreamAppendFlush4m => 4 * 1024 * 1024,
+            | Self::NativeStreamPublishPrefix4m
+            | Self::NativeStreamPublishInterval4m
+            | Self::NativeStreamPublishAtEnd4m => 4 * 1024 * 1024,
             Self::NativeWrite32m
             | Self::NativeAppend32m
             | Self::NativeStreamIngest32m
-            | Self::NativeStreamAppendFlush32m => 32 * 1024 * 1024,
+            | Self::NativeStreamPublishPrefix32m
+            | Self::NativeStreamPublishInterval32m
+            | Self::NativeStreamPublishAtEnd32m => 32 * 1024 * 1024,
             Self::BlockWrite4k
             | Self::BlockWrite4kSameShardContended
             | Self::BlockWrite4kSameShardSerialized
@@ -666,11 +686,17 @@ impl Workload {
             Self::NativeStreamIngest1m
                 | Self::NativeStreamIngest4m
                 | Self::NativeStreamIngest32m
-                | Self::NativeStreamAppendFlush1m
-                | Self::NativeStreamAppendFlush4m
-                | Self::NativeStreamAppendFlush32m
-                | Self::NativeStreamPublishPreflushed1m
-                | Self::NativeStreamFlushPublish1m
+                | Self::NativeStreamPublishPrefix1m
+                | Self::NativeStreamPublishPrefix4m
+                | Self::NativeStreamPublishPrefix32m
+                | Self::NativeStreamPublishServerPersisted1m
+                | Self::NativeStreamPublishPipelined1m
+                | Self::NativeStreamPublishInterval1m
+                | Self::NativeStreamPublishInterval4m
+                | Self::NativeStreamPublishInterval32m
+                | Self::NativeStreamPublishAtEnd1m
+                | Self::NativeStreamPublishAtEnd4m
+                | Self::NativeStreamPublishAtEnd32m
         )
     }
 
@@ -681,21 +707,43 @@ impl Workload {
         )
     }
 
-    fn is_native_stream_append_flush(self) -> bool {
+    fn is_native_stream_publish_prefix(self) -> bool {
         matches!(
             self,
-            Self::NativeStreamAppendFlush1m
-                | Self::NativeStreamAppendFlush4m
-                | Self::NativeStreamAppendFlush32m
+            Self::NativeStreamPublishPrefix1m
+                | Self::NativeStreamPublishPrefix4m
+                | Self::NativeStreamPublishPrefix32m
         )
     }
 
-    fn is_native_stream_publish_preflushed(self) -> bool {
-        matches!(self, Self::NativeStreamPublishPreflushed1m)
+    fn is_native_stream_publish_server_persisted(self) -> bool {
+        matches!(self, Self::NativeStreamPublishServerPersisted1m)
     }
 
-    fn is_native_stream_flush_publish(self) -> bool {
-        matches!(self, Self::NativeStreamFlushPublish1m)
+    fn is_native_stream_publish_pipelined(self) -> bool {
+        matches!(self, Self::NativeStreamPublishPipelined1m)
+    }
+
+    fn is_native_stream_publish_interval(self) -> bool {
+        matches!(
+            self,
+            Self::NativeStreamPublishInterval1m
+                | Self::NativeStreamPublishInterval4m
+                | Self::NativeStreamPublishInterval32m
+        )
+    }
+
+    fn is_native_stream_publish_at_end(self) -> bool {
+        matches!(
+            self,
+            Self::NativeStreamPublishAtEnd1m
+                | Self::NativeStreamPublishAtEnd4m
+                | Self::NativeStreamPublishAtEnd32m
+        )
+    }
+
+    fn is_native_stream_publish_fixed(self) -> bool {
+        self.is_native_stream_publish_interval() || self.is_native_stream_publish_at_end()
     }
 
     fn is_block(self) -> bool {
@@ -790,11 +838,19 @@ impl FromStr for Workload {
             "native-stream-ingest-1m" => Ok(Self::NativeStreamIngest1m),
             "native-stream-ingest-4m" => Ok(Self::NativeStreamIngest4m),
             "native-stream-ingest-32m" => Ok(Self::NativeStreamIngest32m),
-            "native-stream-append-flush-1m" => Ok(Self::NativeStreamAppendFlush1m),
-            "native-stream-append-flush-4m" => Ok(Self::NativeStreamAppendFlush4m),
-            "native-stream-append-flush-32m" => Ok(Self::NativeStreamAppendFlush32m),
-            "native-stream-publish-preflushed-1m" => Ok(Self::NativeStreamPublishPreflushed1m),
-            "native-stream-flush-publish-1m" => Ok(Self::NativeStreamFlushPublish1m),
+            "native-stream-publish-prefix-1m" => Ok(Self::NativeStreamPublishPrefix1m),
+            "native-stream-publish-prefix-4m" => Ok(Self::NativeStreamPublishPrefix4m),
+            "native-stream-publish-prefix-32m" => Ok(Self::NativeStreamPublishPrefix32m),
+            "native-stream-publish-server-persisted-1m" => {
+                Ok(Self::NativeStreamPublishServerPersisted1m)
+            }
+            "native-stream-publish-pipelined-1m" => Ok(Self::NativeStreamPublishPipelined1m),
+            "native-stream-publish-interval-1m" => Ok(Self::NativeStreamPublishInterval1m),
+            "native-stream-publish-interval-4m" => Ok(Self::NativeStreamPublishInterval4m),
+            "native-stream-publish-interval-32m" => Ok(Self::NativeStreamPublishInterval32m),
+            "native-stream-publish-at-end-1m" => Ok(Self::NativeStreamPublishAtEnd1m),
+            "native-stream-publish-at-end-4m" => Ok(Self::NativeStreamPublishAtEnd4m),
+            "native-stream-publish-at-end-32m" => Ok(Self::NativeStreamPublishAtEnd32m),
             "native-hot-append-4k" => Ok(Self::NativeHotAppend4k),
             _ => Err(StorageError::invalid_argument(format!(
                 "unknown workload {value}"

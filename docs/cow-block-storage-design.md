@@ -169,9 +169,10 @@ file_head {
 ```
 
 `file_version` is the fencing identity for ordinary file extent commits. Append
-streams carry writer epochs and separate private durable ingest from visible
-publish, so a stolen stream can reject stale writers even when they durably
-wrote private segment bytes before attempting metadata publish.
+streams carry writer epochs and separate private ingest from visible publish.
+Publish captures a stream prefix, persists any pending append-log bytes for that
+prefix, and then makes the prefix visible. A stolen stream still rejects stale
+writers, and unpublished private bytes are not a restart recovery contract.
 
 Each shard root points to a persistent immutable tree:
 
@@ -404,6 +405,11 @@ Public native guarantees:
 - A successful mutating write or append commit advances the file version and
   owning keyspace catalog shard atomically.
 - Segment bytes are durable before file extent metadata references them.
+- Append publish is the public append durability boundary; append ingest before
+  publish is private server state and may be lost or reclaimed after crash,
+  abort, release, or fencing.
+- Publish does not release the append stream. Releasing the writer lease is an
+  explicit stream operation.
 - Failed or stale append commits leave only orphan segment data that custodians
   can reclaim.
 
@@ -1269,28 +1275,26 @@ Invariants:
 - Failed batches leave the previous file version readable.
 - Segment/block alignment is not exposed to native callers.
 
-### Append Streams, Durable Marks, And Visible Publish
+### Append Streams, Publish Prefixes, And Visible Publish
 
 A native append stream grants one writer the right to ingest private append
 bytes against a specific file and writer epoch. Appended bytes are not visible
-to file readers when they are ingested. A stream flush makes private bytes
-durable through a returned high-water mark, and a publish converts a durable
-range into visible file metadata in one file-version transition.
+to file readers when they are ingested. A publish captures a private stream
+prefix, persists any pending append-log bytes for that prefix, and converts the
+prefix into visible file metadata in one file-version transition.
 
-The production failover model is token-based, not name-based. `AppendStream` is
-bearer authority for one private stream, and `DurableAppendMark` is meaningful
-only with that matching stream token. There is no first-class registry that lets
-a replacement writer discover flushed private bytes by logical file name. A
-replacement writer can resume or publish flushed-but-unpublished bytes only if
-the failover control plane persisted the stream token and durable mark. Without
-that authority it must open a new stream, which fences the old stream and starts
-at the last visible file head.
+The production failover model is visible-head-based, not private-stream-based.
+`AppendStream` is bearer authority for one active private stream, but there is
+no public private durability mark and no first-class registry that lets a
+replacement writer discover unpublished private bytes by logical file name. A
+replacement writer opens a new stream, fences the old stream, and starts at the
+last visible file head.
 
 This keeps the storage contract simple: publish is the only globally
 discoverable append boundary. WAL-like users that require another process to
-recover by file name must publish at their desired recovery interval. Users that
-want private durable checkpoints may flush more often, but those checkpoints are
-private to the stream authority until publish succeeds.
+recover by file name must publish at their desired recovery interval. Server
+auto-flush may persist private bytes on efficient physical boundaries, but it
+is an implementation policy below the public API.
 
 Invariants:
 
@@ -1298,41 +1302,43 @@ Invariants:
   `visible_base_size`, and `writer_epoch`.
 - Append tickets identify the private byte range accepted by a stream append;
   they are diagnostic evidence, not metadata publish authority.
-- `append_stream` success is an acknowledged private ingest. It is not
-  restart-resumable until `flush_append_stream` succeeds.
-- `flush_append_stream` persists private append records and returns a durable
-  mark, but does not advance the visible file head or make the bytes globally
-  discoverable.
-- `publish_append_stream` may only reference private records covered by a
-  durable mark and is the globally durable, visible, file-version boundary.
-- A stale stream cannot ingest, flush, or publish private data.
+- `append_stream` success is an acknowledged private ingest. It is not a
+  restart-resume guarantee.
+- `submit_append_publish` captures a prefix within the accepted private range.
+- `wait_append_publish` persists the captured prefix before metadata references
+  it and is the globally durable, visible, file-version boundary.
+- `publish_append_stream` is the synchronous submit-and-wait convenience path.
+- A stale, released, fenced, or aborted stream cannot ingest, publish, or release
+  private data.
+- Publish does not release the appender lease. `release_append_stream` and
+  `abort_append_stream` are explicit lease-ending operations.
 - Opening a new stream or committing a same-file `write_at` fences the previous
   active stream for that file.
-- Writers take over at the visible file head. Durable-but-unpublished private
-  bytes belong to the fenced stream token and are not inherited by a new writer.
+- Writers take over at the visible file head. Unpublished private bytes are not
+  inherited by a new writer.
 
 ### Native Append Publish
 
 A native append publish:
 
-1. Validates the append stream and durable mark against the active stream state.
-2. Verifies the visible file head still matches the stream's published boundary.
-3. Coalesces the durable private range into compact run-backed file extents.
-4. Publishes the new file root with append-stream and writer-epoch fencing.
-5. Marks the stream range published after metadata publish succeeds.
-6. Returns the new file version.
+1. Captures a publish prefix against the active stream state.
+2. Persists append-log bytes and manifests through the captured prefix.
+3. Verifies the visible file head still matches the stream's published boundary.
+4. Coalesces the persisted private range into compact run-backed file extents.
+5. Publishes the new file root with append-stream and writer-epoch fencing.
+6. Marks the stream range published after metadata publish succeeds.
+7. Returns the new file version.
 
 Invariants:
 
 - A successful publish advances the file version atomically.
 - Stale writers are rejected by metadata fencing.
-- Flush without publish never becomes readable file data.
-- Publish of already-flushed append-stream data is metadata-only; it must not
-  append or sync payload bytes again.
-- Publish metadata scales with durable run count, not with client append call
-  count.
-- Durable private data from fenced, aborted, or abandoned streams is reclaimable
-  once it stops acting as an active stream GC root.
+- Server auto-flush without publish never becomes readable file data.
+- Publish may reuse already-persisted append-log bytes, but must persist any
+  remaining captured prefix bytes before metadata references them.
+- Publish metadata scales with run count, not with client append call count.
+- Private data from released, fenced, aborted, or abandoned streams is
+  reclaimable once it stops acting as an active stream GC root.
 
 ## 8. Sharding
 
@@ -1637,7 +1643,8 @@ Provider and service boundaries:
 - `BlockTransport`: typed request/response transport.
 - `NativeKeyspaceClient`: public native keyspace control handle.
 - `NativeFile`: public native file handle with byte writes, append streams,
-  durable marks, visible publish, and file-version commits.
+  publish-prefix durability, explicit stream release, visible publish, and
+  file-version commits.
 - `NativeServer`: actor boundary that handles native keyspace/file requests.
 - `NativeTransport`: typed request/response transport for native keyspace/file
   requests.

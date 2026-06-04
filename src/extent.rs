@@ -4,8 +4,8 @@ use crate::api::{
 };
 use crate::error::{Result, StorageError};
 use crate::id::{
-    AppendStreamId, AppendTicketId, CheckpointId, ClientEpoch, CommitSeq, FileId, FileVersion,
-    KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
+    AppendPublishTicketId, AppendStreamId, AppendTicketId, CheckpointId, ClientEpoch, CommitSeq,
+    FileId, FileVersion, KeyspaceGeneration, KeyspaceId, LogicalDeadline, RequestId, WriterEpoch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -75,18 +75,19 @@ pub struct AppendTicket {
     pub range: ByteRange,
 }
 
-/// Durable private high-water mark for an append stream.
+/// Ticket for a captured append publish prefix.
 ///
-/// The mark is meaningful only with the matching `AppendStream` bearer token.
-/// It makes bytes restart-resumable by that token, but not visible or
-/// discoverable through normal file metadata.
+/// The ticket is meaningful only with the matching stream identity. Waiting on
+/// it drives or observes persistence of bytes through `publish_through` and the
+/// atomic metadata publish that makes those bytes visible.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DurableAppendMark {
+pub struct AppendPublishTicket {
     pub keyspace_id: KeyspaceId,
     pub file_id: FileId,
     pub stream_id: AppendStreamId,
+    pub ticket_id: AppendPublishTicketId,
     pub writer_epoch: WriterEpoch,
-    pub durable_through: u64,
+    pub publish_through: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -139,8 +140,10 @@ pub enum NativeOperation {
     CommitFileBatch,
     OpenAppendStream,
     AppendStream,
-    FlushAppendStream,
+    SubmitAppendPublish,
+    WaitAppendPublish,
     PublishAppendStream,
+    ReleaseAppendStream,
     AbortAppendStream,
     Flush,
     CheckpointKeyspace,
@@ -157,13 +160,15 @@ pub enum NativeOperation {
 /// Minimal implementor guarantees:
 ///
 /// - Successful writes are atomic file-version transitions.
-/// - Append streams separate durable ingest from visible publish: durable
-///   private bytes remain invisible until `publish_append_stream` succeeds.
-/// - Flushed private bytes are recoverable after restart only by a holder of
-///   the matching stream token and durable mark.
+/// - Append streams separate private ingest from visible publish: private bytes
+///   remain invisible until append publish succeeds.
 /// - Publish is the only globally discoverable append boundary: a replacement
 ///   writer that does not possess the stream token must open a new stream from
 ///   the latest visible file head.
+/// - Publish is the only public append-stream durability boundary; successful
+///   append ingest before publish is not a restart-resume guarantee.
+/// - Publish does not release the append lease. `release_append_stream` and
+///   `abort_append_stream` are explicit lease-ending operations.
 /// - Stale append stream tokens fail without exposing partial file contents.
 /// - Reads observe the latest visible file root/version in this keyspace.
 /// - Failed writes and publishes leave the previous visible file version
@@ -236,9 +241,8 @@ pub trait NativeFile: Send + Sync {
     ///
     /// Success reserves a monotonically increasing byte range in the stream and
     /// stores the bytes privately. Readers do not see the bytes until a later
-    /// publish. This is an acknowledged/private state: it is not
-    /// restart-resumable until `flush_append_stream` succeeds. A zero-length
-    /// append is invalid.
+    /// publish. This is acknowledged private state, not a restart-resume
+    /// guarantee. A zero-length append is invalid.
     fn append_stream(&self, stream: &AppendStream, data: &[u8]) -> Result<AppendTicket> {
         self.append_stream_with_integrity(stream, data, PayloadIntegrity::Verified)
     }
@@ -251,25 +255,37 @@ pub trait NativeFile: Send + Sync {
         payload_integrity: PayloadIntegrity,
     ) -> Result<AppendTicket>;
 
-    /// Make private stream bytes durable through the returned high-water mark.
+    /// Submit a publish request for a captured stream prefix.
     ///
-    /// Success does not advance visible file metadata. The returned mark can be
-    /// used with the matching stream token by the same writer, or by a failover
-    /// replacement that persisted that token, to call `publish_append_stream`
-    /// after restart.
-    fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark>;
+    /// The prefix must be greater than the stream's published high-water and no
+    /// greater than its accepted high-water. Appends beyond the captured prefix
+    /// may continue before the ticket is waited.
+    fn submit_append_publish(
+        &self,
+        stream: &AppendStream,
+        publish_through: u64,
+    ) -> Result<AppendPublishTicket>;
 
-    /// Publish durable private stream bytes as one visible file-version
-    /// transition.
+    /// Wait for a submitted publish to become durable and visible.
     ///
     /// Success is the globally durable/discoverable boundary for append data:
     /// reads, file stats, snapshots, forks, restores, and replacement writers
     /// observe the new visible file head.
+    fn wait_append_publish(&self, ticket: &AppendPublishTicket) -> Result<AppendPublishCommit>;
+
+    /// Submit and wait for a stream prefix publish.
     fn publish_append_stream(
         &self,
         stream: &AppendStream,
-        mark: &DurableAppendMark,
-    ) -> Result<AppendPublishCommit>;
+        publish_through: u64,
+    ) -> Result<AppendPublishCommit> {
+        let ticket = self.submit_append_publish(stream, publish_through)?;
+        self.wait_append_publish(&ticket)
+    }
+
+    /// Release the active append stream without discarding already-published
+    /// bytes. Any unpublished private tail becomes reclaimable.
+    fn release_append_stream(&self, stream: &AppendStream) -> Result<()>;
 
     /// Abandon the active stream. Durable private bytes are no longer GC roots
     /// after abort and may be reclaimed by custodians.
@@ -353,16 +369,27 @@ pub enum NativeRequest {
         bytes: Vec<u8>,
         payload_integrity: PayloadIntegrity,
     },
-    FlushAppendStream {
+    SubmitAppendPublish {
         keyspace_id: KeyspaceId,
         file_id: FileId,
         stream: AppendStream,
+        publish_through: u64,
+    },
+    WaitAppendPublish {
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        ticket: AppendPublishTicket,
     },
     PublishAppendStream {
         keyspace_id: KeyspaceId,
         file_id: FileId,
         stream: AppendStream,
-        mark: DurableAppendMark,
+        publish_through: u64,
+    },
+    ReleaseAppendStream {
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        stream: AppendStream,
     },
     AbortAppendStream {
         keyspace_id: KeyspaceId,
@@ -397,8 +424,10 @@ impl NativeRequest {
             Self::CommitFileBatch { .. } => NativeOperation::CommitFileBatch,
             Self::OpenAppendStream { .. } => NativeOperation::OpenAppendStream,
             Self::AppendStream { .. } => NativeOperation::AppendStream,
-            Self::FlushAppendStream { .. } => NativeOperation::FlushAppendStream,
+            Self::SubmitAppendPublish { .. } => NativeOperation::SubmitAppendPublish,
+            Self::WaitAppendPublish { .. } => NativeOperation::WaitAppendPublish,
             Self::PublishAppendStream { .. } => NativeOperation::PublishAppendStream,
+            Self::ReleaseAppendStream { .. } => NativeOperation::ReleaseAppendStream,
             Self::AbortAppendStream { .. } => NativeOperation::AbortAppendStream,
             Self::Flush { .. } => NativeOperation::Flush,
             Self::CheckpointKeyspace { .. } => NativeOperation::CheckpointKeyspace,
@@ -416,8 +445,10 @@ impl NativeRequest {
             | Self::CommitFileBatch { keyspace_id, .. }
             | Self::OpenAppendStream { keyspace_id, .. }
             | Self::AppendStream { keyspace_id, .. }
-            | Self::FlushAppendStream { keyspace_id, .. }
+            | Self::SubmitAppendPublish { keyspace_id, .. }
+            | Self::WaitAppendPublish { keyspace_id, .. }
             | Self::PublishAppendStream { keyspace_id, .. }
+            | Self::ReleaseAppendStream { keyspace_id, .. }
             | Self::AbortAppendStream { keyspace_id, .. }
             | Self::Flush { keyspace_id, .. }
             | Self::CheckpointKeyspace { keyspace_id } => Some(*keyspace_id),
@@ -435,8 +466,10 @@ impl NativeRequest {
             | Self::CommitFileBatch { file_id, .. }
             | Self::OpenAppendStream { file_id, .. }
             | Self::AppendStream { file_id, .. }
-            | Self::FlushAppendStream { file_id, .. }
+            | Self::SubmitAppendPublish { file_id, .. }
+            | Self::WaitAppendPublish { file_id, .. }
             | Self::PublishAppendStream { file_id, .. }
+            | Self::ReleaseAppendStream { file_id, .. }
             | Self::AbortAppendStream { file_id, .. }
             | Self::Flush { file_id, .. } => Some(*file_id),
             Self::CreateKeyspace { .. }
@@ -476,8 +509,10 @@ impl NativeRequest {
             | Self::CreateFile { .. }
             | Self::FileInfo { .. }
             | Self::OpenAppendStream { .. }
-            | Self::FlushAppendStream { .. }
+            | Self::SubmitAppendPublish { .. }
+            | Self::WaitAppendPublish { .. }
             | Self::PublishAppendStream { .. }
+            | Self::ReleaseAppendStream { .. }
             | Self::AbortAppendStream { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
@@ -505,8 +540,10 @@ impl NativeRequest {
             | Self::CommitFileBatch { .. }
             | Self::OpenAppendStream { .. }
             | Self::AppendStream { .. }
-            | Self::FlushAppendStream { .. }
+            | Self::SubmitAppendPublish { .. }
+            | Self::WaitAppendPublish { .. }
             | Self::PublishAppendStream { .. }
+            | Self::ReleaseAppendStream { .. }
             | Self::AbortAppendStream { .. }
             | Self::Flush { .. }
             | Self::CheckpointKeyspace { .. }
@@ -552,7 +589,31 @@ impl NativeRequest {
                 }
                 Ok(())
             }
-            Self::FlushAppendStream {
+            Self::SubmitAppendPublish {
+                keyspace_id,
+                file_id,
+                stream,
+                publish_through,
+            }
+            | Self::PublishAppendStream {
+                keyspace_id,
+                file_id,
+                stream,
+                publish_through,
+            } => {
+                if *keyspace_id != stream.keyspace_id || *file_id != stream.file_id {
+                    return Err(StorageError::invalid_argument(
+                        "append stream target does not match request target",
+                    ));
+                }
+                if *publish_through <= stream.visible_base_size {
+                    return Err(StorageError::invalid_argument(
+                        "append publish target must advance past stream base",
+                    ));
+                }
+                Ok(())
+            }
+            Self::ReleaseAppendStream {
                 keyspace_id,
                 file_id,
                 stream,
@@ -569,21 +630,14 @@ impl NativeRequest {
                 }
                 Ok(())
             }
-            Self::PublishAppendStream {
+            Self::WaitAppendPublish {
                 keyspace_id,
                 file_id,
-                stream,
-                mark,
+                ticket,
             } => {
-                if *keyspace_id != stream.keyspace_id
-                    || *file_id != stream.file_id
-                    || *keyspace_id != mark.keyspace_id
-                    || *file_id != mark.file_id
-                    || stream.stream_id != mark.stream_id
-                    || stream.writer_epoch != mark.writer_epoch
-                {
+                if *keyspace_id != ticket.keyspace_id || *file_id != ticket.file_id {
                     return Err(StorageError::invalid_argument(
-                        "append publish target does not match stream and mark",
+                        "append publish target does not match ticket",
                     ));
                 }
                 Ok(())
@@ -611,8 +665,9 @@ pub enum NativeResponse {
     FileBatchCommitted(FileWriteCommit),
     AppendStreamOpened(AppendStream),
     AppendTicket(AppendTicket),
-    DurableAppendMark(DurableAppendMark),
+    AppendPublishSubmitted(AppendPublishTicket),
     AppendPublished(AppendPublishCommit),
+    AppendReleased,
     AppendAborted,
     Flush(FlushResult),
     KeyspaceCheckpointed(CheckpointId),
@@ -688,13 +743,14 @@ mod tests {
         }
     }
 
-    fn mark(keyspace_id: KeyspaceId, file_id: FileId) -> DurableAppendMark {
-        DurableAppendMark {
+    fn publish_ticket(keyspace_id: KeyspaceId, file_id: FileId) -> AppendPublishTicket {
+        AppendPublishTicket {
             keyspace_id,
             file_id,
             stream_id: AppendStreamId::from_raw(9),
+            ticket_id: AppendPublishTicketId::from_raw(10),
             writer_epoch: WriterEpoch::from_raw(3),
-            durable_through: 14,
+            publish_through: 14,
         }
     }
 
@@ -797,9 +853,16 @@ mod tests {
             keyspace_id,
             file_id,
             stream: stream(keyspace_id, file_id),
-            mark: mark(keyspace_id, file_id),
+            publish_through: 14,
         };
         assert!(publish.validate_for_existing_file().is_ok());
+
+        let wait = NativeRequest::WaitAppendPublish {
+            keyspace_id,
+            file_id,
+            ticket: publish_ticket(keyspace_id, file_id),
+        };
+        assert!(wait.validate_for_existing_file().is_ok());
     }
 
     #[test]

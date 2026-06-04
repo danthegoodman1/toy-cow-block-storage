@@ -15,13 +15,14 @@ struct Args {
     storage_nodes: usize,
     device_blocks: u64,
     samples_per_worker: usize,
+    matrix_csv: Option<PathBuf>,
     durable_profile_csv: Option<PathBuf>,
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
     block_batch_profile_csv: Option<PathBuf>,
     read_profile_csv: Option<PathBuf>,
-    stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
+    stream_total_bytes: u64,
     block_batch_ops: Option<usize>,
     block_batch_bytes: Option<usize>,
     block_batch_overlap: Option<BlockBatchOverlap>,
@@ -52,13 +53,14 @@ impl Args {
             storage_nodes: 1,
             device_blocks: DEFAULT_DEVICE_BLOCKS,
             samples_per_worker: 200_000,
+            matrix_csv: None,
             durable_profile_csv: None,
             metadata_profile_csv: None,
             block_write_profile_csv: None,
             block_batch_profile_csv: None,
             read_profile_csv: None,
-            stream_flush_bytes: None,
             stream_publish_bytes: None,
+            stream_total_bytes: 1024 * 1024 * 1024,
             block_batch_ops: None,
             block_batch_bytes: None,
             block_batch_overlap: None,
@@ -110,6 +112,12 @@ impl Args {
                 "--samples-per-worker" => {
                     args.samples_per_worker = parse_next(&mut raw, "--samples-per-worker")?;
                 }
+                "--matrix-csv" => {
+                    args.matrix_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--matrix-csv",
+                    )?));
+                }
                 "--durable-profile-csv" => {
                     args.durable_profile_csv = Some(PathBuf::from(parse_next::<String>(
                         &mut raw,
@@ -140,13 +148,13 @@ impl Args {
                         "--read-profile-csv",
                     )?));
                 }
-                "--stream-flush-mib" => {
-                    let mib: u64 = parse_next(&mut raw, "--stream-flush-mib")?;
-                    args.stream_flush_bytes = Some(mib_to_bytes(mib, "--stream-flush-mib")?);
-                }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
                     args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
+                }
+                "--stream-total-mib" => {
+                    let mib: u64 = parse_next(&mut raw, "--stream-total-mib")?;
+                    args.stream_total_bytes = mib_to_bytes(mib, "--stream-total-mib")?;
                 }
                 "--block-batch-ops" => {
                     args.block_batch_ops = Some(parse_next(&mut raw, flag.as_str())?);
@@ -240,6 +248,9 @@ impl Args {
                 "samples-per-worker must be greater than zero",
             ));
         }
+        for workload in &args.workloads {
+            validate_fixed_stream_workload(*workload, &args)?;
+        }
 
         Ok(args)
     }
@@ -318,11 +329,17 @@ options:\n\
                                            native-stream-ingest-1m,\n\
                                            native-stream-ingest-4m,\n\
                                            native-stream-ingest-32m,\n\
-                                           native-stream-append-flush-1m,\n\
-                                           native-stream-append-flush-4m,\n\
-                                           native-stream-append-flush-32m,\n\
-                                           native-stream-publish-preflushed-1m,\n\
-                                           native-stream-flush-publish-1m,\n\
+                                           native-stream-publish-prefix-1m,\n\
+                                           native-stream-publish-prefix-4m,\n\
+                                           native-stream-publish-prefix-32m,\n\
+                                           native-stream-publish-server-persisted-1m,\n\
+                                           native-stream-publish-pipelined-1m,\n\
+                                           native-stream-publish-interval-1m,\n\
+                                           native-stream-publish-interval-4m,\n\
+                                           native-stream-publish-interval-32m,\n\
+                                           native-stream-publish-at-end-1m,\n\
+                                           native-stream-publish-at-end-4m,\n\
+                                           native-stream-publish-at-end-32m,\n\
                                            native-hot-append-4k\n\
   --concurrency LIST                       default: 1,4,16\n\
   --duration-ms N                          default: 1000\n\
@@ -335,13 +352,14 @@ options:\n\
   --storage-nodes N                        local storage node count, default: 1\n\
   --device-blocks N                        logical device blocks, default: 1048576\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
+  --matrix-csv PATH                        append main loadbench rows to CSV\n\
   --durable-profile-csv PATH               append durable persist profiles to CSV\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --block-batch-profile-csv PATH           append block batch commit profiles to CSV\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
-  --stream-flush-mib N                     flush append streams after N MiB per stream; 2-4 is latency-first\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
+  --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --block-batch-ops N                      override writes per block batch workload\n\
   --block-batch-bytes N                    override bytes per write inside block batch workloads\n\
   --block-batch-overlap sequential|random|overwrite-hotset\n\

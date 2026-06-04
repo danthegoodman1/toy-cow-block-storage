@@ -18,14 +18,18 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
-    if !args.warmup.is_zero() {
+    if !workload.is_native_stream_publish_fixed() && !args.warmup.is_zero() {
         let _ = execute_load(args, workload, concurrency, context.clone(), args.warmup)?;
         let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
     }
-    let mut report = execute_load(args, workload, concurrency, context, args.duration)?;
+    let mut report = if workload.is_native_stream_publish_fixed() {
+        execute_fixed_stream_publish_load(args, workload, concurrency, context)?
+    } else {
+        execute_load(args, workload, concurrency, context, args.duration)?
+    };
     report.provider = args.provider;
     report.durability = args.durability;
     report.workload = workload;

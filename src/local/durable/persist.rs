@@ -148,7 +148,7 @@ pub(super) fn persist_row_native_state(
     persist_export_cursor(tx, &DurableExportCursor::from_state(image))
 }
 
-pub(super) fn stream_flush_cursor(
+pub(super) fn stream_prefix_persist_cursor(
     previous_cursor: Option<&DurableExportCursor>,
     current: &DurableExportCursor,
 ) -> DurableExportCursor {
