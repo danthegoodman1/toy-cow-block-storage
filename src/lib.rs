@@ -48,7 +48,7 @@ pub use local::{
     MaintenanceDiagnostics, MaintenanceMode, MaintenanceNodeObservation, MaintenanceObservation,
     MaintenancePolicy, MaintenanceScheduler, MaintenanceSkippedLog, MaintenanceTickPlan,
     MaintenanceTickReport, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
-    MetadataTxnMode, MetadataTxnProfile, MetadataTxnProfilePhase, RemoteBlockEndpoint,
+    MetadataTxnMode, MetadataTxnProfile, MetadataTxnProfilePhase, ReadProfile, RemoteBlockEndpoint,
     RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport, RemoteWireTransport,
     SegmentLifecycleState, TxnBlockCoordinator, TxnBlockMetadataPlane, TxnBlockWriteProfile,
     WriteAdmission,

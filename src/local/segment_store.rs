@@ -141,26 +141,48 @@ impl InMemorySegmentStore {
         segment_id: SegmentId,
         verification: ReadVerification,
     ) -> Result<()> {
+        self.verify_segment_payload_for_read_profiled(segment_id, verification)
+            .map(|_| ())
+    }
+
+    fn verify_segment_payload_for_read_profiled(
+        &self,
+        segment_id: SegmentId,
+        verification: ReadVerification,
+    ) -> Result<LocalSegmentStoreVerifyProfile> {
+        let total_started = Instant::now();
+        let mut profile = LocalSegmentStoreVerifyProfile::default();
         if matches!(verification, ReadVerification::Skip) {
-            return Ok(());
+            profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+            return Ok(profile);
         }
+        let lock_started = Instant::now();
         let inner = lock(&self.inner)?;
+        profile.lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let record = inner
             .segments
             .get(&segment_id)
             .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
-        match record.commit.descriptor.integrity {
+        let integrity = record.commit.descriptor.integrity;
+        let bytes = Arc::clone(&record.bytes);
+        drop(inner);
+        match integrity {
             SegmentPayloadIntegrity::Unchecked => {
                 if matches!(verification, ReadVerification::RequireVerified) {
                     Err(StorageError::conflict(
                         "read requires verified payload but segment is unchecked",
                     ))
                 } else {
-                    Ok(())
+                    profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+                    Ok(profile)
                 }
             }
             integrity @ SegmentPayloadIntegrity::Crc32c(_) => {
-                verify_segment_payload_integrity(integrity, record.bytes.as_ref())
+                let checksum_started = Instant::now();
+                verify_segment_payload_integrity(integrity, bytes.as_ref())?;
+                profile.checksum_nanos = duration_nanos_u64(checksum_started.elapsed());
+                profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+                Ok(profile)
             }
         }
     }
@@ -295,17 +317,17 @@ impl InMemorySegmentStore {
     }
 }
 
-impl SegmentStore for InMemorySegmentStore {
-    fn write_segment(
+impl InMemorySegmentStore {
+    fn read_segment_profiled(
         &self,
-        reservation: &SegmentReservation,
-        bytes: &[u8],
-    ) -> Result<SegmentReplicaCommit> {
-        self.write_segment_owned(reservation, bytes.to_vec(), PayloadIntegrity::Verified)
-    }
-
-    fn read_segment(&self, segment_id: SegmentId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+        segment_id: SegmentId,
+        range: ByteRange,
+        buf: &mut [u8],
+    ) -> Result<LocalSegmentStoreReadProfile> {
+        let total_started = Instant::now();
+        let lock_started = Instant::now();
         let inner = lock(&self.inner)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let record = inner
             .segments
             .get(&segment_id)
@@ -314,7 +336,8 @@ impl SegmentStore for InMemorySegmentStore {
             return Err(StorageError::unavailable("segment is not synced"));
         }
         let end = range.end_exclusive()?;
-        let record_len = u64::try_from(record.bytes.len())
+        let bytes = Arc::clone(&record.bytes);
+        let record_len = u64::try_from(bytes.len())
             .map_err(|_| StorageError::invalid_argument("segment byte length overflows u64"))?;
         if end > record_len {
             return Err(StorageError::invalid_argument(
@@ -333,13 +356,32 @@ impl SegmentStore for InMemorySegmentStore {
             .map_err(|_| StorageError::invalid_argument("segment read offset overflows usize"))?;
         let end = usize::try_from(end)
             .map_err(|_| StorageError::invalid_argument("segment read end overflows usize"))?;
-        let source = record
-            .bytes
+        drop(inner);
+        let source = bytes
             .as_ref()
             .get(start..end)
             .ok_or_else(|| StorageError::corrupt("segment read range exceeds segment bytes"))?;
+        let copy_started = Instant::now();
         buf.copy_from_slice(source);
-        Ok(())
+        Ok(LocalSegmentStoreReadProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            lock_wait_nanos,
+            copy_nanos: duration_nanos_u64(copy_started.elapsed()),
+        })
+    }
+}
+
+impl SegmentStore for InMemorySegmentStore {
+    fn write_segment(
+        &self,
+        reservation: &SegmentReservation,
+        bytes: &[u8],
+    ) -> Result<SegmentReplicaCommit> {
+        self.write_segment_owned(reservation, bytes.to_vec(), PayloadIntegrity::Verified)
+    }
+
+    fn read_segment(&self, segment_id: SegmentId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
+        self.read_segment_profiled(segment_id, range, buf).map(|_| ())
     }
 
     fn sync_segment(&self, segment_id: SegmentId) -> Result<()> {

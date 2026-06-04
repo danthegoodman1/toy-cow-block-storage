@@ -16,8 +16,11 @@ impl LocalStorageNode {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
+        let total_started = Instant::now();
+        let catalog_started = Instant::now();
         let receipt = self.segment_catalog.receipt_for_segment(segment_id)?;
+        let catalog_lookup_nanos = duration_nanos_u64(catalog_started.elapsed());
         if receipt.storage_node != self.storage_node
             || receipt.segment_id != segment_id
             || receipt.integrity != integrity
@@ -27,9 +30,22 @@ impl LocalStorageNode {
             ));
         }
         verify_read_integrity_policy(integrity, verification)?;
-        self.segment_store
-            .verify_segment_payload_for_read(segment_id, verification)?;
-        self.segment_store.read_segment(segment_id, range, buf)
+        let verify_profile = self
+            .segment_store
+            .verify_segment_payload_for_read_profiled(segment_id, verification)?;
+        let read_profile = self
+            .segment_store
+            .read_segment_profiled(segment_id, range, buf)?;
+        Ok(ReadSourceProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            storage_node_catalog_lookup_nanos: catalog_lookup_nanos,
+            storage_node_payload_read_nanos: read_profile.total_nanos,
+            storage_node_lock_wait_nanos: read_profile
+                .lock_wait_nanos
+                .saturating_add(verify_profile.lock_wait_nanos),
+            verification_nanos: verify_profile.total_nanos,
+            copy_nanos: read_profile.copy_nanos,
+        })
     }
 
     fn write_segment_profiled(
@@ -798,7 +814,7 @@ impl StorageNodeRegistry {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
         self.node(storage_node)?.read_segment_with_integrity(
             segment_id,
             range,

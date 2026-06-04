@@ -18,8 +18,8 @@ use toy_cow_block_storage::{
     CreateFileRequest, CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableAppendMark,
     DurableCoordinator, DurableDataLogPolicy, DurablePersistProfile, FileBatchWrite, FileId,
     FileSpec, FlushResult, KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode,
-    MetadataTxnProfile, PayloadIntegrity, ReadVerification, Result, StorageError, StorageNodeId,
-    TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
+    MetadataTxnProfile, PayloadIntegrity, ReadProfile, ReadVerification, Result, StorageError,
+    StorageNodeId, TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);

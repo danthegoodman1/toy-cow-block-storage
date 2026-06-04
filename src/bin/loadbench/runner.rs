@@ -17,11 +17,13 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
     if !args.warmup.is_zero() {
         let _ = execute_load(args, workload, concurrency, context.clone(), args.warmup)?;
         let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
+        let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
     }
     let mut report = execute_load(args, workload, concurrency, context, args.duration)?;
     report.provider = args.provider;
@@ -34,6 +36,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     append_profile_csv(args, workload, concurrency, &profile_store)?;
     append_metadata_profile_csv(args, workload, concurrency, &profile_store)?;
     append_block_write_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_read_profile_csv(args, workload, concurrency, &profile_store)?;
     append_block_batch_profile_csv(args, &report)?;
 
     if matches!(args.provider, ProviderKind::Durable) {

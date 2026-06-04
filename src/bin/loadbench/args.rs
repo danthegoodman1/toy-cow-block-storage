@@ -19,6 +19,7 @@ struct Args {
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
     block_batch_profile_csv: Option<PathBuf>,
+    read_profile_csv: Option<PathBuf>,
     stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
     block_batch_ops: Option<usize>,
@@ -55,6 +56,7 @@ impl Args {
             metadata_profile_csv: None,
             block_write_profile_csv: None,
             block_batch_profile_csv: None,
+            read_profile_csv: None,
             stream_flush_bytes: None,
             stream_publish_bytes: None,
             block_batch_ops: None,
@@ -130,6 +132,12 @@ impl Args {
                     args.block_batch_profile_csv = Some(PathBuf::from(parse_next::<String>(
                         &mut raw,
                         "--block-batch-profile-csv",
+                    )?));
+                }
+                "--read-profile-csv" => {
+                    args.read_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--read-profile-csv",
                     )?));
                 }
                 "--stream-flush-mib" => {
@@ -331,6 +339,7 @@ options:\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --block-batch-profile-csv PATH           append block batch commit profiles to CSV\n\
+  --read-profile-csv PATH                  append block/native read profiles to CSV\n\
   --stream-flush-mib N                     flush append streams after N MiB per stream; 2-4 is latency-first\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --block-batch-ops N                      override writes per block batch workload\n\
@@ -408,6 +417,14 @@ fn parse_read_verification(value: &str) -> Result<ReadVerification> {
         _ => Err(StorageError::invalid_argument(format!(
             "unknown read verification {value}"
         ))),
+    }
+}
+
+fn read_verification_name(value: ReadVerification) -> &'static str {
+    match value {
+        ReadVerification::Default => "default",
+        ReadVerification::RequireVerified => "require-verified",
+        ReadVerification::Skip => "skip",
     }
 }
 

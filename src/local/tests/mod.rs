@@ -5850,7 +5850,7 @@ fn durable_block_read_plan_zero_fills_sparse_ranges() {
         .write_device(device_id, 4096, &payload, WriteDurability::Flushed)
         .unwrap();
 
-    let plan = store
+    let (plan, _) = store
         .local
         .resolve_block_read(device_id, ByteRange::new(0, 3 * 4096))
         .unwrap();
@@ -5893,7 +5893,7 @@ fn durable_block_read_plan_assembles_multiple_segment_extents() {
         .write_device(device_id, 4096, &second, WriteDurability::Flushed)
         .unwrap();
 
-    let plan = store
+    let (plan, _) = store
         .local
         .resolve_block_read(device_id, ByteRange::new(0, 2 * 4096))
         .unwrap();
@@ -5949,7 +5949,7 @@ fn durable_native_read_plan_assembles_segments_and_published_append_runs() {
     )
     .unwrap();
 
-    let plan = store
+    let (plan, _) = store
         .local
         .resolve_file_read(keyspace_id, file_id, ByteRange::new(0, 2 * 4096))
         .unwrap();
@@ -6049,6 +6049,117 @@ fn durable_block_read_fails_when_storage_node_catalog_placement_is_missing() {
             .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
             .is_err()
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_read_profiling_is_opt_in_and_records_block_phase_shape() {
+    let root = durable_temp_dir("read-profile-block");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let payload = repeated_blocks(1, 61);
+    store
+        .write_device(device_id, 0, &payload, WriteDurability::Flushed)
+        .unwrap();
+
+    let mut bytes = vec![0; 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert!(store.drain_read_profiles(8).unwrap().is_empty());
+
+    store.enable_read_profiling(8).unwrap();
+    store
+        .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    let profiles = store.drain_read_profiles(8).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = profiles[0];
+    assert_eq!(profile.sequence, 1);
+    assert_eq!(profile.logical_bytes, 4096);
+    assert_eq!(profile.extent_count, 1);
+    assert_eq!(profile.segment_extent_count, 1);
+    assert_eq!(profile.zero_extent_count, 0);
+    assert_eq!(profile.append_run_extent_count, 0);
+    assert_eq!(profile.storage_node_count, 1);
+    assert!(profile.total_nanos >= profile.metadata_resolve_nanos);
+    assert!(profile.metadata_resolve_nanos >= profile.metadata_lock_wait_nanos);
+    assert!(profile.metadata_resolve_nanos >= profile.metadata_tree_walk_nanos);
+    assert!(profile.metadata_resolve_nanos >= profile.metadata_placement_lookup_nanos);
+    assert!(profile.assemble_nanos >= profile.storage_node_read_nanos);
+    assert!(profile.storage_node_read_nanos > 0);
+    assert!(profile.storage_node_payload_read_nanos > 0);
+    assert!(profile.verification_nanos > 0);
+    assert!(profile.copy_nanos > 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_read_profiling_counts_append_run_sources() {
+    let root = durable_temp_dir("read-profile-append-run");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let segment_bytes = repeated_blocks(1, 62);
+    let run_bytes = repeated_blocks(1, 63);
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, segment_bytes)],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        file_id,
+        &run_bytes,
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+
+    store.enable_read_profiling(8).unwrap();
+    let mut bytes = vec![0; 2 * 4096];
+    store
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, 2 * 4096),
+            &mut bytes,
+        )
+        .unwrap();
+    let profiles = store.drain_read_profiles(8).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = profiles[0];
+    assert_eq!(profile.logical_bytes, 2 * 4096);
+    assert_eq!(profile.segment_extent_count, 1);
+    assert_eq!(profile.append_run_extent_count, 1);
+    assert_eq!(profile.storage_node_count, 1);
+    assert!(profile.metadata_resolve_nanos >= profile.metadata_tree_walk_nanos);
+    assert!(profile.metadata_resolve_nanos >= profile.metadata_placement_lookup_nanos);
+    assert!(profile.storage_node_read_nanos > 0);
+    assert!(profile.storage_node_payload_read_nanos > 0);
+    assert!(profile.verification_nanos > 0);
     let _ = fs::remove_dir_all(root);
 }
 

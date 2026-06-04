@@ -1971,7 +1971,8 @@ impl DurableSqliteStore {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
+        let total_started = Instant::now();
         if usize::try_from(range.len)
             .map_err(|_| StorageError::corrupt("append run range length overflows usize"))?
             != buf.len()
@@ -1980,10 +1981,13 @@ impl DurableSqliteStore {
                 "append run read buffer length disagrees with source range",
             ));
         }
+        let payload_read_started = Instant::now();
         let path = data_log_path(&self.paths.data_dir, storage_node, log_id);
         let mut file = File::open(&path).map_err(fs_error)?;
         file.seek(SeekFrom::Start(range.offset)).map_err(fs_error)?;
         file.read_exact(buf).map_err(fs_error)?;
+        let payload_read_nanos = duration_nanos_u64(payload_read_started.elapsed());
+        let verification_started = Instant::now();
         match integrity {
             SegmentPayloadIntegrity::Unchecked => {
                 if matches!(verification, ReadVerification::RequireVerified) {
@@ -1998,7 +2002,12 @@ impl DurableSqliteStore {
                 }
             }
         }
-        Ok(())
+        Ok(ReadSourceProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            storage_node_payload_read_nanos: payload_read_nanos,
+            verification_nanos: duration_nanos_u64(verification_started.elapsed()),
+            ..ReadSourceProfile::default()
+        })
     }
 
     fn append_segments_profiled_with_state(

@@ -8,10 +8,16 @@ enum BenchStore {
 impl BenchStore {
     fn open(args: &Args, root: &Path) -> Result<Self> {
         match args.provider {
-            ProviderKind::Local => Ok(Self::Local(Arc::new(LocalCoordinator::with_storage_nodes(
-                args.config(),
-                args.storage_node_ids(),
-            )?))),
+            ProviderKind::Local => {
+                let store = Arc::new(LocalCoordinator::with_storage_nodes(
+                    args.config(),
+                    args.storage_node_ids(),
+                )?);
+                if args.read_profile_csv.is_some() {
+                    store.enable_read_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                Ok(Self::Local(store))
+            }
             ProviderKind::TxnSerial => {
                 let store = Arc::new(TxnBlockCoordinator::with_storage_nodes(
                     args.config(),
@@ -53,6 +59,9 @@ impl BenchStore {
                 );
                 if args.durable_profile_csv.is_some() {
                     store.enable_persist_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                if args.read_profile_csv.is_some() {
+                    store.enable_read_profiling(DEFAULT_PROFILE_CAPACITY)?;
                 }
                 Ok(Self::Durable(store))
             }
@@ -335,6 +344,14 @@ impl BenchStore {
         match self {
             Self::Txn(store) => store.drain_block_write_profiles(max),
             Self::Local(_) | Self::Durable(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn drain_read_profiles(&self, max: usize) -> Result<Vec<ReadProfile>> {
+        match self {
+            Self::Local(store) => store.drain_read_profiles(max),
+            Self::Durable(store) => store.drain_read_profiles(max),
+            Self::Txn(_) => Ok(Vec::new()),
         }
     }
 }

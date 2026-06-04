@@ -32,6 +32,7 @@ pub struct LocalCoordinator {
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
     observability: Arc<Observability>,
+    read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
 }
 
 impl LocalCoordinator {
@@ -62,6 +63,7 @@ impl LocalCoordinator {
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
             observability,
+            read_profiler: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -86,6 +88,7 @@ impl LocalCoordinator {
             next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
             observability,
+            read_profiler: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1077,6 +1080,26 @@ impl LocalCoordinator {
         self.observability.drain_events(max)
     }
 
+    pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
+        *lock(&self.read_profiler)? = Some(ReadProfiler::new(capacity)?);
+        Ok(())
+    }
+
+    pub fn drain_read_profiles(&self, max: usize) -> Result<Vec<ReadProfile>> {
+        let mut profiler = lock(&self.read_profiler)?;
+        Ok(profiler
+            .as_mut()
+            .map(|profiler| profiler.drain(max))
+            .unwrap_or_default())
+    }
+
+    fn record_read_profile(&self, profile: ReadProfile) -> Result<()> {
+        if let Some(profiler) = lock(&self.read_profiler)?.as_mut() {
+            profiler.record(profile);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn storage_node_ids_for_test(&self) -> Vec<StorageNodeId> {
         self.storage_nodes.node_ids()
@@ -1923,7 +1946,7 @@ impl LocalCoordinator {
                 let preserved_len_usize = usize::try_from(preserved_len).map_err(|_| {
                     StorageError::invalid_argument("native preserved length overflows usize")
                 })?;
-                let plan = self.resolve_file_read_plan(keyspace_id, file_id, preserved_range)?;
+                let (plan, _) = self.resolve_file_read_plan(keyspace_id, file_id, preserved_range)?;
                 assemble_read_plan(
                     self,
                     plan,
@@ -3264,8 +3287,18 @@ impl LocalCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let plan = self.resolve_block_read(device_id, range)?;
-        assemble_read_plan(self, plan, verification, buf)
+        let total_started = Instant::now();
+        let resolve_started = Instant::now();
+        let (plan, resolve_profile) = MetadataReadService::resolve_block_read(self, device_id, range)?;
+        let metadata_resolve_nanos = duration_nanos_u64(resolve_started.elapsed());
+        let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
+        profile.metadata_resolve_nanos = metadata_resolve_nanos;
+        profile.metadata_lock_wait_nanos = resolve_profile.metadata_lock_wait_nanos;
+        profile.metadata_tree_walk_nanos = resolve_profile.metadata_tree_walk_nanos;
+        profile.metadata_placement_lookup_nanos =
+            resolve_profile.metadata_placement_lookup_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.record_read_profile(profile)
     }
 
     pub fn read_file(
@@ -3292,8 +3325,19 @@ impl LocalCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let plan = self.resolve_file_read(keyspace_id, file_id, range)?;
-        assemble_read_plan(self, plan, verification, buf)
+        let total_started = Instant::now();
+        let resolve_started = Instant::now();
+        let (plan, resolve_profile) =
+            MetadataReadService::resolve_file_read(self, keyspace_id, file_id, range)?;
+        let metadata_resolve_nanos = duration_nanos_u64(resolve_started.elapsed());
+        let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
+        profile.metadata_resolve_nanos = metadata_resolve_nanos;
+        profile.metadata_lock_wait_nanos = resolve_profile.metadata_lock_wait_nanos;
+        profile.metadata_tree_walk_nanos = resolve_profile.metadata_tree_walk_nanos;
+        profile.metadata_placement_lookup_nanos =
+            resolve_profile.metadata_placement_lookup_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.record_read_profile(profile)
     }
 
     fn read_append_run_source_from_memory(
@@ -3304,9 +3348,13 @@ impl LocalCoordinator {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
+        let total_started = Instant::now();
         verify_read_integrity_policy(integrity, verification)?;
+        let payload_read_started = Instant::now();
+        let lock_started = Instant::now();
         let logs = lock(&self.append_run_logs)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let log = logs
             .get(&(storage_node, log_id))
             .ok_or_else(|| StorageError::corrupt("append-run log is missing from local store"))?;
@@ -3325,24 +3373,39 @@ impl LocalCoordinator {
                 "append-run read length disagrees with output buffer",
             ));
         }
+        let payload_read_nanos = duration_nanos_u64(payload_read_started.elapsed());
+        let verification_started = Instant::now();
         if !matches!(verification, ReadVerification::Skip)
             && !matches!(integrity, SegmentPayloadIntegrity::Unchecked)
         {
             verify_segment_payload_integrity(integrity, bytes)?;
         }
+        let verification_nanos = duration_nanos_u64(verification_started.elapsed());
+        let copy_started = Instant::now();
         buf.copy_from_slice(bytes);
-        Ok(())
+        let copy_nanos = duration_nanos_u64(copy_started.elapsed());
+        Ok(ReadSourceProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            storage_node_payload_read_nanos: payload_read_nanos,
+            storage_node_lock_wait_nanos: lock_wait_nanos,
+            verification_nanos,
+            copy_nanos,
+            ..ReadSourceProfile::default()
+        })
     }
 
     fn resolve_block_read_plan(
         &self,
         device_id: DeviceId,
         range: ByteRange,
-    ) -> Result<ReadPlan> {
+    ) -> Result<(ReadPlan, ReadResolveProfile)> {
         let info = self.metadata.device_info(device_id)?;
         range.validate_for_device(&info.spec)?;
         if range.len == 0 {
-            return ReadPlan::from_non_zero_extents(0, Vec::new());
+            return Ok((
+                ReadPlan::from_non_zero_extents(0, Vec::new())?,
+                ReadResolveProfile::default(),
+            ));
         }
 
         let block_size = u64::from(info.spec.block_size);
@@ -3364,7 +3427,10 @@ impl LocalCoordinator {
                 )?;
             }
         }
-        ReadPlan::from_non_zero_extents(range.len, extents)
+        Ok((
+            ReadPlan::from_non_zero_extents(range.len, extents)?,
+            ReadResolveProfile::default(),
+        ))
     }
 
     fn resolve_file_read_plan(
@@ -3372,7 +3438,7 @@ impl LocalCoordinator {
         keyspace_id: KeyspaceId,
         file_id: FileId,
         range: ByteRange,
-    ) -> Result<ReadPlan> {
+    ) -> Result<(ReadPlan, ReadResolveProfile)> {
         let head = self.metadata.get_file_head(keyspace_id, file_id)?;
         let end = range.end_exclusive()?;
         if end > head.size {
@@ -3382,7 +3448,10 @@ impl LocalCoordinator {
         }
         if range.len == 0 {
             let _ = self.metadata.get_metadata_node(head.root)?;
-            return ReadPlan::from_non_zero_extents(0, Vec::new());
+            return Ok((
+                ReadPlan::from_non_zero_extents(0, Vec::new())?,
+                ReadResolveProfile::default(),
+            ));
         }
 
         let block_size = u64::from(self.metadata.config.block_size);
@@ -3414,7 +3483,10 @@ impl LocalCoordinator {
         let mut extents =
             Self::trim_segment_read_extents_for_append_runs(segment_extents, &run_extents)?;
         extents.extend(run_extents);
-        ReadPlan::from_non_zero_extents(range.len, extents)
+        Ok((
+            ReadPlan::from_non_zero_extents(range.len, extents)?,
+            ReadResolveProfile::default(),
+        ))
     }
 
     fn trim_segment_read_extents_for_append_runs(
@@ -3631,31 +3703,44 @@ impl LocalCoordinator {
             }
             MetadataNodeKind::Leaf { run_extents, .. } => {
                 for extent in run_extents {
-                    let extent_range = ByteRange::new(extent.file_offset_start, extent.payload_len);
-                    if let Some(overlap) = byte_range_intersection(extent_range, requested_bytes)?
-                        && let Some(sliced) =
-                            slice_run_extent(extent, overlap.offset, overlap.end_exclusive()?)?
-                    {
-                        out.push(ReadExtent {
-                            output_offset: sliced.file_offset_start - requested_bytes.offset,
-                            len: sliced.payload_len,
-                            source: ReadSource::AppendRun {
-                                storage_node: sliced.run.storage_node,
-                                log_id: sliced.run.log_id,
-                                payload_offset: sliced.run.log_payload_offset,
-                                integrity: sliced.run.integrity,
-                            },
-                        });
-                    }
+                    Self::collect_append_run_read_extent(extent, requested_bytes, out)?;
                 }
             }
         }
         Ok(())
     }
+
+    fn collect_append_run_read_extent(
+        extent: &RunBackedFileExtent,
+        requested_bytes: ByteRange,
+        out: &mut Vec<ReadExtent>,
+    ) -> Result<()> {
+        let extent_range = ByteRange::new(extent.file_offset_start, extent.payload_len);
+        if let Some(overlap) = byte_range_intersection(extent_range, requested_bytes)?
+            && let Some(sliced) = slice_run_extent(extent, overlap.offset, overlap.end_exclusive()?)?
+        {
+            out.push(ReadExtent {
+                output_offset: sliced.file_offset_start - requested_bytes.offset,
+                len: sliced.payload_len,
+                source: ReadSource::AppendRun {
+                    storage_node: sliced.run.storage_node,
+                    log_id: sliced.run.log_id,
+                    payload_offset: sliced.run.log_payload_offset,
+                    integrity: sliced.run.integrity,
+                },
+            });
+        }
+        Ok(())
+    }
+
 }
 
 impl MetadataReadService for LocalCoordinator {
-    fn resolve_block_read(&self, device_id: DeviceId, range: ByteRange) -> Result<ReadPlan> {
+    fn resolve_block_read(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+    ) -> Result<(ReadPlan, ReadResolveProfile)> {
         self.resolve_block_read_plan(device_id, range)
     }
 
@@ -3664,7 +3749,7 @@ impl MetadataReadService for LocalCoordinator {
         keyspace_id: KeyspaceId,
         file_id: FileId,
         range: ByteRange,
-    ) -> Result<ReadPlan> {
+    ) -> Result<(ReadPlan, ReadResolveProfile)> {
         self.resolve_file_read_plan(keyspace_id, file_id, range)
     }
 }
@@ -3678,7 +3763,7 @@ impl StorageNodeReadService for LocalCoordinator {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
         self.storage_nodes.read_segment_from_node(
             storage_node,
             segment_id,
@@ -3697,7 +3782,7 @@ impl StorageNodeReadService for LocalCoordinator {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
         self.read_append_run_source_from_memory(
             storage_node,
             log_id,

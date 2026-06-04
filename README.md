@@ -1,189 +1,179 @@
 # toy-cow-block-storage
 
-Deterministic toy copy-on-write storage built in small, correctness-gated
-phases. It exposes a block device API for compatibility and a native
-keyspace/file API for callers that can speak in files, appends, snapshots, and
-writer fencing directly.
+Toy copy-on-write storage with block devices, native files, snapshots, PITR,
+explicit GC, and a durable local provider.
 
-The simple performance rule is: when you are writing a large stream, batch on
-the caller side and append large buffers into an append stream. Appended bytes
-become durable at explicit stream flush boundaries and become visible to readers
-only when the stream is published, so data ingest can stay sequential while file
-metadata moves at coarser checkpoints. A flush is private durability for the
-holder of the stream token; publish is the only globally discoverable boundary.
-Failover that needs unpublished bytes must persist the `AppendStream` and
-`DurableAppendMark` outside the storage layer. A replacement without that bearer
-authority opens a fresh stream at the last visible file head.
+The project is deliberately small and deterministic. Writes append immutable
+segment data, copy only the metadata path that changed, and publish a new root.
+Forks and snapshots copy root pointers instead of walking data. GC traces from
+live and retained roots instead of relying on deep refcounts.
 
-## Two Public APIs
+The first compatibility surface is a block device. Native keyspace/file APIs
+live beside it for callers that can preserve file intent, append ownership,
+writer epochs, and durable-but-not-yet-visible append data.
 
-The crate exposes two caller-facing APIs over the same copy-on-write segment and
-metadata substrate:
+```text
+Block callers             Native callers
+     |                         |
+     v                         v
+BlockClient/Device       NativeKeyspace/File
+     |                         |
+     +----------+--------------+
+                |
+        Local coordinator
+                |
+     +----------+--------------+
+     |                         |
+Immutable metadata       Immutable segments
+roots and timelines      and append logs
+```
 
-- **Block storage**: `BlockClient` and `BlockDevice`, shaped like a normal block
-  device. Reads, writes, zeroing, and discard are block-aligned. Forks and PITR
-  restores create new device heads that share immutable roots until writes
-  diverge.
-- **Native keyspace/files**: `NativeKeyspaceClient` and `NativeFile`, shaped for
-  custom filesystems or append-heavy users. Files live inside a keyspace so
-  checkpoint, snapshot, and restore are filesystem-level operations, not
-  per-file snapshots. Appends are byte-oriented and fenced by append streams
-  with separate durable and visible boundaries.
+## What is implemented
 
-The local implementation runs in one process, but the API already goes through
-server and transport boundaries so durable or remote implementations can replace
-the adapters later.
+- Block devices with aligned reads/writes, zeroing, discard, fork, restore,
+  flush, delete, PITR, and GC retention.
+- Native keyspaces and files with byte-oriented reads/writes, write batches,
+  keyspace checkpoints, snapshots, restores, and append-stream fencing.
+- Local in-process clients, servers, and transports over one coordinator.
+- A durable local provider backed by SQLite metadata catalogs and rolled data
+  logs.
+- Explicit maintenance scheduling, compaction budgets, backpressure policy, and
+  provider diagnostics.
+- Deterministic simulation tests, provider conformance tests, Criterion
+  mechanism benchmarks, and the `loadbench` integration runner.
 
-### Which One Should I Use?
+The planned POSIX/FUSE path is a sibling mapping layer over the same substrate.
+POSIX needs first-class inode, directory, rename, unlink, truncate, open-handle,
+and fsync semantics.
 
-Use the block API when you want ordinary disk-like behavior, such as a future
-`ublk` adapter or an existing filesystem layered over fixed-size blocks.
+## A tiny local store
 
-Use the native API when you control the caller and can give the storage layer
-more intent. It keeps snapshots at the keyspace level, rejects stale append
-writers, supports ordinary file writes, and lets high-throughput callers batch
-large appends without creating thousands of tiny file-version commits.
-
-The planned POSIX/FUSE path is a third sibling layer, not a wrapper around
-`NativeFile`. POSIX needs first-class inode, directory, rename, unlink,
-truncate, open-handle, and fsync semantics while still reusing the same segment
-substrate and commit machinery.
+Both public APIs can point at the same in-process coordinator:
 
 ```rust
 use std::sync::Arc;
 
 use toy_cow_block_storage::{
-    InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient,
-    LocalBlockServer, LocalNativeClient, LocalNativeServer, LocalCoordinator,
+    BlockClient, BlockDevice, CreateDeviceRequest, CreateFileRequest,
+    CreateKeyspaceRequest, DeviceSpec, FileSpec, InProcessBlockTransport,
+    InProcessNativeTransport, LocalBlockClient, LocalBlockServer,
+    LocalCoordinator, LocalNativeClient, LocalNativeServer, NativeFile,
+    NativeKeyspaceClient,
 };
 
-fn local_clients() -> (LocalBlockClient, LocalNativeClient) {
+fn tiny_store() -> toy_cow_block_storage::Result<()> {
     let store = LocalCoordinator::new();
 
-    let block_client = LocalBlockClient::new(InProcessBlockTransport::new(Arc::new(
+    let blocks = LocalBlockClient::new(InProcessBlockTransport::new(Arc::new(
         LocalBlockServer::new(store.clone()),
     )));
-    let native_client = LocalNativeClient::new(InProcessNativeTransport::new(Arc::new(
+    let native = LocalNativeClient::new(InProcessNativeTransport::new(Arc::new(
         LocalNativeServer::new(store),
     )));
 
-    (block_client, native_client)
-}
-```
-
-### Block Device Flow
-
-Use the block API when the caller wants ordinary block-device semantics, such as
-a future `ublk` adapter or a normal filesystem layered above fixed-size blocks.
-
-```rust
-use std::sync::Arc;
-
-use toy_cow_block_storage::{
-    BlockClient, BlockDevice, CreateDeviceRequest, DeviceSpec, ForkRequest,
-    InProcessBlockTransport, LocalBlockClient, LocalBlockServer, LocalCoordinator,
-    RestorePoint,
-};
-
-fn block_device_flow() -> toy_cow_block_storage::Result<()> {
-    let store = LocalCoordinator::new();
-    let block_client = LocalBlockClient::new(InProcessBlockTransport::new(Arc::new(
-        LocalBlockServer::new(store),
-    )));
-
-    let device_id = block_client.create_device(CreateDeviceRequest {
+    let device_id = blocks.create_device(CreateDeviceRequest {
         spec: DeviceSpec {
             logical_blocks: 1024,
             block_size: 4096,
         },
         name: Some("root".to_string()),
     })?;
+    let device = blocks.open_device(device_id)?;
+    device.write_at(0, &[7; 4096])?;
 
-    let device = block_client.open_device(device_id)?;
-
-    let first_write = device.write_at(0, &[7; 4096])?;
-
-    let mut block = vec![0; 4096];
-    device.read_at(0, &mut block)?;
-    assert_eq!(block[0], 7);
-
-    let fork_id = device.fork(ForkRequest {
-        target: None,
-        name: Some("child".to_string()),
-    })?;
-    let fork = block_client.open_device(fork_id)?;
-
-    fork.write_zeroes(0, 4096)?;
-
-    device.write_at(0, &[9; 4096])?;
-    device.read_at(0, &mut block)?;
-    assert_eq!(block[0], 9);
-
-    let restored_id = device.restore(RestorePoint::Commit(first_write.commit_seq))?;
-    let restored = block_client.open_device(restored_id)?;
-    restored.read_at(0, &mut block)?;
-    assert_eq!(block[0], 7);
-
-    Ok(())
-}
-```
-
-Block API guarantees to care about:
-
-- Public reads and writes are block-aligned and bounded by `DeviceSpec`.
-- A successful write is atomic from the caller's perspective.
-- Sparse ranges read as zeroes.
-- Fork is O(1): it copies root pointers, not data or leaves.
-- Restore creates a new device at a retained point in time.
-- Delete removes the live head but does not imply immediate physical free.
-
-### Native Keyspace/File Flow
-
-Use the native API when the caller wants file/keyspace intent preserved by the
-storage layer: byte-oriented writes, append streams, stale-writer rejection, and
-filesystem-level snapshots. A keyspace snapshot is the native API's fork-like
-operation: it creates a new keyspace lineage that initially shares immutable
-catalog and file roots.
-
-```rust
-use std::sync::Arc;
-
-use toy_cow_block_storage::{
-    CreateFileRequest, CreateKeyspaceRequest, FileSpec, InProcessNativeTransport,
-    LocalNativeClient, LocalNativeServer, LocalCoordinator, NativeFile,
-    NativeKeyspaceClient, RestorePoint, SnapshotKeyspaceRequest,
-};
-
-fn native_keyspace_flow() -> toy_cow_block_storage::Result<()> {
-    let store = LocalCoordinator::new();
-    let native_client = LocalNativeClient::new(InProcessNativeTransport::new(Arc::new(
-        LocalNativeServer::new(store),
-    )));
-
-    let keyspace_id = native_client.create_keyspace(CreateKeyspaceRequest {
+    let keyspace = native.create_keyspace(CreateKeyspaceRequest {
         name: Some("fs-root".to_string()),
     })?;
-
-    let file_id = native_client.create_file(
-        keyspace_id,
+    let file_id = native.create_file(
+        keyspace,
         CreateFileRequest {
             spec: FileSpec {
                 name: Some("journal".to_string()),
             },
         },
     )?;
-
-    let file = native_client.open_file(keyspace_id, file_id)?;
+    let file = native.open_file(keyspace, file_id)?;
     file.write_at(0, b"hello world")?;
 
-    let mut bytes = vec![0; 11];
-    file.read_at(0, &mut bytes)?;
-    assert_eq!(bytes.as_slice(), b"hello world");
+    Ok(())
+}
+```
 
-    let checkpoint = native_client.checkpoint_keyspace(keyspace_id)?;
+## Block devices
 
-    let snapshot_id = native_client.snapshot_keyspace(
-        keyspace_id,
+The block API is shaped like a disk: fixed logical size, fixed block size, and
+block-aligned byte ranges. It is the compatibility layer for disk-image
+experiments, filesystem writeback models, and future block adapters.
+
+Block writes are atomic at request granularity. Sparse and discarded ranges read
+as zeroes. Forks are O(1): a child device initially shares the parent's shard
+roots, then diverges only when either side writes.
+
+```rust
+use toy_cow_block_storage::{
+    BlockClient, BlockDevice, DeviceId, ForkRequest, LocalBlockClient,
+    RestorePoint,
+};
+
+fn fork_and_restore(
+    blocks: &LocalBlockClient,
+    device_id: DeviceId,
+) -> toy_cow_block_storage::Result<()> {
+    let device = blocks.open_device(device_id)?;
+    let first = device.write_at(0, &[7; 4096])?;
+
+    let fork_id = device.fork(ForkRequest {
+        target: None,
+        name: Some("child".to_string()),
+    })?;
+    let fork = blocks.open_device(fork_id)?;
+    fork.write_zeroes(0, 4096)?;
+
+    let restored_id = device.restore(RestorePoint::Commit(first.commit_seq))?;
+    let restored = blocks.open_device(restored_id)?;
+
+    let mut buf = vec![0; 4096];
+    restored.read_at(0, &mut buf)?;
+    assert_eq!(buf[0], 7);
+
+    Ok(())
+}
+```
+
+For filesystem-shaped dirty windows, use `commit_batch` and then `flush` so the
+caller's dirty ranges become one atomic storage boundary. Plain random block
+writes can legitimately conflict at high concurrency if they hit the same shard;
+the `*-shard-lanes` loadbench rows are the happy-path throughput shape.
+
+## Native keyspaces and files
+
+The native API keeps file intent visible to the storage layer. A keyspace is the
+coherent checkpoint, snapshot, and restore boundary. Files inside a keyspace
+support byte-oriented reads, ordinary writes, write batches, and append streams.
+
+This surface is for custom filesystems or direct applications that can express
+file operations directly. File IDs are scoped by keyspace, and a snapshot or
+restore creates a new keyspace lineage that initially shares immutable catalog
+and file roots.
+
+```rust
+use toy_cow_block_storage::{
+    FileId, KeyspaceId, LocalNativeClient, NativeFile, NativeKeyspaceClient,
+    RestorePoint, SnapshotKeyspaceRequest,
+};
+
+fn snapshot_keyspace(
+    native: &LocalNativeClient,
+    keyspace: KeyspaceId,
+    file_id: FileId,
+) -> toy_cow_block_storage::Result<()> {
+    let file = native.open_file(keyspace, file_id)?;
+
+    file.write_at(0, b"hello world")?;
+    let checkpoint = native.checkpoint_keyspace(keyspace)?;
+
+    let snapshot = native.snapshot_keyspace(
+        keyspace,
         SnapshotKeyspaceRequest {
             target: None,
             name: Some("before-overwrite".to_string()),
@@ -192,291 +182,229 @@ fn native_keyspace_flow() -> toy_cow_block_storage::Result<()> {
 
     file.write_at(0, b"goodbye!!!!")?;
 
-    file.read_at(0, &mut bytes)?;
-    assert_eq!(bytes.as_slice(), b"goodbye!!!!");
+    let snapshot_file = native.open_file(snapshot, file_id)?;
+    let mut buf = vec![0; 11];
+    snapshot_file.read_at(0, &mut buf)?;
+    assert_eq!(buf.as_slice(), b"hello world");
 
-    // The snapshot keyspace still sees the original file bytes.
-    let snapshot_file = native_client.open_file(snapshot_id, file_id)?;
-    let mut snapshot_bytes = vec![0; 11];
-    snapshot_file.read_at(0, &mut snapshot_bytes)?;
-    assert_eq!(snapshot_bytes.as_slice(), b"hello world");
-
-    let restored_id = native_client.restore_keyspace(
-        keyspace_id,
-        RestorePoint::Checkpoint(checkpoint),
-    )?;
-
-    let restored_file = native_client.open_file(restored_id, file_id)?;
-    let mut restored_bytes = vec![0; 11];
-    restored_file.read_at(0, &mut restored_bytes)?;
-    assert_eq!(restored_bytes.as_slice(), b"hello world");
+    let restored = native.restore_keyspace(keyspace, RestorePoint::Checkpoint(checkpoint))?;
+    let restored_file = native.open_file(restored, file_id)?;
+    restored_file.read_at(0, &mut buf)?;
+    assert_eq!(buf.as_slice(), b"hello world");
 
     Ok(())
 }
 ```
 
-Native API guarantees to care about:
+`commit_batch` is the native shape for many client writes that should publish as
+one visible file version. Native append workloads should keep their append
+stream token, writer epoch, private durability mark, and visible publish
+boundary intact.
 
-- Keyspaces are the snapshot and restore boundary.
-- File IDs are scoped by keyspace.
-- Writes and appends are byte-oriented. Normal writes commit as file-version
-  transitions; append streams ingest private bytes, flush durable marks, and
-  publish visible file versions explicitly.
-- Append streams carry writer epochs so stale writers fail without partial file
-  visibility.
-- A successful non-empty file write publishes a new immutable keyspace catalog
-  root.
-- Snapshot and restore copy retained keyspace-root pointers rather than walking
-  file contents.
+## Append streams
 
-## Durable Maintenance
+Append streams are for very high-throughput sequential writes: the current
+short-run durable matrix reaches roughly 5 GB/s on the largest ingest rows.
+They split ingest into three explicit boundaries:
 
-The durable local provider stores logical metadata in root SQLite and gives
-each storage node its own SQLite catalog plus rolled data logs. Those catalogs
-are independent durability boundaries: segment bytes and the node's catalog
-receipt commit before root metadata references them, so a failed metadata
-publish leaves an invisible orphan for cleanup instead of a half-visible write.
-Maintenance is explicit by default: callers can observe dirty/reclaimable
-bytes, ask the deterministic scheduler for a plan, and run one bounded tick.
-Acknowledged writes stay in the live in-process segment state until an explicit
-flush or stronger write asks for stable storage. After a restart, unflushed
-acknowledged bytes are ignored; a successful flush appends and syncs the
-selected segment payloads before publishing catalog placement or root metadata.
-Physical data-log sync groups are bounded so large flushes do not become one
-unbounded tail spike.
+```text
+append_stream         accepted private bytes
+flush_append_stream   private durability for this stream token
+publish_append_stream reader-visible file version
+```
+
+```rust
+use toy_cow_block_storage::NativeFile;
+
+fn append_flow(file: &impl NativeFile) -> toy_cow_block_storage::Result<()> {
+    let stream = file.open_append_stream()?;
+
+    file.append_stream(&stream, b"batch-0001\n")?;
+    file.append_stream(&stream, b"batch-0002\n")?;
+
+    let mark = file.flush_append_stream(&stream)?;
+
+    // Readers observe the appended bytes after publish succeeds.
+    let commit = file.publish_append_stream(&stream, &mark)?;
+    assert_eq!(commit.range.len, mark.durable_through);
+
+    Ok(())
+}
+```
+
+A flush is private durability for the holder of the `AppendStream` bearer token.
+Publish is the only globally discoverable append boundary. Failover that needs
+unpublished bytes must persist both the stream token and `DurableAppendMark`
+outside the storage layer; a replacement without that authority opens a fresh
+stream from the latest visible file head.
+
+## Durable local provider
+
+The durable provider stores root metadata in SQLite and gives each storage node
+its own SQLite catalog plus rolled data logs. Segment bytes and catalog receipts
+commit before root metadata references them, so a failed metadata publish leaves
+invisible orphan data for custodian cleanup instead of a half-visible write.
+
+Acknowledged writes stay live in process until an explicit `flush` or stronger
+write asks for stable storage. After restart, unflushed acknowledged bytes are
+ignored; flushed writes are replayed from durable metadata and data logs.
 
 ```rust
 use toy_cow_block_storage::{
-    DurableCoordinator, MaintenanceMode, MaintenancePolicy, WriteAdmission,
+    DurableCoordinator, MaintenancePolicy, WriteAdmission,
 };
 
 let store = DurableCoordinator::open_with_maintenance_policy(
     "/tmp/toy-cow",
     Default::default(),
-    MaintenancePolicy::default(), // Manual mode by default.
+    MaintenancePolicy::default(),
 )?;
 
-let observation = store.observe_maintenance()?;
+let _observation = store.observe_maintenance()?;
 let plan = store.plan_maintenance()?;
+
 if matches!(plan.admission, WriteAdmission::AcceptAndSchedule) {
     store.run_maintenance_tick()?;
 }
 ```
 
-For a long-running local process, opt into automatic bounded compaction by
-using `AlwaysOn`. The worker only runs after writes or custodian work wake it,
-and each tick is still limited by the policy:
+For long-running local services, `MaintenanceMode::AlwaysOn` runs bounded
+maintenance after writes or custodian work wake it. Keep the copy budget small
+enough that one tick has predictable latency, and large enough that compaction
+debt can fall during normal traffic.
 
-```rust
-let mut policy = MaintenancePolicy::default();
-policy.mode = MaintenanceMode::AlwaysOn;
-policy.write_backpressure_enabled = true;
-policy.dirty_low_watermark_bytes = 64 * 1024 * 1024;
-policy.dirty_high_watermark_bytes = 256 * 1024 * 1024;
-policy.compaction_copy_budget_per_tick = 32 * 1024 * 1024;
+## Performance snapshot
 
-let store = DurableCoordinator::open_with_maintenance_policy(
-    "/tmp/toy-cow",
-    Default::default(),
-    policy,
-)?;
+These are short-run durable checkpoints from this dev host with `200us` modeled
+RTT. Treat them as local sanity numbers.
+
+| Scenario | Workload shape | Result |
+| --- | --- | --- |
+| Verified native reads | `native-read-4k`, c16 | about 72.8k IOPS, p99 about 468 us |
+| Block writeback fsync | `block-writeback-fsync-1m`, c16 | about 1.3 GB/s, p99 about 15 ms |
+| Larger block fsync window | `block-writeback-fsync-4m`, c16 | about 1.9 GB/s, p99 about 40 ms |
+| Append stream ingest | `native-stream-ingest-1m`, c16 | about 3.6 GB/s ingest; payload flush p99 around 15 ms in profile rows |
+| Large append stream ingest | `native-stream-ingest-32m`, c16 | roughly 5 GB/s ingest in the current short-run matrix |
+| Preflushed append publish | `native-stream-publish-preflushed-1m`, c16 | about 923 MB/s, p50 about 5.2 ms, p99 about 17 ms |
+
+`cargo bench --bench regression` is the Criterion mechanism suite.
+`loadbench` is the integration runner for public block/native API behavior,
+modeled RTT, concurrency, latency percentiles, conflicts, and errors.
+
+```sh
+# Broad public API smoke.
+docker compose exec dev cargo run --release --bin loadbench -- \
+  --provider durable \
+  --durability ack-flush:1 \
+  --duration-ms 1000 \
+  --warmup-ms 100 \
+  --concurrency 1,4,16 \
+  --workloads north-star \
+  --rtt-us 200
+
+# Filesystem-shaped block fsync windows.
+docker compose exec dev cargo run --release --bin loadbench -- \
+  --provider durable \
+  --durability ack-flush:1 \
+  --duration-ms 1000 \
+  --warmup-ms 100 \
+  --concurrency 1,4,16 \
+  --storage-nodes 4 \
+  --workloads block-writeback \
+  --rtt-us 200
+
+# Native append ingest, private durability, and publish boundaries.
+docker compose exec dev cargo run --release --bin loadbench -- \
+  --provider durable \
+  --durability ack \
+  --duration-ms 1000 \
+  --warmup-ms 100 \
+  --concurrency 1,4,16 \
+  --files 128 \
+  --workloads append-stream \
+  --rtt-us 200 \
+  --stream-flush-mib 2 \
+  --stream-publish-mib 128
 ```
 
-When picking settings, think in plain storage terms:
+`success_iops` is successful operations per second. `mbps` is submitted payload
+MB/s. Append stream rows also report `durable_mbps` and `published_mbps` because
+private durability and reader visibility are different boundaries.
 
-- Use `Manual` for deterministic tests and tools that want to schedule their
-  own maintenance. Use `AlwaysOn` for services that should steadily clean up in
-  the background. `Opportunistic` is the middle ground: writes can run one
-  bounded maintenance tick before they proceed.
-- Larger data logs are better for sequential write throughput and fewer files;
-  smaller data logs make reclaim work more granular.
-- The low dirty watermark says "start cleaning soon"; the high watermark says
-  "slow callers down" when `write_backpressure_enabled` is true.
-- Keep the copy budget small enough that one tick has predictable latency, and
-  large enough that debt can actually fall during normal traffic.
-- PITR retention and custodian release timing decide what is truly reclaimable.
-  Compaction will not delete bytes still protected by retained history.
+Useful workload aliases:
 
-If write backpressure is enabled and pressure crosses a configured hard
-maintenance limit, durable writes return `StorageError::Unavailable` with a
-stable reason. Reads, forks, snapshots, restores, and flush semantics do not
-change.
+| Alias | Use it for |
+| --- | --- |
+| `north-star` | Broad block/native API comparison. |
+| `append-batch` | Client-side append payload size effects. |
+| `append-stream` | Private ingest, stream flush, and visible publish behavior. |
+| `block-writeback` | Filesystem-style dirty window plus fsync behavior. |
+| `block-metadata` | Same-shard conflicts versus different-shard/device convergence. |
+| `native-file-batch` | Client-sized random-write commit boundaries. |
+| `native-metadata` | Same-file pressure versus different-file keyspace lanes. |
 
-## Operational Signals
+## Development
 
-The provider exposes typed diagnostics through `ObservableProvider`; it does
-not bake in Prometheus, OpenTelemetry, or a hosted metrics shape. Exporters can
-poll `diagnostics_snapshot()` and `drain_events(max)` and translate the stable
-counters, gauges, node snapshots, and event kinds into whatever system your
-service uses.
+Run Rust commands inside the Linux container from `docker-compose.yml`. Keep git
+commands on the macOS host.
 
-```rust
-use toy_cow_block_storage::{ObservableProvider, StorageEventKind};
-
-let snapshot = store.diagnostics_snapshot()?;
-let recent = store.drain_events(64)?;
-
-if snapshot.gauges.maintenance_reclaimable_bytes > 0 {
-    // Schedule bounded maintenance when your service is ready for the work.
-}
-
-assert!(recent
-    .iter()
-    .all(|event| event.kind != StorageEventKind::MetadataPublishFailed));
+```sh
+docker compose up -d dev
+docker compose exec dev cargo test
+docker compose exec dev cargo bench --bench regression -- --test
+docker compose down
 ```
 
-The most useful signals during normal operation are:
+Full gate:
 
-- `pending_orphan_segments`: bytes reached storage but did not become visible
-  yet. This should usually fall after custodian work.
+```sh
+docker compose exec dev cargo fmt --check
+docker compose exec dev cargo clippy --all-targets --all-features -- -D warnings
+docker compose exec dev cargo test
+docker compose exec dev cargo doc --no-deps
+docker compose exec dev cargo bench --bench regression -- --test
+```
+
+Use `cargo bench --bench regression` without `-- --test` when you want Criterion
+to record comparison data.
+
+## Operational signals
+
+Providers expose typed diagnostics through `ObservableProvider`; exporters can
+map counters, gauges, node snapshots, and event kinds into their own metrics
+system.
+
+- `pending_orphan_segments`: payload reached storage but did not become visible.
 - `maintenance_dirty_bytes` and `maintenance_reclaimable_bytes`: compaction
-  debt. Rising debt means PITR, release evidence, or copy budgets may need
-  attention.
-- `sqlite_wal_bytes`: metadata WAL pressure. Data-log compaction and SQLite
-  maintenance are separate knobs.
+  debt and reclaim opportunity.
+- `sqlite_wal_bytes`: metadata WAL pressure.
 - `coordinator_write_publish_failures`: storage writes succeeded but metadata
-  publish did not. The data should stay invisible and become reclaimable.
+  publish did not.
 - `coordinator_write_unavailable`: writes were throttled or rejected by policy.
-  Treat the stable reason on recent events as the operator-facing cause.
-- `receipt_rejected_*`: proof, scope, epoch, or replay failures. These are the
-  first things to inspect when introducing remote or trusted-client transports.
+- `receipt_rejected_*`: proof, scope, epoch, or replay failures.
 
-Events are bounded breadcrumbs, not durable history. If the ring buffer
-overwrites unread events, `observability_events_dropped` increases. Long-lived
-truth should come from counters, gauges, metadata timelines, storage-node
-catalogs, and data logs.
+Events are bounded breadcrumbs. Long-lived truth comes from counters, gauges,
+timelines, storage-node catalogs, and data logs.
 
-## Phase Gates
+## Doctrine
 
-Run these before advancing past the project harness and public contract phases:
+The project follows a "build it like NASA" workflow: small deterministic
+modules, explicit invariants, exhaustive simulation, and no advancement to the
+next layer until the current layer is boringly correct.
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo doc --no-deps
-cargo bench --bench regression
-```
+- Keep deterministic code free of hidden I/O, wall-clock reads, background work,
+  and process-global randomness.
+- Prefer pure state transitions shaped like `step(command) -> effects`.
+- Keep immutable objects immutable: segments, metadata nodes, and committed
+  roots are never mutated in place.
+- Keep forks O(1) by copying root pointers only.
+- Keep reclamation explicit: GC traces from committed roots and sweeps only
+  unreachable objects.
+- Add abstractions only when tests, simulations, benchmarks, or real duplication
+  prove they are needed.
 
-The Criterion benchmarks start as tiny regression baselines for API validation
-and deterministic test utilities. Later phases should add read, write, fork,
-PITR, and GC benchmarks before optimizing those paths.
+Read these before changing implementation code:
 
-Criterion reports performance movement; it does not make `cargo bench` fail
-solely because a benchmark regressed. Treat the output as regression detection
-signal until the project adds an explicit CI comparison step.
-
-For final happy-path integration performance expectations, use the load
-benchmark runner rather than Criterion microbenchmarks:
-
-```sh
-cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,4,16,64 --files 1024 --storage-nodes 4
-cargo run --release --bin loadbench -- --provider local --duration-ms 1000 --warmup-ms 200 --concurrency 1,16,64 --files 1024 --storage-nodes 4 --rtt-us 200
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --storage-nodes 4 --workloads block-write-4k,native-write-4k,native-append-4k
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:4 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 1024 --storage-nodes 4 --workloads append-batch --rtt-us 200
-cargo run --release --bin loadbench -- --provider durable --durability ack --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 --workloads append-stream --rtt-us 200 --stream-flush-mib 2 --stream-publish-mib 128
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,16,64 --files 128 --storage-nodes 4 --workloads native-file-batch --rtt-us 200
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16,64 --workloads block-metadata --rtt-us 200 --durable-profile-csv target/loadbench/block-metadata/profile.csv
-cargo run --release --bin loadbench -- --provider durable --durability ack-flush:1 --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --storage-nodes 4 --workloads block-writeback --rtt-us 200 --block-batch-profile-csv target/loadbench/block-writeback/block-batch.csv
-```
-
-`loadbench` is the north-star integration benchmark: it exercises the public
-block and native APIs through the current provider paths, reports IOPS,
-throughput, latency percentiles, and conflicts/errors, and can model a fixed
-RTT between service boundaries. Treat its output as the current implementation's
-happy-environment performance baseline, while Criterion remains the narrow
-regression suite for individual mechanisms.
-
-For large durable writes, prefer small `ack-flush:N` values when comparing
-latency. `ack-flush:64` is useful as a coarse-throughput stress case, but with
-1MiB writes it creates 64MiB per-lane durability intervals and can dominate p99
-with intentional flush queueing.
-
-Use the `*-shard-lanes` block write workloads when the goal is happy-path
-throughput. The plain random block write workloads are intentionally allowed to
-collide at high concurrency and are better read as conflict behavior controls.
-Use the `block-writeback` alias when modeling the block-device work caused by a
-filesystem or mount fsync. Each `block-writeback-fsync-*` row pre-fills a
-filesystem-like dirty 4KiB window, then times `commit_block_batch` plus
-`flush_device`. These rows are storage-boundary measurements, not local
-page-cache write/read IOPS. On the durable provider, `flush_device` records
-replayable block delta rows and durable segment payloads; explicit checkpoints
-fold those deltas into checkpointed CoW shard-head rows.
-Use the `block-metadata` alias when diagnosing block metadata convergence. It
-separates same-shard contention, same-device/different-shard writes, and
-different-device writes. With `--durable-profile-csv`, the profile rows also
-split persist-lock wait, SQLite lock wait, row-sync/commit time, metadata
-publish lock wait, commit sequence allocation time, touched shard-head rows,
-and logical conflict counts. Use a flushing durability mode such as
-`ack-flush:1` when you need SQLite phase profiles; pure `ack` runs measure the
-acknowledged in-memory path and may not emit persist profile rows.
-
-For append-stream workloads, the normal `mbps` column is accepted ingest
-throughput. The `durable_mbps` and `published_mbps` columns separately report
-how many bytes crossed the stream durability boundary and the reader-visible
-publish boundary during the run. A short run with a large publish interval can
-show high ingest throughput and low published throughput simply because it ends
-with private-but-valid stream data still waiting for the next publish boundary.
-That private durable data is resumable only by the matching stream token and
-durable mark; normal file lookup and new append stream open observe only the
-published head.
-
-The normal native write and append workloads partition files by worker so the
-happy-path rows measure throughput across independent file lanes instead of
-accidental same-file fencing conflicts. `native-hot-append-4k` is the explicit
-contention workload; conflicts or errors in the other append-batch and
-append-stream rows should be treated as benchmark or implementation failures,
-not as expected noise.
-
-Use the `native-metadata` alias when diagnosing native keyspace convergence. It
-contrasts same-file write/append pressure with same-keyspace different-file
-lanes, then includes the stream flush+publish path. With
-`--durable-profile-csv`, profile rows show whether successful native publishes
-touch one catalog shard row, how much time is spent waiting on metadata publish
-locks, and whether the remaining ceiling is SQLite/persist work rather than
-logical keyspace convergence.
-
-Use the `native-file-batch` alias when diagnosing client-sized random-write
-commit boundaries. It compares one-write controls with 4KiB batches at 16, 256,
-and 4096 writes, a 1MiB x 16 batch, overwrite-collapse batches, and a
-16MiB fsync-interval simulation. `--native-file-batch-ops`,
-`--native-file-batch-bytes`, `--native-file-batch-overlap`, and
-`--native-file-batch-fsync-mib` can override the default shapes. Treat
-batch rows as commit operations: `success_iops` is batch commits per second,
-while `mbps` is submitted client payload per second.
-
-For durable-provider tail analysis, add `--durable-profile-csv <path>` to append
-one row per physical persist. The profile breaks total persist time into lock
-wait, local state export, data-log append/sync, data-log encode/write/file-sync
-subphases, node-catalog publish, root SQLite row sync, and root SQLite commit
-phases.
-
-Payload integrity is explicit in the benchmark harness. The default
-`--payload-integrity verified` stores CRC32C integrity metadata and default
-reads verify verified payloads. `--payload-integrity unchecked` skips checksum
-creation for applications that already protect their own bytes; default reads
-accept unchecked segments, `--read-verification require-verified` rejects them,
-and `--read-verification skip` bypasses read-time verification.
-
-The opt-in `append-batch` workload suite compares `native-append-4k`,
-`native-append-1m`, `native-append-4m`, and `native-append-32m` against matching
-`native-write-*` controls. Use it to diagnose client-side batching effects: if
-append throughput rises with payload size, fixed per-append overhead dominates;
-if large append remains much slower than same-size write-at, one-shot stream
-open/flush/publish semantics dominate; if both plateau low, the durable data-log
-or catalog persistence path is the bottleneck.
-
-The opt-in `append-stream` workload suite compares `native-stream-ingest-*`,
-`native-stream-append-flush-*`, `native-stream-publish-preflushed-1m`, and
-`native-stream-flush-publish-1m` against `native-write-*` controls. Ingest rows
-keep one stream open per worker/file lane and measure private accepted bytes.
-Use `--stream-flush-mib 2` or `--stream-flush-mib 4` for latency-first durable
-intervals; use `16` or `32` only when explicitly exploring coarser resumability
-points. `--stream-publish-mib 128` models batched reader visibility.
-`native-stream-append-flush-*` measures append plus durable mark per operation.
-`native-stream-publish-preflushed-1m` times the visibility boundary for
-already-flushed private data. `native-stream-flush-publish-1m` measures the
-full append, durable, and visible path. Large durable write controls can retain
-substantial in-flight segment bytes before an `ack-flush:N` boundary; on
-memory-constrained Docker hosts, reduce `--files`, concurrency, or workload
-size for exploratory runs.
+- [docs/cow-block-storage-design.md](docs/cow-block-storage-design.md)
+- [docs/implementation-plan.md](docs/implementation-plan.md)
+- [AGENTS.md](AGENTS.md)

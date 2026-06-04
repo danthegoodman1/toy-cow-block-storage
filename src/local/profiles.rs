@@ -19,6 +19,122 @@ pub(super) struct LocalSegmentStoreSyncProfile {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct LocalSegmentStoreReadProfile {
+    total_nanos: u64,
+    lock_wait_nanos: u64,
+    copy_nanos: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct LocalSegmentStoreVerifyProfile {
+    total_nanos: u64,
+    lock_wait_nanos: u64,
+    checksum_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ReadSourceProfile {
+    total_nanos: u64,
+    storage_node_catalog_lookup_nanos: u64,
+    storage_node_payload_read_nanos: u64,
+    storage_node_lock_wait_nanos: u64,
+    verification_nanos: u64,
+    copy_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ReadResolveProfile {
+    pub metadata_lock_wait_nanos: u64,
+    pub metadata_tree_walk_nanos: u64,
+    pub metadata_placement_lookup_nanos: u64,
+}
+
+/// Process-local timing for one block or native read.
+///
+/// Profiles are opt-in diagnostics for integration benchmarks. They are not
+/// durable state and are not part of the public block/native contracts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadProfile {
+    pub sequence: u64,
+    pub total_nanos: u64,
+    pub metadata_resolve_nanos: u64,
+    pub metadata_lock_wait_nanos: u64,
+    pub metadata_tree_walk_nanos: u64,
+    pub metadata_placement_lookup_nanos: u64,
+    pub assemble_nanos: u64,
+    pub zero_fill_nanos: u64,
+    pub storage_node_read_nanos: u64,
+    pub storage_node_catalog_lookup_nanos: u64,
+    pub storage_node_payload_read_nanos: u64,
+    pub storage_node_lock_wait_nanos: u64,
+    pub verification_nanos: u64,
+    pub copy_nanos: u64,
+    pub logical_bytes: u64,
+    pub extent_count: u64,
+    pub zero_extent_count: u64,
+    pub segment_extent_count: u64,
+    pub append_run_extent_count: u64,
+    pub storage_node_count: u64,
+}
+
+impl ReadProfile {
+    fn absorb_source(&mut self, source: ReadSourceProfile) {
+        self.storage_node_read_nanos = self
+            .storage_node_read_nanos
+            .saturating_add(source.total_nanos);
+        self.storage_node_catalog_lookup_nanos = self
+            .storage_node_catalog_lookup_nanos
+            .saturating_add(source.storage_node_catalog_lookup_nanos);
+        self.storage_node_payload_read_nanos = self
+            .storage_node_payload_read_nanos
+            .saturating_add(source.storage_node_payload_read_nanos);
+        self.storage_node_lock_wait_nanos = self
+            .storage_node_lock_wait_nanos
+            .saturating_add(source.storage_node_lock_wait_nanos);
+        self.verification_nanos = self
+            .verification_nanos
+            .saturating_add(source.verification_nanos);
+        self.copy_nanos = self.copy_nanos.saturating_add(source.copy_nanos);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ReadProfiler {
+    capacity: usize,
+    next_sequence: u64,
+    profiles: VecDeque<ReadProfile>,
+}
+
+impl ReadProfiler {
+    fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "read profile capacity must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            capacity,
+            next_sequence: 1,
+            profiles: VecDeque::with_capacity(capacity.min(1024)),
+        })
+    }
+
+    fn record(&mut self, mut profile: ReadProfile) {
+        profile.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.profiles.len() == self.capacity {
+            self.profiles.pop_front();
+        }
+        self.profiles.push_back(profile);
+    }
+
+    fn drain(&mut self, max: usize) -> Vec<ReadProfile> {
+        let count = max.min(self.profiles.len());
+        self.profiles.drain(..count).collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct LocalSegmentWriteProfile {
     storage_node_ids_nanos: u64,
     placement_select_nanos: u64,
@@ -123,4 +239,3 @@ pub(super) struct LocalMarkReferencedProfile {
     catalog_mark_nanos: u64,
     catalog_mark_lock_wait_nanos: u64,
 }
-

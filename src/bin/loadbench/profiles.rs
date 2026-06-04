@@ -286,3 +286,72 @@ fn append_block_batch_profile_csv(
     }
     Ok(())
 }
+
+fn append_read_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.read_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,payload_integrity,read_verification,sequence,total_nanos,metadata_resolve_nanos,metadata_lock_wait_nanos,metadata_tree_walk_nanos,metadata_placement_lookup_nanos,assemble_nanos,zero_fill_nanos,storage_node_read_nanos,storage_node_catalog_lookup_nanos,storage_node_payload_read_nanos,storage_node_lock_wait_nanos,verification_nanos,copy_nanos,logical_bytes,extent_count,zero_extent_count,segment_extent_count,append_run_extent_count,profile_storage_node_count"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            workload.name(),
+            args.provider,
+            args.durability,
+            args.rtt.as_micros(),
+            args.serial_rtts,
+            concurrency,
+            workload.op_size(args)?,
+            args.storage_nodes,
+            payload_integrity_name(args.payload_integrity),
+            read_verification_name(args.read_verification),
+            profile.sequence,
+            profile.total_nanos,
+            profile.metadata_resolve_nanos,
+            profile.metadata_lock_wait_nanos,
+            profile.metadata_tree_walk_nanos,
+            profile.metadata_placement_lookup_nanos,
+            profile.assemble_nanos,
+            profile.zero_fill_nanos,
+            profile.storage_node_read_nanos,
+            profile.storage_node_catalog_lookup_nanos,
+            profile.storage_node_payload_read_nanos,
+            profile.storage_node_lock_wait_nanos,
+            profile.verification_nanos,
+            profile.copy_nanos,
+            profile.logical_bytes,
+            profile.extent_count,
+            profile.zero_extent_count,
+            profile.segment_extent_count,
+            profile.append_run_extent_count,
+            profile.storage_node_count,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}

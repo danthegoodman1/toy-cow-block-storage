@@ -15,6 +15,7 @@ pub struct DurableCoordinator {
     persist_coordinator: Arc<PersistCoordinator>,
     stream_flush_coordinator: Arc<StreamFlushCoordinator>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
+    read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
@@ -116,6 +117,7 @@ impl DurableCoordinator {
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_flush_coordinator: Arc::new(StreamFlushCoordinator::new()),
             persist_profiler: Arc::new(Mutex::new(None)),
+            read_profiler: Arc::new(Mutex::new(None)),
             maintenance_policy,
             maintenance_cursor,
             maintenance_worker: None,
@@ -183,6 +185,26 @@ impl DurableCoordinator {
 
     fn record_persist_profile(&self, profile: DurablePersistProfile) -> Result<()> {
         if let Some(profiler) = lock(&self.persist_profiler)?.as_mut() {
+            profiler.record(profile);
+        }
+        Ok(())
+    }
+
+    pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
+        *lock(&self.read_profiler)? = Some(ReadProfiler::new(capacity)?);
+        Ok(())
+    }
+
+    pub fn drain_read_profiles(&self, max: usize) -> Result<Vec<ReadProfile>> {
+        let mut profiler = lock(&self.read_profiler)?;
+        Ok(profiler
+            .as_mut()
+            .map(|profiler| profiler.drain(max))
+            .unwrap_or_default())
+    }
+
+    fn record_read_profile(&self, profile: ReadProfile) -> Result<()> {
+        if let Some(profiler) = lock(&self.read_profiler)?.as_mut() {
             profiler.record(profile);
         }
         Ok(())
@@ -1380,8 +1402,19 @@ impl DurableCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let plan = self.local.resolve_block_read(device_id, range)?;
-        assemble_read_plan(self, plan, verification, buf)
+        let total_started = Instant::now();
+        let resolve_started = Instant::now();
+        let (plan, resolve_profile) =
+            MetadataReadService::resolve_block_read(&self.local, device_id, range)?;
+        let metadata_resolve_nanos = duration_nanos_u64(resolve_started.elapsed());
+        let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
+        profile.metadata_resolve_nanos = metadata_resolve_nanos;
+        profile.metadata_lock_wait_nanos = resolve_profile.metadata_lock_wait_nanos;
+        profile.metadata_tree_walk_nanos = resolve_profile.metadata_tree_walk_nanos;
+        profile.metadata_placement_lookup_nanos =
+            resolve_profile.metadata_placement_lookup_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.record_read_profile(profile)
     }
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
@@ -1598,8 +1631,19 @@ impl DurableCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let plan = self.local.resolve_file_read(keyspace_id, file_id, range)?;
-        assemble_read_plan(self, plan, verification, buf)
+        let total_started = Instant::now();
+        let resolve_started = Instant::now();
+        let (plan, resolve_profile) =
+            MetadataReadService::resolve_file_read(&self.local, keyspace_id, file_id, range)?;
+        let metadata_resolve_nanos = duration_nanos_u64(resolve_started.elapsed());
+        let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
+        profile.metadata_resolve_nanos = metadata_resolve_nanos;
+        profile.metadata_lock_wait_nanos = resolve_profile.metadata_lock_wait_nanos;
+        profile.metadata_tree_walk_nanos = resolve_profile.metadata_tree_walk_nanos;
+        profile.metadata_placement_lookup_nanos =
+            resolve_profile.metadata_placement_lookup_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.record_read_profile(profile)
     }
 
     pub fn fork_device(&self, source: DeviceId, request: ForkRequest) -> Result<DeviceId> {
@@ -1741,7 +1785,7 @@ impl StorageNodeReadService for DurableCoordinator {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
         self.local.read_segment_source(
             storage_node,
             segment_id,
@@ -1760,7 +1804,7 @@ impl StorageNodeReadService for DurableCoordinator {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<ReadSourceProfile> {
         self.durable.read_append_run_source_payload(
             storage_node,
             log_id,

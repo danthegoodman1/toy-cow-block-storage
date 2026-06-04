@@ -29,14 +29,18 @@ pub(super) enum ReadSource {
 }
 
 pub(super) trait MetadataReadService {
-    fn resolve_block_read(&self, device_id: DeviceId, range: ByteRange) -> Result<ReadPlan>;
+    fn resolve_block_read(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+    ) -> Result<(ReadPlan, ReadResolveProfile)>;
 
     fn resolve_file_read(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
         range: ByteRange,
-    ) -> Result<ReadPlan>;
+    ) -> Result<(ReadPlan, ReadResolveProfile)>;
 }
 
 pub(super) trait StorageNodeReadService {
@@ -48,7 +52,7 @@ pub(super) trait StorageNodeReadService {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()>;
+    ) -> Result<ReadSourceProfile>;
 
     fn read_append_run_source(
         &self,
@@ -58,7 +62,7 @@ pub(super) trait StorageNodeReadService {
         integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<()>;
+    ) -> Result<ReadSourceProfile>;
 }
 
 impl ReadPlan {
@@ -108,6 +112,33 @@ impl ReadPlan {
             extents: out,
         })
     }
+
+    fn profile_shape(&self) -> ReadProfile {
+        let mut storage_nodes = BTreeSet::new();
+        let mut profile = ReadProfile {
+            logical_bytes: self.logical_len,
+            extent_count: usize_to_u64(self.extents.len()),
+            ..ReadProfile::default()
+        };
+        for extent in &self.extents {
+            match extent.source {
+                ReadSource::Zero => {
+                    profile.zero_extent_count = profile.zero_extent_count.saturating_add(1);
+                }
+                ReadSource::Segment { storage_node, .. } => {
+                    profile.segment_extent_count = profile.segment_extent_count.saturating_add(1);
+                    storage_nodes.insert(storage_node);
+                }
+                ReadSource::AppendRun { storage_node, .. } => {
+                    profile.append_run_extent_count =
+                        profile.append_run_extent_count.saturating_add(1);
+                    storage_nodes.insert(storage_node);
+                }
+            }
+        }
+        profile.storage_node_count = usize_to_u64(storage_nodes.len());
+        profile
+    }
 }
 
 fn read_output_slice(buf: &mut [u8], output_offset: u64, len: u64) -> Result<&mut [u8]> {
@@ -143,6 +174,16 @@ pub(super) fn assemble_read_plan(
     verification: ReadVerification,
     buf: &mut [u8],
 ) -> Result<()> {
+    assemble_read_plan_profiled(storage, plan, verification, buf).map(|_| ())
+}
+
+pub(super) fn assemble_read_plan_profiled(
+    storage: &impl StorageNodeReadService,
+    plan: ReadPlan,
+    verification: ReadVerification,
+    buf: &mut [u8],
+) -> Result<ReadProfile> {
+    let assemble_started = Instant::now();
     let buf_len = u64::try_from(buf.len())
         .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
     if buf_len != plan.logical_len {
@@ -150,7 +191,10 @@ pub(super) fn assemble_read_plan(
             "read buffer length must match read plan length",
         ));
     }
+    let mut profile = plan.profile_shape();
+    let zero_started = Instant::now();
     buf.fill(0);
+    profile.zero_fill_nanos = duration_nanos_u64(zero_started.elapsed());
     for extent in plan.extents {
         match extent.source {
             ReadSource::Zero => {}
@@ -161,7 +205,7 @@ pub(super) fn assemble_read_plan(
                 integrity,
             } => {
                 let output = read_output_slice(buf, extent.output_offset, extent.len)?;
-                storage.read_segment_source(
+                let source_profile = storage.read_segment_source(
                     storage_node,
                     segment_id,
                     ByteRange::new(segment_offset, extent.len),
@@ -169,6 +213,7 @@ pub(super) fn assemble_read_plan(
                     verification,
                     output,
                 )?;
+                profile.absorb_source(source_profile);
             }
             ReadSource::AppendRun {
                 storage_node,
@@ -177,7 +222,7 @@ pub(super) fn assemble_read_plan(
                 integrity,
             } => {
                 let output = read_output_slice(buf, extent.output_offset, extent.len)?;
-                storage.read_append_run_source(
+                let source_profile = storage.read_append_run_source(
                     storage_node,
                     log_id,
                     ByteRange::new(payload_offset, extent.len),
@@ -185,8 +230,10 @@ pub(super) fn assemble_read_plan(
                     verification,
                     output,
                 )?;
+                profile.absorb_source(source_profile);
             }
         }
     }
-    Ok(())
+    profile.assemble_nanos = duration_nanos_u64(assemble_started.elapsed());
+    Ok(profile)
 }
