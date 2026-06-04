@@ -13,6 +13,7 @@ pub struct DurableCoordinator {
     persist_lock: Arc<Mutex<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
+    append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
     stream_auto_persist_worker: Option<Arc<StreamAutoPersistWorker>>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
@@ -274,6 +275,7 @@ impl DurableCoordinator {
             persist_lock: Arc::new(Mutex::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
+            append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
             stream_auto_persist_worker: None,
             persist_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
@@ -327,6 +329,9 @@ impl DurableCoordinator {
             persist_lock: Arc::clone(&self.persist_lock),
             persist_coordinator: Arc::clone(&self.persist_coordinator),
             stream_prefix_persist_coordinator: Arc::clone(&self.stream_prefix_persist_coordinator),
+            append_publish_persist_coordinator: Arc::clone(
+                &self.append_publish_persist_coordinator,
+            ),
             stream_auto_persist_worker: None,
             persist_profiler: Arc::clone(&self.persist_profiler),
             read_profiler: Arc::clone(&self.read_profiler),
@@ -1248,6 +1253,7 @@ impl DurableCoordinator {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn persist_append_stream_publish_delta(
         &self,
         stream: &AppendStream,
@@ -1313,6 +1319,7 @@ impl DurableCoordinator {
         }
     }
 
+    #[cfg(test)]
     fn persist_append_stream_publish_delta_physical(
         &self,
         stream: &AppendStream,
@@ -1372,6 +1379,219 @@ impl DurableCoordinator {
         self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_high_water)
+    }
+
+    fn append_publish_requires_full_persist_before_plan(&self) -> Result<bool> {
+        let Some(previous_cursor) = self.durable.export_cursor()? else {
+            return Ok(true);
+        };
+        if !lock(&self.pending_data_log_append)?.is_empty() || self.has_unfolded_block_deltas()? {
+            return Ok(true);
+        }
+        let local_cursor = self.local.durable_export_cursor()?;
+        Ok(previous_cursor.next_commit_seq != local_cursor.next_commit_seq)
+    }
+
+    fn merged_append_publish_plan_delta(plans: &[AppendPublishPlan]) -> Result<NativeMetadataDelta> {
+        let Some(first) = plans.first() else {
+            return Err(StorageError::invalid_argument(
+                "append publish batch must include at least one plan",
+            ));
+        };
+        let mut delta = first.delta.clone();
+        for plan in &plans[1..] {
+            delta.cursor = plan.delta.cursor.clone();
+            delta
+                .keyspace_heads
+                .extend(plan.delta.keyspace_heads.iter().map(|(key, value)| (*key, value.clone())));
+            delta.keyspace_roots.extend(
+                plan.delta
+                    .keyspace_roots
+                    .iter()
+                    .map(|(key, value)| (*key, value.clone())),
+            );
+            delta.keyspace_catalog_shards.extend(
+                plan.delta
+                    .keyspace_catalog_shards
+                    .iter()
+                    .map(|(key, value)| (*key, value.clone())),
+            );
+            delta
+                .file_writer_epochs
+                .extend(plan.delta.file_writer_epochs.iter().copied());
+            delta.append_streams.extend(plan.delta.append_streams.clone());
+            delta.metadata_nodes.extend(
+                plan.delta
+                    .metadata_nodes
+                    .iter()
+                    .map(|(key, value)| (*key, value.clone())),
+            );
+            delta
+                .referenced_segment_ids
+                .extend(plan.delta.referenced_segment_ids.iter().copied());
+            delta.commit_groups.extend(
+                plan.delta
+                    .commit_groups
+                    .iter()
+                    .map(|(key, value)| (*key, value.clone())),
+            );
+            delta.keyspace_commits.extend(plan.delta.keyspace_commits.clone());
+            delta.file_commits.extend(plan.delta.file_commits.clone());
+        }
+        Ok(delta)
+    }
+
+    fn persist_prepared_append_publish_plans(
+        &self,
+        plans: &[AppendPublishPlan],
+        total_started: Instant,
+        lock_wait_nanos: u64,
+    ) -> Result<CommitSeq> {
+        let snapshot_started = Instant::now();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let delta = Self::merged_append_publish_plan_delta(plans)?;
+        let changed_segments = delta.referenced_segment_ids.clone();
+        if changed_segments
+            .iter()
+            .any(|segment_id| !previous_segments.contains(segment_id))
+        {
+            return Err(StorageError::conflict(
+                "prepared append publish references unpersisted segments",
+            ));
+        }
+        let nodes = self
+            .local
+            .selected_state_for_segment_ids(&changed_segments)?;
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+
+        let mut profile =
+            self.durable
+                .persist_native_metadata_delta(&delta, &nodes, &changed_segments, Vec::new())?;
+        let durable_high_water = CommitSeq::from_raw(profile.durable_commit_high_water);
+        let target_commit = plans
+            .last()
+            .map(|plan| plan.commit.commit_seq)
+            .ok_or_else(|| StorageError::invalid_argument("append publish batch is empty"))?;
+        if durable_high_water < target_commit {
+            return Err(StorageError::conflict(
+                "prepared append publish persist did not reach required commit sequence",
+            ));
+        }
+        lock(&self.persisted_segments)?.extend(changed_segments);
+        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.attach_metadata_publish_profile(&mut profile)?;
+        self.record_persist_profile(profile)?;
+        Ok(durable_high_water)
+    }
+
+    fn persist_append_publish_ticket_batch(
+        &self,
+        tickets: Vec<AppendPublishTicket>,
+    ) -> Result<()> {
+        if tickets.is_empty() {
+            return Ok(());
+        }
+        enum BatchStep {
+            Published(CommitSeq),
+            NeedsFullPersist,
+        }
+
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            while state.in_flight {
+                state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+            }
+            state.in_flight = true;
+            drop(state);
+
+            let total_started = Instant::now();
+            let result = (|| {
+                if self.append_publish_requires_full_persist_before_plan()? {
+                    return Ok(BatchStep::NeedsFullPersist);
+                }
+                let mut cursor = self.durable.export_cursor()?.ok_or_else(|| {
+                    StorageError::conflict("prepared append publish requires durable cursor")
+                })?;
+                let mut draft_keyspace_heads = BTreeMap::new();
+                let mut planned_files = BTreeSet::new();
+                let mut plans = Vec::new();
+                for ticket in &tickets {
+                    if matches!(
+                        self.local.metadata.append_publish_ticket_status(ticket)?,
+                        AppendPublishTicketStatus::Completed(_)
+                    ) {
+                        continue;
+                    }
+                    if !planned_files.insert((ticket.keyspace_id, ticket.file_id)) {
+                        continue;
+                    }
+                    let plan = match self.local.prepare_append_publish_plan_with_drafts(
+                        ticket,
+                        WriteDurability::Flushed,
+                        &cursor,
+                        &mut draft_keyspace_heads,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(StorageError::Conflict { reason })
+                            if reason
+                                == "prepared append publish requires prior metadata durable" =>
+                        {
+                            return Ok(BatchStep::NeedsFullPersist);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    cursor = plan.delta.cursor.clone();
+                    plans.push(plan);
+                }
+                if plans.is_empty() {
+                    return Ok(BatchStep::Published(CommitSeq::from_raw(
+                        cursor.next_commit_seq.saturating_sub(1),
+                    )));
+                }
+                let durable_high_water =
+                    match self.persist_prepared_append_publish_plans(&plans, total_started, 0) {
+                        Ok(durable_high_water) => durable_high_water,
+                        Err(error) => {
+                            for plan in &plans {
+                                self.local.cancel_append_publish_plan(plan)?;
+                            }
+                            return Err(error);
+                        }
+                    };
+                for plan in plans {
+                    self.local.apply_append_publish_plan(plan)?;
+                }
+                Ok(BatchStep::Published(durable_high_water))
+            })();
+
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            state.in_flight = false;
+            state.generation = state.generation.saturating_add(1);
+            let generation = state.generation;
+            match result {
+                Ok(BatchStep::Published(durable_high_water)) => {
+                    state.durable_through = state.durable_through.max(durable_high_water);
+                    let durable_through = state.durable_through;
+                    state.requested_through = state.requested_through.max(durable_through);
+                    state.last_error = None;
+                    self.persist_coordinator.cvar.notify_all();
+                    return Ok(());
+                }
+                Ok(BatchStep::NeedsFullPersist) => {
+                    state.last_error = None;
+                    self.persist_coordinator.cvar.notify_all();
+                    drop(state);
+                    self.persist_now()?;
+                }
+                Err(error) => {
+                    state.last_error = Some((generation, error.clone()));
+                    self.persist_coordinator.cvar.notify_all();
+                    return Err(error);
+                }
+            }
+        }
     }
 
     /// Return the maintenance policy configured for this store.
@@ -1934,16 +2154,81 @@ impl DurableCoordinator {
         &self,
         ticket: &AppendPublishTicket,
     ) -> Result<AppendPublishCommit> {
-        let stream = match self.local.metadata.append_publish_ticket_status(ticket)? {
-            AppendPublishTicketStatus::Completed(commit) => return Ok(commit),
-            AppendPublishTicketStatus::Pending(stream) => stream,
-        };
-        self.persist_append_stream_prefix(&stream, ticket.publish_through)?;
-        let commit = self
-            .local
-            .wait_append_publish(ticket, WriteDurability::Flushed)?;
-        self.persist_append_stream_publish_delta(&stream, commit.commit_seq, &BTreeSet::new())?;
-        Ok(commit)
+        let mut registered = false;
+        let mut observed_generation = 0_u64;
+        loop {
+            if registered {
+                let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                while state.in_flight {
+                    state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                }
+                if let Some((error_generation, error)) = state.last_error.clone()
+                    && error_generation > observed_generation
+                {
+                    state.requests.remove(&ticket.ticket_id);
+                    return Err(error);
+                }
+                observed_generation = state.generation;
+            }
+            let stream = match self.local.metadata.append_publish_ticket_status(ticket)? {
+                AppendPublishTicketStatus::Completed(commit) => {
+                    if registered {
+                        let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                        state.requests.remove(&ticket.ticket_id);
+                    }
+                    return Ok(commit);
+                }
+                AppendPublishTicketStatus::Pending(stream) => stream,
+            };
+            self.persist_append_stream_prefix(&stream, ticket.publish_through)?;
+
+            if !registered {
+                let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                state.requests.insert(ticket.ticket_id, ticket.clone());
+                observed_generation = state.generation;
+                registered = true;
+            }
+
+            let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+            if let Some((error_generation, error)) = state.last_error.clone()
+                && error_generation > observed_generation
+            {
+                state.requests.remove(&ticket.ticket_id);
+                return Err(error);
+            }
+            if state.in_flight {
+                let generation = state.generation;
+                while state.in_flight && state.generation == generation {
+                    state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                }
+                observed_generation = state.generation;
+                continue;
+            }
+            state.in_flight = true;
+            let tickets = state.requests.values().cloned().collect::<Vec<_>>();
+            drop(state);
+
+            let result = self.persist_append_publish_ticket_batch(tickets);
+
+            let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+            state.in_flight = false;
+            state.generation = state.generation.saturating_add(1);
+            let generation = state.generation;
+            match result {
+                Ok(()) => {
+                    state.last_error = None;
+                    self.append_publish_persist_coordinator.cvar.notify_all();
+                    observed_generation = generation;
+                    continue;
+                }
+                Err(error) => {
+                    state.last_error = Some((generation, error.clone()));
+                    state.requests.remove(&ticket.ticket_id);
+                    self.append_publish_persist_coordinator.cvar.notify_all();
+                    return Err(error);
+                }
+            }
+        }
     }
 
     pub fn publish_append_stream(

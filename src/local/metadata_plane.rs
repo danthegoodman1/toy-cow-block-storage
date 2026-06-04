@@ -24,6 +24,8 @@ pub(super) struct MetadataInner {
     keyspace_catalog_shards: BTreeMap<KeyspaceCatalogShardId, KeyspaceCatalogShard>,
     file_writer_epochs: BTreeMap<(KeyspaceId, FileId), WriterEpoch>,
     append_streams: BTreeMap<AppendStreamId, AppendStreamState>,
+    #[serde(skip, default)]
+    append_publish_in_flight: BTreeMap<AppendPublishTicketId, AppendPublishInFlight>,
     metadata_nodes: BTreeMap<MetadataNodeId, MetadataNode>,
     commit_groups: BTreeMap<CommitGroupId, CommitGroup>,
     shard_commits: Vec<ShardCommit>,
@@ -57,6 +59,7 @@ impl MetadataInner {
             keyspace_catalog_shards: BTreeMap::new(),
             file_writer_epochs: BTreeMap::new(),
             append_streams: BTreeMap::new(),
+            append_publish_in_flight: BTreeMap::new(),
             metadata_nodes: BTreeMap::new(),
             commit_groups: BTreeMap::new(),
             shard_commits: Vec::new(),
@@ -71,6 +74,7 @@ impl MetadataInner {
     }
 
     fn prune_append_streams_for_durable_export(&mut self) {
+        self.append_publish_in_flight.clear();
         for stream in self.append_streams.values_mut() {
             stream.records.retain(|record| {
                 record
@@ -80,6 +84,25 @@ impl MetadataInner {
             });
             stream.reserved_tail = stream.reserved_tail.min(stream.durable_through);
         }
+    }
+
+    fn append_publish_in_flight_for_file(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+    ) -> bool {
+        self.append_publish_in_flight
+            .values()
+            .any(|publish| publish.keyspace_id == keyspace_id && publish.file_id == file_id)
+    }
+
+    fn append_publish_in_flight_for_stream(&self, stream: &AppendStream) -> bool {
+        self.append_publish_in_flight.values().any(|publish| {
+            publish.keyspace_id == stream.keyspace_id
+                && publish.file_id == stream.file_id
+                && publish.stream_id == stream.stream_id
+                && publish.writer_epoch == stream.writer_epoch
+        })
     }
 
     fn alloc_device_id(&mut self) -> DeviceId {
@@ -355,6 +378,37 @@ pub(super) struct AppendStreamState {
     records: Vec<AppendStreamRunRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AppendPublishInFlight {
+    ticket_id: AppendPublishTicketId,
+    stream_id: AppendStreamId,
+    writer_epoch: WriterEpoch,
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    publish_through: u64,
+    old_root: MetadataNodeId,
+    old_size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AppendPublishPlan {
+    ticket: AppendPublishTicket,
+    stream: AppendStream,
+    old_head: FileHead,
+    new_head: FileHead,
+    new_keyspace_head: KeyspaceHead,
+    new_keyspace_shard: KeyspaceCatalogShard,
+    commit_group: CommitGroup,
+    keyspace_commit: KeyspaceCommit,
+    file_commit: FileCommit,
+    planned_stream: AppendStreamState,
+    commit: AppendPublishCommit,
+    publish_range: ByteRange,
+    run_extents: Vec<RunBackedFileExtent>,
+    delta: NativeMetadataDelta,
+    in_flight: AppendPublishInFlight,
+}
+
 impl AppendStreamState {
     fn public_stream(&self) -> AppendStream {
         AppendStream {
@@ -485,6 +539,37 @@ impl AppendStreamState {
                 .checked_add(record.len)
                 .is_some_and(|end| end <= durable_through)
         });
+        Ok(exported)
+    }
+
+    fn published_export_at(&self, publish_through: u64) -> Result<Self> {
+        if publish_through < self.published_through {
+            return Err(StorageError::conflict(
+                "append stream publish export cannot regress",
+            ));
+        }
+        if publish_through > self.durable_through {
+            return Err(StorageError::conflict(
+                "append stream publish export exceeds durable prefix",
+            ));
+        }
+        let mut exported = self.durable_export_at(self.durable_through)?;
+        exported.published_through = publish_through;
+        let mut retained = Vec::new();
+        for record in &exported.records {
+            let record_end = record.end_exclusive()?;
+            if record_end <= publish_through {
+                continue;
+            }
+            if record.offset < publish_through {
+                if let Some(suffix) = record.slice(publish_through, record_end)? {
+                    retained.push(suffix);
+                }
+            } else {
+                retained.push(record.clone());
+            }
+        }
+        exported.records = retained;
         Ok(exported)
     }
 }
@@ -884,6 +969,11 @@ impl InMemoryMetadataPlane {
     ) -> Result<AppendStream> {
         let stream_id = lock(&self.append_stream_allocator)?.next_stream_id()?;
         let mut inner = lock(&self.inner)?;
+        if inner.append_publish_in_flight_for_file(keyspace_id, file_id) {
+            return Err(StorageError::conflict(
+                "append publish already in flight for file",
+            ));
+        }
         let head = Self::file_head_locked(&inner, keyspace_id, file_id)?;
         let key = (keyspace_id, file_id);
         let persisted_epoch = inner
@@ -1095,6 +1185,11 @@ impl InMemoryMetadataPlane {
                 .get(&stream.stream_id)
                 .ok_or_else(|| StorageError::conflict("stale append stream"))?;
             state.validate_token(stream)?;
+            if inner.append_publish_in_flight_for_file(stream.keyspace_id, stream.file_id) {
+                return Err(StorageError::conflict(
+                    "append publish already in flight for file",
+                ));
+            }
             if publish_through <= state.published_through {
                 return Err(StorageError::invalid_argument(
                     "append publish target must advance published stream prefix",
@@ -1164,6 +1259,11 @@ impl InMemoryMetadataPlane {
             || ticket.publish_through > state.contiguous_record_tail_from(state.published_through)?
         {
             return Err(StorageError::conflict("stale append publish ticket"));
+        }
+        if inner.append_publish_in_flight_for_file(ticket.keyspace_id, ticket.file_id) {
+            return Err(StorageError::conflict(
+                "append publish already in flight for file",
+            ));
         }
         Ok(AppendPublishTicketStatus::Pending(state.public_stream()))
     }
@@ -1360,6 +1460,11 @@ impl InMemoryMetadataPlane {
 
     pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {
         let mut inner = lock(&self.inner)?;
+        if inner.append_publish_in_flight_for_stream(stream) {
+            return Err(StorageError::conflict(
+                "append publish already in flight for stream",
+            ));
+        }
         let state = inner
             .append_streams
             .get_mut(&stream.stream_id)
@@ -1371,6 +1476,11 @@ impl InMemoryMetadataPlane {
 
     pub fn release_append_stream(&self, stream: &AppendStream) -> Result<()> {
         let mut inner = lock(&self.inner)?;
+        if inner.append_publish_in_flight_for_stream(stream) {
+            return Err(StorageError::conflict(
+                "append publish already in flight for stream",
+            ));
+        }
         let state = inner
             .append_streams
             .get_mut(&stream.stream_id)
@@ -1386,6 +1496,11 @@ impl InMemoryMetadataPlane {
         file_id: FileId,
     ) -> Result<()> {
         let mut inner = lock(&self.inner)?;
+        if inner.append_publish_in_flight_for_file(keyspace_id, file_id) {
+            return Err(StorageError::conflict(
+                "append publish already in flight for file",
+            ));
+        }
         for stream in inner.append_streams.values_mut() {
             if stream.keyspace_id == keyspace_id
                 && stream.file_id == file_id
@@ -2946,6 +3061,16 @@ impl MetadataPlane for InMemoryMetadataPlane {
                     file_id,
                 )?;
                 let current = current_entry.head.clone();
+                if inner.append_publish_in_flight_for_file(keyspace_id, file_id) {
+                    self.record_publish_profile(MetadataPublishProfile {
+                        lock_wait_nanos: publish_lock_wait_nanos,
+                        logical_conflict_count: 1,
+                        ..MetadataPublishProfile::default()
+                    })?;
+                    return Err(StorageError::conflict(
+                        "append publish already in flight for file",
+                    ));
+                }
                 let append_stream_commit = match intent.fence {
                     MetadataFence::FileVersion(version) if version == current.version => None,
                     MetadataFence::FileVersion(_) => {

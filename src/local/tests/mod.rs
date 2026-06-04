@@ -3327,6 +3327,161 @@ fn durable_stream_auto_persist_failure_does_not_poison_publish_retry() {
 }
 
 #[test]
+fn durable_append_publish_metadata_failure_keeps_head_invisible_and_ticket_retryable() {
+    let root = durable_temp_dir("stream-publish-metadata-failure-retry");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 82);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    store.persist_append_stream_prefix(&stream, 4096).unwrap();
+    let ticket = store.submit_append_publish(&stream, 4096).unwrap();
+
+    store.fail_next_persist_for_test();
+    let failed = store.wait_append_publish(&ticket);
+    assert!(matches!(failed, Err(StorageError::Unavailable { .. })));
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        0
+    );
+    assert!(
+        store
+            .local
+            .metadata
+            .state_inner()
+            .unwrap()
+            .append_publish_in_flight
+            .is_empty(),
+        "failed durable publish should clear the transient in-flight marker"
+    );
+
+    let commit = store.wait_append_publish(&ticket).unwrap();
+    assert_eq!(commit.range, ByteRange::new(0, 4096));
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        4096
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepared_append_publish_plan_is_invisible_and_fences_same_file_mutations() {
+    let root = durable_temp_dir("stream-publish-plan-fences-file");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    store
+        .append_stream(
+            &stream,
+            &repeated_blocks(1, 83),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store.persist_append_stream_prefix(&stream, 4096).unwrap();
+    let ticket = store.submit_append_publish(&stream, 4096).unwrap();
+    let previous = store.durable.export_cursor().unwrap().unwrap();
+
+    let plan = store
+        .local
+        .prepare_append_publish_plan(&ticket, WriteDurability::Flushed, &previous)
+        .unwrap();
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        0,
+        "prepared plan must not update the visible file head"
+    );
+
+    let tail = store
+        .append_stream(&stream, b"tail", WriteDurability::Acknowledged)
+        .unwrap();
+    assert_eq!(tail.range.offset, 4096);
+    assert!(
+        store
+            .local
+            .commit_file_batch(
+                keyspace_id,
+                file_id,
+                &[FileBatchWrite::new(0, b"write-at".to_vec())],
+                WriteDurability::Flushed,
+            )
+            .is_err()
+    );
+    assert!(store.open_append_stream(keyspace_id, file_id).is_err());
+    assert!(store.release_append_stream(&stream).is_err());
+    assert!(store.abort_append_stream(&stream).is_err());
+    assert!(
+        store
+            .submit_append_publish(&stream, tail.range.end_exclusive().unwrap())
+            .is_err()
+    );
+
+    store.local.cancel_append_publish_plan(&plan).unwrap();
+    let commit = store.wait_append_publish(&ticket).unwrap();
+    assert_eq!(commit.range, ByteRange::new(0, 4096));
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        4096
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_append_stream_publish_prefix_profiles_are_bounded_sync_groups() {
     let root = durable_temp_dir("stream-publish-prefix-bounded-groups");
     let cfg = LocalStoreConfig {

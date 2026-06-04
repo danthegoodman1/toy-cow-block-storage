@@ -357,6 +357,20 @@ pub(super) struct StreamPrefixPersistCoordinator {
 }
 
 #[derive(Debug)]
+pub(super) struct AppendPublishPersistCoordinator {
+    inner: Mutex<AppendPublishPersistCoordinatorState>,
+    cvar: Condvar,
+}
+
+#[derive(Debug)]
+pub(super) struct AppendPublishPersistCoordinatorState {
+    in_flight: bool,
+    generation: u64,
+    requests: BTreeMap<AppendPublishTicketId, AppendPublishTicket>,
+    last_error: Option<(u64, StorageError)>,
+}
+
+#[derive(Debug)]
 pub(super) struct StreamPrefixPersistCoordinatorState {
     in_flight: bool,
     generation: u64,
@@ -408,6 +422,20 @@ impl StreamPrefixPersistCoordinator {
     fn new() -> Self {
         Self {
             inner: Mutex::new(StreamPrefixPersistCoordinatorState {
+                in_flight: false,
+                generation: 0,
+                requests: BTreeMap::new(),
+                last_error: None,
+            }),
+            cvar: Condvar::new(),
+        }
+    }
+}
+
+impl AppendPublishPersistCoordinator {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(AppendPublishPersistCoordinatorState {
                 in_flight: false,
                 generation: 0,
                 requests: BTreeMap::new(),

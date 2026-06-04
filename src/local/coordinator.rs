@@ -705,6 +705,7 @@ impl LocalCoordinator {
         })
     }
 
+    #[cfg(test)]
     fn native_append_publish_delta_through(
         &self,
         stream: &AppendStream,
@@ -1845,6 +1846,476 @@ impl LocalCoordinator {
         self.metadata
             .complete_append_publish_ticket(ticket, commit.clone())?;
         Ok(commit)
+    }
+
+    #[cfg(test)]
+    fn prepare_append_publish_plan(
+        &self,
+        ticket: &AppendPublishTicket,
+        durability: crate::api::WriteDurability,
+        previous: &DurableExportCursor,
+    ) -> Result<AppendPublishPlan> {
+        self.prepare_append_publish_plan_with_drafts(
+            ticket,
+            durability,
+            previous,
+            &mut BTreeMap::new(),
+        )
+    }
+
+    fn prepare_append_publish_plan_with_drafts(
+        &self,
+        ticket: &AppendPublishTicket,
+        durability: crate::api::WriteDurability,
+        previous: &DurableExportCursor,
+        draft_keyspace_heads: &mut BTreeMap<KeyspaceId, KeyspaceHead>,
+    ) -> Result<AppendPublishPlan> {
+        fn next_after_u128(current: u128, raw: u128) -> Result<u128> {
+            Ok(current.max(
+                raw.checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("durable cursor id overflow"))?,
+            ))
+        }
+
+        let stream = match self.metadata.append_publish_ticket_status(ticket)? {
+            AppendPublishTicketStatus::Completed(_) => {
+                return Err(StorageError::conflict(
+                    "append publish ticket is already completed",
+                ));
+            }
+            AppendPublishTicketStatus::Pending(stream) => stream,
+        };
+        let old_head = {
+            let metadata = lock(&self.metadata.inner)?;
+            let current_keyspace = draft_keyspace_heads
+                .get(&ticket.keyspace_id)
+                .or_else(|| metadata.keyspace_heads.get(&ticket.keyspace_id))
+                .cloned()
+                .ok_or_else(|| {
+                    StorageError::not_found("keyspace", ticket.keyspace_id.to_string())
+                })?;
+            InMemoryMetadataPlane::keyspace_file_in_shards_locked(
+                &metadata,
+                &current_keyspace.shard_roots,
+                ticket.file_id,
+            )?
+            .head
+        };
+
+        let unpublished =
+            self.metadata
+                .append_stream_publish_records(&stream, old_head.size, ticket.publish_through)?;
+        let run_extents: Vec<_> = unpublished
+            .iter()
+            .map(|record| {
+                let extent = RunBackedFileExtent {
+                    file_offset_start: record.offset,
+                    payload_len: record.len,
+                    run: record.run.full_range(),
+                };
+                extent.validate()?;
+                Ok(extent)
+            })
+            .collect::<Result<_>>()?;
+        let publish_range = ByteRange::new(
+            old_head.size,
+            ticket
+                .publish_through
+                .checked_sub(old_head.size)
+                .ok_or_else(|| StorageError::conflict("append publish range underflows"))?,
+        );
+        let new_root = self
+            .replace_tree_byte_range_with_run_extents(
+                old_head.root,
+                publish_range,
+                run_extents.clone(),
+            )?
+            .root;
+
+        let mut metadata_nodes = BTreeMap::new();
+        let mut referenced_segment_ids = BTreeSet::new();
+        {
+            let metadata = lock(&self.metadata.inner)?;
+            Self::collect_native_delta_metadata_root(
+                &metadata,
+                new_root,
+                previous,
+                &mut metadata_nodes,
+                &mut referenced_segment_ids,
+            )?;
+        }
+
+        let publish_started = Instant::now();
+        let mut metadata = lock(&self.metadata.inner)?;
+        let publish_lock_wait_nanos = duration_nanos_u64(publish_started.elapsed());
+        if previous.next_commit_seq != metadata.next_commit_seq {
+            self.metadata.record_publish_profile(MetadataPublishProfile {
+                lock_wait_nanos: publish_lock_wait_nanos,
+                logical_conflict_count: 1,
+                ..MetadataPublishProfile::default()
+            })?;
+            return Err(StorageError::conflict(
+                "prepared append publish requires prior metadata durable",
+            ));
+        }
+        if metadata.append_publish_in_flight_for_file(ticket.keyspace_id, ticket.file_id) {
+            self.metadata.record_publish_profile(MetadataPublishProfile {
+                lock_wait_nanos: publish_lock_wait_nanos,
+                logical_conflict_count: 1,
+                ..MetadataPublishProfile::default()
+            })?;
+            return Err(StorageError::conflict(
+                "append publish already in flight for file",
+            ));
+        }
+
+        let current_keyspace = draft_keyspace_heads
+            .get(&ticket.keyspace_id)
+            .or_else(|| metadata.keyspace_heads.get(&ticket.keyspace_id))
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", ticket.keyspace_id.to_string()))?;
+        let current_entry = InMemoryMetadataPlane::keyspace_file_in_shards_locked(
+            &metadata,
+            &current_keyspace.shard_roots,
+            ticket.file_id,
+        )?;
+        let current = current_entry.head.clone();
+        if current.root != old_head.root
+            || current.size != old_head.size
+            || current.version != old_head.version
+            || current.latest_commit != old_head.latest_commit
+        {
+            self.metadata.record_publish_profile(MetadataPublishProfile {
+                lock_wait_nanos: publish_lock_wait_nanos,
+                logical_conflict_count: 1,
+                ..MetadataPublishProfile::default()
+            })?;
+            return Err(StorageError::conflict(
+                "append publish file head changed before plan",
+            ));
+        }
+
+        let stream_state = metadata
+            .append_streams
+            .get(&ticket.stream_id)
+            .cloned()
+            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
+        stream_state.validate_token(&stream)?;
+        if stream_state.published_through != old_head.size
+            || ticket.publish_through <= stream_state.published_through
+            || ticket.publish_through > stream_state.reserved_tail
+            || ticket.publish_through
+                > stream_state.contiguous_record_tail_from(stream_state.published_through)?
+            || ticket.publish_through > stream_state.durable_through
+        {
+            self.metadata.record_publish_profile(MetadataPublishProfile {
+                lock_wait_nanos: publish_lock_wait_nanos,
+                logical_conflict_count: 1,
+                ..MetadataPublishProfile::default()
+            })?;
+            return Err(StorageError::conflict(
+                "append publish stream state changed before plan",
+            ));
+        }
+        let planned_stream = stream_state.published_export_at(ticket.publish_through)?;
+
+        let new_root_node = metadata
+            .metadata_nodes
+            .get(&new_root)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("metadata_node", new_root.to_string()))?;
+        let commit_seq_started = Instant::now();
+        let commit_seq = metadata.alloc_commit_seq()?;
+        let commit_sequence_alloc_nanos = duration_nanos_u64(commit_seq_started.elapsed());
+        let commit_group_id = metadata.alloc_commit_group_id();
+        let commit_group = CommitGroup {
+            commit_group: commit_group_id,
+            commit_seq,
+            owner: MappingOwner::NativeKeyspace(ticket.keyspace_id),
+            updates: vec![RootUpdate::FileRoot {
+                file_id: ticket.file_id,
+                old_root: old_head.root,
+                new_root,
+                new_size: ticket.publish_through,
+            }],
+        };
+
+        let mut new_head = current.clone();
+        new_head.version = InMemoryMetadataPlane::next_file_version(new_head.version)?;
+        new_head.latest_commit = commit_seq;
+        new_head.root = new_root;
+        new_head.size = ticket.publish_through;
+        new_head.validate_transition_from(
+            &current,
+            new_root_node.covered_range,
+            self.metadata.config.block_size,
+        )?;
+        let (shard_index, old_shard, new_keyspace_shard, new_file_count) =
+            InMemoryMetadataPlane::update_keyspace_file_locked(
+                &mut metadata,
+                &current_keyspace.shard_roots,
+                current_keyspace.file_count,
+                ticket.file_id,
+                KeyspaceFile {
+                    head: new_head.clone(),
+                    ..current_entry
+                },
+            )?;
+        let mut new_keyspace_head = current_keyspace.clone();
+        new_keyspace_head.generation =
+            InMemoryMetadataPlane::next_keyspace_generation(new_keyspace_head.generation)?;
+        new_keyspace_head.latest_commit = commit_seq;
+        new_keyspace_head.shard_roots[shard_index] = new_keyspace_shard.shard_id;
+        new_keyspace_head.file_count = new_file_count;
+        let keyspace_commit = KeyspaceCommit {
+            commit_seq,
+            commit_group: commit_group.commit_group,
+            time: LogicalTime::from_raw(commit_seq.raw()),
+            keyspace_id: ticket.keyspace_id,
+            shard_index: u32::try_from(shard_index).map_err(|_| {
+                StorageError::invalid_argument("keyspace shard index overflows u32")
+            })?,
+            old_shard,
+            new_shard: new_keyspace_shard.shard_id,
+            old_file_count: current_keyspace.file_count,
+            new_file_count,
+        };
+        let file_commit = FileCommit {
+            commit_seq,
+            commit_group: commit_group.commit_group,
+            time: LogicalTime::from_raw(commit_seq.raw()),
+            keyspace_id: ticket.keyspace_id,
+            file_id: ticket.file_id,
+            old_root: Some(old_head.root),
+            new_root,
+            old_version: Some(old_head.version),
+            new_version: new_head.version,
+            old_size: old_head.size,
+            new_size: ticket.publish_through,
+        };
+        let in_flight = AppendPublishInFlight {
+            ticket_id: ticket.ticket_id,
+            stream_id: ticket.stream_id,
+            writer_epoch: ticket.writer_epoch,
+            keyspace_id: ticket.keyspace_id,
+            file_id: ticket.file_id,
+            publish_through: ticket.publish_through,
+            old_root: old_head.root,
+            old_size: old_head.size,
+        };
+        if metadata
+            .append_publish_in_flight
+            .insert(ticket.ticket_id, in_flight.clone())
+            .is_some()
+        {
+            return Err(StorageError::conflict(
+                "append publish ticket already has in-flight plan",
+            ));
+        }
+        self.metadata.record_publish_profile(MetadataPublishProfile {
+            lock_wait_nanos: publish_lock_wait_nanos,
+            commit_sequence_alloc_nanos,
+            touched_shard_head_rows: 1,
+            commit_rows_written: 1,
+            ..MetadataPublishProfile::default()
+        })?;
+        drop(metadata);
+
+        let mut keyspace_heads = BTreeMap::new();
+        keyspace_heads.insert(ticket.keyspace_id, new_keyspace_head.clone());
+        let mut keyspace_catalog_shards = BTreeMap::new();
+        if new_keyspace_shard.shard_id.raw() >= previous.next_keyspace_catalog_shard_id {
+            keyspace_catalog_shards.insert(new_keyspace_shard.shard_id, new_keyspace_shard.clone());
+        }
+        let keyspace_roots = BTreeMap::new();
+        let file_writer_epochs = vec![((ticket.keyspace_id, ticket.file_id), ticket.writer_epoch)];
+        let append_streams = vec![planned_stream.clone()];
+        let mut commit_groups = BTreeMap::new();
+        commit_groups.insert(commit_group.commit_group, commit_group.clone());
+        let keyspace_commits = vec![keyspace_commit.clone()];
+        let file_commits = vec![file_commit.clone()];
+
+        let mut cursor = previous.clone();
+        cursor.config = self.metadata.config;
+        for id in keyspace_catalog_shards.keys() {
+            cursor.next_keyspace_catalog_shard_id =
+                next_after_u128(cursor.next_keyspace_catalog_shard_id, id.raw())?;
+        }
+        for id in metadata_nodes.keys() {
+            cursor.next_metadata_node_id = next_after_u128(cursor.next_metadata_node_id, id.raw())?;
+        }
+        for id in commit_groups.keys() {
+            cursor.next_commit_group_id = next_after_u128(cursor.next_commit_group_id, id.raw())?;
+        }
+        cursor.next_commit_seq = commit_seq
+            .raw()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?
+            .max(cursor.next_commit_seq);
+        cursor.next_write_intent = *lock(&self.next_write_intent)?;
+        cursor.next_extent_id = *lock(&self.next_extent_id)?;
+        cursor.next_segment_id =
+            u128::from(self.storage_nodes.next_segment_id.load(Ordering::Relaxed));
+        cursor.next_placement_index = *lock(&self.storage_nodes.next_placement_index)?;
+
+        let commit = AppendPublishCommit {
+            keyspace_id: ticket.keyspace_id,
+            file_id: ticket.file_id,
+            range: publish_range,
+            version: new_head.version,
+            commit_seq,
+            durability,
+        };
+        let delta = NativeMetadataDelta {
+            cursor,
+            keyspace_heads,
+            keyspace_roots,
+            keyspace_catalog_shards,
+            file_writer_epochs,
+            append_streams,
+            metadata_nodes,
+            referenced_segment_ids,
+            commit_groups,
+            keyspace_commits,
+            file_commits,
+        };
+        draft_keyspace_heads.insert(ticket.keyspace_id, new_keyspace_head.clone());
+        Ok(AppendPublishPlan {
+            ticket: ticket.clone(),
+            stream,
+            old_head,
+            new_head,
+            new_keyspace_head,
+            new_keyspace_shard,
+            commit_group,
+            keyspace_commit,
+            file_commit,
+            planned_stream,
+            commit,
+            publish_range,
+            run_extents,
+            delta,
+            in_flight,
+        })
+    }
+
+    fn cancel_append_publish_plan(&self, plan: &AppendPublishPlan) -> Result<()> {
+        let mut metadata = lock(&self.metadata.inner)?;
+        if let Some(current) = metadata
+            .append_publish_in_flight
+            .get(&plan.ticket.ticket_id)
+            && current == &plan.in_flight
+        {
+            metadata
+                .append_publish_in_flight
+                .remove(&plan.ticket.ticket_id);
+        }
+        Ok(())
+    }
+
+    fn apply_append_publish_plan(&self, plan: AppendPublishPlan) -> Result<AppendPublishCommit> {
+        for extent in &plan.run_extents {
+            extent.validate()?;
+        }
+        let expected_publish_len = plan
+            .in_flight
+            .publish_through
+            .checked_sub(plan.old_head.size)
+            .ok_or_else(|| StorageError::corrupt("append publish plan range underflows"))?;
+        if plan.publish_range.offset != plan.old_head.size
+            || plan.publish_range.len != expected_publish_len
+            || plan.new_head.root != plan.file_commit.new_root
+            || plan.new_head.size != plan.file_commit.new_size
+            || plan.new_head.version != plan.file_commit.new_version
+            || plan.new_head.latest_commit != plan.commit.commit_seq
+            || plan.in_flight.old_root != plan.old_head.root
+            || plan.in_flight.old_size != plan.old_head.size
+        {
+            return Err(StorageError::corrupt("append publish plan range is invalid"));
+        }
+        {
+            let tickets = lock(&self.metadata.append_publish_tickets)?;
+            let record = tickets
+                .get(&plan.ticket.ticket_id)
+                .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
+            if record.ticket != plan.ticket || record.completed.is_some() {
+                return Err(StorageError::conflict("stale append publish ticket"));
+            }
+        }
+
+        let mut metadata = lock(&self.metadata.inner)?;
+        let Some(current_in_flight) = metadata
+            .append_publish_in_flight
+            .get(&plan.ticket.ticket_id)
+            .cloned()
+        else {
+            return Err(StorageError::corrupt(
+                "prepared append publish is not in flight",
+            ));
+        };
+        if current_in_flight != plan.in_flight {
+            return Err(StorageError::corrupt(
+                "prepared append publish in-flight marker changed",
+            ));
+        }
+        let current_keyspace = metadata
+            .keyspace_heads
+            .get(&plan.ticket.keyspace_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("keyspace", plan.ticket.keyspace_id.to_string()))?;
+        let current_entry = InMemoryMetadataPlane::keyspace_file_in_shards_locked(
+            &metadata,
+            &current_keyspace.shard_roots,
+            plan.ticket.file_id,
+        )?;
+        let current = current_entry.head.clone();
+        if current.root != plan.old_head.root
+            || current.size != plan.old_head.size
+            || current.version != plan.old_head.version
+            || current.latest_commit != plan.old_head.latest_commit
+        {
+            return Err(StorageError::corrupt(
+                "prepared append publish file head changed before apply",
+            ));
+        }
+        let stream = metadata
+            .append_streams
+            .get_mut(&plan.ticket.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        stream.validate_token(&plan.stream)?;
+        if stream.published_through != plan.old_head.size
+            || stream.durable_through < plan.ticket.publish_through
+        {
+            return Err(StorageError::corrupt(
+                "prepared append publish stream state changed before apply",
+            ));
+        }
+
+        metadata
+            .keyspace_heads
+            .insert(plan.ticket.keyspace_id, plan.new_keyspace_head.clone());
+        metadata
+            .keyspace_catalog_shards
+            .insert(plan.new_keyspace_shard.shard_id, plan.new_keyspace_shard.clone());
+        metadata.keyspace_commits.push(plan.keyspace_commit.clone());
+        metadata.file_commits.push(plan.file_commit.clone());
+        metadata
+            .commit_groups
+            .insert(plan.commit_group.commit_group, plan.commit_group.clone());
+        metadata
+            .file_writer_epochs
+            .insert((plan.ticket.keyspace_id, plan.ticket.file_id), plan.ticket.writer_epoch);
+        metadata
+            .append_streams
+            .insert(plan.ticket.stream_id, plan.planned_stream.clone());
+        metadata
+            .append_publish_in_flight
+            .remove(&plan.ticket.ticket_id);
+        drop(metadata);
+
+        self.metadata
+            .complete_append_publish_ticket(&plan.ticket, plan.commit.clone())?;
+        Ok(plan.commit)
     }
 
     pub fn publish_append_stream(
