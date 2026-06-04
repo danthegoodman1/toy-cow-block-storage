@@ -82,7 +82,7 @@ impl MetadataInner {
                     .checked_add(record.len)
                     .is_some_and(|end| end <= stream.durable_through)
             });
-            stream.reserved_tail = stream.reserved_tail.min(stream.durable_through);
+            stream.accepted_tail = stream.accepted_tail.min(stream.durable_through);
         }
     }
 
@@ -370,7 +370,7 @@ pub(super) struct AppendStreamState {
     writer_epoch: WriterEpoch,
     base_version: FileVersion,
     visible_base_size: u64,
-    reserved_tail: u64,
+    accepted_tail: u64,
     durable_through: u64,
     published_through: u64,
     status: AppendStreamStatus,
@@ -532,7 +532,7 @@ impl AppendStreamState {
         }
         let mut exported = self.clone();
         exported.durable_through = durable_through;
-        exported.reserved_tail = durable_through;
+        exported.accepted_tail = durable_through;
         exported.records.retain(|record| {
             record
                 .offset
@@ -1011,7 +1011,7 @@ impl InMemoryMetadataPlane {
             writer_epoch,
             base_version: head.version,
             visible_base_size: head.size,
-            reserved_tail: head.size,
+            accepted_tail: head.size,
             durable_through: head.size,
             published_through: head.size,
             status: AppendStreamStatus::Active,
@@ -1030,7 +1030,7 @@ impl InMemoryMetadataPlane {
         lock(&self.append_stream_allocator)?.next_publish_ticket_id()
     }
 
-    pub fn reserve_append_stream_range(
+    pub fn prepare_append_stream_range(
         &self,
         stream: &AppendStream,
         len: u64,
@@ -1040,19 +1040,18 @@ impl InMemoryMetadataPlane {
                 "append payload must not be empty",
             ));
         }
-        let mut inner = lock(&self.inner)?;
+        let inner = lock(&self.inner)?;
         Self::file_head_locked(&inner, stream.keyspace_id, stream.file_id)?;
         let state = inner
             .append_streams
-            .get_mut(&stream.stream_id)
+            .get(&stream.stream_id)
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
-        let offset = state.reserved_tail;
-        let next_tail = state
-            .reserved_tail
+        let offset = state.accepted_tail;
+        state
+            .accepted_tail
             .checked_add(len)
             .ok_or_else(|| StorageError::invalid_argument("append stream tail overflows file"))?;
-        state.reserved_tail = next_tail;
         Ok(ByteRange::new(offset, len))
     }
 
@@ -1087,9 +1086,10 @@ impl InMemoryMetadataPlane {
             .get_mut(&stream.stream_id)
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
-        if range.end_exclusive()? > state.reserved_tail {
+        let next_tail = range.end_exclusive()?;
+        if range.offset != state.accepted_tail {
             return Err(StorageError::conflict(
-                "append stream record exceeds reserved tail",
+                "append stream record must start at accepted tail",
             ));
         }
         if let Some(last) = state.records.last()
@@ -1113,6 +1113,7 @@ impl InMemoryMetadataPlane {
         } else {
             state.records.push(record);
         }
+        state.accepted_tail = next_tail;
         Ok(AppendTicket {
             keyspace_id: stream.keyspace_id,
             file_id: stream.file_id,
@@ -1191,7 +1192,7 @@ impl InMemoryMetadataPlane {
                     "append publish target must advance published stream prefix",
                 ));
             }
-            if publish_through > state.reserved_tail {
+            if publish_through > state.accepted_tail {
                 return Err(StorageError::conflict(
                     "append publish target exceeds accepted stream bytes",
                 ));
@@ -1251,7 +1252,7 @@ impl InMemoryMetadataPlane {
             || state.writer_epoch != ticket.writer_epoch
             || state.status != AppendStreamStatus::Active
             || ticket.publish_through <= state.published_through
-            || ticket.publish_through > state.reserved_tail
+            || ticket.publish_through > state.accepted_tail
             || ticket.publish_through > state.contiguous_record_tail_from(state.published_through)?
         {
             return Err(StorageError::conflict("stale append publish ticket"));
@@ -1289,7 +1290,7 @@ impl InMemoryMetadataPlane {
             || state.writer_epoch != ticket.writer_epoch
             || state.status != AppendStreamStatus::Active
             || ticket.publish_through <= state.published_through
-            || ticket.publish_through > state.reserved_tail
+            || ticket.publish_through > state.accepted_tail
             || ticket.publish_through > state.contiguous_record_tail_from(state.published_through)?
         {
             return Err(StorageError::conflict("stale append publish ticket"));
@@ -1352,7 +1353,7 @@ impl InMemoryMetadataPlane {
                 "append publish target must advance published stream prefix",
             ));
         }
-        if end > state.reserved_tail {
+        if end > state.accepted_tail {
             return Err(StorageError::conflict(
                 "append publish target exceeds accepted stream bytes",
             ));

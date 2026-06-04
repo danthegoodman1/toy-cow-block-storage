@@ -8248,6 +8248,52 @@ fn durable_same_file_publish_tickets_serialize_without_inflight_conflict() {
 }
 
 #[test]
+fn append_stream_prepare_without_record_leaves_no_accepted_tail_hole() {
+    let root = durable_temp_dir("append-prepare-no-tail-hole");
+    let store = DurableCoordinator::open(&root, config()).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    {
+        let prepared = store
+            .local
+            .prepare_append_stream_run(&stream, 4096, WriteDurability::Acknowledged)
+            .unwrap();
+        assert_eq!(prepared.range, ByteRange::new(0, 4096));
+    }
+
+    let ticket = store
+        .local
+        .append_stream(&stream, b"ok", WriteDurability::Acknowledged)
+        .unwrap();
+    assert_eq!(ticket.range, ByteRange::new(0, 2));
+    let commit = store
+        .local
+        .publish_append_stream(&stream, 2, WriteDurability::Acknowledged);
+    assert!(commit.is_ok());
+    let mut bytes = [0_u8; 2];
+    store
+        .local
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 2), &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes, b"ok");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_reopen_invalidates_unpublished_append_streams() {
     let root = durable_temp_dir("native-restart-stale-stream");
     let cfg = config();

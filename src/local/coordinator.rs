@@ -1696,7 +1696,7 @@ impl LocalCoordinator {
         let ticket_id = self.metadata.next_append_ticket_id()?;
         let range = self
             .metadata
-            .reserve_append_stream_range(stream, data_len_u64)?;
+            .prepare_append_stream_range(stream, data_len_u64)?;
         let storage_node = self.append_stream_storage_node(stream.stream_id)?;
         Ok(PreparedAppendStreamRun {
             stream: stream.clone(),
@@ -2018,7 +2018,7 @@ impl LocalCoordinator {
         stream_state.validate_token(&stream)?;
         if stream_state.published_through != old_head.size
             || ticket.publish_through <= stream_state.published_through
-            || ticket.publish_through > stream_state.reserved_tail
+            || ticket.publish_through > stream_state.accepted_tail
             || ticket.publish_through
                 > stream_state.contiguous_record_tail_from(stream_state.published_through)?
         {

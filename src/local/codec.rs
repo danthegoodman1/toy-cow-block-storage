@@ -2117,7 +2117,7 @@ impl DurableCodec for AppendStreamState {
         self.writer_epoch.encode(out)?;
         self.base_version.encode(out)?;
         self.visible_base_size.encode(out)?;
-        self.reserved_tail.encode(out)?;
+        self.accepted_tail.encode(out)?;
         self.durable_through.encode(out)?;
         self.published_through.encode(out)?;
         self.status.encode(out)?;
@@ -2132,7 +2132,7 @@ impl DurableCodec for AppendStreamState {
             writer_epoch: WriterEpoch::decode(input)?,
             base_version: FileVersion::decode(input)?,
             visible_base_size: u64::decode(input)?,
-            reserved_tail: u64::decode(input)?,
+            accepted_tail: u64::decode(input)?,
             durable_through: u64::decode(input)?,
             published_through: u64::decode(input)?,
             status: AppendStreamStatus::decode(input)?,
