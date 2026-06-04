@@ -57,10 +57,9 @@ fn append_local_file_once(
     durability: WriteDurability,
 ) {
     let stream = open_local_append_stream(store, keyspace_id, file_id);
-    store.append_stream(&stream, bytes, durability).unwrap();
-    let mark = store.flush_append_stream(&stream).unwrap();
+    let ticket = store.append_stream(&stream, bytes, durability).unwrap();
     store
-        .publish_append_stream(&stream, &mark, durability)
+        .publish_append_stream(&stream, ticket.range.end_exclusive().unwrap(), durability)
         .unwrap();
 }
 
@@ -467,4 +466,3 @@ fn bench_native_concurrent_batches(c: &mut Criterion) {
 
     group.finish();
 }
-

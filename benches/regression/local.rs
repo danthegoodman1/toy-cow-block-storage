@@ -279,18 +279,17 @@ fn bench_local_grant_receipt_flow(c: &mut Criterion) {
                 (store, stream, vec![6; 4096])
             },
             |(store, stream, bytes)| {
-                store
+                let ticket = store
                     .append_stream(
                         black_box(&stream),
                         black_box(&bytes),
                         WriteDurability::Acknowledged,
                     )
                     .unwrap();
-                let mark = store.flush_append_stream(black_box(&stream)).unwrap();
                 store
                     .publish_append_stream(
                         black_box(&stream),
-                        black_box(&mark),
+                        black_box(ticket.range.end_exclusive().unwrap()),
                         WriteDurability::Acknowledged,
                     )
                     .unwrap()
@@ -946,9 +945,9 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
                         .unwrap();
                     let file = client.open_file(keyspace_id, file_id).unwrap();
                     let stream = file.open_append_stream().unwrap();
-                    file.append_stream(&stream, &[7; 4096]).unwrap();
-                    let mark = file.flush_append_stream(&stream).unwrap();
-                    file.publish_append_stream(&stream, &mark).unwrap();
+                    let ticket = file.append_stream(&stream, &[7; 4096]).unwrap();
+                    file.publish_append_stream(&stream, ticket.range.end_exclusive().unwrap())
+                        .unwrap();
                 }
                 let checkpoint = client.checkpoint_keyspace(keyspace_id).unwrap();
                 let file_id = client
@@ -961,9 +960,9 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
                     .unwrap();
                 let file = client.open_file(keyspace_id, file_id).unwrap();
                 let stream = file.open_append_stream().unwrap();
-                file.append_stream(&stream, &[9; 4096]).unwrap();
-                let mark = file.flush_append_stream(&stream).unwrap();
-                file.publish_append_stream(&stream, &mark).unwrap();
+                let ticket = file.append_stream(&stream, &[9; 4096]).unwrap();
+                file.publish_append_stream(&stream, ticket.range.end_exclusive().unwrap())
+                    .unwrap();
                 (client, keyspace_id, checkpoint)
             },
             |(client, keyspace_id, checkpoint)| {

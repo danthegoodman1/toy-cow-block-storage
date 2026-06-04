@@ -345,27 +345,27 @@ impl BlockDeltaPrestageTracker {
 }
 
 #[derive(Debug)]
-pub(super) struct StreamFlushCoordinator {
-    inner: Mutex<StreamFlushCoordinatorState>,
+pub(super) struct StreamPrefixPersistCoordinator {
+    inner: Mutex<StreamPrefixPersistCoordinatorState>,
     cvar: Condvar,
 }
 
 #[derive(Debug)]
-pub(super) struct StreamFlushCoordinatorState {
+pub(super) struct StreamPrefixPersistCoordinatorState {
     in_flight: bool,
     generation: u64,
-    requests: BTreeMap<AppendStreamId, StreamFlushRequest>,
+    requests: BTreeMap<AppendStreamId, StreamPrefixPersistRequest>,
     last_error: Option<(u64, StorageError)>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct StreamFlushRequest {
+pub(super) struct StreamPrefixPersistRequest {
     stream: AppendStream,
     durable_through: u64,
     waiters: usize,
 }
 
-impl StreamFlushCoordinatorState {
+impl StreamPrefixPersistCoordinatorState {
     fn add_request(&mut self, stream: &AppendStream, durable_through: u64) {
         self.requests
             .entry(stream.stream_id)
@@ -373,7 +373,7 @@ impl StreamFlushCoordinatorState {
                 request.durable_through = request.durable_through.max(durable_through);
                 request.waiters = request.waiters.saturating_add(1);
             })
-            .or_insert_with(|| StreamFlushRequest {
+            .or_insert_with(|| StreamPrefixPersistRequest {
                 stream: stream.clone(),
                 durable_through,
                 waiters: 1,
@@ -398,10 +398,10 @@ impl StreamFlushCoordinatorState {
     }
 }
 
-impl StreamFlushCoordinator {
+impl StreamPrefixPersistCoordinator {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(StreamFlushCoordinatorState {
+            inner: Mutex::new(StreamPrefixPersistCoordinatorState {
                 in_flight: false,
                 generation: 0,
                 requests: BTreeMap::new(),
@@ -597,7 +597,7 @@ pub(super) const DATA_LOG_KIND_SEGMENT: u8 = 1;
 pub(super) const DATA_LOG_KIND_APPEND_RUN: u8 = 2;
 pub(super) const MAX_DATA_LOG_SYNC_GROUP_BYTES: u64 = 32 * 1024 * 1024;
 pub(super) const MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES: u64 = 32 * 1024 * 1024;
-pub(super) const MAX_STREAM_FLUSH_GROUPS_PER_RUN: usize = 64;
+pub(super) const MAX_STREAM_PREFIX_PERSIST_GROUPS_PER_RUN: usize = 64;
 pub(super) const GENERIC_DATA_LOG_STATE_ACTIVE: &str = "active";
 pub(super) const STREAM_DATA_LOG_STATE_ACTIVE: &str = "stream-active";
 
@@ -1473,7 +1473,7 @@ impl DurableSqliteStore {
         })
     }
 
-    fn persist_preingested_append_stream_flush(
+    fn persist_preingested_append_stream_prefix(
         &self,
         cursor: &DurableExportCursor,
         streams: &[AppendStreamState],
@@ -1520,7 +1520,7 @@ impl DurableSqliteStore {
         let mut conn = lock(&self.conn)?;
         let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
         let previous_cursor = load_export_cursor(&conn)?;
-        let stream_cursor = stream_flush_cursor(previous_cursor.as_ref(), cursor);
+        let stream_cursor = stream_prefix_persist_cursor(previous_cursor.as_ref(), cursor);
         let tx = conn.transaction().map_err(sqlite_error)?;
         let started = Instant::now();
         for stream in streams {

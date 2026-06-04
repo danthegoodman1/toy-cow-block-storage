@@ -340,6 +340,7 @@ macro_rules! durable_id_codec_u32 {
 }
 
 durable_id_codec_u128!(
+    AppendPublishTicketId,
     AppendRunId,
     AppendStreamId,
     AppendTicketId,
@@ -1982,13 +1983,14 @@ impl DurableCodec for AppendTicket {
     }
 }
 
-impl DurableCodec for DurableAppendMark {
+impl DurableCodec for AppendPublishTicket {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.keyspace_id.encode(out)?;
         self.file_id.encode(out)?;
         self.stream_id.encode(out)?;
+        self.ticket_id.encode(out)?;
         self.writer_epoch.encode(out)?;
-        self.durable_through.encode(out)
+        self.publish_through.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -1996,8 +1998,9 @@ impl DurableCodec for DurableAppendMark {
             keyspace_id: KeyspaceId::decode(input)?,
             file_id: FileId::decode(input)?,
             stream_id: AppendStreamId::decode(input)?,
+            ticket_id: AppendPublishTicketId::decode(input)?,
             writer_epoch: WriterEpoch::decode(input)?,
-            durable_through: u64::decode(input)?,
+            publish_through: u64::decode(input)?,
         })
     }
 }
@@ -2064,9 +2067,9 @@ impl DurableCodec for AppendStreamStatus {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         match self {
             Self::Active => 1u8,
-            Self::Fenced => 2,
-            Self::Aborted => 3,
-            Self::Published => 4,
+            Self::Released => 2,
+            Self::Fenced => 3,
+            Self::Aborted => 4,
         }
         .encode(out)
     }
@@ -2074,9 +2077,9 @@ impl DurableCodec for AppendStreamStatus {
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
         match u8::decode(input)? {
             1 => Ok(Self::Active),
-            2 => Ok(Self::Fenced),
-            3 => Ok(Self::Aborted),
-            4 => Ok(Self::Published),
+            2 => Ok(Self::Released),
+            3 => Ok(Self::Fenced),
+            4 => Ok(Self::Aborted),
             _ => Err(durable_codec_error("invalid append stream status tag")),
         }
     }
@@ -2211,34 +2214,56 @@ impl DurableCodec for NativeRequest {
                 bytes.encode(out)?;
                 payload_integrity.encode(out)
             }
-            Self::FlushAppendStream {
+            Self::SubmitAppendPublish {
                 keyspace_id,
                 file_id,
                 stream,
+                publish_through,
             } => {
                 9u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
-                stream.encode(out)
+                stream.encode(out)?;
+                publish_through.encode(out)
+            }
+            Self::WaitAppendPublish {
+                keyspace_id,
+                file_id,
+                ticket,
+            } => {
+                10u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                ticket.encode(out)
             }
             Self::PublishAppendStream {
                 keyspace_id,
                 file_id,
                 stream,
-                mark,
+                publish_through,
             } => {
-                10u8.encode(out)?;
+                11u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
                 stream.encode(out)?;
-                mark.encode(out)
+                publish_through.encode(out)
+            }
+            Self::ReleaseAppendStream {
+                keyspace_id,
+                file_id,
+                stream,
+            } => {
+                12u8.encode(out)?;
+                keyspace_id.encode(out)?;
+                file_id.encode(out)?;
+                stream.encode(out)
             }
             Self::AbortAppendStream {
                 keyspace_id,
                 file_id,
                 stream,
             } => {
-                11u8.encode(out)?;
+                13u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)?;
                 stream.encode(out)
@@ -2247,21 +2272,21 @@ impl DurableCodec for NativeRequest {
                 keyspace_id,
                 file_id,
             } => {
-                12u8.encode(out)?;
+                14u8.encode(out)?;
                 keyspace_id.encode(out)?;
                 file_id.encode(out)
             }
             Self::CheckpointKeyspace { keyspace_id } => {
-                13u8.encode(out)?;
+                15u8.encode(out)?;
                 keyspace_id.encode(out)
             }
             Self::SnapshotKeyspace { source, request } => {
-                14u8.encode(out)?;
+                16u8.encode(out)?;
                 source.encode(out)?;
                 request.encode(out)
             }
             Self::RestoreKeyspace { source, point } => {
-                15u8.encode(out)?;
+                17u8.encode(out)?;
                 source.encode(out)?;
                 point.encode(out)
             }
@@ -2308,34 +2333,45 @@ impl DurableCodec for NativeRequest {
                 bytes: Vec::decode(input)?,
                 payload_integrity: PayloadIntegrity::decode(input)?,
             }),
-            9 => Ok(Self::FlushAppendStream {
+            9 => Ok(Self::SubmitAppendPublish {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                stream: AppendStream::decode(input)?,
+                publish_through: u64::decode(input)?,
+            }),
+            10 => Ok(Self::WaitAppendPublish {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                ticket: AppendPublishTicket::decode(input)?,
+            }),
+            11 => Ok(Self::PublishAppendStream {
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                stream: AppendStream::decode(input)?,
+                publish_through: u64::decode(input)?,
+            }),
+            12 => Ok(Self::ReleaseAppendStream {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
                 stream: AppendStream::decode(input)?,
             }),
-            10 => Ok(Self::PublishAppendStream {
-                keyspace_id: KeyspaceId::decode(input)?,
-                file_id: FileId::decode(input)?,
-                stream: AppendStream::decode(input)?,
-                mark: DurableAppendMark::decode(input)?,
-            }),
-            11 => Ok(Self::AbortAppendStream {
+            13 => Ok(Self::AbortAppendStream {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
                 stream: AppendStream::decode(input)?,
             }),
-            12 => Ok(Self::Flush {
+            14 => Ok(Self::Flush {
                 keyspace_id: KeyspaceId::decode(input)?,
                 file_id: FileId::decode(input)?,
             }),
-            13 => Ok(Self::CheckpointKeyspace {
+            15 => Ok(Self::CheckpointKeyspace {
                 keyspace_id: KeyspaceId::decode(input)?,
             }),
-            14 => Ok(Self::SnapshotKeyspace {
+            16 => Ok(Self::SnapshotKeyspace {
                 source: KeyspaceId::decode(input)?,
                 request: SnapshotKeyspaceRequest::decode(input)?,
             }),
-            15 => Ok(Self::RestoreKeyspace {
+            17 => Ok(Self::RestoreKeyspace {
                 source: KeyspaceId::decode(input)?,
                 point: RestorePoint::decode(input)?,
             }),
@@ -2379,29 +2415,30 @@ impl DurableCodec for NativeResponse {
                 8u8.encode(out)?;
                 ticket.encode(out)
             }
-            Self::DurableAppendMark(mark) => {
+            Self::AppendPublishSubmitted(ticket) => {
                 9u8.encode(out)?;
-                mark.encode(out)
+                ticket.encode(out)
             }
             Self::AppendPublished(commit) => {
                 10u8.encode(out)?;
                 commit.encode(out)
             }
-            Self::AppendAborted => 11u8.encode(out),
+            Self::AppendReleased => 11u8.encode(out),
+            Self::AppendAborted => 12u8.encode(out),
             Self::Flush(flush) => {
-                12u8.encode(out)?;
+                13u8.encode(out)?;
                 flush.encode(out)
             }
             Self::KeyspaceCheckpointed(checkpoint_id) => {
-                13u8.encode(out)?;
+                14u8.encode(out)?;
                 checkpoint_id.encode(out)
             }
             Self::KeyspaceSnapshotted(keyspace_id) => {
-                14u8.encode(out)?;
+                15u8.encode(out)?;
                 keyspace_id.encode(out)
             }
             Self::KeyspaceRestored(keyspace_id) => {
-                15u8.encode(out)?;
+                16u8.encode(out)?;
                 keyspace_id.encode(out)
             }
         }
@@ -2417,13 +2454,14 @@ impl DurableCodec for NativeResponse {
             6 => Ok(Self::FileBatchCommitted(FileWriteCommit::decode(input)?)),
             7 => Ok(Self::AppendStreamOpened(AppendStream::decode(input)?)),
             8 => Ok(Self::AppendTicket(AppendTicket::decode(input)?)),
-            9 => Ok(Self::DurableAppendMark(DurableAppendMark::decode(input)?)),
+            9 => Ok(Self::AppendPublishSubmitted(AppendPublishTicket::decode(input)?)),
             10 => Ok(Self::AppendPublished(AppendPublishCommit::decode(input)?)),
-            11 => Ok(Self::AppendAborted),
-            12 => Ok(Self::Flush(FlushResult::decode(input)?)),
-            13 => Ok(Self::KeyspaceCheckpointed(CheckpointId::decode(input)?)),
-            14 => Ok(Self::KeyspaceSnapshotted(KeyspaceId::decode(input)?)),
-            15 => Ok(Self::KeyspaceRestored(KeyspaceId::decode(input)?)),
+            11 => Ok(Self::AppendReleased),
+            12 => Ok(Self::AppendAborted),
+            13 => Ok(Self::Flush(FlushResult::decode(input)?)),
+            14 => Ok(Self::KeyspaceCheckpointed(CheckpointId::decode(input)?)),
+            15 => Ok(Self::KeyspaceSnapshotted(KeyspaceId::decode(input)?)),
+            16 => Ok(Self::KeyspaceRestored(KeyspaceId::decode(input)?)),
             _ => Err(durable_codec_error("invalid native response tag")),
         }
     }

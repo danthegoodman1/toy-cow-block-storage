@@ -1638,7 +1638,7 @@ impl LocalCoordinator {
         let run = self.append_run_payload_memory(&prepared, data, payload_integrity)?;
         let ticket = self.commit_prepared_append_stream_run(prepared, run)?;
         if matches!(durability, crate::api::WriteDurability::Flushed) {
-            self.flush_append_stream(stream)?;
+            self.metadata.mark_append_stream_durable(stream)?;
         }
         Ok(ticket)
     }
@@ -1656,7 +1656,7 @@ impl LocalCoordinator {
         }
         if matches!(durability, crate::api::WriteDurability::Flushed) {
             return Err(StorageError::invalid_argument(
-                "append stream flushed durability is handled by DurableCoordinator",
+                "append stream persisted durability is handled by DurableCoordinator",
             ));
         }
         self.observability.record_with_update(
@@ -1753,67 +1753,36 @@ impl LocalCoordinator {
         )
     }
 
-    pub fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
-        self.metadata.mark_append_stream_durable(stream)
-    }
-
-    pub fn publish_append_stream(
+    pub fn submit_append_publish(
         &self,
         stream: &AppendStream,
-        mark: &DurableAppendMark,
+        publish_through: u64,
+    ) -> Result<AppendPublishTicket> {
+        let ticket_id = self.metadata.next_append_publish_ticket_id()?;
+        self.metadata
+            .submit_append_publish(stream, ticket_id, publish_through)
+    }
+
+    pub fn wait_append_publish(
+        &self,
+        ticket: &AppendPublishTicket,
         durability: crate::api::WriteDurability,
     ) -> Result<AppendPublishCommit> {
-        let state = self.metadata.validate_append_stream_mark(stream, mark)?;
+        let state = match self.metadata.append_publish_ticket_status(ticket)? {
+            AppendPublishTicketStatus::Completed(commit) => return Ok(commit),
+            AppendPublishTicketStatus::Pending(state) => state,
+        };
+        let stream = state.public_stream();
         let head = self
             .metadata
-            .get_file_head(stream.keyspace_id, stream.file_id)?;
+            .get_file_head(ticket.keyspace_id, ticket.file_id)?;
         if head.size != state.published_through {
             return Err(StorageError::conflict(
                 "append stream no longer matches visible file head",
             ));
         }
-        if mark.durable_through == state.published_through {
-            return Ok(AppendPublishCommit {
-                keyspace_id: stream.keyspace_id,
-                file_id: stream.file_id,
-                range: ByteRange::new(mark.durable_through, 0),
-                version: head.version,
-                commit_seq: head.latest_commit,
-                durability,
-            });
-        }
 
-        let unpublished: Vec<_> = state
-            .records
-            .iter()
-            .filter(|record| {
-                record.offset >= state.published_through
-                    && record.offset < mark.durable_through
-                    && record.offset.saturating_add(record.len) <= mark.durable_through
-            })
-            .cloned()
-            .collect();
-        if unpublished.is_empty() {
-            return Err(StorageError::conflict(
-                "append stream mark has no durable records to publish",
-            ));
-        }
-
-        let mut contiguous = true;
-        let mut expected_offset = head.size;
-        for record in &unpublished {
-            contiguous &= record.offset == expected_offset;
-            expected_offset = record
-                .offset
-                .checked_add(record.len)
-                .ok_or_else(|| StorageError::invalid_argument("append record end overflows"))?;
-        }
-        contiguous &= expected_offset == mark.durable_through;
-        if !contiguous {
-            return Err(StorageError::conflict(
-                "append-run publish requires contiguous durable records",
-            ));
-        }
+        let unpublished = state.publish_records(state.published_through, ticket.publish_through)?;
         let run_extents: Vec<_> = unpublished
             .iter()
             .map(|record| {
@@ -1826,38 +1795,55 @@ impl LocalCoordinator {
                 Ok(extent)
             })
             .collect::<Result<_>>()?;
-        let publish_range = ByteRange::new(head.size, mark.durable_through - head.size);
+        let publish_range = ByteRange::new(head.size, ticket.publish_through - head.size);
         let new_root = self
             .replace_tree_byte_range_with_run_extents(head.root, publish_range, run_extents)?
             .root;
 
         self.publish_commit_group_observed(CommitGroupIntent {
-            owner: MappingOwner::NativeKeyspace(stream.keyspace_id),
+            owner: MappingOwner::NativeKeyspace(ticket.keyspace_id),
             fence: MetadataFence::AppendStream {
-                stream_id: stream.stream_id,
-                writer_epoch: stream.writer_epoch,
+                stream_id: ticket.stream_id,
+                writer_epoch: ticket.writer_epoch,
             },
             updates: vec![RootUpdate::FileRoot {
-                file_id: stream.file_id,
+                file_id: ticket.file_id,
                 old_root: head.root,
                 new_root,
-                new_size: mark.durable_through,
+                new_size: ticket.publish_through,
             }],
         })?;
         self.metadata
-            .mark_append_stream_published(stream, mark.durable_through)?;
+            .mark_append_stream_published(&stream, ticket.publish_through)?;
         let committed = self
             .metadata
-            .get_file_head(stream.keyspace_id, stream.file_id)?;
+            .get_file_head(ticket.keyspace_id, ticket.file_id)?;
 
-        Ok(AppendPublishCommit {
-            keyspace_id: stream.keyspace_id,
-            file_id: stream.file_id,
-            range: ByteRange::new(head.size, mark.durable_through - head.size),
+        let commit = AppendPublishCommit {
+            keyspace_id: ticket.keyspace_id,
+            file_id: ticket.file_id,
+            range: ByteRange::new(head.size, ticket.publish_through - head.size),
             version: committed.version,
             commit_seq: committed.latest_commit,
             durability,
-        })
+        };
+        self.metadata
+            .complete_append_publish_ticket(ticket, commit.clone())?;
+        Ok(commit)
+    }
+
+    pub fn publish_append_stream(
+        &self,
+        stream: &AppendStream,
+        publish_through: u64,
+        durability: crate::api::WriteDurability,
+    ) -> Result<AppendPublishCommit> {
+        let ticket = self.submit_append_publish(stream, publish_through)?;
+        self.wait_append_publish(&ticket, durability)
+    }
+
+    pub fn release_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        self.metadata.release_append_stream(stream)
     }
 
     pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {

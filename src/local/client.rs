@@ -576,42 +576,59 @@ impl NativeFile for LocalNativeFile {
         }
     }
 
-    fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
+    fn submit_append_publish(
+        &self,
+        stream: &AppendStream,
+        publish_through: u64,
+    ) -> Result<AppendPublishTicket> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::FlushAppendStream {
+            NativeRequest::SubmitAppendPublish {
                 keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
                 stream: stream.clone(),
+                publish_through,
             },
         ))?;
         match response.response {
-            NativeResponse::DurableAppendMark(mark) => Ok(mark),
-            _ => Err(StorageError::corrupt("unexpected append-flush response")),
+            NativeResponse::AppendPublishSubmitted(ticket) => Ok(ticket),
+            _ => Err(StorageError::corrupt("unexpected append-publish-submit response")),
         }
     }
 
-    fn publish_append_stream(
-        &self,
-        stream: &AppendStream,
-        mark: &DurableAppendMark,
-    ) -> Result<AppendPublishCommit> {
+    fn wait_append_publish(&self, ticket: &AppendPublishTicket) -> Result<AppendPublishCommit> {
         let response = self.transport.call(NativeRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            NativeRequest::PublishAppendStream {
+            NativeRequest::WaitAppendPublish {
                 keyspace_id: self.keyspace_id,
                 file_id: self.file_id,
-                stream: stream.clone(),
-                mark: mark.clone(),
+                ticket: ticket.clone(),
             },
         ))?;
         match response.response {
             NativeResponse::AppendPublished(commit) => Ok(commit),
-            _ => Err(StorageError::corrupt("unexpected append-publish response")),
+            _ => Err(StorageError::corrupt("unexpected append-publish-wait response")),
+        }
+    }
+
+    fn release_append_stream(&self, stream: &AppendStream) -> Result<()> {
+        let response = self.transport.call(NativeRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            NativeRequest::ReleaseAppendStream {
+                keyspace_id: self.keyspace_id,
+                file_id: self.file_id,
+                stream: stream.clone(),
+            },
+        ))?;
+        match response.response {
+            NativeResponse::AppendReleased => Ok(()),
+            _ => Err(StorageError::corrupt("unexpected append-release response")),
         }
     }
 

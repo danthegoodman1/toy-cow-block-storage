@@ -67,14 +67,133 @@ mod tests {
     }
 
     #[test]
-    fn append_stream_suite_uses_explicit_ingest_flush_and_publish_names() {
+    fn append_stream_suite_uses_explicit_ingest_and_publish_names() {
         let suite = Workload::append_stream_suite();
         assert!(suite.contains(&Workload::NativeStreamIngest1m));
-        assert!(suite.contains(&Workload::NativeStreamAppendFlush1m));
-        assert!(suite.contains(&Workload::NativeStreamPublishPreflushed1m));
-        assert!(suite.contains(&Workload::NativeStreamFlushPublish1m));
+        assert!(suite.contains(&Workload::NativeStreamPublishPrefix1m));
+        assert!(suite.contains(&Workload::NativeStreamPublishServerPersisted1m));
+        assert!(suite.contains(&Workload::NativeStreamPublishPipelined1m));
         assert!(Workload::from_str("native-stream-append-1m").is_err());
         assert!(Workload::from_str("native-stream-publish-1m").is_err());
+    }
+
+    #[test]
+    fn fixed_stream_publish_workloads_parse_explicit_names() {
+        assert_eq!(
+            Workload::from_str("native-stream-publish-interval-1m").unwrap(),
+            Workload::NativeStreamPublishInterval1m
+        );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-interval-4m").unwrap(),
+            Workload::NativeStreamPublishInterval4m
+        );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-interval-32m").unwrap(),
+            Workload::NativeStreamPublishInterval32m
+        );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-at-end-1m").unwrap(),
+            Workload::NativeStreamPublishAtEnd1m
+        );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-at-end-4m").unwrap(),
+            Workload::NativeStreamPublishAtEnd4m
+        );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-at-end-32m").unwrap(),
+            Workload::NativeStreamPublishAtEnd32m
+        );
+    }
+
+    #[test]
+    fn fixed_stream_total_must_match_workload_boundaries() {
+        assert!(validate_fixed_stream_total_bytes(1024 * 1024 * 1024, 32 * 1024 * 1024).is_ok());
+        assert!(validate_fixed_stream_total_bytes(1025 * 1024 * 1024, 32 * 1024 * 1024).is_err());
+        assert!(validate_fixed_stream_total_bytes(0, 32 * 1024 * 1024).is_err());
+        assert!(validate_fixed_stream_total_bytes(DEFAULT_FILE_CAPACITY_BYTES + 1, 1024).is_err());
+    }
+
+    #[test]
+    fn fixed_stream_interval_must_match_workload_boundaries() {
+        assert!(validate_fixed_stream_publish_interval(128 * 1024 * 1024, 32 * 1024 * 1024)
+            .is_ok());
+        assert!(validate_fixed_stream_publish_interval(96 * 1024 * 1024, 32 * 1024 * 1024)
+            .is_ok());
+        assert!(validate_fixed_stream_publish_interval(100 * 1024 * 1024, 32 * 1024 * 1024)
+            .is_err());
+        assert!(validate_fixed_stream_publish_interval(0, 32 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn fixed_stream_interval_publishes_boundaries_and_final_tail() {
+        let workload = Workload::NativeStreamPublishInterval32m;
+        let mut target = Some(128 * 1024 * 1024);
+        let mut published = Vec::new();
+        for next in [
+            32 * 1024 * 1024,
+            64 * 1024 * 1024,
+            96 * 1024 * 1024,
+            128 * 1024 * 1024,
+            160 * 1024 * 1024,
+            192 * 1024 * 1024,
+        ] {
+            if let Some(publish_through) =
+                fixed_stream_publish_target(workload, next, 192 * 1024 * 1024, target)
+            {
+                published.push(publish_through);
+                target = Some(publish_through + 128 * 1024 * 1024);
+            }
+        }
+        assert_eq!(
+            published,
+            vec![128 * 1024 * 1024, 192 * 1024 * 1024]
+        );
+    }
+
+    #[test]
+    fn fixed_stream_at_end_publishes_once() {
+        let workload = Workload::NativeStreamPublishAtEnd32m;
+        let mut published = Vec::new();
+        for next in [
+            32 * 1024 * 1024,
+            64 * 1024 * 1024,
+            96 * 1024 * 1024,
+        ] {
+            if let Some(publish_through) =
+                fixed_stream_publish_target(workload, next, 96 * 1024 * 1024, None)
+            {
+                published.push(publish_through);
+            }
+        }
+        assert_eq!(published, vec![96 * 1024 * 1024]);
+    }
+
+    #[test]
+    fn stream_ingest_does_not_publish_when_threshold_is_configured() {
+        assert!(!should_publish_after_stream_append(
+            Workload::NativeStreamIngest1m,
+            true
+        ));
+        assert!(!should_publish_after_stream_append(
+            Workload::NativeStreamIngest4m,
+            true
+        ));
+        assert!(!should_publish_after_stream_append(
+            Workload::NativeStreamIngest32m,
+            true
+        ));
+        assert!(should_publish_after_stream_append(
+            Workload::NativeStreamPublishPrefix1m,
+            false
+        ));
+        assert!(should_publish_after_stream_append(
+            Workload::NativeStreamPublishPipelined1m,
+            false
+        ));
+        assert!(!should_publish_after_stream_append(
+            Workload::NativeStreamPublishServerPersisted1m,
+            true
+        ));
     }
 
     #[test]

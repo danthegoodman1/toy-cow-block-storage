@@ -240,9 +240,8 @@ impl BenchStore {
         payload_integrity: PayloadIntegrity,
     ) -> Result<()> {
         let stream = self.open_append_stream(keyspace_id, file_id)?;
-        self.append_stream(&stream, data, durability, payload_integrity)?;
-        let mark = self.flush_append_stream(&stream)?;
-        self.publish_append_stream(&stream, &mark)
+        let ticket = self.append_stream(&stream, data, durability, payload_integrity)?;
+        self.publish_append_stream(&stream, ticket.range.end_exclusive()?)
     }
 
     fn append_stream(
@@ -265,22 +264,12 @@ impl BenchStore {
         }
     }
 
-    fn flush_append_stream(&self, stream: &AppendStream) -> Result<DurableAppendMark> {
-        match self {
-            Self::Local(store) => store.flush_append_stream(stream),
-            Self::Durable(store) => store.flush_append_stream(stream),
-            Self::Txn(_) => Err(StorageError::unsupported(
-                "txn metadata provider is block-only in loadbench",
-            )),
-        }
-    }
-
-    fn publish_append_stream(&self, stream: &AppendStream, mark: &DurableAppendMark) -> Result<()> {
+    fn publish_append_stream(&self, stream: &AppendStream, publish_through: u64) -> Result<()> {
         match self {
             Self::Local(store) => {
-                store.publish_append_stream(stream, mark, WriteDurability::Acknowledged)
+                store.publish_append_stream(stream, publish_through, WriteDurability::Acknowledged)
             }
-            Self::Durable(store) => store.publish_append_stream(stream, mark),
+            Self::Durable(store) => store.publish_append_stream(stream, publish_through),
             Self::Txn(_) => Err(StorageError::unsupported(
                 "txn metadata provider is block-only in loadbench",
             )),

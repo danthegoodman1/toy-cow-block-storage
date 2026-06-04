@@ -28,18 +28,18 @@ use crate::api::{
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
-    AppendPublishCommit, AppendStream, AppendTicket, CreateFileRequest, CreateKeyspaceRequest,
-    DurableAppendMark, FileBatchWrite, FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo,
+    AppendPublishCommit, AppendPublishTicket, AppendStream, AppendTicket, CreateFileRequest,
+    CreateKeyspaceRequest, FileBatchWrite, FileInfo, FileSpec, FileWriteCommit, KeyspaceInfo,
     NativeFile, NativeKeyspaceClient, NativeRequest, NativeRequestEnvelope, NativeResponse,
     NativeResponseEnvelope, NativeServer, NativeTransport, SnapshotKeyspaceRequest,
 };
 use crate::id::{
-    AppendRunId, AppendStreamId, AppendTicketId, BlockCount, BlockIndex, CheckpointId, ClientEpoch,
-    CommitGroupId, CommitSeq, DeviceGeneration, DeviceId, ExtentId, FileId, FileVersion,
-    GrantEpoch, GrantId, GrantNonce, KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId,
-    KeyspaceRootId, LogicalDeadline, LogicalTime, MetadataNodeId, PrincipalId, RequestId,
-    SegmentId, ServerIncarnation, ShardId, StorageNodeId, StorageNodeKeyId, TenantId,
-    WriteIntentId, WriterEpoch,
+    AppendPublishTicketId, AppendRunId, AppendStreamId, AppendTicketId, BlockCount, BlockIndex,
+    CheckpointId, ClientEpoch, CommitGroupId, CommitSeq, DeviceGeneration, DeviceId, ExtentId,
+    FileId, FileVersion, GrantEpoch, GrantId, GrantNonce, KeyspaceCatalogShardId,
+    KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalDeadline, LogicalTime, MetadataNodeId,
+    PrincipalId, RequestId, SegmentId, ServerIncarnation, ShardId, StorageNodeId, StorageNodeKeyId,
+    TenantId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
     AppendLogRun, AppendLogRunRange, Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord,

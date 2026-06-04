@@ -16,7 +16,6 @@ fn execute_load(
         delay_mode: args.delay_mode,
         durability: args.durability,
         samples_per_worker: args.samples_per_worker,
-        stream_flush_bytes: args.stream_flush_bytes,
         stream_publish_bytes: args.stream_publish_bytes,
         native_file_batch: if workload.is_native_file_batch() {
             Some(workload.native_file_batch_spec(args)?)
@@ -56,6 +55,58 @@ fn execute_load(
     Ok(BenchReport::from_workers(elapsed, reports))
 }
 
+fn execute_fixed_stream_publish_load(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    context: BenchContext,
+) -> Result<BenchReport> {
+    let total_bytes = validate_fixed_stream_workload(workload, args)?;
+    let config = FixedStreamPublishConfig {
+        workload,
+        concurrency,
+        modeled_delay: args.modeled_delay(),
+        delay_mode: args.delay_mode,
+        samples_per_worker: args.samples_per_worker,
+        stream_publish_bytes: args.stream_publish_bytes,
+        payload_integrity: args.payload_integrity,
+    };
+    let started = Instant::now();
+
+    let reports = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(concurrency);
+        for worker in 0..concurrency {
+            let context = context.clone();
+            handles.push(scope.spawn(move || {
+                run_fixed_stream_publish_worker(context, worker as u64, config, total_bytes)
+            }));
+        }
+
+        let mut reports = Vec::with_capacity(concurrency);
+        for handle in handles {
+            reports.push(
+                handle
+                    .join()
+                    .map_err(|_| StorageError::unavailable("loadbench worker panicked"))??,
+            );
+        }
+        Ok::<_, StorageError>(reports)
+    })?;
+
+    Ok(BenchReport::from_workers(started.elapsed(), reports))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FixedStreamPublishConfig {
+    workload: Workload,
+    concurrency: usize,
+    modeled_delay: Duration,
+    delay_mode: DelayMode,
+    samples_per_worker: usize,
+    stream_publish_bytes: Option<u64>,
+    payload_integrity: PayloadIntegrity,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WorkerConfig {
     workload: Workload,
@@ -65,13 +116,62 @@ struct WorkerConfig {
     delay_mode: DelayMode,
     durability: DurabilityMode,
     samples_per_worker: usize,
-    stream_flush_bytes: Option<u64>,
     stream_publish_bytes: Option<u64>,
     native_file_batch: Option<NativeFileBatchSpec>,
     block_batch: Option<BlockBatchSpec>,
     block_batch_profiles_enabled: bool,
     payload_integrity: PayloadIntegrity,
     read_verification: ReadVerification,
+}
+
+fn validate_fixed_stream_workload(workload: Workload, args: &Args) -> Result<u64> {
+    if !workload.is_native_stream_publish_fixed() {
+        return Ok(args.stream_total_bytes);
+    }
+    let op_size = workload.op_size(args)? as u64;
+    validate_fixed_stream_total_bytes(args.stream_total_bytes, op_size)?;
+    if workload.is_native_stream_publish_interval() {
+        let publish_bytes = args.stream_publish_bytes.ok_or_else(|| {
+            StorageError::invalid_argument(
+                "native-stream-publish-interval workloads require --stream-publish-mib",
+            )
+        })?;
+        validate_fixed_stream_publish_interval(publish_bytes, op_size)?;
+    }
+    Ok(args.stream_total_bytes)
+}
+
+fn validate_fixed_stream_total_bytes(total_bytes: u64, op_size: u64) -> Result<()> {
+    if total_bytes == 0 {
+        return Err(StorageError::invalid_argument(
+            "stream-total-mib must be greater than zero",
+        ));
+    }
+    if op_size == 0 || !total_bytes.is_multiple_of(op_size) {
+        return Err(StorageError::invalid_argument(
+            "stream-total-mib must be a multiple of the workload op size",
+        ));
+    }
+    if total_bytes > DEFAULT_FILE_CAPACITY_BYTES {
+        return Err(StorageError::invalid_argument(
+            "stream-total-mib exceeds the native file capacity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fixed_stream_publish_interval(publish_bytes: u64, op_size: u64) -> Result<()> {
+    if publish_bytes == 0 {
+        return Err(StorageError::invalid_argument(
+            "stream-publish-mib must be greater than zero",
+        ));
+    }
+    if op_size == 0 || !publish_bytes.is_multiple_of(op_size) {
+        return Err(StorageError::invalid_argument(
+            "stream-publish-mib must be a multiple of the workload op size",
+        ));
+    }
+    Ok(())
 }
 
 fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Result<WorkerReport> {
@@ -153,9 +253,7 @@ struct StreamAppendState {
     file_index: usize,
     stream: AppendStream,
     next_offset: u64,
-    durable_offset: u64,
     published_offset: u64,
-    durable_mark: Option<DurableAppendMark>,
 }
 
 #[derive(Default)]
@@ -235,12 +333,169 @@ fn ensure_stream_append_state(
             file_index,
             stream,
             next_offset: visible_base_size,
-            durable_offset: visible_base_size,
             published_offset: visible_base_size,
-            durable_mark: None,
         });
     }
     Ok(())
+}
+
+fn run_fixed_stream_publish_worker(
+    context: BenchContext,
+    worker: u64,
+    config: FixedStreamPublishConfig,
+    total_bytes: u64,
+) -> Result<WorkerReport> {
+    let mut rng = Lcg::new(0xa076_1d64_78bd_642f_u64 ^ worker.wrapping_mul(0xe703_7ed1_a0b4_28db));
+    let mut report = WorkerReport::new(config.samples_per_worker);
+    let Target::Native { keyspace_id, files } = &context.target else {
+        return Err(StorageError::invalid_argument(
+            "fixed stream publish workloads require native target",
+        ));
+    };
+    if files.len() < config.concurrency {
+        return Err(StorageError::invalid_argument(
+            "fixed stream publish workloads require at least one file per worker",
+        ));
+    }
+
+    let file_id = files[worker as usize % files.len()];
+    let stream = context.store.open_append_stream(*keyspace_id, file_id)?;
+    let mut next_offset = stream.visible_base_size;
+    let mut published_offset = stream.visible_base_size;
+    let final_offset = next_offset
+        .checked_add(total_bytes)
+        .ok_or_else(|| StorageError::invalid_argument("fixed stream final offset overflows"))?;
+    if final_offset > DEFAULT_FILE_CAPACITY_BYTES {
+        return Err(StorageError::invalid_argument(
+            "fixed stream publish workload exceeds native file capacity",
+        ));
+    }
+
+    let publish_interval = config
+        .workload
+        .is_native_stream_publish_interval()
+        .then_some(
+            config
+                .stream_publish_bytes
+                .ok_or_else(|| StorageError::corrupt("missing fixed stream publish interval"))?,
+        );
+    let mut next_publish_target =
+        publish_interval.map(|interval| stream.visible_base_size.saturating_add(interval));
+
+    while next_offset < final_offset {
+        let append_started = Instant::now();
+        if !config.modeled_delay.is_zero() {
+            apply_modeled_delay(config.modeled_delay, config.delay_mode);
+        }
+        let append_result = context.store.append_stream(
+            &stream,
+            &context.payload,
+            WriteDurability::Acknowledged,
+            config.payload_integrity,
+        );
+        let append_nanos = elapsed_nanos_u64(append_started);
+        let ticket = match append_result {
+            Ok(ticket) => {
+                report.record(
+                    append_nanos,
+                    context.payload.len() as u64,
+                    OpProgress::default(),
+                    true,
+                    &mut rng,
+                );
+                ticket
+            }
+            Err(error) => {
+                report.record(
+                    append_nanos,
+                    context.payload.len() as u64,
+                    OpProgress::default(),
+                    false,
+                    &mut rng,
+                );
+                return Err(error);
+            }
+        };
+        next_offset = ticket.range.end_exclusive()?;
+
+        if let Some(publish_through) = fixed_stream_publish_target(
+            config.workload,
+            next_offset,
+            final_offset,
+            next_publish_target,
+        ) {
+            let previous_published = published_offset;
+            let publish_started = Instant::now();
+            if !config.modeled_delay.is_zero() {
+                apply_modeled_delay(config.modeled_delay, config.delay_mode);
+            }
+            let publish_result = context
+                .store
+                .publish_append_stream(&stream, publish_through);
+            let publish_nanos = elapsed_nanos_u64(publish_started);
+            match publish_result {
+                Ok(()) => {
+                    published_offset = publish_through;
+                    report.record(
+                        publish_nanos,
+                        0,
+                        OpProgress {
+                            durable_bytes: 0,
+                            published_bytes: publish_through.saturating_sub(previous_published),
+                            block_batch_profile: None,
+                        },
+                        true,
+                        &mut rng,
+                    );
+                    if let Some(interval) = publish_interval {
+                        while next_publish_target.is_some_and(|target| target <= published_offset)
+                        {
+                            next_publish_target = published_offset.checked_add(interval);
+                        }
+                    }
+                }
+                Err(error) => {
+                    report.record(
+                        publish_nanos,
+                        0,
+                        OpProgress::default(),
+                        false,
+                        &mut rng,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    if published_offset != final_offset {
+        return Err(StorageError::corrupt(
+            "fixed stream publish workload left an unpublished tail",
+        ));
+    }
+    if report.bytes != report.published_bytes {
+        return Err(StorageError::corrupt(
+            "fixed stream publish workload did not publish every appended byte",
+        ));
+    }
+    Ok(report)
+}
+
+fn fixed_stream_publish_target(
+    workload: Workload,
+    next_offset: u64,
+    final_offset: u64,
+    next_publish_target: Option<u64>,
+) -> Option<u64> {
+    if workload.is_native_stream_publish_at_end() {
+        return (next_offset == final_offset).then_some(final_offset);
+    }
+    if let Some(target) = next_publish_target
+        && next_offset >= target
+    {
+        return Some(target);
+    }
+    (next_offset == final_offset).then_some(final_offset)
 }
 
 fn prepare_for_timed_op(
@@ -269,7 +524,7 @@ fn prepare_for_timed_op(
         }
         return Ok(());
     }
-    if !config.workload.is_native_stream_publish_preflushed() {
+    if !config.workload.is_native_stream_publish_server_persisted() {
         return Ok(());
     }
     let Target::Native { keyspace_id, files } = &context.target else {
@@ -277,11 +532,11 @@ fn prepare_for_timed_op(
     };
     let payload_len = context.payload.len() as u64;
     ensure_stream_append_state(context, *keyspace_id, files, worker, state, payload_len)?;
-    let needs_preflush = state
+    let needs_preload = state
         .stream_append
         .as_ref()
-        .is_none_or(|stream| stream.durable_mark.is_none());
-    if !needs_preflush {
+        .is_none_or(|stream| stream.next_offset == stream.published_offset);
+    if !needs_preload {
         return Ok(());
     }
     let stream = state
@@ -295,11 +550,8 @@ fn prepare_for_timed_op(
         WriteDurability::Acknowledged,
         config.payload_integrity,
     )?;
-    let mark = context.store.flush_append_stream(&stream)?;
     if let Some(stream_state) = state.stream_append.as_mut() {
         stream_state.next_offset = ticket.range.offset.saturating_add(ticket.range.len);
-        stream_state.durable_offset = mark.durable_through;
-        stream_state.durable_mark = Some(mark);
         state.last_native_file_index = Some(stream_state.file_index);
     }
     Ok(())
@@ -1022,28 +1274,26 @@ fn run_one_op(
                     state,
                     payload_len,
                 )?;
-                if workload.is_native_stream_publish_preflushed() {
+                if workload.is_native_stream_publish_server_persisted() {
                     let stream = state
                         .stream_append
                         .as_ref()
                         .map(|stream| stream.stream.clone())
                         .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
-                    let mark = state
+                    let publish_through = state
                         .stream_append
                         .as_ref()
-                        .and_then(|stream| stream.durable_mark.clone())
-                        .ok_or_else(|| {
-                            StorageError::conflict("append stream has no durable mark")
-                        })?;
+                        .map(|stream| stream.next_offset)
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
                     let previous_published = state
                         .stream_append
                         .as_ref()
                         .map(|stream| stream.published_offset)
                         .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
-                    context.store.publish_append_stream(&stream, &mark)?;
+                    context.store.publish_append_stream(&stream, publish_through)?;
                     progress.published_bytes = progress
                         .published_bytes
-                        .saturating_add(mark.durable_through.saturating_sub(previous_published));
+                        .saturating_add(publish_through.saturating_sub(previous_published));
                     advance_stream_lane(state, files.len());
                     return Ok(progress);
                 }
@@ -1071,75 +1321,42 @@ fn run_one_op(
                 }
                 if let Some(stream) = state.stream_append.as_mut() {
                     stream.next_offset = next_offset;
-                    stream.durable_mark = None;
                     state.last_native_file_index = Some(stream.file_index);
                 }
-                let threshold_flush = state
-                    .stream_append
-                    .as_ref()
-                    .zip(config.stream_flush_bytes)
-                    .is_some_and(|(stream, threshold)| {
-                        stream.next_offset.saturating_sub(stream.durable_offset) >= threshold
-                    });
-                if workload.is_native_stream_append_flush()
-                    || workload.is_native_stream_flush_publish()
-                    || threshold_flush
-                {
-                    let stream = state
-                        .stream_append
-                        .as_ref()
-                        .map(|stream| stream.stream.clone())
-                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
-                    let previous_durable = state
-                        .stream_append
-                        .as_ref()
-                        .map(|stream| stream.durable_offset)
-                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
-                    let mark = context.store.flush_append_stream(&stream)?;
-                    if let Some(stream_state) = state.stream_append.as_mut() {
-                        progress.durable_bytes = progress
-                            .durable_bytes
-                            .saturating_add(mark.durable_through.saturating_sub(previous_durable));
-                        stream_state.durable_offset = mark.durable_through;
-                        stream_state.durable_mark = Some(mark);
-                    }
-                }
-                let threshold_publish = state
+                let threshold_reached = state
                     .stream_append
                     .as_ref()
                     .zip(config.stream_publish_bytes)
                     .is_some_and(|(stream, threshold)| {
                         stream
-                            .durable_offset
+                            .next_offset
                             .saturating_sub(stream.published_offset)
                             >= threshold
                     });
-                if workload.is_native_stream_flush_publish() || threshold_publish {
+                if should_publish_after_stream_append(workload, threshold_reached) {
                     let stream = state
                         .stream_append
                         .as_ref()
                         .map(|stream| stream.stream.clone())
                         .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
-                    let mark = state
+                    let publish_through = state
                         .stream_append
                         .as_ref()
-                        .and_then(|stream| stream.durable_mark.clone())
-                        .ok_or_else(|| {
-                            StorageError::conflict("append stream has no durable mark")
-                        })?;
+                        .map(|stream| stream.next_offset)
+                        .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
                     let previous_published = state
                         .stream_append
                         .as_ref()
                         .map(|stream| stream.published_offset)
                         .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
-                    context.store.publish_append_stream(&stream, &mark)?;
+                    context.store.publish_append_stream(&stream, publish_through)?;
                     if let Some(stream_state) = state.stream_append.as_mut() {
-                        progress.published_bytes = progress.published_bytes.saturating_add(
-                            mark.durable_through.saturating_sub(previous_published),
-                        );
-                        stream_state.published_offset = mark.durable_through;
+                        progress.published_bytes = progress
+                            .published_bytes
+                            .saturating_add(publish_through.saturating_sub(previous_published));
+                        stream_state.published_offset = publish_through;
                     }
-                    if workload.is_native_stream_flush_publish() {
+                    if workload.is_native_stream_publish_pipelined() {
                         advance_stream_lane(state, files.len());
                     }
                 }
@@ -1167,6 +1384,15 @@ fn run_one_op(
             "workload does not match benchmark target",
         )),
     }
+}
+
+fn should_publish_after_stream_append(workload: Workload, threshold_reached: bool) -> bool {
+    if workload.is_native_stream_ingest() || workload.is_native_stream_publish_server_persisted() {
+        return false;
+    }
+    workload.is_native_stream_publish_prefix()
+        || workload.is_native_stream_publish_pipelined()
+        || threshold_reached
 }
 
 fn maybe_flush(
@@ -1201,21 +1427,7 @@ fn maybe_flush(
                 .flush_device(flush_device)
                 .map(|_| OpProgress::default())
         }
-        Target::Native { .. } if workload.is_native_stream_ingest() => {
-            if let Some(stream_state) = state.stream_append.as_mut() {
-                let previous_durable = stream_state.durable_offset;
-                let mark = context.store.flush_append_stream(&stream_state.stream)?;
-                let durable_through = mark.durable_through;
-                stream_state.durable_offset = durable_through;
-                stream_state.durable_mark = Some(mark);
-                return Ok(OpProgress {
-                    durable_bytes: durable_through.saturating_sub(previous_durable),
-                    published_bytes: 0,
-                    block_batch_profile: None,
-                });
-            }
-            Ok(OpProgress::default())
-        }
+        Target::Native { .. } if workload.is_native_stream_ingest() => Ok(OpProgress::default()),
         Target::Native { keyspace_id, files } => {
             let file_id = if matches!(workload, Workload::NativeHotAppend4k) {
                 files[0]

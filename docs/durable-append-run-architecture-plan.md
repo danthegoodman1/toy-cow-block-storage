@@ -1,7 +1,7 @@
 # Durable Append-Run Architecture Plan
 
 Status: implemented and measured checkpoint
-Scope: native append streams, durable ingest, visible publish, stream GC
+Scope: native append streams, private ingest, publish-prefix persistence, stream GC
 Goal: make append performance scale with large sequential log writes and compact
 metadata publishes, not with per-append segment placement or full-state durable
 persists.
@@ -14,8 +14,9 @@ split:
 ```text
 open stream      -> metadata service fences old writer at visible file head
 append bytes     -> storage-node ingest lanes append bytes to private logs
-flush stream     -> storage nodes sync durable log ranges and record stream mark
-publish stream   -> metadata service attaches durable runs as visible file extents
+submit publish   -> capture a private stream prefix
+wait publish     -> sync captured prefix and attach runs as visible file extents
+release stream   -> explicitly release the writer lease
 gc               -> visible extents and active streams protect only live log ranges
 ```
 
@@ -25,37 +26,38 @@ segment in the node catalog, and used durable-provider persist paths built for
 whole-state or generic segment commits. That made p99 latency follow the burst
 cost of many small segment placements and data-log syncs.
 
-The current implementation stores stream appends as durable append runs and
+The current implementation stores stream appends as append runs and
 publishes those runs as compact file extents. Stream ingest now has one payload
 owner: append-run data, not append-run data plus ordinary segments. Contiguous
-unflushed stream appends coalesce into bounded run records before durable flush,
-and concurrent stream flush waiters batch only requested stream ranges so they
-do not make unrelated private data durable behind its writer.
+unpublished stream appends coalesce into bounded run records before publish
+prefix persistence, and concurrent publish waiters batch only requested stream
+ranges so they do not expose unrelated private data.
 
 The north-star outcome is:
 
 - append ingest is cheap and mostly independent of metadata service latency;
-- durability is a stream-private high-water, not a reader-visible file update;
-- private durability is bearer-token resumability, not logical-name discovery;
-- publish is metadata-only and scales with durable run count;
+- publish is the only public append durability and visibility boundary;
+- private ingest is not a restart-resume contract;
+- publish persists the captured prefix, then performs a compact metadata update;
 - file metadata contains a small number of large extents per publish;
-- GC treats private durable stream data as a first-class root only while the
-  stream is active or resumable.
+- GC treats private stream data as a first-class root only while the stream is
+  active and unreleased.
 
 Measured checkpoint: `target/loadbench/append-run-waiter-batch-final/` records
 the 200 us RTT durable matrix for the append-run implementation. At c16,
 `native-stream-ingest-1m` reached about 3.6 GiB/s with p50 624 us and p99
 70 ms; `native-stream-ingest-32m` reached about 4.9 GiB/s with p50 111 ms and
-p99 159 ms; preflushed publish reached about 923 MiB/s with p50 5.2 ms and p99
-17 ms; flush+publish reached about 1.1 GiB/s with p50 14 ms and p99 42 ms.
+p99 159 ms; server-persisted publish reached about 923 MiB/s with p50 5.2 ms
+and p99 17 ms; publish-pipelined reached about 1.1 GiB/s with p50 14 ms and p99
+42 ms.
 Profile rows show metadata work is generally sub-ms to low-single-digit ms.
-When split by profile `new_segment_bytes`, payload flush rows are dominated by
-bounded data-log sync groups: c16 `native-stream-ingest-1m` 32 MiB flush rows
+When split by profile `new_segment_bytes`, payload prefix-persist rows are dominated by
+bounded data-log sync groups: c16 `native-stream-ingest-1m` 32 MiB prefix-persist rows
 had total p50/p99 about 9.9/15.6 ms, lock wait p99 about 0 ms, and file-sync
-p99 about 14.9 ms; c16 `native-stream-ingest-32m` 32 MiB flush rows had total
+p99 about 14.9 ms; c16 `native-stream-ingest-32m` 32 MiB prefix-persist rows had total
 p50/p99 about 5.6/15.7 ms, lock wait p99 below 1 ms, and file-sync p99 about
 13.1 ms. The higher zero-byte profile tail is publish metadata waiting behind
-an in-flight bounded data-log sync, not stream flush metadata fanout.
+an in-flight bounded data-log sync, not publish metadata fanout.
 
 Read verification was measured separately in
 `target/loadbench/append-run-read-verification/`. At c16 and 200 us RTT,
@@ -69,18 +71,18 @@ The desired appender model is not "every append creates a segment and publishes
 metadata." It is:
 
 ```text
-lease/fence        = control plane
-append log write   = storage-node data plane
-durable mark       = stream-private recovery boundary
-publish            = reader-visible file boundary
+lease/fence          = control plane
+append log write     = storage-node data plane
+submit publish       = captured prefix boundary
+wait publish         = durable reader-visible file boundary
+release/abort        = explicit lease end
 ```
 
-There is intentionally no durable stream registry or resume-by-logical-name API
-in this model. A failover replacement can resume flushed private bytes only if
-it has the matching `AppendStream` token and `DurableAppendMark`. A replacement
-without that authority opens a fresh stream, fences the old stream, and starts
-at the visible file head. WAL-like users that need recovery by file name must
-publish at the interval they want to make globally recoverable.
+There is intentionally no durable stream registry, resume-by-logical-name API,
+or public private-durability mark in this model. A replacement opens a fresh
+stream, fences the old stream, and starts at the visible file head. WAL-like
+users that need recovery by file name must publish at the interval they want to
+make globally recoverable.
 
 A 128 MiB append made from 128 one-MiB client calls should become one durable
 stream run when the physical log range is contiguous, and then one visible file
@@ -102,8 +104,10 @@ The metadata service owns stream identity and fencing:
 
 - `open_append_stream(keyspace_id, file_id) -> AppendStream`
 - `append_stream(stream, bytes) -> AppendTicket`
-- `flush_append_stream(stream) -> DurableAppendMark`
-- `publish_append_stream(stream, mark) -> FileCommit`
+- `submit_append_publish(stream, publish_through) -> AppendPublishTicket`
+- `wait_append_publish(ticket) -> FileCommit`
+- `publish_append_stream(stream, publish_through) -> FileCommit`
+- `release_append_stream(stream)`
 - `abort_append_stream(stream)`
 
 Same-file rules:
@@ -112,8 +116,9 @@ Same-file rules:
 - same-file `write_at` fences the active stream;
 - other files in the same keyspace do not affect the stream;
 - new writers start from the visible file head, not private durable bytes.
-- flushed private data is recoverable only by the matching stream token and
-  durable mark; publish is the first globally discoverable boundary.
+- publish does not release the active stream;
+- release and abort explicitly end the stream;
+- publish is the first globally discoverable and restart-durable boundary.
 
 The metadata service tracks:
 
@@ -126,9 +131,10 @@ AppendStreamState {
   visible_base_version
   visible_base_size
   reserved_tail
+  publishing_high_water
   durable_high_water
   published_high_water
-  status: active | fenced | aborted | published
+  status: active | released | fenced | aborted
 }
 ```
 
@@ -163,47 +169,48 @@ Append lanes should be simple:
 - sequential append-only files;
 - no global `persist_lock` for data ingest;
 - no metadata tree update while ingesting bytes;
-- bounded group sync for durable marks;
-- data-before-metadata ordering for every durable mark.
+- bounded group sync for publish-prefix persistence;
+- data-before-metadata ordering for every publish commit.
 
-`append_stream` may return after bytes are accepted into the local ingest path.
-Only `flush_append_stream` returns a durability guarantee. Automatic flush
-policy may run every configured interval, but explicit flush remains the
-contract boundary.
+`append_stream` returns after bytes are accepted into the local ingest path.
+The server may auto-sync private append-log bytes on implementation-chosen
+boundaries, but that is not a public durability guarantee. Publish is the public
+boundary.
 
-### Durable Mark
+### Publish Prefix
 
-`flush_append_stream` persists private bytes and records a stream high-water:
+`submit_append_publish(stream, publish_through)` captures a stream prefix:
 
 ```text
-DurableAppendMark {
+AppendPublishTicket {
+  ticket_id
   stream_id
   writer_epoch
-  durable_through_file_offset
-  covered_runs
+  publish_through_file_offset
 }
 ```
 
-The durable mark means:
+The captured prefix means:
 
-- bytes through the high-water are restart-resumable by the same stream token;
-- bytes are still invisible to normal file readers;
+- appends above the prefix may continue while publish work runs;
+- bytes through the prefix are invisible until `wait_append_publish` commits;
 - a different writer cannot inherit those private bytes;
-- a later publish may reference only data covered by a durable mark.
+- the publish may reference only data accepted before the captured prefix.
 
 Physical ordering:
 
 1. append bytes to storage-node log files;
 2. sync the touched log files;
 3. persist run manifests and checksum metadata;
-4. persist stream durable high-water;
-5. return `DurableAppendMark`.
+4. publish metadata that references those persisted runs;
+5. return `AppendPublishCommit`.
 
-No generic full-state image persist is allowed on the stream flush hot path.
+No generic full-state image persist is allowed on the publish-prefix persistence
+hot path.
 
 ### Visible Publish
 
-`publish_append_stream(stream, mark)` converts durable private runs into visible
+`wait_append_publish(ticket)` converts the captured private prefix into visible
 file metadata in one atomic file-version transition:
 
 ```text
@@ -216,13 +223,15 @@ FileExtent {
 
 Publish rules:
 
-- publish is metadata-only for already flushed stream data;
-- publish fails if the stream is stale, fenced, or the mark is not covered by
-  the stream durable high-water;
+- publish persists any pending bytes through the captured prefix before metadata
+  references them;
+- publish fails if the stream is stale, fenced, released, aborted, or the prefix
+  is no longer publishable;
 - publish creates the fewest deterministic extents possible by coalescing
   adjacent compatible runs;
 - readers, PITR, forks, and normal metadata traversal see only published
   extents;
+- publish does not release the appender lease;
 - publish failure must not expose partial bytes.
 
 The file tree should store compact run-backed extents, not per-append segment
@@ -251,20 +260,14 @@ clear win.
 On reopen:
 
 - visible file heads are reconstructed from published metadata;
-- active/resumable append streams are reconstructed from durable stream rows and
-  append run manifests;
-- unflushed bytes are ignored;
-- durable-but-unpublished bytes are invisible to readers;
-- the same stream token may resume private durable bytes if it was not fenced;
-- fenced or aborted streams cannot resume.
+- active append streams may be reconstructed as implementation-private cleanup
+  roots, but unpublished bytes are ignored for public recovery;
+- unpublished bytes are invisible to readers;
+- released, fenced, or aborted streams cannot resume.
 
 Crash cases:
 
-- before log sync: no durable mark, no resume;
-- after log sync before run manifest: no returned durable mark, no visible data;
-- after run manifest before stream mark: no returned durable mark, no visible
-  data;
-- after stream mark before publish: resumable by token, invisible;
+- before publish commit: no visible data and no public resume guarantee;
 - after publish commit: visible after reopen.
 
 ### GC
@@ -292,7 +295,7 @@ segment model.
 Remove or replace:
 
 - per-append stream records embedded in durable stream rows;
-- stream flush through generic full-state durable persist;
+- publish-prefix persistence through generic full-state durable persist;
 - stream publish through ordinary segment placement fanout;
 - one-shot append as a performance path;
 - any wrapper that translates the new append-run model back into old per-segment
@@ -308,7 +311,7 @@ Each stage must be committed separately with benchmark CSV under ignored
 
 ### Stage 0: Baseline And Design Alignment
 
-- Record current stream ingest, flush, publish, native write, and block write
+- Record current stream ingest, publish-prefix, native write, and block write
   matrix at 200 us RTT.
 - Add this plan to the implementation plan as the next native append phase.
 - Update the design spec to state that native append publish uses run-backed
@@ -324,11 +327,12 @@ Exit gate:
 ### Stage 1: Append Run Types In The Deterministic Core
 
 - Add core types for append log runs, run ranges, payload-integrity policy,
-  durable marks, and run-backed file extents.
+  publish prefixes, and run-backed file extents.
 - Update metadata validation to accept run-backed extents beside existing
   segment-backed extents where native files need them.
 - Add deterministic coalescing rules for adjacent compatible run ranges.
-- Add reference-model tests for append, flush, publish, recovery, and fencing.
+- Add reference-model tests for append, publish-prefix persistence, recovery,
+  and fencing.
 
 Exit gate:
 
@@ -350,25 +354,27 @@ Exit gate:
 
 - `append_stream` does not create ordinary segment placements;
 - stream ingest has one payload owner and one durable data layout;
-- unflushed stream bytes are not restart-resumable;
+- unpublished stream bytes are not restart-resumable;
 - c16 `native-stream-ingest-1m` p50 is sub-ms except when the operation performs
-  its own flush boundary;
+  its own publish boundary;
 - profiles show no global persist lock wait on stream ingest.
 
 ### Stage 3: Durable Stream Mark Persistence
 
-- Persist append run manifests and stream durable high-water without generic
-  full-state persist.
-- Load resumable stream state from durable rows and manifests.
+- Persist accepted append run manifests for a captured publish prefix without
+  generic full-state persist.
+- Reopen ignores unpublished stream state for public recovery.
 - Add failure injection at each data-before-metadata boundary.
 - Ensure new writers fence old streams and start from visible head.
 
 Exit gate:
 
-- after returned durable mark, same token can resume after reopen;
-- after crash before mark, data is invisible and not resumable;
-- unrelated generic durable persists do not make unflushed stream data durable;
-- c16 stream flush p99 is dominated by physical sync, not metadata or lock wait.
+- after publish commit, bytes are visible after reopen;
+- after crash before publish, data is invisible and not resumable through the
+  public API;
+- unrelated generic durable persists do not make unpublished stream data visible;
+- c16 publish-prefix persistence p99 is dominated by physical sync, not metadata
+  or lock wait.
 
 ### Stage 4: Compact Visible Publish
 
@@ -444,10 +450,10 @@ docker compose exec dev cargo bench --bench regression -- --test
 
 docker compose exec dev cargo run --release --bin loadbench -- \
   --provider durable --durability ack \
-  --workloads native-stream-ingest-1m,native-stream-ingest-4m,native-stream-ingest-32m,native-stream-publish-preflushed-1m,native-stream-flush-publish-1m,native-write-1m,block-write-4k,block-read-4k,native-read-4k \
+  --workloads native-stream-ingest-1m,native-stream-ingest-4m,native-stream-ingest-32m,native-stream-publish-prefix-1m,native-stream-publish-pipelined-1m,native-write-1m,block-write-4k,block-read-4k,native-read-4k \
   --duration-ms 1000 --warmup-ms 100 --concurrency 1,4,16 --files 128 \
   --rtt-us 200 --delay-mode spin \
-  --stream-flush-mib 16 --stream-publish-mib 128 \
+  --stream-publish-mib 128 \
   --durable-profile-csv target/loadbench/<stage>/profile.csv
 
 docker compose down
@@ -470,13 +476,12 @@ obviously hardware or configured durability policy, not metadata shape.
 
 Acceptance targets in a happy local environment with 200 us modeled RTT:
 
-- `append_stream` ingest p50 stays sub-ms when it does not cross a flush
-  boundary;
-- stream flush p99 tracks bounded physical sync group size, not number of
-  append calls;
+- `append_stream` ingest p50 stays sub-ms when it does not wait for publish;
+- publish-prefix persistence p99 tracks bounded physical sync group size, not
+  number of append calls;
 - publish p99 is single-digit to low double-digit ms for a 128 MiB publish;
 - publish metadata entries scale with run count, not append call count;
-- c16 1 MiB stream ingest reaches multi-GB/s when flush/publish intervals are
+- c16 1 MiB stream ingest reaches multi-GB/s when publish intervals are
   large enough to amortize durability;
 - block and ordinary native write paths do not regress by more than 5 percent
   unless the stage explicitly changes shared storage-node logic and explains

@@ -316,18 +316,36 @@ impl NativeServer for LocalNativeServer {
                         ))
                     }
                 }
-                NativeRequest::FlushAppendStream {
+                NativeRequest::SubmitAppendPublish {
                     keyspace_id,
                     file_id,
                     stream,
+                    publish_through,
                 } => {
                     if keyspace_id != stream.keyspace_id || file_id != stream.file_id {
                         Err(StorageError::invalid_argument(
                             "append stream target does not match request target",
                         ))
                     } else {
-                        Ok(NativeResponse::DurableAppendMark(
-                            self.store.flush_append_stream(&stream)?,
+                        Ok(NativeResponse::AppendPublishSubmitted(
+                            self.store
+                                .submit_append_publish(&stream, publish_through)?,
+                        ))
+                    }
+                }
+                NativeRequest::WaitAppendPublish {
+                    keyspace_id,
+                    file_id,
+                    ticket,
+                } => {
+                    if keyspace_id != ticket.keyspace_id || file_id != ticket.file_id {
+                        Err(StorageError::invalid_argument(
+                            "append publish target does not match ticket",
+                        ))
+                    } else {
+                        Ok(NativeResponse::AppendPublished(
+                            self.store
+                                .wait_append_publish(&ticket, WriteDurability::Acknowledged)?,
                         ))
                     }
                 }
@@ -335,7 +353,7 @@ impl NativeServer for LocalNativeServer {
                     keyspace_id,
                     file_id,
                     stream,
-                    mark,
+                    publish_through,
                 } => {
                     if keyspace_id != stream.keyspace_id || file_id != stream.file_id {
                         Err(StorageError::invalid_argument(
@@ -345,10 +363,24 @@ impl NativeServer for LocalNativeServer {
                         Ok(NativeResponse::AppendPublished(
                             self.store.publish_append_stream(
                                 &stream,
-                                &mark,
+                                publish_through,
                                 WriteDurability::Acknowledged,
                             )?,
                         ))
+                    }
+                }
+                NativeRequest::ReleaseAppendStream {
+                    keyspace_id,
+                    file_id,
+                    stream,
+                } => {
+                    if keyspace_id != stream.keyspace_id || file_id != stream.file_id {
+                        Err(StorageError::invalid_argument(
+                            "append stream target does not match request target",
+                        ))
+                    } else {
+                        self.store.release_append_stream(&stream)?;
+                        Ok(NativeResponse::AppendReleased)
                     }
                 }
                 NativeRequest::AbortAppendStream {

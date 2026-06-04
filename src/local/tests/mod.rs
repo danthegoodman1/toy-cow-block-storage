@@ -646,9 +646,12 @@ impl ProviderConformanceStore for LocalCoordinator {
         data: &[u8],
     ) -> Result<AppendPublishCommit> {
         let stream = self.open_append_stream(keyspace_id, file_id)?;
-        self.append_stream(&stream, data, WriteDurability::Acknowledged)?;
-        let mark = self.flush_append_stream(&stream)?;
-        self.publish_append_stream(&stream, &mark, WriteDurability::Acknowledged)
+        let ticket = self.append_stream(&stream, data, WriteDurability::Acknowledged)?;
+        self.publish_append_stream(
+            &stream,
+            ticket.range.end_exclusive()?,
+            WriteDurability::Acknowledged,
+        )
     }
 
     fn read_file_for_conformance(
@@ -738,9 +741,8 @@ impl ProviderConformanceStore for DurableCoordinator {
         data: &[u8],
     ) -> Result<AppendPublishCommit> {
         let stream = self.open_append_stream(keyspace_id, file_id)?;
-        self.append_stream(&stream, data, WriteDurability::Acknowledged)?;
-        let mark = self.flush_append_stream(&stream)?;
-        self.publish_append_stream(&stream, &mark)
+        let ticket = self.append_stream(&stream, data, WriteDurability::Acknowledged)?;
+        self.publish_append_stream(&stream, ticket.range.end_exclusive()?)
     }
 
     fn read_file_for_conformance(
@@ -3021,8 +3023,8 @@ fn durable_acknowledged_block_prestage_does_not_wait_for_persist_lock() {
 }
 
 #[test]
-fn durable_acknowledged_append_stream_ingests_private_data_without_cataloging_before_flush() {
-    let root = durable_temp_dir("stream-ack-private-memory-before-flush");
+fn durable_acknowledged_append_stream_ingests_private_data_without_cataloging_before_publish() {
+    let root = durable_temp_dir("stream-ack-private-memory-before-publish");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let keyspace_id = store
@@ -3057,14 +3059,22 @@ fn durable_acknowledged_append_stream_ingests_private_data_without_cataloging_be
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
-    assert!(reopened.flush_append_stream(&stream).is_err());
+    assert!(
+        reopened
+            .publish_append_stream(&stream, stream.visible_base_size + 4096)
+            .is_err()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn durable_append_stream_flush_profiles_are_bounded_sync_groups() {
-    let root = durable_temp_dir("stream-flush-bounded-groups");
-    let cfg = config();
+fn durable_append_stream_publish_prefix_profiles_are_bounded_sync_groups() {
+    let root = durable_temp_dir("stream-publish-prefix-bounded-groups");
+    let cfg = LocalStoreConfig {
+        file_root_blocks: 48 * 1024,
+        metadata_leaf_blocks: 48 * 1024,
+        ..config()
+    };
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let keyspace_id = store
         .create_keyspace(CreateKeyspaceRequest {
@@ -3091,26 +3101,25 @@ fn durable_append_stream_flush_profiles_are_bounded_sync_groups() {
             .append_stream(&stream, &one_mib, WriteDurability::Acknowledged)
             .unwrap();
     }
-    let preflush_state = store.local.metadata.state_inner().unwrap();
-    let preflush_runs = &preflush_state
+    let prepublish_state = store.local.metadata.state_inner().unwrap();
+    let prepublish_runs = &prepublish_state
         .append_streams
         .get(&stream.stream_id)
         .unwrap()
         .records;
     assert_eq!(
-        preflush_runs.len(),
+        prepublish_runs.len(),
         2,
         "stream rows should store bounded append runs, not one record per client append"
     );
-    assert_eq!(preflush_runs[0].len, MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES);
-    assert_eq!(preflush_runs[1].len, 8 * 1024 * 1024);
+    assert_eq!(prepublish_runs[0].len, MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES);
+    assert_eq!(prepublish_runs[1].len, 8 * 1024 * 1024);
 
-    let mark = store.flush_append_stream(&stream).unwrap();
-    assert_eq!(mark.durable_through, total_bytes);
+    store.publish_append_stream(&stream, total_bytes).unwrap();
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(
         profiles.len() >= 2,
-        "cap-plus stream flush should require multiple bounded physical persists"
+        "cap-plus stream publish should require multiple bounded physical persists"
     );
     assert!(
         profiles
@@ -3128,8 +3137,8 @@ fn durable_append_stream_flush_profiles_are_bounded_sync_groups() {
 }
 
 #[test]
-fn durable_append_stream_flush_collapses_many_appends_into_one_run_extent() {
-    let root = durable_temp_dir("stream-flush-collapses-appends");
+fn durable_append_stream_prefix_persist_collapses_many_appends_into_one_run_extent() {
+    let root = durable_temp_dir("stream-prefix-persist-collapses-appends");
     let cfg = LocalStoreConfig {
         file_root_blocks: 16 * 1024,
         metadata_leaf_blocks: 16 * 1024,
@@ -3158,27 +3167,27 @@ fn durable_append_stream_flush_collapses_many_appends_into_one_run_extent() {
             .append_stream(&stream, &one_mib, WriteDurability::Acknowledged)
             .unwrap();
     }
-    let preflush_state = store.local.metadata.state_inner().unwrap();
+    let prepublish_state = store.local.metadata.state_inner().unwrap();
     assert_eq!(
-        preflush_state
+        prepublish_state
             .append_streams
             .get(&stream.stream_id)
             .unwrap()
             .records
             .len(),
         1,
-        "stream rows should coalesce contiguous ingest before durable flush"
+        "stream rows should coalesce contiguous ingest before publish-prefix persistence"
     );
 
-    let mark = store.flush_append_stream(&stream).unwrap();
-    assert_eq!(mark.durable_through, 16 * 1024 * 1024);
-    store.publish_append_stream(&stream, &mark).unwrap();
+    store
+        .publish_append_stream(&stream, 16 * 1024 * 1024)
+        .unwrap();
 
     let run_extents = file_run_extents(&store.metadata(), keyspace_id, file_id);
     assert_eq!(
         run_extents.len(),
         1,
-        "one bounded flush group should publish one run extent, not one extent per append"
+        "one bounded prefix-persist group should publish one run extent, not one extent per append"
     );
     assert_eq!(run_extents[0].payload_len, 16 * 1024 * 1024);
 
@@ -3242,10 +3251,12 @@ fn durable_append_stream_lanes_keep_interleaved_files_coalescible() {
             .unwrap();
     }
 
-    let mark_a = store.flush_append_stream(&stream_a).unwrap();
-    let mark_b = store.flush_append_stream(&stream_b).unwrap();
-    store.publish_append_stream(&stream_a, &mark_a).unwrap();
-    store.publish_append_stream(&stream_b, &mark_b).unwrap();
+    store
+        .publish_append_stream(&stream_a, 8 * 1024 * 1024)
+        .unwrap();
+    store
+        .publish_append_stream(&stream_b, 8 * 1024 * 1024)
+        .unwrap();
 
     let extents_a = file_run_extents(&store.metadata(), keyspace_id, file_a);
     let extents_b = file_run_extents(&store.metadata(), keyspace_id, file_b);
@@ -3259,9 +3270,13 @@ fn durable_append_stream_lanes_keep_interleaved_files_coalescible() {
 }
 
 #[test]
-fn durable_concurrent_append_stream_flushes_do_not_overdrain_other_streams() {
-    let root = durable_temp_dir("stream-flush-no-overdrain");
-    let cfg = config();
+fn durable_concurrent_append_stream_publishes_do_not_overdrain_other_streams() {
+    let root = durable_temp_dir("stream-publish-no-overdrain");
+    let cfg = LocalStoreConfig {
+        file_root_blocks: 16 * 1024,
+        metadata_leaf_blocks: 16 * 1024,
+        ..config()
+    };
     let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
     let keyspace_id = store
         .create_keyspace(CreateKeyspaceRequest {
@@ -3298,34 +3313,40 @@ fn durable_concurrent_append_stream_flushes_do_not_overdrain_other_streams() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            store.flush_append_stream(&stream).unwrap()
+            store
+                .publish_append_stream(&stream, 16 * 1024 * 1024)
+                .unwrap()
         }));
     }
     barrier.wait();
 
-    let marks: Vec<_> = handles
+    let commits: Vec<_> = handles
         .into_iter()
         .map(|handle| handle.join().unwrap())
         .collect();
     assert!(
-        marks
+        commits
             .iter()
-            .all(|mark| mark.durable_through == 16 * 1024 * 1024)
+            .all(|commit| commit.range.end_exclusive().unwrap() == 16 * 1024 * 1024)
     );
     let profiles = store.drain_persist_profiles(16).unwrap();
+    let data_profiles: Vec<_> = profiles
+        .iter()
+        .filter(|profile| profile.new_segment_bytes > 0)
+        .collect();
     assert!(
-        (2..=4).contains(&profiles.len()),
-        "flush runners may batch waiting streams, but must not overdrain non-waiters"
+        (2..=4).contains(&data_profiles.len()),
+        "publish waiters may batch prefix persistence, but must not overdrain non-waiters"
     );
     assert_eq!(
-        profiles
+        data_profiles
             .iter()
             .map(|profile| profile.new_segment_bytes)
             .sum::<u64>(),
         4 * 16 * 1024 * 1024
     );
     assert!(
-        profiles
+        data_profiles
             .iter()
             .all(|profile| profile.new_segment_bytes <= MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES)
     );
@@ -3338,7 +3359,7 @@ fn durable_concurrent_append_stream_flushes_do_not_overdrain_other_streams() {
 }
 
 #[test]
-fn stream_flush_request_table_keeps_same_stream_waiters() {
+fn stream_prefix_persist_request_table_keeps_same_stream_waiters() {
     let stream = AppendStream {
         keyspace_id: KeyspaceId::from_raw(1),
         file_id: FileId::from_raw(2),
@@ -3347,7 +3368,7 @@ fn stream_flush_request_table_keeps_same_stream_waiters() {
         base_version: FileVersion::from_raw(5),
         visible_base_size: 0,
     };
-    let mut state = StreamFlushCoordinatorState {
+    let mut state = StreamPrefixPersistCoordinatorState {
         in_flight: false,
         generation: 0,
         requests: BTreeMap::new(),
@@ -3372,8 +3393,8 @@ fn stream_flush_request_table_keeps_same_stream_waiters() {
 }
 
 #[test]
-fn durable_stream_publish_does_not_flush_unrelated_private_stream_data() {
-    let root = durable_temp_dir("stream-publish-leaves-private-data-unflushed");
+fn durable_stream_publish_does_not_persist_unrelated_private_stream_data() {
+    let root = durable_temp_dir("stream-publish-leaves-private-data-unpublished");
     let cfg = LocalStoreConfig {
         file_root_blocks: 16 * 1024,
         ..config()
@@ -3411,9 +3432,6 @@ fn durable_stream_publish_does_not_flush_unrelated_private_stream_data() {
     store
         .append_stream(&target_stream, &one_mib, WriteDurability::Acknowledged)
         .unwrap();
-    let target_mark = store.flush_append_stream(&target_stream).unwrap();
-    assert_eq!(target_mark.durable_through, 1024 * 1024);
-    let _ = store.drain_persist_profiles(16).unwrap();
 
     let private_stream = store.open_append_stream(keyspace_id, private_file).unwrap();
     for _ in 0..40 {
@@ -3423,7 +3441,7 @@ fn durable_stream_publish_does_not_flush_unrelated_private_stream_data() {
     }
 
     store
-        .publish_append_stream(&target_stream, &target_mark)
+        .publish_append_stream(&target_stream, 1024 * 1024)
         .unwrap();
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(
@@ -3440,24 +3458,24 @@ fn durable_stream_publish_does_not_flush_unrelated_private_stream_data() {
             .iter()
             .map(|profile| profile.new_segment_bytes)
             .sum::<u64>(),
-        0,
-        "publishing one stream must not persist unrelated unflushed private bytes"
+        1024 * 1024,
+        "publishing one stream must persist only that stream's requested prefix"
     );
     drop(store);
 
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
     assert!(
         matches!(
-            reopened.flush_append_stream(&private_stream),
+            reopened.publish_append_stream(&private_stream, 40 * 1024 * 1024),
             Err(StorageError::Conflict { reason }) if reason == "stale append stream"
         ),
-        "unflushed private stream tokens must not become resumable through unrelated publish"
+        "unpublished private stream tokens must not become publishable through unrelated publish"
     );
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn durable_append_stream_publish_delta_does_not_reappend_flushed_payloads() {
+fn durable_append_stream_publish_delta_does_not_reappend_persisted_payloads() {
     let root = durable_temp_dir("stream-publish-no-reappend");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -3482,26 +3500,22 @@ fn durable_append_stream_publish_delta_does_not_reappend_flushed_payloads() {
     store
         .append_stream(&stream, &payload, WriteDurability::Acknowledged)
         .unwrap();
-    let mark = store.flush_append_stream(&stream).unwrap();
-    let flush_profiles = store.drain_persist_profiles(8).unwrap();
-    assert_eq!(flush_profiles.len(), 1);
-    assert_eq!(flush_profiles[0].new_segment_bytes, 4096);
-    assert!(flush_profiles[0].data_log_files_synced > 0);
-    assert!(flush_profiles[0].data_log_file_sync_max_nanos > 0);
-    assert!(flush_profiles[0].node_catalog_manifest_rows > 0);
-    assert_eq!(flush_profiles[0].node_catalog_placement_rows, 0);
-    assert_eq!(flush_profiles[0].node_catalog_segment_rows, 0);
-
-    store.publish_append_stream(&stream, &mark).unwrap();
+    store.publish_append_stream(&stream, 4096).unwrap();
     let publish_profiles = store.drain_persist_profiles(8).unwrap();
-    assert_eq!(publish_profiles.len(), 1);
-    assert_eq!(publish_profiles[0].new_segment_count, 0);
-    assert_eq!(publish_profiles[0].new_segment_bytes, 0);
-    assert_eq!(publish_profiles[0].data_log_append_sync_nanos, 0);
-    assert_eq!(publish_profiles[0].data_log_encode_nanos, 0);
-    assert_eq!(publish_profiles[0].data_log_write_nanos, 0);
-    assert_eq!(publish_profiles[0].data_log_file_sync_nanos, 0);
-    assert_eq!(publish_profiles[0].data_log_dir_sync_nanos, 0);
+    assert_eq!(publish_profiles.len(), 2);
+    assert_eq!(publish_profiles[0].new_segment_bytes, 4096);
+    assert!(publish_profiles[0].data_log_files_synced > 0);
+    assert!(publish_profiles[0].data_log_file_sync_max_nanos > 0);
+    assert!(publish_profiles[0].node_catalog_manifest_rows > 0);
+    assert_eq!(publish_profiles[0].node_catalog_placement_rows, 0);
+    assert_eq!(publish_profiles[0].node_catalog_segment_rows, 0);
+    assert_eq!(publish_profiles[1].new_segment_count, 0);
+    assert_eq!(publish_profiles[1].new_segment_bytes, 0);
+    assert_eq!(publish_profiles[1].data_log_append_sync_nanos, 0);
+    assert_eq!(publish_profiles[1].data_log_encode_nanos, 0);
+    assert_eq!(publish_profiles[1].data_log_write_nanos, 0);
+    assert_eq!(publish_profiles[1].data_log_file_sync_nanos, 0);
+    assert_eq!(publish_profiles[1].data_log_dir_sync_nanos, 0);
     let head = store
         .local
         .metadata
@@ -3578,14 +3592,14 @@ fn durable_append_stream_publish_delta_is_target_bounded() {
     store
         .append_stream(&stream_a, &payload_a, WriteDurability::Acknowledged)
         .unwrap();
-    let mark_a = store.flush_append_stream(&stream_a).unwrap();
+    store.persist_append_stream_prefix(&stream_a, 4096).unwrap();
 
     let stream_b = store.open_append_stream(keyspace_id, file_b).unwrap();
     let payload_b = repeated_blocks(1, 62);
     store
         .append_stream(&stream_b, &payload_b, WriteDurability::Acknowledged)
         .unwrap();
-    let mark_b = store.flush_append_stream(&stream_b).unwrap();
+    store.persist_append_stream_prefix(&stream_b, 4096).unwrap();
     let _ = store.drain_persist_profiles(16).unwrap();
 
     let changed_a = BTreeSet::new();
@@ -3593,11 +3607,11 @@ fn durable_append_stream_publish_delta_is_target_bounded() {
 
     let commit_a = store
         .local
-        .publish_append_stream(&stream_a, &mark_a, WriteDurability::Flushed)
+        .publish_append_stream(&stream_a, 4096, WriteDurability::Flushed)
         .unwrap();
     let commit_b = store
         .local
-        .publish_append_stream(&stream_b, &mark_b, WriteDurability::Flushed)
+        .publish_append_stream(&stream_b, 4096, WriteDurability::Flushed)
         .unwrap();
     assert!(commit_b.commit_seq > commit_a.commit_seq);
 
@@ -3684,7 +3698,7 @@ fn durable_append_stream_publish_delta_does_not_wait_for_data_log_persist_lock()
     store
         .append_stream(&stream, &payload, WriteDurability::Acknowledged)
         .unwrap();
-    let mark = store.flush_append_stream(&stream).unwrap();
+    store.persist_append_stream_prefix(&stream, 4096).unwrap();
     store.enable_persist_profiling(16).unwrap();
 
     let persist_guard = lock(&store.persist_lock).unwrap();
@@ -3692,9 +3706,8 @@ fn durable_append_stream_publish_delta_does_not_wait_for_data_log_persist_lock()
     let worker = {
         let store = Arc::clone(&store);
         let stream = stream.clone();
-        let mark = mark.clone();
         thread::spawn(move || {
-            let result = store.publish_append_stream(&stream, &mark);
+            let result = store.publish_append_stream(&stream, 4096);
             tx.send(result.map(|_| ())).unwrap();
         })
     };
@@ -3762,22 +3775,22 @@ fn durable_concurrent_append_stream_publish_persists_to_requested_high_water() {
     store
         .append_stream(&stream_a, &payload_a, WriteDurability::Acknowledged)
         .unwrap();
-    let mark_a = store.flush_append_stream(&stream_a).unwrap();
+    store.persist_append_stream_prefix(&stream_a, 4096).unwrap();
 
     let stream_b = store.open_append_stream(keyspace_id, file_b).unwrap();
     let payload_b = repeated_blocks(1, 64);
     store
         .append_stream(&stream_b, &payload_b, WriteDurability::Acknowledged)
         .unwrap();
-    let mark_b = store.flush_append_stream(&stream_b).unwrap();
+    store.persist_append_stream_prefix(&stream_b, 4096).unwrap();
 
     let commit_a = store
         .local
-        .publish_append_stream(&stream_a, &mark_a, WriteDurability::Flushed)
+        .publish_append_stream(&stream_a, 4096, WriteDurability::Flushed)
         .unwrap();
     let commit_b = store
         .local
-        .publish_append_stream(&stream_b, &mark_b, WriteDurability::Flushed)
+        .publish_append_stream(&stream_b, 4096, WriteDurability::Flushed)
         .unwrap();
     assert!(commit_b.commit_seq > commit_a.commit_seq);
 
@@ -3819,12 +3832,18 @@ fn durable_concurrent_append_stream_publish_persists_to_requested_high_water() {
 
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert_eq!(
-        profiles.len(),
-        1,
-        "concurrent publish waiters should share one target-bounded physical persist"
+        profiles
+            .iter()
+            .map(|profile| profile.new_segment_bytes)
+            .sum::<u64>(),
+        0,
+        "metadata publish persistence should not reappend stream payload bytes"
     );
-    assert_eq!(profiles[0].new_segment_bytes, 0);
-    assert!(profiles[0].durable_commit_high_water >= commit_b.commit_seq.raw());
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.durable_commit_high_water >= commit_b.commit_seq.raw())
+    );
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -5979,7 +5998,7 @@ fn durable_native_read_plan_assembles_segments_and_published_append_runs() {
 }
 
 #[test]
-fn durable_native_read_ignores_flushed_unpublished_append_stream_bytes() {
+fn durable_native_read_ignores_unpublished_append_stream_bytes() {
     let root = durable_temp_dir("read-plan-unpublished-stream");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -5999,7 +6018,6 @@ fn durable_native_read_ignores_flushed_unpublished_append_stream_bytes() {
     store
         .append_stream(&stream, &payload, WriteDurability::Acknowledged)
         .unwrap();
-    let mark = store.flush_append_stream(&stream).unwrap();
 
     let mut bytes = vec![0; 4096];
     assert!(
@@ -6008,7 +6026,7 @@ fn durable_native_read_ignores_flushed_unpublished_append_stream_bytes() {
             .is_err()
     );
 
-    store.publish_append_stream(&stream, &mark).unwrap();
+    store.publish_append_stream(&stream, 4096).unwrap();
     store
         .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
         .unwrap();
@@ -7415,7 +7433,7 @@ fn durable_append_stream_open_does_not_persist_writer_epoch() {
 }
 
 #[test]
-fn durable_unflushed_append_streams_fail_after_reopen_even_when_epoch_repeats() {
+fn durable_unpublished_append_streams_fail_after_reopen_even_when_epoch_repeats() {
     let root = durable_temp_dir("native-restart-stale-stream");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -7558,7 +7576,209 @@ fn same_file_write_at_invalidates_append_stream_without_touching_other_files() {
 }
 
 #[test]
-fn durable_reopen_invalidates_unflushed_append_streams() {
+fn durable_publish_does_not_revoke_append_stream() {
+    let root = durable_temp_dir("native-publish-keeps-stream-active");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let first = store
+        .append_stream(&stream, b"one", WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .publish_append_stream(&stream, first.range.end_exclusive().unwrap())
+        .unwrap();
+
+    let second = store
+        .append_stream(&stream, b"two", WriteDurability::Acknowledged)
+        .unwrap();
+    let commit = store
+        .publish_append_stream(&stream, second.range.end_exclusive().unwrap())
+        .unwrap();
+    assert_eq!(commit.range, ByteRange::new(3, 3));
+
+    let mut bytes = vec![0; b"onetwo".len()];
+    store
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, bytes.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"onetwo");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_release_append_stream_revokes_token_and_discards_private_tail() {
+    let root = durable_temp_dir("native-release-revokes-stream");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let published = store
+        .append_stream(&stream, b"published", WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .publish_append_stream(&stream, published.range.end_exclusive().unwrap())
+        .unwrap();
+    let private = store
+        .append_stream(&stream, b"private", WriteDurability::Acknowledged)
+        .unwrap();
+    store.release_append_stream(&stream).unwrap();
+
+    assert!(
+        store
+            .append_stream(&stream, b"after", WriteDurability::Acknowledged)
+            .is_err()
+    );
+    assert!(
+        store
+            .submit_append_publish(&stream, private.range.end_exclusive().unwrap())
+            .is_err()
+    );
+    assert!(store.release_append_stream(&stream).is_err());
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        b"published".len() as u64
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; b"published".len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, bytes.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"published");
+    assert_eq!(
+        reopened
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        b"published".len() as u64
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_submitted_publish_captures_prefix_while_later_appends_continue() {
+    let root = durable_temp_dir("native-ticket-captures-prefix");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let first = repeated_blocks(1, 7);
+    let second = repeated_blocks(1, 8);
+    store
+        .append_stream(&stream, &first, WriteDurability::Acknowledged)
+        .unwrap();
+    let ticket = store
+        .submit_append_publish(&stream, first.len() as u64)
+        .unwrap();
+    let mut forged_ticket = ticket.clone();
+    forged_ticket.ticket_id = AppendPublishTicketId::from_raw(ticket.ticket_id.raw() + 1);
+    assert!(store.wait_append_publish(&forged_ticket).is_err());
+    store
+        .append_stream(&stream, &second, WriteDurability::Acknowledged)
+        .unwrap();
+
+    let first_commit = store.wait_append_publish(&ticket).unwrap();
+    assert_eq!(store.wait_append_publish(&ticket).unwrap(), first_commit);
+    assert_eq!(first_commit.range, ByteRange::new(0, first.len() as u64));
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        first.len() as u64
+    );
+    let mut first_bytes = vec![0; first.len()];
+    store
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, first.len() as u64),
+            &mut first_bytes,
+        )
+        .unwrap();
+    assert_eq!(first_bytes, first);
+
+    let full_len = (first.len() + second.len()) as u64;
+    let second_commit = store.publish_append_stream(&stream, full_len).unwrap();
+    assert_eq!(
+        second_commit.range,
+        ByteRange::new(first.len() as u64, second.len() as u64)
+    );
+    let mut all_bytes = vec![0; first.len() + second.len()];
+    store
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, full_len),
+            &mut all_bytes,
+        )
+        .unwrap();
+    assert_eq!(&all_bytes[..first.len()], first.as_slice());
+    assert_eq!(&all_bytes[first.len()..], second.as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_reopen_invalidates_unpublished_append_streams() {
     let root = durable_temp_dir("native-restart-stale-stream");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -7584,7 +7804,11 @@ fn durable_reopen_invalidates_unflushed_append_streams() {
     drop(store);
 
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
-    assert!(reopened.flush_append_stream(&stream).is_err());
+    assert!(
+        reopened
+            .publish_append_stream(&stream, b"stale".len() as u64)
+            .is_err()
+    );
     append_durable_store_once(
         &reopened,
         keyspace_id,
@@ -7608,8 +7832,8 @@ fn durable_reopen_invalidates_unflushed_append_streams() {
 }
 
 #[test]
-fn unrelated_persist_does_not_make_unflushed_append_bytes_resumable() {
-    let root = durable_temp_dir("native-stream-unflushed-private-pruned");
+fn unrelated_persist_does_not_make_unpublished_append_bytes_resumable() {
+    let root = durable_temp_dir("native-stream-unpublished-private-pruned");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let keyspace_id = store
@@ -7652,10 +7876,11 @@ fn unrelated_persist_does_not_make_unflushed_append_bytes_resumable() {
     drop(store);
 
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
-    let mark = reopened.flush_append_stream(&stream).unwrap();
-    assert_eq!(mark.durable_through, stream.visible_base_size);
-    let no_op = reopened.publish_append_stream(&stream, &mark).unwrap();
-    assert_eq!(no_op.range.len, 0);
+    assert!(
+        reopened
+            .publish_append_stream(&stream, b"private".len() as u64)
+            .is_err()
+    );
     assert_eq!(
         reopened
             .metadata()
@@ -7665,7 +7890,8 @@ fn unrelated_persist_does_not_make_unflushed_append_bytes_resumable() {
         0
     );
 
-    append_durable_store_with_stream(&reopened, &stream, b"new", WriteDurability::Acknowledged)
+    let fresh = reopened.open_append_stream(keyspace_id, file_id).unwrap();
+    append_durable_store_with_stream(&reopened, &fresh, b"new", WriteDurability::Acknowledged)
         .unwrap();
     let mut bytes = vec![0; b"new".len()];
     reopened
@@ -7681,8 +7907,8 @@ fn unrelated_persist_does_not_make_unflushed_append_bytes_resumable() {
 }
 
 #[test]
-fn durable_append_stream_flush_is_invisible_until_publish_and_resumable_after_reopen() {
-    let root = durable_temp_dir("native-stream-flush-invisible");
+fn durable_unpublished_stream_is_invisible_and_not_resumable_after_reopen() {
+    let root = durable_temp_dir("native-stream-unpublished-invisible");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let keyspace_id = store
@@ -7704,8 +7930,6 @@ fn durable_append_stream_flush_is_invisible_until_publish_and_resumable_after_re
     store
         .append_stream(&stream, b"private", WriteDurability::Acknowledged)
         .unwrap();
-    let mark = store.flush_append_stream(&stream).unwrap();
-    assert_eq!(mark.durable_through, b"private".len() as u64);
     assert_eq!(
         store
             .metadata()
@@ -7736,22 +7960,16 @@ fn durable_append_stream_flush_is_invisible_until_publish_and_resumable_after_re
             .size,
         0
     );
-    reopened.publish_append_stream(&stream, &mark).unwrap();
-    let mut visible = vec![0; b"private".len()];
-    reopened
-        .read_file(
-            keyspace_id,
-            file_id,
-            ByteRange::new(0, visible.len() as u64),
-            &mut visible,
-        )
-        .unwrap();
-    assert_eq!(visible, b"private");
+    assert!(
+        reopened
+            .publish_append_stream(&stream, b"private".len() as u64)
+            .is_err()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn durable_flushed_stream_resume_requires_matching_bearer_token() {
+fn durable_unpublished_stream_cannot_be_resumed_by_token_after_reopen() {
     let root = durable_temp_dir("native-stream-token-authority");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -7783,8 +8001,6 @@ fn durable_flushed_stream_resume_requires_matching_bearer_token() {
     store
         .append_stream(&stream, b"private", WriteDurability::Acknowledged)
         .unwrap();
-    let mark = store.flush_append_stream(&stream).unwrap();
-    assert_eq!(mark.durable_through, b"baseprivate".len() as u64);
     assert_eq!(
         store
             .metadata()
@@ -7800,21 +8016,18 @@ fn durable_flushed_stream_resume_requires_matching_bearer_token() {
     forged_stream.stream_id = AppendStreamId::from_raw(stream.stream_id.raw() + 1);
     assert!(
         reopened
-            .publish_append_stream(&forged_stream, &mark)
+            .publish_append_stream(&forged_stream, b"baseprivate".len() as u64)
             .is_err(),
-        "logical file identity alone must not resume private durable bytes"
+        "logical file identity alone must not resume private bytes"
     );
-    let mut forged_mark = mark.clone();
-    forged_mark.stream_id = forged_stream.stream_id;
     assert!(
         reopened
-            .publish_append_stream(&stream, &forged_mark)
+            .publish_append_stream(&stream, b"baseprivate".len() as u64)
             .is_err(),
-        "durable marks are bound to the original stream token"
+        "unpublished private bytes are not a public restart-resume contract"
     );
 
-    reopened.publish_append_stream(&stream, &mark).unwrap();
-    let mut bytes = vec![0; b"baseprivate".len()];
+    let mut bytes = vec![0; b"base".len()];
     reopened
         .read_file(
             keyspace_id,
@@ -7823,7 +8036,7 @@ fn durable_flushed_stream_resume_requires_matching_bearer_token() {
             &mut bytes,
         )
         .unwrap();
-    assert_eq!(bytes, b"baseprivate");
+    assert_eq!(bytes, b"base");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -7859,27 +8072,26 @@ fn durable_takeover_without_stream_token_starts_from_visible_head() {
     store
         .append_stream(&old, b"old-private", WriteDurability::Acknowledged)
         .unwrap();
-    let old_mark = store.flush_append_stream(&old).unwrap();
     drop(store);
 
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
     let fresh = reopened.open_append_stream(keyspace_id, file_id).unwrap();
     assert_eq!(fresh.visible_base_size, b"base".len() as u64);
-    assert!(fresh.writer_epoch.raw() > old.writer_epoch.raw());
-    assert_eq!(
-        reopened
+    assert_eq!(fresh.writer_epoch, old.writer_epoch);
+    assert_ne!(fresh.stream_id, old.stream_id);
+    assert!(
+        !reopened
             .metadata()
             .state_inner()
             .unwrap()
             .append_streams
-            .get(&old.stream_id)
-            .unwrap()
-            .status,
-        AppendStreamStatus::Fenced
+            .contains_key(&old.stream_id)
     );
     assert!(
-        reopened.publish_append_stream(&old, &old_mark).is_err(),
-        "opening a replacement stream fences the old private durable stream"
+        reopened
+            .publish_append_stream(&old, b"baseold-private".len() as u64)
+            .is_err(),
+        "unpublished private stream state is not recovered after reopen"
     );
     append_durable_store_with_stream(&reopened, &fresh, b"new", WriteDurability::Acknowledged)
         .unwrap();
@@ -7916,21 +8128,23 @@ fn new_append_stream_fences_old_private_data_and_starts_at_visible_head() {
     store
         .append_stream(&old, b"old", WriteDurability::Acknowledged)
         .unwrap();
-    let old_mark = store.flush_append_stream(&old).unwrap();
     let fresh = store.open_append_stream(keyspace_id, file_id).unwrap();
     assert_eq!(fresh.visible_base_size, b"base".len() as u64);
     assert!(
         store
-            .publish_append_stream(&old, &old_mark, WriteDurability::Acknowledged)
+            .publish_append_stream(&old, b"baseold".len() as u64, WriteDurability::Acknowledged,)
             .is_err()
     );
 
-    store
+    let ticket = store
         .append_stream(&fresh, b"new", WriteDurability::Acknowledged)
         .unwrap();
-    let fresh_mark = store.flush_append_stream(&fresh).unwrap();
     store
-        .publish_append_stream(&fresh, &fresh_mark, WriteDurability::Acknowledged)
+        .publish_append_stream(
+            &fresh,
+            ticket.range.end_exclusive().unwrap(),
+            WriteDurability::Acknowledged,
+        )
         .unwrap();
     let mut bytes = vec![0; b"basenew".len()];
     store
@@ -7954,7 +8168,6 @@ fn gc_roots_active_private_stream_data_and_reclaims_fenced_private_data() {
     store
         .append_stream(&stream, b"private", WriteDurability::Acknowledged)
         .unwrap();
-    store.flush_append_stream(&stream).unwrap();
     let private_log = {
         let state = store.metadata().state_inner().unwrap();
         let private_run = &state
@@ -12319,9 +12532,8 @@ fn trusted_native_grant_receipt_flow_publishes_write_and_stream_append() {
             WriteDurability::Acknowledged,
         )
         .unwrap();
-    let mark = store.flush_append_stream(&stream).unwrap();
     let append = store
-        .publish_append_stream(&stream, &mark, WriteDurability::Acknowledged)
+        .publish_append_stream(&stream, 4096, WriteDurability::Acknowledged)
         .unwrap();
     assert_eq!(append.range, ByteRange::new(0, 4096));
     assert_eq!(
@@ -12787,9 +12999,8 @@ fn append_native_file_with_stream(
     stream: &AppendStream,
     data: &[u8],
 ) -> Result<AppendPublishCommit> {
-    file.append_stream(stream, data)?;
-    let mark = file.flush_append_stream(stream)?;
-    file.publish_append_stream(stream, &mark)
+    let ticket = file.append_stream(stream, data)?;
+    file.publish_append_stream(stream, ticket.range.end_exclusive()?)
 }
 
 fn append_local_store_once(
@@ -12809,9 +13020,8 @@ fn append_local_store_with_stream(
     data: &[u8],
     durability: WriteDurability,
 ) -> Result<AppendPublishCommit> {
-    store.append_stream(stream, data, durability)?;
-    let mark = store.flush_append_stream(stream)?;
-    store.publish_append_stream(stream, &mark, durability)
+    let ticket = store.append_stream(stream, data, durability)?;
+    store.publish_append_stream(stream, ticket.range.end_exclusive()?, durability)
 }
 
 fn append_durable_store_once(
@@ -12831,9 +13041,8 @@ fn append_durable_store_with_stream(
     data: &[u8],
     durability: WriteDurability,
 ) -> Result<AppendPublishCommit> {
-    store.append_stream(stream, data, durability)?;
-    let mark = store.flush_append_stream(stream)?;
-    store.publish_append_stream(stream, &mark)
+    let ticket = store.append_stream(stream, data, durability)?;
+    store.publish_append_stream(stream, ticket.range.end_exclusive()?)
 }
 
 fn repeated_blocks(blocks: u64, byte: u8) -> Vec<u8> {

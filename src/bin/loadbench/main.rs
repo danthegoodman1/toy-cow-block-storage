@@ -15,11 +15,11 @@ use toy_cow_block_storage::provider::{
 };
 use toy_cow_block_storage::{
     AppendStream, AppendTicket, BlockBatchCommit, BlockBatchWrite, ByteRange, CreateDeviceRequest,
-    CreateFileRequest, CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableAppendMark,
-    DurableCoordinator, DurableDataLogPolicy, DurablePersistProfile, FileBatchWrite, FileId,
-    FileSpec, FlushResult, KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode,
-    MetadataTxnProfile, PayloadIntegrity, ReadProfile, ReadVerification, Result, StorageError,
-    StorageNodeId, TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
+    CreateFileRequest, CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableCoordinator,
+    DurableDataLogPolicy, DurablePersistProfile, FileBatchWrite, FileId, FileSpec, FlushResult,
+    KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile,
+    PayloadIntegrity, ReadProfile, ReadVerification, Result, StorageError, StorageNodeId,
+    TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -40,14 +40,13 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse()?;
-    println!(
-        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,durable_mbps,published_mbps,durable_bytes,published_bytes,p50_us,p90_us,p99_us,p999_us,max_us,samples"
-    );
+    println!("{}", BenchReport::csv_header());
 
     for workload in &args.workloads {
         for &concurrency in &args.concurrency {
             let report = run_case(&args, *workload, concurrency)?;
             report.print_csv();
+            append_matrix_csv(&args, &report)?;
         }
     }
 
