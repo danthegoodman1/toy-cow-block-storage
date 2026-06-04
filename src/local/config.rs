@@ -7,6 +7,7 @@ pub struct LocalStoreConfig {
     pub metadata_leaf_blocks: u64,
     pub storage_node: StorageNodeId,
     pub observability_event_capacity: usize,
+    pub stream_auto_persist_bytes: Option<u64>,
 }
 
 impl Default for LocalStoreConfig {
@@ -19,6 +20,7 @@ impl Default for LocalStoreConfig {
             metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(1),
             observability_event_capacity: DEFAULT_OBSERVABILITY_EVENT_CAPACITY,
+            stream_auto_persist_bytes: None,
         }
     }
 }
@@ -33,9 +35,10 @@ impl LocalStoreConfig {
             && self.storage_node == other.storage_node
     }
 
-    fn with_observability_event_capacity(self, observability_event_capacity: usize) -> Self {
+    fn with_runtime_policy(self, expected: Self) -> Self {
         Self {
-            observability_event_capacity,
+            observability_event_capacity: expected.observability_event_capacity,
+            stream_auto_persist_bytes: expected.stream_auto_persist_bytes,
             ..self
         }
     }
@@ -80,6 +83,12 @@ impl LocalStoreConfig {
         if self.observability_event_capacity == 0 {
             return Err(StorageError::invalid_argument(
                 "observability_event_capacity must be greater than zero",
+            ));
+        }
+
+        if self.stream_auto_persist_bytes == Some(0) {
+            return Err(StorageError::invalid_argument(
+                "stream_auto_persist_bytes must be greater than zero when configured",
             ));
         }
 

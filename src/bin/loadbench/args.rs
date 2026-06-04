@@ -23,6 +23,7 @@ struct Args {
     read_profile_csv: Option<PathBuf>,
     stream_publish_bytes: Option<u64>,
     stream_total_bytes: u64,
+    stream_auto_persist_bytes: Option<u64>,
     block_batch_ops: Option<usize>,
     block_batch_bytes: Option<usize>,
     block_batch_overlap: Option<BlockBatchOverlap>,
@@ -61,6 +62,7 @@ impl Args {
             read_profile_csv: None,
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,
+            stream_auto_persist_bytes: None,
             block_batch_ops: None,
             block_batch_bytes: None,
             block_batch_overlap: None,
@@ -155,6 +157,11 @@ impl Args {
                 "--stream-total-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-total-mib")?;
                     args.stream_total_bytes = mib_to_bytes(mib, "--stream-total-mib")?;
+                }
+                "--stream-auto-persist-mib" => {
+                    let mib: u64 = parse_next(&mut raw, "--stream-auto-persist-mib")?;
+                    args.stream_auto_persist_bytes =
+                        Some(mib_to_bytes(mib, "--stream-auto-persist-mib")?);
                 }
                 "--block-batch-ops" => {
                     args.block_batch_ops = Some(parse_next(&mut raw, flag.as_str())?);
@@ -264,6 +271,7 @@ impl Args {
             metadata_leaf_blocks: 1024,
             storage_node: StorageNodeId::from_raw(1),
             observability_event_capacity: 16_384,
+            stream_auto_persist_bytes: self.stream_auto_persist_bytes,
         }
     }
 
@@ -363,6 +371,7 @@ options:\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
+  --stream-auto-persist-mib N              durable provider internal stream dirty-tail threshold\n\
   --block-batch-ops N                      override writes per block batch workload\n\
   --block-batch-bytes N                    override bytes per write inside block batch workloads\n\
   --block-batch-overlap sequential|random|overwrite-hotset\n\

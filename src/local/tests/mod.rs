@@ -19,6 +19,7 @@ fn config() -> LocalStoreConfig {
         metadata_leaf_blocks: 1024,
         storage_node: StorageNodeId::from_raw(77),
         observability_event_capacity: DEFAULT_OBSERVABILITY_EVENT_CAPACITY,
+        stream_auto_persist_bytes: None,
     }
 }
 
@@ -3064,6 +3065,264 @@ fn durable_acknowledged_append_stream_ingests_private_data_without_cataloging_be
             .publish_append_stream(&stream, stream.visible_base_size + 4096)
             .is_err()
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_stream_auto_persist_keeps_private_bytes_invisible_after_reopen() {
+    let root = durable_temp_dir("stream-auto-persist-private-invisible");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    store.enable_persist_profiling(8).unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 37);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    store.persist_append_stream_prefix(&stream, 4096).unwrap();
+
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .append_stream_durable_high_water_if_reached(&stream, 4096)
+            .unwrap(),
+        Some(4096),
+        "auto-persist should advance only the private durable high-water"
+    );
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        0
+    );
+    let profiles = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].stream_prefix_payload_bytes, 4096);
+    assert_eq!(profiles[0].new_segment_bytes, 4096);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert!(
+        reopened
+            .publish_append_stream(&stream, payload.len() as u64)
+            .is_err(),
+        "auto-persisted private bytes are not public stream recovery"
+    );
+    assert!(
+        !reopened
+            .metadata()
+            .state_inner()
+            .unwrap()
+            .append_streams
+            .contains_key(&stream.stream_id)
+    );
+    assert_eq!(
+        reopened
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        0
+    );
+    let fresh = reopened.open_append_stream(keyspace_id, file_id).unwrap();
+    assert_eq!(fresh.visible_base_size, 0);
+    let ticket = reopened
+        .append_stream(&fresh, b"new", WriteDurability::Acknowledged)
+        .unwrap();
+    reopened
+        .publish_append_stream(&fresh, ticket.range.end_exclusive().unwrap())
+        .unwrap();
+    let mut bytes = vec![0; b"new".len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, bytes.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"new");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_stream_auto_persist_publish_does_not_reappend_payload() {
+    let root = durable_temp_dir("stream-auto-persist-publish-no-reappend");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    store.enable_persist_profiling(8).unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 39);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    store.persist_append_stream_prefix(&stream, 4096).unwrap();
+    let auto_profiles = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(auto_profiles.len(), 1);
+    assert_eq!(auto_profiles[0].new_segment_bytes, 4096);
+    assert!(auto_profiles[0].data_log_files_synced > 0);
+
+    store.publish_append_stream(&stream, 4096).unwrap();
+    let publish_profiles = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(publish_profiles.len(), 1);
+    assert_eq!(publish_profiles[0].new_segment_count, 0);
+    assert_eq!(publish_profiles[0].new_segment_bytes, 0);
+    assert_eq!(publish_profiles[0].data_log_append_sync_nanos, 0);
+    assert_eq!(publish_profiles[0].data_log_encode_nanos, 0);
+    assert_eq!(publish_profiles[0].data_log_write_nanos, 0);
+    assert_eq!(publish_profiles[0].data_log_file_sync_nanos, 0);
+    assert_eq!(publish_profiles[0].data_log_dir_sync_nanos, 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_stream_auto_persist_does_not_block_append_ack() {
+    let root = durable_temp_dir("stream-auto-persist-nonblocking-append");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    store
+        .set_persist_delay_for_test(Some(Duration::from_millis(250)))
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 41);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let store = Arc::clone(&store);
+        let stream = stream.clone();
+        thread::spawn(move || {
+            let result = store.append_stream(&stream, &payload, WriteDurability::Acknowledged);
+            tx.send(result.map(|_| ())).unwrap();
+        })
+    };
+
+    rx.recv_timeout(Duration::from_millis(100))
+        .expect("append ack should not wait for background auto-persist delay")
+        .unwrap();
+    worker.join().unwrap();
+    store.set_persist_delay_for_test(None).unwrap();
+    store.persist_append_stream_prefix(&stream, 4096).unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_stream_auto_persist_failure_does_not_poison_publish_retry() {
+    let root = durable_temp_dir("stream-auto-persist-failure-retry");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    store.fail_next_persist_for_test();
+    store
+        .append_stream(
+            &stream,
+            &repeated_blocks(1, 43),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    for _ in 0..100 {
+        if !store.durable.fail_next_persist.load(Ordering::SeqCst) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !store.durable.fail_next_persist.load(Ordering::SeqCst),
+        "background auto-persist should consume the injected failure"
+    );
+
+    store.publish_append_stream(&stream, 4096).unwrap();
+    let mut bytes = vec![0; 4096];
+    store
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, repeated_blocks(1, 43));
     let _ = fs::remove_dir_all(root);
 }
 

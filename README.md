@@ -242,7 +242,10 @@ committing the visible metadata. Publish does not release the stream token, so a
 writer can keep appending and publish later prefixes; `release_append_stream`
 ends the lease explicitly. A replacement writer without the active stream token
 opens a fresh stream from the latest visible file head, and any unpublished
-private tail from the old stream is ignored after restart.
+private tail from the old stream is ignored after restart. Durable providers may
+auto-persist active stream prefixes before publish to reduce the dirty tail a
+later publish must wait for; that is an internal latency policy and does not make
+unpublished bytes visible or publicly recoverable.
 
 ## Durable local provider
 
@@ -362,7 +365,17 @@ docker compose exec dev cargo run --release --bin loadbench -- \
 MB/s. Append publish rows also report `published_mbps`; use it for throughput
 comparisons when the benchmark includes a publish boundary. Plain stream ingest
 rows measure accepted private bytes and are useful for hot-path diagnostics, not
-for visible durability claims.
+for visible durability claims. `--stream-auto-persist-mib` is an internal
+durable-provider policy knob for append-stream latency experiments: it asks the
+server to persist private prefixes before publish once the dirty tail reaches
+the configured size. In `target/loadbench/stream-auto-persist-after-128/`, a
+128 MiB synchronous threshold collapsed publish p99 but moved the sync wait into
+append p99. The background implementation in
+`target/loadbench/stream-auto-persist-after-32-bg2/` keeps append p99 much
+closer to baseline while improving c16/c32 `published_mbps` by about 27%/23% for
+publish-interval and about 2%/6% for publish-at-end. Publish p99 improves when
+the background worker has enough head start, but it still waits for any
+remaining prefix if the worker trails active writers.
 
 Useful workload aliases:
 

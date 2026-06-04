@@ -13,6 +13,7 @@ pub struct DurableCoordinator {
     persist_lock: Arc<Mutex<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
+    stream_auto_persist_worker: Option<Arc<StreamAutoPersistWorker>>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
     maintenance_policy: MaintenancePolicy,
@@ -32,6 +33,150 @@ impl StreamAppendLane {
             append: Mutex::new(()),
             pending: Mutex::new(PendingDataLogAppend::default()),
         }
+    }
+}
+
+#[derive(Debug)]
+struct StreamAutoPersistWorkerState {
+    shutdown: bool,
+    requests: BTreeMap<AppendStreamId, (AppendStream, u64)>,
+}
+
+struct StreamAutoPersistWorker {
+    state: Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for StreamAutoPersistWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamAutoPersistWorker")
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamAutoPersistWorker {
+    fn start(store: DurableCoordinator) -> Result<Arc<Self>> {
+        let state = Arc::new((
+            Mutex::new(StreamAutoPersistWorkerState {
+                shutdown: false,
+                requests: BTreeMap::new(),
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let handle = thread::Builder::new()
+            .name("toy-cow-stream-auto-persist".to_string())
+            .spawn(move || stream_auto_persist_worker_loop(store, worker_state))
+            .map_err(|error| {
+                StorageError::unavailable(format!(
+                    "failed to start stream auto-persist worker: {error}"
+                ))
+            })?;
+        Ok(Arc::new(Self {
+            state,
+            handle: Mutex::new(Some(handle)),
+        }))
+    }
+
+    fn request(&self, stream: &AppendStream, target: u64) {
+        let (lock_state, cvar) = &*self.state;
+        if let Ok(mut state) = lock_state.lock() {
+            state
+                .requests
+                .entry(stream.stream_id)
+                .and_modify(|(_, existing)| *existing = (*existing).max(target))
+                .or_insert_with(|| (stream.clone(), target));
+            cvar.notify_one();
+        }
+    }
+
+    fn shutdown(&self) {
+        let (lock_state, cvar) = &*self.state;
+        if let Ok(mut state) = lock_state.lock() {
+            state.shutdown = true;
+            cvar.notify_one();
+        }
+        if let Ok(mut handle) = self.handle.lock()
+            && let Some(handle) = handle.take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StreamAutoPersistWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn stream_auto_persist_worker_loop(
+    store: DurableCoordinator,
+    state: Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
+) {
+    loop {
+        let requests = {
+            let (lock_state, cvar) = &*state;
+            let mut guard = match lock_state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            while !guard.shutdown && guard.requests.is_empty() {
+                guard = match cvar.wait(guard) {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+            }
+            if guard.shutdown {
+                return;
+            }
+            let requests = guard.requests.values().cloned().collect::<Vec<_>>();
+            guard.requests.clear();
+            requests
+        };
+        if store
+            .persist_append_stream_prefix_background_batch(&requests)
+            .unwrap_or(false)
+        {
+            stream_auto_persist_requeue_unreached(&store, &state, &requests);
+        }
+    }
+}
+
+fn stream_auto_persist_requeue_unreached(
+    store: &DurableCoordinator,
+    state: &Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
+    requests: &[(AppendStream, u64)],
+) {
+    let remaining = requests
+        .iter()
+        .filter_map(|(stream, target)| {
+            match store
+                .local
+                .metadata
+                .append_stream_durable_high_water_if_reached(stream, *target)
+            {
+                Ok(Some(_)) | Err(_) => None,
+                Ok(None) => Some((stream.clone(), *target)),
+            }
+        })
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        return;
+    }
+    let (lock_state, cvar) = &**state;
+    if let Ok(mut guard) = lock_state.lock() {
+        if guard.shutdown {
+            return;
+        }
+        for (stream, target) in remaining {
+            guard
+                .requests
+                .entry(stream.stream_id)
+                .and_modify(|(_, existing)| *existing = (*existing).max(target))
+                .or_insert((stream, target));
+        }
+        cvar.notify_one();
     }
 }
 
@@ -129,6 +274,7 @@ impl DurableCoordinator {
             persist_lock: Arc::new(Mutex::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
+            stream_auto_persist_worker: None,
             persist_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
             maintenance_policy,
@@ -136,6 +282,7 @@ impl DurableCoordinator {
             maintenance_worker: None,
         };
         store.start_maintenance_worker_if_needed()?;
+        store.start_stream_auto_persist_worker_if_needed()?;
         Ok(store)
     }
 
@@ -158,6 +305,35 @@ impl DurableCoordinator {
 
     fn startup_maintenance_has_work(&self) -> Result<bool> {
         self.maintenance_plan_has_commands(self.maintenance_policy)
+    }
+
+    fn start_stream_auto_persist_worker_if_needed(&mut self) -> Result<()> {
+        if self.local.config().stream_auto_persist_bytes.is_some() {
+            self.stream_auto_persist_worker = Some(StreamAutoPersistWorker::start(self.worker_view())?);
+        }
+        Ok(())
+    }
+
+    fn worker_view(&self) -> Self {
+        Self {
+            local: self.local.clone(),
+            durable: self.durable.clone(),
+            persisted_segments: Arc::clone(&self.persisted_segments),
+            pending_block_deltas: Arc::clone(&self.pending_block_deltas),
+            pending_data_log_append: Arc::clone(&self.pending_data_log_append),
+            block_delta_staging_lock: Arc::clone(&self.block_delta_staging_lock),
+            block_delta_prestage: Arc::clone(&self.block_delta_prestage),
+            stream_append_lanes: Arc::clone(&self.stream_append_lanes),
+            persist_lock: Arc::clone(&self.persist_lock),
+            persist_coordinator: Arc::clone(&self.persist_coordinator),
+            stream_prefix_persist_coordinator: Arc::clone(&self.stream_prefix_persist_coordinator),
+            stream_auto_persist_worker: None,
+            persist_profiler: Arc::clone(&self.persist_profiler),
+            read_profiler: Arc::clone(&self.read_profiler),
+            maintenance_policy: self.maintenance_policy,
+            maintenance_cursor: Arc::clone(&self.maintenance_cursor),
+            maintenance_worker: None,
+        }
     }
 
     fn maintenance_plan_has_commands(&self, policy: MaintenancePolicy) -> Result<bool> {
@@ -762,26 +938,52 @@ impl DurableCoordinator {
     }
 
     fn persist_append_stream_prefix(&self, stream: &AppendStream, target: u64) -> Result<u64> {
-        let mut observed_generation = 0_u64;
+        self.persist_append_stream_prefix_requests(&[(stream.clone(), target)])?;
+        self.local
+            .metadata
+            .append_stream_durable_high_water_if_reached(stream, target)?
+            .ok_or_else(|| {
+                StorageError::conflict(
+                    "append stream prefix persist did not reach required high-water",
+                )
+            })
+    }
+
+    fn persist_append_stream_prefix_requests(
+        &self,
+        requests: &[(AppendStream, u64)],
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let mut observed_generation;
         {
             let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
-            state.add_request(stream, target);
+            for (stream, target) in requests {
+                state.add_request(stream, *target);
+            }
+            observed_generation = state.generation;
         }
         loop {
-            if let Some(durable_through) = self
-                .local
-                .metadata
-                .append_stream_durable_high_water_if_reached(stream, target)?
-            {
-                lock(&self.stream_prefix_persist_coordinator.inner)?.release_request(stream.stream_id);
-                return Ok(durable_through);
+            match self.append_stream_requests_reached(requests) {
+                Ok(true) => {
+                    self.release_append_stream_prefix_requests(requests)?;
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = self.release_append_stream_prefix_requests(requests);
+                    return Err(error);
+                }
             }
 
             let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
             if let Some((error_generation, error)) = state.last_error.clone()
                 && error_generation > observed_generation
             {
-                state.release_request(stream.stream_id);
+                for (stream, _) in requests {
+                    state.release_request(stream.stream_id);
+                }
                 return Err(error);
             }
             if !state.in_flight {
@@ -801,7 +1003,9 @@ impl DurableCoordinator {
                         self.stream_prefix_persist_coordinator.cvar.notify_all();
                     }
                     Err(error) => {
-                        state.release_request(stream.stream_id);
+                        for (stream, _) in requests {
+                            state.release_request(stream.stream_id);
+                        }
                         state.last_error = Some((state.generation, error.clone()));
                         self.stream_prefix_persist_coordinator.cvar.notify_all();
                         return Err(error);
@@ -815,6 +1019,55 @@ impl DurableCoordinator {
                 state = wait_on_cvar(&self.stream_prefix_persist_coordinator.cvar, state)?;
             }
             observed_generation = state.generation;
+        }
+    }
+
+    fn release_append_stream_prefix_requests(&self, requests: &[(AppendStream, u64)]) -> Result<()> {
+        let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
+        for (stream, _) in requests {
+            state.release_request(stream.stream_id);
+        }
+        Ok(())
+    }
+
+    fn persist_append_stream_prefix_background_batch(
+        &self,
+        requests: &[(AppendStream, u64)],
+    ) -> Result<bool> {
+        if requests.is_empty() {
+            return Ok(false);
+        }
+        let snapshot = {
+            let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
+            if state.in_flight {
+                return Ok(false);
+            }
+            for (stream, target) in requests {
+                state.add_request(stream, *target);
+            }
+            state.in_flight = true;
+            state.snapshot_requests()
+        };
+
+        let result = self.persist_one_append_stream_request_batch(&snapshot);
+
+        let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
+        state.in_flight = false;
+        state.generation = state.generation.saturating_add(1);
+        for (stream, _) in requests {
+            state.release_request(stream.stream_id);
+        }
+        match result {
+            Ok(made_progress) => {
+                state.last_error = None;
+                self.stream_prefix_persist_coordinator.cvar.notify_all();
+                Ok(made_progress)
+            }
+            Err(error) => {
+                state.last_error = Some((state.generation, error.clone()));
+                self.stream_prefix_persist_coordinator.cvar.notify_all();
+                Err(error)
+            }
         }
     }
 
@@ -1615,49 +1868,58 @@ impl DurableCoordinator {
             flushed,
         )?;
         let lane = self.stream_append_lane(stream.stream_id)?;
-        let _append_guard = lock(&lane.append)?;
-        let result = self
-            .local
-            .prepare_append_stream_run(
-                stream,
-                data.len(),
-                crate::api::WriteDurability::Acknowledged,
-            )
-            .and_then(|prepared| {
-                let payload = DurableAppendRunChunkPayload {
-                    run_id: prepared.run_id,
-                    storage_node: prepared.storage_node,
-                    stream_id: prepared.stream.stream_id,
-                    writer_epoch: prepared.stream.writer_epoch,
-                    keyspace_id: prepared.stream.keyspace_id,
-                    file_id: prepared.stream.file_id,
-                    file_offset_start: prepared.range.offset,
-                    payload_integrity,
-                    chunks: vec![Arc::from(data)],
-                };
-                let pending_base = lock(&lane.pending)?.clone();
-                let (run, append, _) = self
-                    .durable
-                    .append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
-                let appended_log_refs = append.log_refs();
-                lock(&lane.pending)?.merge(append);
-                let commit = self.local.commit_prepared_append_stream_run(prepared, run);
-                let ticket = match commit {
-                    Ok(ticket) => ticket,
-                    Err(error) => {
-                        lock(&lane.pending)?.remove_log_refs(&appended_log_refs);
-                        return Err(error);
+        let result = {
+            let _append_guard = lock(&lane.append)?;
+            self.local
+                .prepare_append_stream_run(
+                    stream,
+                    data.len(),
+                    crate::api::WriteDurability::Acknowledged,
+                )
+                .and_then(|prepared| {
+                    let payload = DurableAppendRunChunkPayload {
+                        run_id: prepared.run_id,
+                        storage_node: prepared.storage_node,
+                        stream_id: prepared.stream.stream_id,
+                        writer_epoch: prepared.stream.writer_epoch,
+                        keyspace_id: prepared.stream.keyspace_id,
+                        file_id: prepared.stream.file_id,
+                        file_offset_start: prepared.range.offset,
+                        payload_integrity,
+                        chunks: vec![Arc::from(data)],
+                    };
+                    let pending_base = lock(&lane.pending)?.clone();
+                    let (run, append, _) = self
+                        .durable
+                        .append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
+                    let appended_log_refs = append.log_refs();
+                    lock(&lane.pending)?.merge(append);
+                    let commit = self.local.commit_prepared_append_stream_run(prepared, run);
+                    match commit {
+                        Ok(ticket) => Ok(ticket),
+                        Err(error) => {
+                            lock(&lane.pending)?.remove_log_refs(&appended_log_refs);
+                            Err(error)
+                        }
                     }
-                };
-                if flushed {
-                    self.persist_append_stream(stream)?;
-                }
-                Ok(ticket)
-            });
+                })
+        };
         if result.is_ok() {
             self.after_successful_write(admission);
         }
-        result
+        let ticket = result?;
+        if flushed {
+            self.persist_append_stream(stream)?;
+        } else if let Some(threshold) = self.local.config().stream_auto_persist_bytes
+            && let Some(target) = self
+                .local
+                .metadata
+                .append_stream_auto_persist_target(stream, threshold)?
+            && let Some(worker) = &self.stream_auto_persist_worker
+        {
+            worker.request(stream, target);
+        }
+        Ok(ticket)
     }
 
     pub fn submit_append_publish(

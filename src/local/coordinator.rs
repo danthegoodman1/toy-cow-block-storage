@@ -1005,6 +1005,10 @@ impl LocalCoordinator {
         Arc::clone(&self.metadata)
     }
 
+    pub fn config(&self) -> LocalStoreConfig {
+        self.metadata.config()
+    }
+
     pub fn segment_store(&self) -> Arc<InMemorySegmentStore> {
         Arc::clone(
             &self

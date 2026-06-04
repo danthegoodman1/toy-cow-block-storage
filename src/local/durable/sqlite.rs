@@ -850,11 +850,10 @@ impl DurableSqliteStore {
                 "durable SQLite state disagrees with open config",
             ));
         }
-        let runtime_config = cursor
-            .config
-            .with_observability_event_capacity(expected_config.observability_event_capacity);
+        let runtime_config = cursor.config.with_runtime_policy(expected_config);
 
         let mut metadata = load_metadata_inner(&conn, &cursor)?;
+        metadata.append_streams.clear();
         let (mut storage_nodes, next_write_intent) = self
             .load_storage_registry_from_node_catalogs(
                 cursor.next_segment_id,

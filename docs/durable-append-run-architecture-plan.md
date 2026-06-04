@@ -183,6 +183,16 @@ The server may auto-sync private append-log bytes on implementation-chosen
 boundaries, but that is not a public durability guarantee. Publish is the public
 boundary.
 
+Durable providers may also auto-persist a stream prefix when the private dirty
+tail crosses a configured byte threshold. This is an internal latency policy:
+it can reduce the data-log sync debt that a later publish waits for, but it does
+not make bytes visible or restart-resumable through the public stream token.
+The current durable provider queues this work to a bounded background worker so
+append acknowledgements do not wait for the physical sync. Benchmark
+interpretation must still compare both publish p99 and append p99: if the
+background worker trails the writers, publish still waits for the remaining
+prefix.
+
 ### Publish Prefix
 
 `submit_append_publish(stream, publish_through)` captures a stream prefix:
@@ -369,6 +379,8 @@ Exit gate:
 
 - Persist accepted append run manifests for a captured publish prefix without
   generic full-state persist.
+- Optionally auto-persist active append prefixes on a provider-private dirty-tail
+  threshold without making them visible or publicly recoverable.
 - Reopen ignores unpublished stream state for public recovery.
 - Add failure injection at each data-before-metadata boundary.
 - Ensure new writers fence old streams and start from visible head.

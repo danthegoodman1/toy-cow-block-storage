@@ -587,6 +587,10 @@ impl InMemoryMetadataPlane {
         Ok(lock(&self.inner)?.clone())
     }
 
+    fn config(&self) -> LocalStoreConfig {
+        self.config
+    }
+
     fn enable_publish_profiling(&self, capacity: usize) -> Result<()> {
         *lock(&self.publish_profiler)? = Some(MetadataPublishProfiler::new(capacity)?);
         Ok(())
@@ -1052,6 +1056,30 @@ impl InMemoryMetadataPlane {
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
         state.contiguous_record_tail_from(state.durable_through)
+    }
+
+    fn append_stream_auto_persist_target(
+        &self,
+        stream: &AppendStream,
+        threshold: u64,
+    ) -> Result<Option<u64>> {
+        if threshold == 0 {
+            return Err(StorageError::invalid_argument(
+                "append stream auto-persist threshold must be greater than zero",
+            ));
+        }
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        let contiguous = state.contiguous_record_tail_from(state.durable_through)?;
+        let dirty_bytes = contiguous.saturating_sub(state.durable_through);
+        if dirty_bytes < threshold {
+            return Ok(None);
+        }
+        Ok(Some(contiguous))
     }
 
     pub fn submit_append_publish(

@@ -9,6 +9,7 @@ fn config() -> LocalStoreConfig {
         metadata_leaf_blocks: 1024,
         storage_node: StorageNodeId::from_raw(77),
         observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
     }
 }
 

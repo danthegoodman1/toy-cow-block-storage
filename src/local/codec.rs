@@ -389,7 +389,8 @@ impl DurableCodec for LocalStoreConfig {
         self.metadata_fanout.encode(out)?;
         self.metadata_leaf_blocks.encode(out)?;
         self.storage_node.encode(out)?;
-        self.observability_event_capacity.encode(out)
+        self.observability_event_capacity.encode(out)?;
+        self.stream_auto_persist_bytes.encode(out)
     }
 
     fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
@@ -401,6 +402,7 @@ impl DurableCodec for LocalStoreConfig {
             metadata_leaf_blocks: u64::decode(input)?,
             storage_node: StorageNodeId::decode(input)?,
             observability_event_capacity: usize::decode(input)?,
+            stream_auto_persist_bytes: Option::<u64>::decode(input)?,
         })
     }
 }

@@ -481,6 +481,7 @@ fn bench_local_single_shard_write_by_tree_depth(c: &mut Criterion) {
                             metadata_leaf_blocks: leaf_blocks,
                             storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
                             observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
                         })
                         .unwrap();
                         let head = store
@@ -525,6 +526,7 @@ fn bench_local_multi_shard_atomic_write(c: &mut Criterion) {
                     metadata_leaf_blocks: 8,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
                     observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
                 })
                 .unwrap();
                 let server =
@@ -564,6 +566,7 @@ fn bench_local_read_by_mapping_count(c: &mut Criterion) {
                     metadata_leaf_blocks: 4,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
                     observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
                 })
                 .unwrap();
                 let server =
@@ -654,6 +657,7 @@ fn bench_local_native_large_append(c: &mut Criterion) {
         metadata_leaf_blocks: LARGE_BLOCKS,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
         observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
     };
 
     group.bench_function("normal_single_32mib_append", |b| {
@@ -825,6 +829,7 @@ fn bench_local_fork_vs_device_size(c: &mut Criterion) {
                             metadata_leaf_blocks: logical_blocks,
                             storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
                             observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
                         })
                         .unwrap();
                         let server = std::sync::Arc::new(
@@ -872,6 +877,7 @@ fn bench_local_checkpoint_restore(c: &mut Criterion) {
                     metadata_leaf_blocks: 16,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
                     observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
                 })
                 .unwrap();
                 let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(
@@ -921,6 +927,7 @@ fn bench_local_native_keyspace_checkpoint_restore(c: &mut Criterion) {
                     metadata_leaf_blocks: 16,
                     storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
                     observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
                 })
                 .unwrap();
                 let server = std::sync::Arc::new(toy_cow_block_storage::LocalNativeServer::new(
@@ -987,6 +994,7 @@ fn bench_roots_for_gc_with_deleted_retention(c: &mut Criterion) {
         metadata_leaf_blocks: 16,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
         observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
     })
     .unwrap();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store.clone()));
@@ -1029,6 +1037,7 @@ fn bench_metadata_gc_mark_traversal(c: &mut Criterion) {
         metadata_leaf_blocks: 8,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
         observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
     })
     .unwrap();
     let server = std::sync::Arc::new(toy_cow_block_storage::LocalBlockServer::new(store.clone()));

@@ -10,6 +10,7 @@ fn durable_bench_config() -> LocalStoreConfig {
         metadata_leaf_blocks: 16,
         storage_node: toy_cow_block_storage::StorageNodeId::from_raw(1),
         observability_event_capacity: 1024,
+        stream_auto_persist_bytes: None,
     }
 }
 

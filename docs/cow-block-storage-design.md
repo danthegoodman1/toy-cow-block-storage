@@ -180,7 +180,10 @@ for very large streams, not from per-append fragmentation across every node.
 Durable append-log admission should keep unsynced stream-log manifests with the
 stream lane that produced them, so prefix persistence can select only the lanes
 it is publishing without forcing unrelated streams through one shared pending
-append-log structure.
+append-log structure. Durable providers may also auto-persist active stream
+prefixes before publish as an internal dirty-tail policy. That persistence is
+not a public recovery promise and does not make bytes visible; it only reduces
+the outstanding durability work a later publish must wait for.
 
 Each shard root points to a persistent immutable tree:
 

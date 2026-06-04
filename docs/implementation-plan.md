@@ -1336,6 +1336,9 @@ Deliverables:
   lanes.
 - [x] Unsynced stream append-log manifests are tracked with their stream lanes
   instead of one shared pending stream-log structure.
+- [x] Durable providers can optionally auto-persist active stream prefixes as an
+  internal dirty-tail policy without making those bytes visible or recoverable
+  through the public append contract.
 - [x] Bounded internal stream-prefix persistence syncs append-log runs without
   generic full-state or generic segment publish paths.
 - [x] Visible publish converts persisted stream prefixes into coalesced file
