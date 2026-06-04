@@ -173,6 +173,14 @@ streams carry writer epochs and separate private ingest from visible publish.
 Publish captures a stream prefix, persists any pending append-log bytes for that
 prefix, and then makes the prefix visible. A stolen stream still rejects stale
 writers, and unpublished private bytes are not a restart recovery contract.
+Append-run placement should prefer stable storage-node lanes for each active
+stream so repeated appends stay contiguous. Aggregate throughput should come
+from spreading independent streams across lanes, or from later coarse striping
+for very large streams, not from per-append fragmentation across every node.
+Durable append-log admission should keep unsynced stream-log manifests with the
+stream lane that produced them, so prefix persistence can select only the lanes
+it is publishing without forcing unrelated streams through one shared pending
+append-log structure.
 
 Each shard root points to a persistent immutable tree:
 

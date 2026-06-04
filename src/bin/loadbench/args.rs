@@ -340,6 +340,9 @@ options:\n\
                                            native-stream-publish-at-end-1m,\n\
                                            native-stream-publish-at-end-4m,\n\
                                            native-stream-publish-at-end-32m,\n\
+                                           native-stream-publish-barrier-at-end-1m,\n\
+                                           native-stream-publish-barrier-at-end-4m,\n\
+                                           native-stream-publish-barrier-at-end-32m,\n\
                                            native-hot-append-4k\n\
   --concurrency LIST                       default: 1,4,16\n\
   --duration-ms N                          default: 1000\n\

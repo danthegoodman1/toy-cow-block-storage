@@ -1,6 +1,7 @@
 pub(super) type InMemoryAppendRunLogKey = (StorageNodeId, u64);
 pub(super) type InMemoryAppendRunLogs = BTreeMap<InMemoryAppendRunLogKey, Vec<u8>>;
 pub(super) type AppendStreamLaneMap = BTreeMap<AppendStreamId, Arc<Mutex<()>>>;
+pub(super) type AppendStreamStorageLaneMap = BTreeMap<AppendStreamId, StorageNodeId>;
 
 #[derive(Debug)]
 struct BlockBatchShardEdits {
@@ -28,6 +29,7 @@ pub struct LocalCoordinator {
     storage_nodes: StorageNodeRegistry,
     append_run_logs: Arc<Mutex<InMemoryAppendRunLogs>>,
     append_stream_lanes: Arc<Mutex<AppendStreamLaneMap>>,
+    append_stream_storage_lanes: Arc<Mutex<AppendStreamStorageLaneMap>>,
     authority: Arc<LocalGrantReceiptAuthority>,
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
@@ -59,6 +61,7 @@ impl LocalCoordinator {
             )?,
             append_run_logs: Arc::new(Mutex::new(BTreeMap::new())),
             append_stream_lanes: Arc::new(Mutex::new(BTreeMap::new())),
+            append_stream_storage_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             authority: Arc::new(LocalGrantReceiptAuthority),
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
@@ -84,6 +87,7 @@ impl LocalCoordinator {
             )?,
             append_run_logs: Arc::new(Mutex::new(BTreeMap::new())),
             append_stream_lanes: Arc::new(Mutex::new(BTreeMap::new())),
+            append_stream_storage_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             authority: Arc::new(LocalGrantReceiptAuthority),
             next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
@@ -1619,6 +1623,18 @@ impl LocalCoordinator {
         ))
     }
 
+    fn append_stream_storage_node(&self, stream_id: AppendStreamId) -> Result<StorageNodeId> {
+        let mut lanes = lock(&self.append_stream_storage_lanes)?;
+        if let Some(storage_node) = lanes.get(&stream_id).copied() {
+            self.storage_nodes.node(storage_node)?;
+            return Ok(storage_node);
+        }
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        lanes.insert(stream_id, storage_node);
+        Ok(storage_node)
+    }
+
     pub fn append_stream_with_integrity(
         &self,
         stream: &AppendStream,
@@ -1676,8 +1692,7 @@ impl LocalCoordinator {
         let range = self
             .metadata
             .reserve_append_stream_range(stream, data_len_u64)?;
-        let candidates = self.storage_nodes.storage_node_ids()?;
-        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        let storage_node = self.append_stream_storage_node(stream.stream_id)?;
         Ok(PreparedAppendStreamRun {
             stream: stream.clone(),
             ticket_id,
@@ -1843,11 +1858,15 @@ impl LocalCoordinator {
     }
 
     pub fn release_append_stream(&self, stream: &AppendStream) -> Result<()> {
-        self.metadata.release_append_stream(stream)
+        self.metadata.release_append_stream(stream)?;
+        lock(&self.append_stream_storage_lanes)?.remove(&stream.stream_id);
+        Ok(())
     }
 
     pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {
-        self.metadata.abort_append_stream(stream)
+        self.metadata.abort_append_stream(stream)?;
+        lock(&self.append_stream_storage_lanes)?.remove(&stream.stream_id);
+        Ok(())
     }
 
     pub fn commit_file_batch(

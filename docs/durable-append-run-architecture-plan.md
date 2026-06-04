@@ -32,6 +32,10 @@ owner: append-run data, not append-run data plus ordinary segments. Contiguous
 unpublished stream appends coalesce into bounded run records before publish
 prefix persistence, and concurrent publish waiters batch only requested stream
 ranges so they do not expose unrelated private data.
+Placement is lane-oriented: one active stream should keep using a stable
+storage-node append lane for contiguous runs, while independent streams can
+spread across storage-node lanes. That preserves sequential run shape and avoids
+turning throughput fanout into per-append file fragmentation.
 
 The north-star outcome is:
 
@@ -166,6 +170,8 @@ AppendLogRun {
 Append lanes should be simple:
 
 - one or more per-storage-node log writers;
+- lane-local pending log manifests for accepted-but-not-yet-published stream
+  bytes;
 - sequential append-only files;
 - no global `persist_lock` for data ingest;
 - no metadata tree update while ingesting bytes;

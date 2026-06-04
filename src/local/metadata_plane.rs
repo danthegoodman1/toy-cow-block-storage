@@ -243,6 +243,10 @@ impl AppendStreamRunRecord {
         self.run.payload_len
     }
 
+    fn storage_node(&self) -> StorageNodeId {
+        self.run.storage_node
+    }
+
     fn slice(&self, start: u64, end: u64) -> Result<Option<Self>> {
         if start >= end {
             return Ok(None);
@@ -487,6 +491,19 @@ impl AppendStreamState {
                 .is_some_and(|end| end <= durable_through)
         });
         Ok(exported)
+    }
+}
+
+impl AppendStreamPrefixPersistBatch {
+    fn payload_bytes_by_storage_node(&self) -> Result<BTreeMap<StorageNodeId, u64>> {
+        let mut out = BTreeMap::new();
+        for record in &self.records {
+            let entry = out.entry(record.storage_node()).or_insert(0_u64);
+            *entry = entry
+                .checked_add(record.payload_bytes())
+                .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
+        }
+        Ok(out)
     }
 }
 
@@ -1160,7 +1177,7 @@ impl InMemoryMetadataPlane {
         max_batch_bytes: u64,
     ) -> Result<Vec<AppendStreamPrefixPersistPlan>> {
         let inner = lock(&self.inner)?;
-        let mut total_bytes = 0_u64;
+        let mut payload_bytes_by_storage_node = BTreeMap::<StorageNodeId, u64>::new();
         let mut plans = Vec::new();
         for (stream, durable_through) in requests {
             let state = inner
@@ -1177,17 +1194,31 @@ impl InMemoryMetadataPlane {
             if batch.records.is_empty() {
                 continue;
             }
+            let batch_payload_bytes = batch.payload_bytes_by_storage_node()?;
             let would_exceed = !plans.is_empty()
-                && total_bytes
-                    .checked_add(batch.payload_bytes)
-                    .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?
-                    > max_batch_bytes;
+                && batch_payload_bytes
+                    .iter()
+                    .try_fold(false, |exceeded, (storage_node, bytes)| {
+                        let current = payload_bytes_by_storage_node
+                            .get(storage_node)
+                            .copied()
+                            .unwrap_or_default();
+                        let next = current.checked_add(*bytes).ok_or_else(|| {
+                            StorageError::invalid_argument("append batch bytes overflow")
+                        })?;
+                        Ok(exceeded || next > max_batch_bytes)
+                    })?;
             if would_exceed {
                 continue;
             }
-            total_bytes = total_bytes
-                .checked_add(batch.payload_bytes)
-                .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
+            for (storage_node, bytes) in batch_payload_bytes {
+                let entry = payload_bytes_by_storage_node
+                    .entry(storage_node)
+                    .or_insert(0_u64);
+                *entry = entry
+                    .checked_add(bytes)
+                    .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
+            }
             plans.push(AppendStreamPrefixPersistPlan {
                 stream: state.public_stream(),
                 batch,

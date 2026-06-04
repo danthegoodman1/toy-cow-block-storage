@@ -61,6 +61,12 @@ struct BlockBatchOpProfile {
     committed_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LatencyClass {
+    StreamAppend,
+    StreamPublish,
+}
+
 #[derive(Debug)]
 struct WorkerReport {
     attempts: u64,
@@ -72,6 +78,12 @@ struct WorkerReport {
     max_latency_nanos: u64,
     latency_seen: u64,
     latencies: Vec<u64>,
+    stream_append_max_latency_nanos: u64,
+    stream_append_latency_seen: u64,
+    stream_append_latencies: Vec<u64>,
+    stream_publish_max_latency_nanos: u64,
+    stream_publish_latency_seen: u64,
+    stream_publish_latencies: Vec<u64>,
     sample_limit: usize,
     block_batch_profiles: Vec<BlockBatchOpProfile>,
 }
@@ -88,9 +100,51 @@ impl WorkerReport {
             max_latency_nanos: 0,
             latency_seen: 0,
             latencies: Vec::with_capacity(sample_limit.min(1024)),
+            stream_append_max_latency_nanos: 0,
+            stream_append_latency_seen: 0,
+            stream_append_latencies: Vec::with_capacity(sample_limit.min(1024)),
+            stream_publish_max_latency_nanos: 0,
+            stream_publish_latency_seen: 0,
+            stream_publish_latencies: Vec::with_capacity(sample_limit.min(1024)),
             sample_limit,
             block_batch_profiles: Vec::new(),
         }
+    }
+
+    fn record_stream_append(
+        &mut self,
+        latency_nanos: u64,
+        bytes: u64,
+        progress: OpProgress,
+        success: bool,
+        rng: &mut Lcg,
+    ) {
+        self.record_classified(
+            latency_nanos,
+            bytes,
+            progress,
+            success,
+            Some(LatencyClass::StreamAppend),
+            rng,
+        );
+    }
+
+    fn record_stream_publish(
+        &mut self,
+        latency_nanos: u64,
+        bytes: u64,
+        progress: OpProgress,
+        success: bool,
+        rng: &mut Lcg,
+    ) {
+        self.record_classified(
+            latency_nanos,
+            bytes,
+            progress,
+            success,
+            Some(LatencyClass::StreamPublish),
+            rng,
+        );
     }
 
     fn record(
@@ -99,6 +153,18 @@ impl WorkerReport {
         bytes: u64,
         progress: OpProgress,
         success: bool,
+        rng: &mut Lcg,
+    ) {
+        self.record_classified(latency_nanos, bytes, progress, success, None, rng);
+    }
+
+    fn record_classified(
+        &mut self,
+        latency_nanos: u64,
+        bytes: u64,
+        progress: OpProgress,
+        success: bool,
+        class: Option<LatencyClass>,
         rng: &mut Lcg,
     ) {
         self.attempts = self.attempts.saturating_add(1);
@@ -120,13 +186,59 @@ impl WorkerReport {
             self.errors = self.errors.saturating_add(1);
         }
 
-        if self.latencies.len() < self.sample_limit {
-            self.latencies.push(latency_nanos);
-        } else {
-            let replacement = rng.below(self.latency_seen) as usize;
-            if replacement < self.sample_limit {
-                self.latencies[replacement] = latency_nanos;
+        sample_latency(
+            &mut self.latencies,
+            self.sample_limit,
+            self.latency_seen,
+            latency_nanos,
+            rng,
+        );
+
+        match class {
+            Some(LatencyClass::StreamAppend) => {
+                self.stream_append_latency_seen =
+                    self.stream_append_latency_seen.saturating_add(1);
+                self.stream_append_max_latency_nanos =
+                    self.stream_append_max_latency_nanos.max(latency_nanos);
+                sample_latency(
+                    &mut self.stream_append_latencies,
+                    self.sample_limit,
+                    self.stream_append_latency_seen,
+                    latency_nanos,
+                    rng,
+                );
             }
+            Some(LatencyClass::StreamPublish) => {
+                self.stream_publish_latency_seen =
+                    self.stream_publish_latency_seen.saturating_add(1);
+                self.stream_publish_max_latency_nanos =
+                    self.stream_publish_max_latency_nanos.max(latency_nanos);
+                sample_latency(
+                    &mut self.stream_publish_latencies,
+                    self.sample_limit,
+                    self.stream_publish_latency_seen,
+                    latency_nanos,
+                    rng,
+                );
+            }
+            None => {}
+        }
+    }
+}
+
+fn sample_latency(
+    samples: &mut Vec<u64>,
+    sample_limit: usize,
+    latency_seen: u64,
+    latency_nanos: u64,
+    rng: &mut Lcg,
+) {
+    if samples.len() < sample_limit {
+        samples.push(latency_nanos);
+    } else {
+        let replacement = rng.below(latency_seen) as usize;
+        if replacement < sample_limit {
+            samples[replacement] = latency_nanos;
         }
     }
 }
@@ -154,11 +266,23 @@ struct BenchReport {
     p999_nanos: u64,
     max_nanos: u64,
     samples: usize,
+    stream_append_p50_nanos: u64,
+    stream_append_p90_nanos: u64,
+    stream_append_p99_nanos: u64,
+    stream_append_p999_nanos: u64,
+    stream_append_max_nanos: u64,
+    stream_append_samples: usize,
+    stream_publish_p50_nanos: u64,
+    stream_publish_p90_nanos: u64,
+    stream_publish_p99_nanos: u64,
+    stream_publish_p999_nanos: u64,
+    stream_publish_max_nanos: u64,
+    stream_publish_samples: usize,
 }
 
 impl BenchReport {
     fn csv_header() -> &'static str {
-        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,durable_mbps,published_mbps,durable_bytes,published_bytes,p50_us,p90_us,p99_us,p999_us,max_us,samples"
+        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,durable_mbps,published_mbps,durable_bytes,published_bytes,p50_us,p90_us,p99_us,p999_us,max_us,samples,stream_append_p50_us,stream_append_p90_us,stream_append_p99_us,stream_append_p999_us,stream_append_max_us,stream_append_samples,stream_publish_p50_us,stream_publish_p90_us,stream_publish_p99_us,stream_publish_p999_us,stream_publish_max_us,stream_publish_samples"
     }
 
     fn from_workers(elapsed: Duration, workers: Vec<WorkerReport>) -> Self {
@@ -170,6 +294,10 @@ impl BenchReport {
         let mut published_bytes = 0_u64;
         let mut max_nanos = 0_u64;
         let mut samples = Vec::new();
+        let mut stream_append_max_nanos = 0_u64;
+        let mut stream_append_samples = Vec::new();
+        let mut stream_publish_max_nanos = 0_u64;
+        let mut stream_publish_samples = Vec::new();
         let mut block_batch_profiles = Vec::new();
 
         for worker in workers {
@@ -181,9 +309,17 @@ impl BenchReport {
             published_bytes = published_bytes.saturating_add(worker.published_bytes);
             max_nanos = max_nanos.max(worker.max_latency_nanos);
             samples.extend(worker.latencies);
+            stream_append_max_nanos =
+                stream_append_max_nanos.max(worker.stream_append_max_latency_nanos);
+            stream_append_samples.extend(worker.stream_append_latencies);
+            stream_publish_max_nanos =
+                stream_publish_max_nanos.max(worker.stream_publish_max_latency_nanos);
+            stream_publish_samples.extend(worker.stream_publish_latencies);
             block_batch_profiles.extend(worker.block_batch_profiles);
         }
         samples.sort_unstable();
+        stream_append_samples.sort_unstable();
+        stream_publish_samples.sort_unstable();
 
         Self {
             workload: Workload::BlockWrite4k,
@@ -207,6 +343,18 @@ impl BenchReport {
             p999_nanos: percentile(&samples, 0.999),
             max_nanos,
             samples: samples.len(),
+            stream_append_p50_nanos: percentile(&stream_append_samples, 0.50),
+            stream_append_p90_nanos: percentile(&stream_append_samples, 0.90),
+            stream_append_p99_nanos: percentile(&stream_append_samples, 0.99),
+            stream_append_p999_nanos: percentile(&stream_append_samples, 0.999),
+            stream_append_max_nanos,
+            stream_append_samples: stream_append_samples.len(),
+            stream_publish_p50_nanos: percentile(&stream_publish_samples, 0.50),
+            stream_publish_p90_nanos: percentile(&stream_publish_samples, 0.90),
+            stream_publish_p99_nanos: percentile(&stream_publish_samples, 0.99),
+            stream_publish_p999_nanos: percentile(&stream_publish_samples, 0.999),
+            stream_publish_max_nanos,
+            stream_publish_samples: stream_publish_samples.len(),
         }
     }
 
@@ -218,7 +366,7 @@ impl BenchReport {
         let durable_mbps = self.durable_bytes as f64 / seconds / 1_000_000.0;
         let published_mbps = self.published_bytes as f64 / seconds / 1_000_000.0;
         format!(
-            "{},{},{},{},{},{},{},{:.6},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+            "{},{},{},{},{},{},{},{:.6},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
             self.workload.name(),
             self.provider,
             self.durability,
@@ -242,7 +390,19 @@ impl BenchReport {
             nanos_to_micros(self.p99_nanos),
             nanos_to_micros(self.p999_nanos),
             nanos_to_micros(self.max_nanos),
-            self.samples
+            self.samples,
+            nanos_to_micros(self.stream_append_p50_nanos),
+            nanos_to_micros(self.stream_append_p90_nanos),
+            nanos_to_micros(self.stream_append_p99_nanos),
+            nanos_to_micros(self.stream_append_p999_nanos),
+            nanos_to_micros(self.stream_append_max_nanos),
+            self.stream_append_samples,
+            nanos_to_micros(self.stream_publish_p50_nanos),
+            nanos_to_micros(self.stream_publish_p90_nanos),
+            nanos_to_micros(self.stream_publish_p99_nanos),
+            nanos_to_micros(self.stream_publish_p999_nanos),
+            nanos_to_micros(self.stream_publish_max_nanos),
+            self.stream_publish_samples
         )
     }
 

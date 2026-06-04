@@ -43,7 +43,7 @@ fn append_profile_csv(
     if write_header {
         writeln!(
             file,
-            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water"
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,stream_prefix_request_count,stream_prefix_plan_count,stream_prefix_record_count,stream_prefix_payload_bytes,stream_prefix_storage_node_count,stream_prefix_pending_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water"
         )
         .map_err(fs_error)?;
     }
@@ -62,6 +62,12 @@ fn append_profile_csv(
             profile.block_delta_prestage_wait_nanos.to_string(),
             profile.block_delta_selected_count.to_string(),
             profile.block_delta_selected_bytes.to_string(),
+            profile.stream_prefix_request_count.to_string(),
+            profile.stream_prefix_plan_count.to_string(),
+            profile.stream_prefix_record_count.to_string(),
+            profile.stream_prefix_payload_bytes.to_string(),
+            profile.stream_prefix_storage_node_count.to_string(),
+            profile.stream_prefix_pending_lock_wait_nanos.to_string(),
             profile.sqlite_lock_wait_nanos.to_string(),
             profile.local_snapshot_nanos.to_string(),
             profile.metadata_publish_lock_wait_nanos.to_string(),

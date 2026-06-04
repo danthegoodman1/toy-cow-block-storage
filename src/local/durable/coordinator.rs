@@ -9,8 +9,7 @@ pub struct DurableCoordinator {
     pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     block_delta_staging_lock: Arc<Mutex<()>>,
     block_delta_prestage: Arc<BlockDeltaPrestageTracker>,
-    pending_stream_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
-    stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<Mutex<()>>>>>,
+    stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<StreamAppendLane>>>>,
     persist_lock: Arc<Mutex<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
@@ -19,6 +18,21 @@ pub struct DurableCoordinator {
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
+}
+
+#[derive(Debug)]
+struct StreamAppendLane {
+    append: Mutex<()>,
+    pending: Mutex<PendingDataLogAppend>,
+}
+
+impl StreamAppendLane {
+    fn new() -> Self {
+        Self {
+            append: Mutex::new(()),
+            pending: Mutex::new(PendingDataLogAppend::default()),
+        }
+    }
 }
 
 impl DurableCoordinator {
@@ -111,7 +125,6 @@ impl DurableCoordinator {
             pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             block_delta_staging_lock: Arc::new(Mutex::new(())),
             block_delta_prestage: Arc::new(BlockDeltaPrestageTracker::new()),
-            pending_stream_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_lock: Arc::new(Mutex::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
@@ -867,6 +880,14 @@ impl DurableCoordinator {
                     .map(AppendStreamRunRecord::log_ref)
             })
             .collect();
+        let stream_prefix_storage_node_count = usize_to_u64(
+            plans
+                .iter()
+                .flat_map(|plan| plan.batch.records.iter())
+                .map(AppendStreamRunRecord::storage_node)
+                .collect::<BTreeSet<_>>()
+                .len(),
+        );
         let new_run_count = usize_to_u64(
             plans
                 .iter()
@@ -878,9 +899,24 @@ impl DurableCoordinator {
             .flat_map(|plan| plan.batch.records.iter())
             .map(|record| record.len)
             .fold(0_u64, u64::saturating_add);
-        let pending_stream = lock(&self.pending_stream_data_log_append)?;
-        let mut pending_stream_append = pending_stream.selected_log_refs(&run_log_refs);
-        drop(pending_stream);
+        let mut stream_prefix_pending_lock_wait_nanos = 0_u64;
+        let mut pending_stream_append = PendingDataLogAppend::default();
+        for plan in &plans {
+            let Some(lane) = self.existing_stream_append_lane(plan.stream.stream_id)? else {
+                continue;
+            };
+            let plan_log_refs: BTreeSet<_> = plan
+                .batch
+                .records
+                .iter()
+                .map(AppendStreamRunRecord::log_ref)
+                .collect();
+            let pending_lock_started = Instant::now();
+            let pending_stream = lock(&lane.pending)?;
+            stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos
+                .saturating_add(duration_nanos_u64(pending_lock_started.elapsed()));
+            pending_stream_append.merge(pending_stream.selected_log_refs(&plan_log_refs));
+        }
         let mut pending_log_refs = pending_stream_append.log_refs();
         let missing_log_refs: Vec<_> = run_log_refs
             .difference(&pending_log_refs)
@@ -924,9 +960,20 @@ impl DurableCoordinator {
             &segment_ids,
             pending_stream_append,
         )?;
-        let mut pending_stream = lock(&self.pending_stream_data_log_append)?;
-        pending_stream.remove_log_refs(&run_log_refs);
         for plan in &plans {
+            if let Some(lane) = self.existing_stream_append_lane(plan.stream.stream_id)? {
+                let plan_log_refs: BTreeSet<_> = plan
+                    .batch
+                    .records
+                    .iter()
+                    .map(AppendStreamRunRecord::log_ref)
+                    .collect();
+                let pending_lock_started = Instant::now();
+                let mut pending_stream = lock(&lane.pending)?;
+                stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos
+                    .saturating_add(duration_nanos_u64(pending_lock_started.elapsed()));
+                pending_stream.remove_log_refs(&plan_log_refs);
+            }
             self.local
                 .metadata
                 .mark_append_stream_durable_through(&plan.stream, plan.batch.durable_through)?;
@@ -934,6 +981,12 @@ impl DurableCoordinator {
 
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.stream_prefix_request_count = usize_to_u64(requests.len());
+        profile.stream_prefix_plan_count = usize_to_u64(plans.len());
+        profile.stream_prefix_record_count = new_run_count;
+        profile.stream_prefix_payload_bytes = new_run_bytes;
+        profile.stream_prefix_storage_node_count = stream_prefix_storage_node_count;
+        profile.stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos;
         profile.new_segment_count = profile.new_segment_count.saturating_add(new_run_count);
         profile.new_segment_bytes = profile.new_segment_bytes.saturating_add(new_run_bytes);
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
@@ -1527,13 +1580,25 @@ impl DurableCoordinator {
         self.append_stream_with_integrity(stream, data, durability, PayloadIntegrity::Verified)
     }
 
-    fn stream_append_lane(&self, stream_id: AppendStreamId) -> Result<Arc<Mutex<()>>> {
+    fn stream_append_lane(&self, stream_id: AppendStreamId) -> Result<Arc<StreamAppendLane>> {
         let mut lanes = lock(&self.stream_append_lanes)?;
         Ok(Arc::clone(
             lanes
                 .entry(stream_id)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
+                .or_insert_with(|| Arc::new(StreamAppendLane::new())),
         ))
+    }
+
+    fn existing_stream_append_lane(
+        &self,
+        stream_id: AppendStreamId,
+    ) -> Result<Option<Arc<StreamAppendLane>>> {
+        Ok(lock(&self.stream_append_lanes)?.get(&stream_id).cloned())
+    }
+
+    fn remove_stream_append_lane(&self, stream_id: AppendStreamId) -> Result<()> {
+        lock(&self.stream_append_lanes)?.remove(&stream_id);
+        Ok(())
     }
 
     pub fn append_stream_with_integrity(
@@ -1550,7 +1615,7 @@ impl DurableCoordinator {
             flushed,
         )?;
         let lane = self.stream_append_lane(stream.stream_id)?;
-        let _lane_guard = lock(&lane)?;
+        let _append_guard = lock(&lane.append)?;
         let result = self
             .local
             .prepare_append_stream_run(
@@ -1570,18 +1635,17 @@ impl DurableCoordinator {
                     payload_integrity,
                     chunks: vec![Arc::from(data)],
                 };
-                let pending_base = lock(&self.pending_stream_data_log_append)?.clone();
+                let pending_base = lock(&lane.pending)?.clone();
                 let (run, append, _) = self
                     .durable
                     .append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
                 let appended_log_refs = append.log_refs();
-                lock(&self.pending_stream_data_log_append)?.merge(append);
+                lock(&lane.pending)?.merge(append);
                 let commit = self.local.commit_prepared_append_stream_run(prepared, run);
                 let ticket = match commit {
                     Ok(ticket) => ticket,
                     Err(error) => {
-                        lock(&self.pending_stream_data_log_append)?
-                            .remove_log_refs(&appended_log_refs);
+                        lock(&lane.pending)?.remove_log_refs(&appended_log_refs);
                         return Err(error);
                     }
                 };
@@ -1632,11 +1696,13 @@ impl DurableCoordinator {
 
     pub fn release_append_stream(&self, stream: &AppendStream) -> Result<()> {
         self.local.release_append_stream(stream)?;
+        self.remove_stream_append_lane(stream.stream_id)?;
         self.persist_now()
     }
 
     pub fn abort_append_stream(&self, stream: &AppendStream) -> Result<()> {
         self.local.abort_append_stream(stream)?;
+        self.remove_stream_append_lane(stream.stream_id)?;
         self.persist_now()
     }
 

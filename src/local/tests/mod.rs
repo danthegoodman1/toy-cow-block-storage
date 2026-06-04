@@ -12116,6 +12116,142 @@ fn local_multi_node_placement_spreads_block_and_native_segments_without_api_leak
 }
 
 #[test]
+fn append_stream_storage_lanes_are_stable_and_spread_across_streams() {
+    let cfg = config();
+    let node_ids = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+    ];
+    let store = LocalCoordinator::with_storage_nodes(cfg, node_ids.clone()).unwrap();
+    let client = create_native_client(&store);
+    let keyspace_id = create_local_keyspace(&client);
+    let (file_a, _) = create_local_file(&client, keyspace_id);
+    let (file_b, _) = create_local_file(&client, keyspace_id);
+    let (file_c, _) = create_local_file(&client, keyspace_id);
+
+    let stream_a = store.open_append_stream(keyspace_id, file_a).unwrap();
+    for byte in [1, 2, 3] {
+        store
+            .append_stream(
+                &stream_a,
+                &repeated_blocks(1, byte),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+    }
+
+    let stream_b = store.open_append_stream(keyspace_id, file_b).unwrap();
+    store
+        .append_stream(
+            &stream_b,
+            &repeated_blocks(1, 4),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    let stream_c = store.open_append_stream(keyspace_id, file_c).unwrap();
+    store
+        .append_stream(
+            &stream_c,
+            &repeated_blocks(1, 5),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+
+    let state = store.metadata().state_inner().unwrap();
+    let stream_a_records = &state
+        .append_streams
+        .get(&stream_a.stream_id)
+        .unwrap()
+        .records;
+    assert_eq!(
+        stream_a_records.len(),
+        1,
+        "one stream should keep a stable append lane and coalesce adjacent runs"
+    );
+    assert_eq!(stream_a_records[0].len, 3 * 4096);
+
+    let assigned_nodes: BTreeSet<_> = [stream_a, stream_b, stream_c]
+        .iter()
+        .map(|stream| {
+            state
+                .append_streams
+                .get(&stream.stream_id)
+                .unwrap()
+                .records
+                .first()
+                .unwrap()
+                .run
+                .storage_node
+        })
+        .collect();
+    assert_eq!(
+        assigned_nodes,
+        node_ids.iter().copied().collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn append_stream_prefix_persist_batches_are_bounded_per_storage_node_lane() {
+    let cfg = config();
+    let node_ids = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+    ];
+    let store = LocalCoordinator::with_storage_nodes(cfg, node_ids.clone()).unwrap();
+    let client = create_native_client(&store);
+    let keyspace_id = create_local_keyspace(&client);
+    let mut streams = Vec::new();
+    for byte in [11, 12, 13] {
+        let (file_id, _) = create_local_file(&client, keyspace_id);
+        let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+        store
+            .append_stream(
+                &stream,
+                &repeated_blocks(1, byte),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+        streams.push(stream);
+    }
+
+    let requests: Vec<_> = streams
+        .iter()
+        .map(|stream| (stream.clone(), stream.visible_base_size + 4096))
+        .collect();
+    let plans = store
+        .metadata()
+        .append_stream_prefix_persist_plans_for(&requests, 4096)
+        .unwrap();
+    assert_eq!(
+        plans.len(),
+        3,
+        "one 4KiB prefix from each storage-node lane should share one physical batch"
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.batch.payload_bytes)
+            .sum::<u64>(),
+        3 * 4096
+    );
+    let planned_nodes: BTreeSet<_> = plans
+        .iter()
+        .flat_map(|plan| {
+            plan.batch
+                .records
+                .iter()
+                .map(|record| record.run.storage_node)
+        })
+        .collect();
+    assert_eq!(
+        planned_nodes,
+        node_ids.iter().copied().collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
 fn storage_node_transport_write_receipt_stays_pending_until_reference_message() {
     let cfg = config();
     let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();

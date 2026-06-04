@@ -103,6 +103,18 @@ mod tests {
             Workload::from_str("native-stream-publish-at-end-32m").unwrap(),
             Workload::NativeStreamPublishAtEnd32m
         );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-barrier-at-end-1m").unwrap(),
+            Workload::NativeStreamPublishBarrierAtEnd1m
+        );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-barrier-at-end-4m").unwrap(),
+            Workload::NativeStreamPublishBarrierAtEnd4m
+        );
+        assert_eq!(
+            Workload::from_str("native-stream-publish-barrier-at-end-32m").unwrap(),
+            Workload::NativeStreamPublishBarrierAtEnd32m
+        );
     }
 
     #[test]
@@ -166,6 +178,15 @@ mod tests {
             }
         }
         assert_eq!(published, vec![96 * 1024 * 1024]);
+    }
+
+    #[test]
+    fn fixed_stream_barrier_at_end_is_fixed_but_not_inline_at_end() {
+        let workload = Workload::NativeStreamPublishBarrierAtEnd32m;
+
+        assert!(workload.is_native_stream_publish_fixed());
+        assert!(workload.is_native_stream_publish_barrier_at_end());
+        assert!(!workload.is_native_stream_publish_at_end());
     }
 
     #[test]

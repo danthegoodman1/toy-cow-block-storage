@@ -1331,6 +1331,11 @@ Deliverables:
   run-backed-file-extent types with deterministic validation.
 - [x] Stream ingest writes payloads once into storage-node append lanes, not
   into both append logs and ordinary segments.
+- [x] Active streams use stable storage-node append lanes so repeated appends
+  remain coarse contiguous runs while independent streams can spread across
+  lanes.
+- [x] Unsynced stream append-log manifests are tracked with their stream lanes
+  instead of one shared pending stream-log structure.
 - [x] Bounded internal stream-prefix persistence syncs append-log runs without
   generic full-state or generic segment publish paths.
 - [x] Visible publish converts persisted stream prefixes into coalesced file

@@ -227,6 +227,9 @@ enum Workload {
     NativeStreamPublishAtEnd1m,
     NativeStreamPublishAtEnd4m,
     NativeStreamPublishAtEnd32m,
+    NativeStreamPublishBarrierAtEnd1m,
+    NativeStreamPublishBarrierAtEnd4m,
+    NativeStreamPublishBarrierAtEnd32m,
     NativeHotAppend4k,
 }
 
@@ -406,6 +409,15 @@ impl Workload {
             Self::NativeStreamPublishAtEnd1m => "native-stream-publish-at-end-1m",
             Self::NativeStreamPublishAtEnd4m => "native-stream-publish-at-end-4m",
             Self::NativeStreamPublishAtEnd32m => "native-stream-publish-at-end-32m",
+            Self::NativeStreamPublishBarrierAtEnd1m => {
+                "native-stream-publish-barrier-at-end-1m"
+            }
+            Self::NativeStreamPublishBarrierAtEnd4m => {
+                "native-stream-publish-barrier-at-end-4m"
+            }
+            Self::NativeStreamPublishBarrierAtEnd32m => {
+                "native-stream-publish-barrier-at-end-32m"
+            }
             Self::NativeHotAppend4k => "native-hot-append-4k",
         }
     }
@@ -441,19 +453,22 @@ impl Workload {
             | Self::NativeStreamPublishServerPersisted1m
             | Self::NativeStreamPublishPipelined1m
             | Self::NativeStreamPublishInterval1m
-            | Self::NativeStreamPublishAtEnd1m => 1024 * 1024,
+            | Self::NativeStreamPublishAtEnd1m
+            | Self::NativeStreamPublishBarrierAtEnd1m => 1024 * 1024,
             Self::NativeWrite4m
             | Self::NativeAppend4m
             | Self::NativeStreamIngest4m
             | Self::NativeStreamPublishPrefix4m
             | Self::NativeStreamPublishInterval4m
-            | Self::NativeStreamPublishAtEnd4m => 4 * 1024 * 1024,
+            | Self::NativeStreamPublishAtEnd4m
+            | Self::NativeStreamPublishBarrierAtEnd4m => 4 * 1024 * 1024,
             Self::NativeWrite32m
             | Self::NativeAppend32m
             | Self::NativeStreamIngest32m
             | Self::NativeStreamPublishPrefix32m
             | Self::NativeStreamPublishInterval32m
-            | Self::NativeStreamPublishAtEnd32m => 32 * 1024 * 1024,
+            | Self::NativeStreamPublishAtEnd32m
+            | Self::NativeStreamPublishBarrierAtEnd32m => 32 * 1024 * 1024,
             Self::BlockWrite4k
             | Self::BlockWrite4kSameShardContended
             | Self::BlockWrite4kSameShardSerialized
@@ -697,6 +712,9 @@ impl Workload {
                 | Self::NativeStreamPublishAtEnd1m
                 | Self::NativeStreamPublishAtEnd4m
                 | Self::NativeStreamPublishAtEnd32m
+                | Self::NativeStreamPublishBarrierAtEnd1m
+                | Self::NativeStreamPublishBarrierAtEnd4m
+                | Self::NativeStreamPublishBarrierAtEnd32m
         )
     }
 
@@ -742,8 +760,19 @@ impl Workload {
         )
     }
 
+    fn is_native_stream_publish_barrier_at_end(self) -> bool {
+        matches!(
+            self,
+            Self::NativeStreamPublishBarrierAtEnd1m
+                | Self::NativeStreamPublishBarrierAtEnd4m
+                | Self::NativeStreamPublishBarrierAtEnd32m
+        )
+    }
+
     fn is_native_stream_publish_fixed(self) -> bool {
-        self.is_native_stream_publish_interval() || self.is_native_stream_publish_at_end()
+        self.is_native_stream_publish_interval()
+            || self.is_native_stream_publish_at_end()
+            || self.is_native_stream_publish_barrier_at_end()
     }
 
     fn is_block(self) -> bool {
@@ -851,6 +880,15 @@ impl FromStr for Workload {
             "native-stream-publish-at-end-1m" => Ok(Self::NativeStreamPublishAtEnd1m),
             "native-stream-publish-at-end-4m" => Ok(Self::NativeStreamPublishAtEnd4m),
             "native-stream-publish-at-end-32m" => Ok(Self::NativeStreamPublishAtEnd32m),
+            "native-stream-publish-barrier-at-end-1m" => {
+                Ok(Self::NativeStreamPublishBarrierAtEnd1m)
+            }
+            "native-stream-publish-barrier-at-end-4m" => {
+                Ok(Self::NativeStreamPublishBarrierAtEnd4m)
+            }
+            "native-stream-publish-barrier-at-end-32m" => {
+                Ok(Self::NativeStreamPublishBarrierAtEnd32m)
+            }
             "native-hot-append-4k" => Ok(Self::NativeHotAppend4k),
             _ => Err(StorageError::invalid_argument(format!(
                 "unknown workload {value}"

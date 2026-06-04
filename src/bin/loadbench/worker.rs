@@ -72,13 +72,24 @@ fn execute_fixed_stream_publish_load(
         payload_integrity: args.payload_integrity,
     };
     let started = Instant::now();
+    let publish_barrier = config
+        .workload
+        .is_native_stream_publish_barrier_at_end()
+        .then(|| Arc::new(Barrier::new(concurrency)));
 
     let reports = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(concurrency);
         for worker in 0..concurrency {
             let context = context.clone();
+            let publish_barrier = publish_barrier.clone();
             handles.push(scope.spawn(move || {
-                run_fixed_stream_publish_worker(context, worker as u64, config, total_bytes)
+                run_fixed_stream_publish_worker(
+                    context,
+                    worker as u64,
+                    config,
+                    total_bytes,
+                    publish_barrier,
+                )
             }));
         }
 
@@ -344,6 +355,7 @@ fn run_fixed_stream_publish_worker(
     worker: u64,
     config: FixedStreamPublishConfig,
     total_bytes: u64,
+    publish_barrier: Option<Arc<Barrier>>,
 ) -> Result<WorkerReport> {
     let mut rng = Lcg::new(0xa076_1d64_78bd_642f_u64 ^ worker.wrapping_mul(0xe703_7ed1_a0b4_28db));
     let mut report = WorkerReport::new(config.samples_per_worker);
@@ -396,7 +408,7 @@ fn run_fixed_stream_publish_worker(
         let append_nanos = elapsed_nanos_u64(append_started);
         let ticket = match append_result {
             Ok(ticket) => {
-                report.record(
+                report.record_stream_append(
                     append_nanos,
                     context.payload.len() as u64,
                     OpProgress::default(),
@@ -406,7 +418,7 @@ fn run_fixed_stream_publish_worker(
                 ticket
             }
             Err(error) => {
-                report.record(
+                report.record_stream_append(
                     append_nanos,
                     context.payload.len() as u64,
                     OpProgress::default(),
@@ -418,54 +430,44 @@ fn run_fixed_stream_publish_worker(
         };
         next_offset = ticket.range.end_exclusive()?;
 
-        if let Some(publish_through) = fixed_stream_publish_target(
-            config.workload,
-            next_offset,
-            final_offset,
-            next_publish_target,
-        ) {
-            let previous_published = published_offset;
-            let publish_started = Instant::now();
-            if !config.modeled_delay.is_zero() {
-                apply_modeled_delay(config.modeled_delay, config.delay_mode);
-            }
-            let publish_result = context
-                .store
-                .publish_append_stream(&stream, publish_through);
-            let publish_nanos = elapsed_nanos_u64(publish_started);
-            match publish_result {
-                Ok(()) => {
-                    published_offset = publish_through;
-                    report.record(
-                        publish_nanos,
-                        0,
-                        OpProgress {
-                            durable_bytes: 0,
-                            published_bytes: publish_through.saturating_sub(previous_published),
-                            block_batch_profile: None,
-                        },
-                        true,
-                        &mut rng,
-                    );
-                    if let Some(interval) = publish_interval {
-                        while next_publish_target.is_some_and(|target| target <= published_offset)
-                        {
-                            next_publish_target = published_offset.checked_add(interval);
-                        }
-                    }
-                }
-                Err(error) => {
-                    report.record(
-                        publish_nanos,
-                        0,
-                        OpProgress::default(),
-                        false,
-                        &mut rng,
-                    );
-                    return Err(error);
+        if !config.workload.is_native_stream_publish_barrier_at_end()
+            && let Some(publish_through) = fixed_stream_publish_target(
+                config.workload,
+                next_offset,
+                final_offset,
+                next_publish_target,
+            )
+        {
+            publish_fixed_stream_boundary(
+                &context,
+                &stream,
+                publish_through,
+                &mut published_offset,
+                &config,
+                &mut report,
+                &mut rng,
+            )?;
+            if let Some(interval) = publish_interval {
+                while next_publish_target.is_some_and(|target| target <= published_offset) {
+                    next_publish_target = published_offset.checked_add(interval);
                 }
             }
         }
+    }
+
+    if config.workload.is_native_stream_publish_barrier_at_end() {
+        let barrier = publish_barrier
+            .ok_or_else(|| StorageError::corrupt("missing fixed stream publish barrier"))?;
+        barrier.wait();
+        publish_fixed_stream_boundary(
+            &context,
+            &stream,
+            final_offset,
+            &mut published_offset,
+            &config,
+            &mut report,
+            &mut rng,
+        )?;
     }
 
     if published_offset != final_offset {
@@ -479,6 +481,51 @@ fn run_fixed_stream_publish_worker(
         ));
     }
     Ok(report)
+}
+
+fn publish_fixed_stream_boundary(
+    context: &BenchContext,
+    stream: &AppendStream,
+    publish_through: u64,
+    published_offset: &mut u64,
+    config: &FixedStreamPublishConfig,
+    report: &mut WorkerReport,
+    rng: &mut Lcg,
+) -> Result<()> {
+    let previous_published = *published_offset;
+    let publish_started = Instant::now();
+    if !config.modeled_delay.is_zero() {
+        apply_modeled_delay(config.modeled_delay, config.delay_mode);
+    }
+    let publish_result = context.store.publish_append_stream(stream, publish_through);
+    let publish_nanos = elapsed_nanos_u64(publish_started);
+    match publish_result {
+        Ok(()) => {
+            *published_offset = publish_through;
+            report.record_stream_publish(
+                publish_nanos,
+                0,
+                OpProgress {
+                    durable_bytes: 0,
+                    published_bytes: publish_through.saturating_sub(previous_published),
+                    block_batch_profile: None,
+                },
+                true,
+                rng,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            report.record_stream_publish(
+                publish_nanos,
+                0,
+                OpProgress::default(),
+                false,
+                rng,
+            );
+            Err(error)
+        }
+    }
 }
 
 fn fixed_stream_publish_target(
