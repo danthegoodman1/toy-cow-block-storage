@@ -198,19 +198,20 @@ fn snapshot_keyspace(
 
 `commit_batch` is the native shape for many client writes that should publish as
 one visible file version. Native append workloads should keep their append
-stream token, writer epoch, private durability mark, and visible publish
-boundary intact.
+stream token, writer epoch, accepted private tail, and visible publish boundary
+intact.
 
 ## Append streams
 
-Append streams are for very high-throughput sequential writes: the current
-short-run durable matrix reaches roughly 5 GB/s on the largest ingest rows.
-They split ingest into three explicit boundaries:
+Append streams are for very high-throughput sequential writes. They split ingest
+from visibility while leaving payload persistence policy inside the storage
+server:
 
 ```text
-append_stream         accepted private bytes
-flush_append_stream   private durability for this stream token
-publish_append_stream reader-visible file version
+append_stream                    accepted private bytes
+submit/wait append publish        durable, reader-visible prefix
+release_append_stream             explicit lease release
+abort_append_stream               discard unpublished private tail and release
 ```
 
 ```rust
@@ -220,23 +221,28 @@ fn append_flow(file: &impl NativeFile) -> toy_cow_block_storage::Result<()> {
     let stream = file.open_append_stream()?;
 
     file.append_stream(&stream, b"batch-0001\n")?;
-    file.append_stream(&stream, b"batch-0002\n")?;
+    let ticket = file.append_stream(&stream, b"batch-0002\n")?;
 
-    let mark = file.flush_append_stream(&stream)?;
+    let publish_through = ticket.range.end_exclusive()?;
 
-    // Readers observe the appended bytes after publish succeeds.
-    let commit = file.publish_append_stream(&stream, &mark)?;
-    assert_eq!(commit.range.len, mark.durable_through);
+    // Readers observe the appended bytes after publish succeeds. Publish is
+    // also the public restart-durability boundary for this stream prefix.
+    let commit = file.publish_append_stream(&stream, publish_through)?;
+    assert_eq!(commit.range.end_exclusive()?, publish_through);
+
+    file.release_append_stream(&stream)?;
 
     Ok(())
 }
 ```
 
-A flush is private durability for the holder of the `AppendStream` bearer token.
-Publish is the only globally discoverable append boundary. Failover that needs
-unpublished bytes must persist both the stream token and `DurableAppendMark`
-outside the storage layer; a replacement without that authority opens a fresh
-stream from the latest visible file head.
+Publish is the only public durability and globally discoverable append boundary.
+It captures a prefix and may persist not-yet-durable bytes internally before
+committing the visible metadata. Publish does not release the stream token, so a
+writer can keep appending and publish later prefixes; `release_append_stream`
+ends the lease explicitly. A replacement writer without the active stream token
+opens a fresh stream from the latest visible file head, and any unpublished
+private tail from the old stream is ignored after restart.
 
 ## Durable local provider
 
@@ -245,9 +251,11 @@ its own SQLite catalog plus rolled data logs. Segment bytes and catalog receipts
 commit before root metadata references them, so a failed metadata publish leaves
 invisible orphan data for custodian cleanup instead of a half-visible write.
 
-Acknowledged writes stay live in process until an explicit `flush` or stronger
-write asks for stable storage. After restart, unflushed acknowledged bytes are
-ignored; flushed writes are replayed from durable metadata and data logs.
+For block writes and ordinary native file writes, acknowledged bytes stay live in
+process until an explicit `flush` or stronger write asks for stable storage.
+After restart, unflushed acknowledged bytes are ignored; flushed writes and
+published append-stream prefixes are replayed from durable metadata and data
+logs.
 
 ```rust
 use toy_cow_block_storage::{
@@ -275,17 +283,38 @@ debt can fall during normal traffic.
 
 ## Performance snapshot
 
-These are short-run durable checkpoints from this dev host with `200us` modeled
-RTT. Treat them as local sanity numbers.
+These are short-run checkpoints from this dev host. The loadbench rows include
+`200us` modeled RTT; the fio controls are local filesystem runs inside the same
+dev container without modeled network delay. Treat them as local sanity numbers,
+not as portable hardware claims. Append publish rows should be compared with
+`published_mbps`, because that measures bytes that became visible and
+restart-durable inside the timed window.
 
 | Scenario | Workload shape | Result |
 | --- | --- | --- |
 | Verified native reads | `native-read-4k`, c16 | about 72.8k IOPS, p99 about 468 us |
 | Block writeback fsync | `block-writeback-fsync-1m`, c16 | about 1.3 GB/s, p99 about 15 ms |
 | Larger block fsync window | `block-writeback-fsync-4m`, c16 | about 1.9 GB/s, p99 about 40 ms |
-| Append stream ingest | `native-stream-ingest-1m`, c16 | about 3.6 GB/s ingest; payload flush p99 around 15 ms in profile rows |
-| Large append stream ingest | `native-stream-ingest-32m`, c16 | roughly 5 GB/s ingest in the current short-run matrix |
-| Preflushed append publish | `native-stream-publish-preflushed-1m`, c16 | about 923 MB/s, p50 about 5.2 ms, p99 about 17 ms |
+| Append stream ingest | `native-stream-ingest-32m`, c16 | accepted private throughput peaks around 6.1 GB/s in the latest local sweep; this is not a visible durability result |
+| Publish at end, 1 MiB appends | `native-stream-publish-at-end-1m`, c16, 1024 MiB/worker | `published_mbps` about 2.77 GB/s with 1 node, 3.34 GB/s with 4 nodes, 3.31 GB/s with 16 nodes |
+| Publish at end, 4 MiB appends | `native-stream-publish-at-end-4m`, c16, 1024 MiB/worker | `published_mbps` about 2.51 GB/s with 1 node, 3.49 GB/s with 4 nodes, 3.17 GB/s with 16 nodes |
+| Publish at end, 32 MiB appends | `native-stream-publish-at-end-32m`, c16, 1024 MiB/worker | `published_mbps` about 2.16 GB/s with 1 node, 3.18 GB/s with 4 nodes, 1.76 GB/s with 16 nodes |
+| Local FS, no fsync | `fio`, buffered writes, 16 jobs, 4 MiB writes, 1024 MiB/job | about 5.77 GB/s write-phase bandwidth |
+| Local FS, fsync at end | `fio`, buffered writes plus `--end_fsync=1`, same shape | about 3.49 GB/s write-phase bandwidth |
+| Local FS, direct with fsync at end | `fio`, direct writes plus `--end_fsync=1`, same shape | about 3.82 GB/s write-phase bandwidth |
+
+Read the append/fio comparison as two separate pairs:
+
+| Question | Native row | Local filesystem control | Interpretation |
+| --- | --- | --- | --- |
+| How fast is accepted append ingest before a visibility/durability boundary? | `native-stream-ingest-32m`, `mbps` about 6.1 GB/s, with `200us` modeled RTT | fio buffered no-fsync, about 5.77 GB/s, no modeled RTT | Hot-path diagnostic only. Native accepted bytes are private and are not yet reader-visible or restart-durable. |
+| How fast is append-all-then-durable? | `native-stream-publish-at-end-4m`, `published_mbps` about 3.49 GB/s at 4 storage nodes/c16, with `200us` modeled RTT | fio buffered writes plus end fsync, about 3.49 GB/s write-phase bandwidth, no modeled RTT | Closest durability-shape comparison. Native publish makes the prefix visible and restart-durable; fio fsync makes the file data durable at job end. |
+
+The fio control was run inside the same dev container on `/tmp` and cleaned up
+afterward. Its JSON write bandwidth does not isolate the final fsync as a
+separate phase, while shell wall timing includes process setup and cleanup, so
+read it as a rough local filesystem bracket rather than an exact phase-by-phase
+accounting.
 
 `cargo bench --bench regression` is the Criterion mechanism suite.
 `loadbench` is the integration runner for public block/native API behavior,
@@ -313,23 +342,27 @@ docker compose exec dev cargo run --release --bin loadbench -- \
   --workloads block-writeback \
   --rtt-us 200
 
-# Native append ingest, private durability, and publish boundaries.
+# Native append ingest and publish boundaries.
 docker compose exec dev cargo run --release --bin loadbench -- \
   --provider durable \
   --durability ack \
-  --duration-ms 1000 \
-  --warmup-ms 100 \
+  --warmup-ms 0 \
   --concurrency 1,4,16 \
   --files 128 \
-  --workloads append-stream \
+  --storage-nodes 4 \
+  --workloads native-stream-ingest-32m,native-stream-publish-interval-4m,native-stream-publish-at-end-4m \
   --rtt-us 200 \
-  --stream-flush-mib 2 \
-  --stream-publish-mib 128
+  --stream-total-mib 1024 \
+  --stream-publish-mib 128 \
+  --matrix-csv target/loadbench/native-publish-boundary/matrix.csv \
+  --durable-profile-csv target/loadbench/native-publish-boundary/profile.csv
 ```
 
 `success_iops` is successful operations per second. `mbps` is submitted payload
-MB/s. Append stream rows also report `durable_mbps` and `published_mbps` because
-private durability and reader visibility are different boundaries.
+MB/s. Append publish rows also report `published_mbps`; use it for throughput
+comparisons when the benchmark includes a publish boundary. Plain stream ingest
+rows measure accepted private bytes and are useful for hot-path diagnostics, not
+for visible durability claims.
 
 Useful workload aliases:
 
@@ -337,7 +370,7 @@ Useful workload aliases:
 | --- | --- |
 | `north-star` | Broad block/native API comparison. |
 | `append-batch` | Client-side append payload size effects. |
-| `append-stream` | Private ingest, stream flush, and visible publish behavior. |
+| `append-stream` | Private ingest and publish-prefix behavior. |
 | `block-writeback` | Filesystem-style dirty window plus fsync behavior. |
 | `block-metadata` | Same-shard conflicts versus different-shard/device convergence. |
 | `native-file-batch` | Client-sized random-write commit boundaries. |

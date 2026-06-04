@@ -47,10 +47,11 @@ pub struct FileInfo {
 
 /// Bearer authority for one active native append stream.
 ///
-/// The stream token is the only authority that can flush or publish
-/// flushed-but-unpublished private bytes. Implementations must not provide
-/// implicit resume by file name or keyspace path: opening a new stream for the
-/// same file is writer takeover at the visible file head and fences this token.
+/// The stream token is the only authority that can publish accepted private
+/// bytes or explicitly release/abort the stream. Implementations must not
+/// provide implicit resume by file name or keyspace path: opening a new stream
+/// for the same file is writer takeover at the visible file head and fences
+/// this token.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppendStream {
     pub keyspace_id: KeyspaceId,
