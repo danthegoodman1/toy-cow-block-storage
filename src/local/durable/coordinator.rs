@@ -1380,10 +1380,8 @@ impl DurableCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let segment_ids = self.local.segment_ids_for_device_read(device_id, range)?;
-        self.local.read_device_unverified(device_id, range, buf)?;
-        self.local
-            .verify_segment_payloads_for_read(segment_ids, verification)
+        let plan = self.local.resolve_block_read(device_id, range)?;
+        assemble_read_plan(self, plan, verification, buf)
     }
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
@@ -1600,38 +1598,8 @@ impl DurableCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let segment_ids = self
-            .local
-            .segment_ids_for_file_read(keyspace_id, file_id, range)?;
-        let run_extents = self
-            .local
-            .run_extents_for_file_read(keyspace_id, file_id, range)?;
-        self.local
-            .read_file_unverified(keyspace_id, file_id, range, buf)?;
-        for extent in run_extents {
-            let bytes = self
-                .durable
-                .read_append_run_range_payload(&extent.run, verification)?;
-            let output_offset = usize::try_from(
-                extent
-                    .file_offset_start
-                    .checked_sub(range.offset)
-                    .ok_or_else(|| {
-                        StorageError::corrupt("run-backed extent precedes read range")
-                    })?,
-            )
-            .map_err(|_| StorageError::invalid_argument("run read offset overflows usize"))?;
-            let output_len = bytes.len();
-            let output_end = output_offset
-                .checked_add(output_len)
-                .ok_or_else(|| StorageError::invalid_argument("run read end overflows"))?;
-            let output = buf
-                .get_mut(output_offset..output_end)
-                .ok_or_else(|| StorageError::corrupt("run-backed read output exceeds buffer"))?;
-            output.copy_from_slice(&bytes);
-        }
-        self.local
-            .verify_segment_payloads_for_read(segment_ids, verification)
+        let plan = self.local.resolve_file_read(keyspace_id, file_id, range)?;
+        assemble_read_plan(self, plan, verification, buf)
     }
 
     pub fn fork_device(&self, source: DeviceId, request: ForkRequest) -> Result<DeviceId> {
@@ -1761,6 +1729,46 @@ impl DurableCoordinator {
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
     ) -> Result<()> {
         self.persist_now_with_catalog_changes(changed_catalog_segments)
+    }
+}
+
+impl StorageNodeReadService for DurableCoordinator {
+    fn read_segment_source(
+        &self,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
+        verification: ReadVerification,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        self.local.read_segment_source(
+            storage_node,
+            segment_id,
+            range,
+            integrity,
+            verification,
+            buf,
+        )
+    }
+
+    fn read_append_run_source(
+        &self,
+        storage_node: StorageNodeId,
+        log_id: u64,
+        range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
+        verification: ReadVerification,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        self.durable.read_append_run_source_payload(
+            storage_node,
+            log_id,
+            range,
+            integrity,
+            verification,
+            buf,
+        )
     }
 }
 

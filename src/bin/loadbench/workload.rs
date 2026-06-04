@@ -174,6 +174,7 @@ enum Workload {
     BlockWrite4kShardLanes,
     BlockWrite4kDeviceLanes,
     BlockRead4k,
+    BlockRead1m,
     BlockWrite1m,
     BlockWrite1mShardLanes,
     BlockWrite1mDeviceLanes,
@@ -193,6 +194,7 @@ enum Workload {
     BlockWritebackPrestagedFsync4m,
     BlockWritebackPrestagedFsync16m,
     NativeRead4k,
+    NativeRead1m,
     NativeWrite4k,
     NativeWrite4kSameFile,
     NativeWrite4kFileLanes,
@@ -228,9 +230,11 @@ impl Workload {
             Self::BlockWrite4k,
             Self::BlockWrite4kShardLanes,
             Self::BlockRead4k,
+            Self::BlockRead1m,
             Self::BlockWrite1m,
             Self::BlockWrite1mShardLanes,
             Self::NativeRead4k,
+            Self::NativeRead1m,
             Self::NativeWrite4k,
             Self::NativeAppend4k,
             Self::NativeHotAppend4k,
@@ -341,6 +345,7 @@ impl Workload {
             Self::BlockWrite4kShardLanes => "block-write-4k-shard-lanes",
             Self::BlockWrite4kDeviceLanes => "block-write-4k-device-lanes",
             Self::BlockRead4k => "block-read-4k",
+            Self::BlockRead1m => "block-read-1m",
             Self::BlockWrite1m => "block-write-1m",
             Self::BlockWrite1mShardLanes => "block-write-1m-shard-lanes",
             Self::BlockWrite1mDeviceLanes => "block-write-1m-device-lanes",
@@ -360,6 +365,7 @@ impl Workload {
             Self::BlockWritebackPrestagedFsync4m => "block-writeback-prestaged-fsync-4m",
             Self::BlockWritebackPrestagedFsync16m => "block-writeback-prestaged-fsync-16m",
             Self::NativeRead4k => "native-read-4k",
+            Self::NativeRead1m => "native-read-1m",
             Self::NativeWrite4k => "native-write-4k",
             Self::NativeWrite4kSameFile => "native-write-4k-same-file",
             Self::NativeWrite4kFileLanes => "native-write-4k-file-lanes",
@@ -412,6 +418,8 @@ impl Workload {
             Self::BlockWrite1m
             | Self::BlockWrite1mShardLanes
             | Self::BlockWrite1mDeviceLanes
+            | Self::BlockRead1m
+            | Self::NativeRead1m
             | Self::NativeWrite1m
             | Self::NativeAppend1m
             | Self::NativeStreamIngest1m
@@ -465,7 +473,10 @@ impl Workload {
     }
 
     fn is_read(self) -> bool {
-        matches!(self, Self::BlockRead4k | Self::NativeRead4k)
+        matches!(
+            self,
+            Self::BlockRead4k | Self::BlockRead1m | Self::NativeRead4k | Self::NativeRead1m
+        )
     }
 
     fn is_native_write(self) -> bool {
@@ -696,6 +707,7 @@ impl Workload {
                 | Self::BlockWrite4kShardLanes
                 | Self::BlockWrite4kDeviceLanes
                 | Self::BlockRead4k
+                | Self::BlockRead1m
                 | Self::BlockWrite1m
                 | Self::BlockWrite1mShardLanes
                 | Self::BlockWrite1mDeviceLanes
@@ -736,6 +748,7 @@ impl FromStr for Workload {
             "block-write-4k-shard-lanes" => Ok(Self::BlockWrite4kShardLanes),
             "block-write-4k-device-lanes" => Ok(Self::BlockWrite4kDeviceLanes),
             "block-read-4k" => Ok(Self::BlockRead4k),
+            "block-read-1m" => Ok(Self::BlockRead1m),
             "block-write-1m" => Ok(Self::BlockWrite1m),
             "block-write-1m-shard-lanes" => Ok(Self::BlockWrite1mShardLanes),
             "block-write-1m-device-lanes" => Ok(Self::BlockWrite1mDeviceLanes),
@@ -755,6 +768,7 @@ impl FromStr for Workload {
             "block-writeback-prestaged-fsync-4m" => Ok(Self::BlockWritebackPrestagedFsync4m),
             "block-writeback-prestaged-fsync-16m" => Ok(Self::BlockWritebackPrestagedFsync16m),
             "native-read-4k" => Ok(Self::NativeRead4k),
+            "native-read-1m" => Ok(Self::NativeRead1m),
             "native-write-4k" => Ok(Self::NativeWrite4k),
             "native-write-4k-same-file" => Ok(Self::NativeWrite4kSameFile),
             "native-write-4k-file-lanes" => Ok(Self::NativeWrite4kFileLanes),

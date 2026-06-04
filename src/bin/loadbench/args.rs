@@ -275,7 +275,8 @@ options:\n\
                                            block-write-4k-same-shard-contended,\n\
                                            block-write-4k-same-shard-serialized,\n\
                                            block-write-4k-shard-lanes,\n\
-                                           block-write-4k-device-lanes, block-read-4k,\n\
+                                           block-write-4k-device-lanes,\n\
+                                           block-read-4k, block-read-1m,\n\
                                            block-write-1m, block-write-1m-shard-lanes,\n\
                                            block-write-1m-device-lanes,\n\
                                            block-batch-4k-16ops,\n\
@@ -293,7 +294,7 @@ options:\n\
                                            block-writeback-prestaged-fsync-2m,\n\
                                            block-writeback-prestaged-fsync-4m,\n\
                                            block-writeback-prestaged-fsync-16m,\n\
-                                           native-read-4k,\n\
+                                           native-read-4k, native-read-1m,\n\
                                            native-write-4k, native-write-4k-same-file,\n\
                                            native-write-4k-file-lanes, native-write-1m,\n\
                                            native-write-4m, native-write-32m,\n\

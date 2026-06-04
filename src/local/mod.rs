@@ -68,6 +68,7 @@ include!("config.rs");
 include!("observability.rs");
 include!("proof.rs");
 include!("storage_node.rs");
+include!("read_path.rs");
 include!("coordinator.rs");
 
 mod txn_metadata;

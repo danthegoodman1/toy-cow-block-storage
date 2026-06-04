@@ -861,9 +861,11 @@ fn run_one_op(
                 hot_blocks,
                 ..
             },
-            Workload::BlockRead4k,
+            Workload::BlockRead4k | Workload::BlockRead1m,
         ) => {
-            let block = rng.below(*hot_blocks);
+            let blocks = (context.op_size as u64) / u64::from(BLOCK_SIZE);
+            let max_start = hot_blocks.saturating_sub(blocks);
+            let block = rng.below(max_start.saturating_add(1));
             context
                 .store
                 .read_device(
@@ -968,7 +970,7 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, Workload::NativeRead4k) => {
+        (Target::Native { keyspace_id, files }, Workload::NativeRead4k | Workload::NativeRead1m) => {
             let file_id = files[rng.below(files.len() as u64) as usize];
             context
                 .store

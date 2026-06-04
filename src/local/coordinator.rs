@@ -990,18 +990,6 @@ impl LocalCoordinator {
         Ok(())
     }
 
-    fn verify_segment_payloads_for_read(
-        &self,
-        segment_ids: BTreeSet<SegmentId>,
-        verification: ReadVerification,
-    ) -> Result<()> {
-        for segment_id in segment_ids {
-            self.storage_nodes
-                .verify_segment_payload_for_read(segment_id, verification)?;
-        }
-        Ok(())
-    }
-
     fn segment_ids(&self) -> Result<BTreeSet<SegmentId>> {
         self.storage_nodes.segment_ids()
     }
@@ -1930,16 +1918,17 @@ impl LocalCoordinator {
             })?;
             let mut segment_bytes = vec![0; segment_len_usize];
             if group.start < head.size {
-                self.read_metadata_node(&root, write_range, block_size, &mut segment_bytes)?;
                 let preserved_len = head.size.saturating_sub(group.start).min(segment_len);
                 let preserved_range = ByteRange::new(group.start, preserved_len);
-                let run_extents =
-                    self.run_extents_for_file_read(keyspace_id, file_id, preserved_range)?;
-                self.read_append_run_extents_from_memory(
-                    &run_extents,
-                    ByteRange::new(group.start, segment_len),
-                    &mut segment_bytes,
+                let preserved_len_usize = usize::try_from(preserved_len).map_err(|_| {
+                    StorageError::invalid_argument("native preserved length overflows usize")
+                })?;
+                let plan = self.resolve_file_read_plan(keyspace_id, file_id, preserved_range)?;
+                assemble_read_plan(
+                    self,
+                    plan,
                     ReadVerification::Default,
+                    &mut segment_bytes[..preserved_len_usize],
                 )?;
             }
             overlay_native_batch_writes(
@@ -3275,47 +3264,8 @@ impl LocalCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let segment_ids = self.segment_ids_for_device_read(device_id, range)?;
-        self.read_device_unverified(device_id, range, buf)?;
-        self.verify_segment_payloads_for_read(segment_ids, verification)
-    }
-
-    fn read_device_unverified(
-        &self,
-        device_id: DeviceId,
-        range: ByteRange,
-        buf: &mut [u8],
-    ) -> Result<()> {
-        let info = self.metadata.device_info(device_id)?;
-        range.validate_for_device(&info.spec)?;
-        let buf_len = u64::try_from(buf.len())
-            .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
-        if buf_len != range.len {
-            return Err(StorageError::invalid_argument(
-                "read buffer length must match range length",
-            ));
-        }
-
-        buf.fill(0);
-        if range.len == 0 {
-            return Ok(());
-        }
-
-        let block_size = u64::from(info.spec.block_size);
-        let requested = crate::api::BlockRange::new(
-            BlockIndex::from_raw(range.offset / block_size),
-            BlockCount::from_raw(range.len / block_size),
-        );
-        let head = self.metadata.get_head(device_id)?;
-
-        for root in head.shard_roots {
-            let node = self.metadata.get_metadata_node(root)?;
-            if node.covered_range.overlaps(requested)? {
-                self.read_metadata_node(&node, requested, block_size, buf)?;
-            }
-        }
-
-        Ok(())
+        let plan = self.resolve_block_read(device_id, range)?;
+        assemble_read_plan(self, plan, verification, buf)
     }
 
     pub fn read_file(
@@ -3342,149 +3292,57 @@ impl LocalCoordinator {
         buf: &mut [u8],
         verification: ReadVerification,
     ) -> Result<()> {
-        let segment_ids = self.segment_ids_for_file_read(keyspace_id, file_id, range)?;
-        let run_extents = self.run_extents_for_file_read(keyspace_id, file_id, range)?;
-        self.read_file_unverified(keyspace_id, file_id, range, buf)?;
-        self.read_append_run_extents_from_memory(&run_extents, range, buf, verification)?;
-        self.verify_segment_payloads_for_read(segment_ids, verification)
+        let plan = self.resolve_file_read(keyspace_id, file_id, range)?;
+        assemble_read_plan(self, plan, verification, buf)
     }
 
-    fn read_append_run_extents_from_memory(
+    fn read_append_run_source_from_memory(
         &self,
-        extents: &[RunBackedFileExtent],
+        storage_node: StorageNodeId,
+        log_id: u64,
         range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
+        verification: ReadVerification,
         buf: &mut [u8],
-        verification: ReadVerification,
     ) -> Result<()> {
-        for extent in extents {
-            let bytes = self.read_append_run_range_from_memory(&extent.run, verification)?;
-            let output_offset = usize::try_from(
-                extent
-                    .file_offset_start
-                    .checked_sub(range.offset)
-                    .ok_or_else(|| StorageError::corrupt("run extent precedes read range"))?,
-            )
-            .map_err(|_| StorageError::invalid_argument("run read output offset overflows"))?;
-            let output_end = output_offset
-                .checked_add(bytes.len())
-                .ok_or_else(|| StorageError::invalid_argument("run read output end overflows"))?;
-            let output = buf.get_mut(output_offset..output_end).ok_or_else(|| {
-                StorageError::corrupt("run-backed extent exceeds read output buffer")
-            })?;
-            output.copy_from_slice(&bytes);
-        }
-        Ok(())
-    }
-
-    fn read_append_run_range_from_memory(
-        &self,
-        run: &AppendLogRunRange,
-        verification: ReadVerification,
-    ) -> Result<Vec<u8>> {
-        run.validate()?;
+        verify_read_integrity_policy(integrity, verification)?;
         let logs = lock(&self.append_run_logs)?;
         let log = logs
-            .get(&(run.storage_node, run.log_id))
+            .get(&(storage_node, log_id))
             .ok_or_else(|| StorageError::corrupt("append-run log is missing from local store"))?;
-        let start = usize::try_from(run.log_payload_offset)
+        let start = usize::try_from(range.offset)
             .map_err(|_| StorageError::corrupt("append-run offset overflows usize"))?;
-        let len = usize::try_from(run.payload_len)
+        let len = usize::try_from(range.len)
             .map_err(|_| StorageError::corrupt("append-run length overflows usize"))?;
         let end = start
             .checked_add(len)
             .ok_or_else(|| StorageError::corrupt("append-run range overflows"))?;
         let bytes = log
             .get(start..end)
-            .ok_or_else(|| StorageError::corrupt("append-run range exceeds local log"))?
-            .to_vec();
-        match run.integrity {
-            SegmentPayloadIntegrity::Unchecked => {
-                if matches!(verification, ReadVerification::RequireVerified) {
-                    return Err(StorageError::conflict(
-                        "read requires verified payload but append run is unchecked",
-                    ));
-                }
-            }
-            integrity @ SegmentPayloadIntegrity::Crc32c(_) => {
-                if !matches!(verification, ReadVerification::Skip) {
-                    verify_segment_payload_integrity(integrity, &bytes)?;
-                }
-            }
-        }
-        Ok(bytes)
-    }
-
-    fn read_file_unverified(
-        &self,
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        range: ByteRange,
-        buf: &mut [u8],
-    ) -> Result<()> {
-        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
-        let buf_len = u64::try_from(buf.len())
-            .map_err(|_| StorageError::invalid_argument("read buffer length overflows u64"))?;
-        if buf_len != range.len {
-            return Err(StorageError::invalid_argument(
-                "read buffer length must match range length",
+            .ok_or_else(|| StorageError::corrupt("append-run range exceeds local log"))?;
+        if bytes.len() != buf.len() {
+            return Err(StorageError::corrupt(
+                "append-run read length disagrees with output buffer",
             ));
         }
-        let end = range.end_exclusive()?;
-        if end > head.size {
-            return Err(StorageError::invalid_argument(
-                "native file read extends past end of file",
-            ));
+        if !matches!(verification, ReadVerification::Skip)
+            && !matches!(integrity, SegmentPayloadIntegrity::Unchecked)
+        {
+            verify_segment_payload_integrity(integrity, bytes)?;
         }
-
-        buf.fill(0);
-        if range.len == 0 {
-            let _ = self.metadata.get_metadata_node(head.root)?;
-            return Ok(());
-        }
-
-        let block_size = u64::from(self.metadata.config.block_size);
-        let first_block = range.offset / block_size;
-        let requested_start = first_block
-            .checked_mul(block_size)
-            .ok_or_else(|| StorageError::invalid_argument("native read range overflows"))?;
-        let requested_blocks = blocks_for_bytes(end - requested_start, block_size)?;
-        let requested = crate::api::BlockRange::new(
-            BlockIndex::from_raw(first_block),
-            BlockCount::from_raw(requested_blocks),
-        );
-        let root = self.metadata.get_metadata_node(head.root)?;
-        let scratch_len = requested_blocks.checked_mul(block_size).ok_or_else(|| {
-            StorageError::invalid_argument("native read scratch length overflows")
-        })?;
-        let scratch_len = usize::try_from(scratch_len).map_err(|_| {
-            StorageError::invalid_argument("native read scratch length overflows usize")
-        })?;
-        let mut scratch = vec![0; scratch_len];
-        self.read_metadata_node(&root, requested, block_size, &mut scratch)?;
-        let start = usize::try_from(range.offset % block_size)
-            .map_err(|_| StorageError::invalid_argument("native read offset overflows usize"))?;
-        let len = usize::try_from(range.len)
-            .map_err(|_| StorageError::invalid_argument("native read length overflows usize"))?;
-        let copy_end = start
-            .checked_add(len)
-            .ok_or_else(|| StorageError::invalid_argument("native read end overflows"))?;
-        let bytes = scratch.get(start..copy_end).ok_or_else(|| {
-            StorageError::corrupt("native read scratch range does not cover request")
-        })?;
         buf.copy_from_slice(bytes);
         Ok(())
     }
 
-    fn segment_ids_for_device_read(
+    fn resolve_block_read_plan(
         &self,
         device_id: DeviceId,
         range: ByteRange,
-    ) -> Result<BTreeSet<SegmentId>> {
+    ) -> Result<ReadPlan> {
         let info = self.metadata.device_info(device_id)?;
         range.validate_for_device(&info.spec)?;
-        let mut out = BTreeSet::new();
         if range.len == 0 {
-            return Ok(out);
+            return ReadPlan::from_non_zero_extents(0, Vec::new());
         }
 
         let block_size = u64::from(info.spec.block_size);
@@ -3492,22 +3350,29 @@ impl LocalCoordinator {
             BlockIndex::from_raw(range.offset / block_size),
             BlockCount::from_raw(range.len / block_size),
         );
+        let mut extents = Vec::new();
         let head = self.metadata.get_head(device_id)?;
         for root in head.shard_roots {
             let node = self.metadata.get_metadata_node(root)?;
             if node.covered_range.overlaps(requested)? {
-                self.collect_segment_ids_for_metadata_node(&node, requested, &mut out)?;
+                self.collect_segment_read_extents_for_metadata_node(
+                    &node,
+                    requested,
+                    range,
+                    block_size,
+                    &mut extents,
+                )?;
             }
         }
-        Ok(out)
+        ReadPlan::from_non_zero_extents(range.len, extents)
     }
 
-    fn segment_ids_for_file_read(
+    fn resolve_file_read_plan(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
         range: ByteRange,
-    ) -> Result<BTreeSet<SegmentId>> {
+    ) -> Result<ReadPlan> {
         let head = self.metadata.get_file_head(keyspace_id, file_id)?;
         let end = range.end_exclusive()?;
         if end > head.size {
@@ -3515,10 +3380,9 @@ impl LocalCoordinator {
                 "native file read extends past end of file",
             ));
         }
-        let mut out = BTreeSet::new();
         if range.len == 0 {
             let _ = self.metadata.get_metadata_node(head.root)?;
-            return Ok(out);
+            return ReadPlan::from_non_zero_extents(0, Vec::new());
         }
 
         let block_size = u64::from(self.metadata.config.block_size);
@@ -3532,84 +3396,231 @@ impl LocalCoordinator {
             BlockCount::from_raw(requested_blocks),
         );
         let root = self.metadata.get_metadata_node(head.root)?;
-        self.collect_segment_ids_for_metadata_node(&root, requested, &mut out)?;
-        Ok(out)
+        let mut segment_extents = Vec::new();
+        self.collect_segment_read_extents_for_metadata_node(
+            &root,
+            requested,
+            range,
+            block_size,
+            &mut segment_extents,
+        )?;
+        let mut run_extents = Vec::new();
+        self.collect_append_run_read_extents_for_metadata_node(
+            &root,
+            requested,
+            range,
+            &mut run_extents,
+        )?;
+        let mut extents =
+            Self::trim_segment_read_extents_for_append_runs(segment_extents, &run_extents)?;
+        extents.extend(run_extents);
+        ReadPlan::from_non_zero_extents(range.len, extents)
     }
 
-    fn run_extents_for_file_read(
-        &self,
-        keyspace_id: KeyspaceId,
-        file_id: FileId,
-        range: ByteRange,
-    ) -> Result<Vec<RunBackedFileExtent>> {
-        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
-        let end = range.end_exclusive()?;
-        if end > head.size {
-            return Err(StorageError::invalid_argument(
-                "native file read extends past end of file",
-            ));
-        }
+    fn trim_segment_read_extents_for_append_runs(
+        segment_extents: Vec<ReadExtent>,
+        run_extents: &[ReadExtent],
+    ) -> Result<Vec<ReadExtent>> {
         let mut out = Vec::new();
-        if range.len == 0 {
-            let _ = self.metadata.get_metadata_node(head.root)?;
-            return Ok(out);
+        for segment in segment_extents {
+            let mut pieces = vec![segment];
+            for run in run_extents {
+                let run_start = run.output_offset;
+                let run_end = run_start
+                    .checked_add(run.len)
+                    .ok_or_else(|| StorageError::corrupt("append-run read extent overflows"))?;
+                let mut next = Vec::with_capacity(pieces.len().saturating_add(1));
+                for piece in pieces {
+                    let piece_start = piece.output_offset;
+                    let piece_end = piece_start
+                        .checked_add(piece.len)
+                        .ok_or_else(|| StorageError::corrupt("segment read extent overflows"))?;
+                    let overlap_start = piece_start.max(run_start);
+                    let overlap_end = piece_end.min(run_end);
+                    if overlap_start >= overlap_end {
+                        next.push(piece);
+                        continue;
+                    }
+                    if piece_start < overlap_start {
+                        next.push(Self::slice_read_extent(
+                            &piece,
+                            piece_start,
+                            overlap_start - piece_start,
+                        )?);
+                    }
+                    if overlap_end < piece_end {
+                        next.push(Self::slice_read_extent(
+                            &piece,
+                            overlap_end,
+                            piece_end - overlap_end,
+                        )?);
+                    }
+                }
+                pieces = next;
+                if pieces.is_empty() {
+                    break;
+                }
+            }
+            out.extend(pieces);
         }
-
-        let block_size = u64::from(self.metadata.config.block_size);
-        let first_block = range.offset / block_size;
-        let requested_start = first_block
-            .checked_mul(block_size)
-            .ok_or_else(|| StorageError::invalid_argument("native read range overflows"))?;
-        let requested_blocks = blocks_for_bytes(end - requested_start, block_size)?;
-        let requested = crate::api::BlockRange::new(
-            BlockIndex::from_raw(first_block),
-            BlockCount::from_raw(requested_blocks),
-        );
-        let root = self.metadata.get_metadata_node(head.root)?;
-        self.collect_run_extents_for_metadata_node(&root, requested, range, &mut out)?;
-        out.sort_by_key(|extent| extent.file_offset_start);
         Ok(out)
     }
 
-    fn collect_segment_ids_for_metadata_node(
-        &self,
-        node: &MetadataNode,
-        requested: crate::api::BlockRange,
-        out: &mut BTreeSet<SegmentId>,
-    ) -> Result<()> {
-        match &node.kind {
-            MetadataNodeKind::Internal { children } => {
-                for child in children {
-                    if child.range.overlaps(requested)? {
-                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
-                        self.collect_segment_ids_for_metadata_node(&child_node, requested, out)?;
-                    }
-                }
-            }
-            MetadataNodeKind::Leaf { entries, .. } => {
-                for entry in entries {
-                    if entry.logical_range().overlaps(requested)? {
-                        out.insert(entry.segment_id);
-                    }
-                }
-            }
+    fn slice_read_extent(extent: &ReadExtent, output_offset: u64, len: u64) -> Result<ReadExtent> {
+        if len == 0 {
+            return Err(StorageError::invalid_argument(
+                "read extent slice must not be empty",
+            ));
         }
-        Ok(())
+        let delta = output_offset
+            .checked_sub(extent.output_offset)
+            .ok_or_else(|| StorageError::corrupt("read extent slice precedes source extent"))?;
+        let source = match extent.source {
+            ReadSource::Zero => ReadSource::Zero,
+            ReadSource::Segment {
+                storage_node,
+                segment_id,
+                segment_offset,
+                integrity,
+            } => ReadSource::Segment {
+                storage_node,
+                segment_id,
+                segment_offset: segment_offset.checked_add(delta).ok_or_else(|| {
+                    StorageError::corrupt("segment read extent slice offset overflows")
+                })?,
+                integrity,
+            },
+            ReadSource::AppendRun {
+                storage_node,
+                log_id,
+                payload_offset,
+                integrity,
+            } => ReadSource::AppendRun {
+                storage_node,
+                log_id,
+                payload_offset: payload_offset.checked_add(delta).ok_or_else(|| {
+                    StorageError::corrupt("append-run read extent slice offset overflows")
+                })?,
+                integrity,
+            },
+        };
+        Ok(ReadExtent {
+            output_offset,
+            len,
+            source,
+        })
     }
 
-    fn collect_run_extents_for_metadata_node(
+    fn collect_segment_read_extents_for_metadata_node(
         &self,
         node: &MetadataNode,
         requested_blocks: crate::api::BlockRange,
         requested_bytes: ByteRange,
-        out: &mut Vec<RunBackedFileExtent>,
+        block_size: u64,
+        out: &mut Vec<ReadExtent>,
     ) -> Result<()> {
         match &node.kind {
             MetadataNodeKind::Internal { children } => {
                 for child in children {
                     if child.range.overlaps(requested_blocks)? {
                         let child_node = self.metadata.get_metadata_node(child.node_id)?;
-                        self.collect_run_extents_for_metadata_node(
+                        self.collect_segment_read_extents_for_metadata_node(
+                            &child_node,
+                            requested_blocks,
+                            requested_bytes,
+                            block_size,
+                            out,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            MetadataNodeKind::Leaf { entries, .. } => {
+                for entry in entries {
+                    self.collect_segment_entry_read_extent(
+                        entry,
+                        requested_bytes,
+                        block_size,
+                        out,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn collect_segment_entry_read_extent(
+        &self,
+        entry: &LeafEntry,
+        requested_bytes: ByteRange,
+        block_size: u64,
+        out: &mut Vec<ReadExtent>,
+    ) -> Result<()> {
+        let entry_start = entry
+            .logical_start
+            .raw()
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("entry byte start overflows"))?;
+        let entry_len = entry
+            .blocks
+            .raw()
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("entry byte length overflows"))?;
+        let Some(overlap) =
+            byte_range_intersection(ByteRange::new(entry_start, entry_len), requested_bytes)?
+        else {
+            return Ok(());
+        };
+        let segment_start = entry
+            .segment_offset
+            .raw()
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("segment byte start overflows"))?;
+        let segment_offset = segment_start
+            .checked_add(overlap.offset - entry_start)
+            .ok_or_else(|| StorageError::invalid_argument("segment read offset overflows"))?;
+        let output_offset = overlap
+            .offset
+            .checked_sub(requested_bytes.offset)
+            .ok_or_else(|| StorageError::corrupt("read extent precedes requested range"))?;
+        let receipt = self.storage_nodes.receipt_for_segment(entry.segment_id)?;
+        let verified = self.authority.verify_segment_receipt(&receipt)?;
+        let descriptor = verified.descriptor();
+        if segment_offset
+            .checked_add(overlap.len)
+            .ok_or_else(|| StorageError::invalid_argument("segment read end overflows"))?
+            > descriptor.bytes
+        {
+            return Err(StorageError::corrupt(
+                "metadata read extent exceeds segment descriptor",
+            ));
+        }
+        out.push(ReadExtent {
+            output_offset,
+            len: overlap.len,
+            source: ReadSource::Segment {
+                storage_node: verified.receipt().storage_node,
+                segment_id: entry.segment_id,
+                segment_offset,
+                integrity: descriptor.integrity,
+            },
+        });
+        Ok(())
+    }
+
+    fn collect_append_run_read_extents_for_metadata_node(
+        &self,
+        node: &MetadataNode,
+        requested_blocks: crate::api::BlockRange,
+        requested_bytes: ByteRange,
+        out: &mut Vec<ReadExtent>,
+    ) -> Result<()> {
+        match &node.kind {
+            MetadataNodeKind::Internal { children } => {
+                for child in children {
+                    if child.range.overlaps(requested_blocks)? {
+                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                        self.collect_append_run_read_extents_for_metadata_node(
                             &child_node,
                             requested_blocks,
                             requested_bytes,
@@ -3625,82 +3636,76 @@ impl LocalCoordinator {
                         && let Some(sliced) =
                             slice_run_extent(extent, overlap.offset, overlap.end_exclusive()?)?
                     {
-                        out.push(sliced);
+                        out.push(ReadExtent {
+                            output_offset: sliced.file_offset_start - requested_bytes.offset,
+                            len: sliced.payload_len,
+                            source: ReadSource::AppendRun {
+                                storage_node: sliced.run.storage_node,
+                                log_id: sliced.run.log_id,
+                                payload_offset: sliced.run.log_payload_offset,
+                                integrity: sliced.run.integrity,
+                            },
+                        });
                     }
                 }
             }
         }
         Ok(())
     }
+}
 
-    fn read_metadata_node(
+impl MetadataReadService for LocalCoordinator {
+    fn resolve_block_read(&self, device_id: DeviceId, range: ByteRange) -> Result<ReadPlan> {
+        self.resolve_block_read_plan(device_id, range)
+    }
+
+    fn resolve_file_read(
         &self,
-        node: &MetadataNode,
-        requested: crate::api::BlockRange,
-        block_size: u64,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+    ) -> Result<ReadPlan> {
+        self.resolve_file_read_plan(keyspace_id, file_id, range)
+    }
+}
+
+impl StorageNodeReadService for LocalCoordinator {
+    fn read_segment_source(
+        &self,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
+        verification: ReadVerification,
         buf: &mut [u8],
     ) -> Result<()> {
-        match &node.kind {
-            MetadataNodeKind::Internal { children } => {
-                for child in children {
-                    if child.range.overlaps(requested)? {
-                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
-                        self.read_metadata_node(&child_node, requested, block_size, buf)?;
-                    }
-                }
-                Ok(())
-            }
-            MetadataNodeKind::Leaf { entries, .. } => {
-                for entry in entries {
-                    let Some(overlap) = entry.logical_range().intersection(requested)? else {
-                        continue;
-                    };
-                    let segment_offset_blocks = entry
-                        .segment_offset
-                        .raw()
-                        .checked_add(overlap.start.raw() - entry.logical_start.raw())
-                        .ok_or_else(|| {
-                            StorageError::invalid_argument("segment read offset overflows")
-                        })?;
-                    let segment_range = ByteRange::new(
-                        segment_offset_blocks
-                            .checked_mul(block_size)
-                            .ok_or_else(|| {
-                                StorageError::invalid_argument("segment byte offset overflows")
-                            })?,
-                        overlap
-                            .blocks
-                            .raw()
-                            .checked_mul(block_size)
-                            .ok_or_else(|| {
-                                StorageError::invalid_argument("segment byte length overflows")
-                            })?,
-                    );
-                    let output_offset = usize::try_from(
-                        (overlap.start.raw() - requested.start.raw())
-                            .checked_mul(block_size)
-                            .ok_or_else(|| {
-                                StorageError::invalid_argument("read output offset overflows")
-                            })?,
-                    )
-                    .map_err(|_| {
-                        StorageError::invalid_argument("read output offset overflows usize")
-                    })?;
-                    let output_len = usize::try_from(segment_range.len).map_err(|_| {
-                        StorageError::invalid_argument("read output length overflows usize")
-                    })?;
-                    let output_end = output_offset.checked_add(output_len).ok_or_else(|| {
-                        StorageError::invalid_argument("read output end overflows")
-                    })?;
-                    let output = buf.get_mut(output_offset..output_end).ok_or_else(|| {
-                        StorageError::corrupt("metadata read output range exceeds buffer")
-                    })?;
-                    self.storage_nodes
-                        .read_segment(entry.segment_id, segment_range, output)?;
-                }
-                Ok(())
-            }
-        }
+        self.storage_nodes.read_segment_from_node(
+            storage_node,
+            segment_id,
+            range,
+            integrity,
+            verification,
+            buf,
+        )
+    }
+
+    fn read_append_run_source(
+        &self,
+        storage_node: StorageNodeId,
+        log_id: u64,
+        range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
+        verification: ReadVerification,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        self.read_append_run_source_from_memory(
+            storage_node,
+            log_id,
+            range,
+            integrity,
+            verification,
+            buf,
+        )
     }
 }
 

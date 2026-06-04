@@ -5350,13 +5350,19 @@ fn durable_append_run_payload_writes_without_segment_placement() {
     assert_eq!(pending.placements.len(), 0);
     assert_eq!(pending.logs.len(), 1);
     assert!(profile.write_nanos > 0);
-    assert_eq!(
-        store
-            .durable
-            .read_append_run_range_payload(&run.full_range(), ReadVerification::Default)
-            .unwrap(),
-        bytes
-    );
+    let mut read = vec![0; bytes.len()];
+    store
+        .durable
+        .read_append_run_source_payload(
+            run.storage_node,
+            run.log_id,
+            ByteRange::new(run.log_payload_offset, run.payload_len),
+            run.integrity,
+            ReadVerification::Default,
+            &mut read,
+        )
+        .unwrap();
+    assert_eq!(read, bytes);
     assert!(store.local.segment_ids().unwrap().is_empty());
 
     let _ = fs::remove_dir_all(root);
@@ -5820,6 +5826,227 @@ fn durable_unchecked_native_payload_allows_default_read_but_not_required_verific
                 &mut bytes,
                 ReadVerification::RequireVerified,
             )
+            .is_err()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_read_plan_zero_fills_sparse_ranges() {
+    let root = durable_temp_dir("read-plan-sparse-block");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let payload = repeated_blocks(1, 17);
+    store
+        .write_device(device_id, 4096, &payload, WriteDurability::Flushed)
+        .unwrap();
+
+    let plan = store
+        .local
+        .resolve_block_read(device_id, ByteRange::new(0, 3 * 4096))
+        .unwrap();
+    assert_eq!(plan.logical_len, 3 * 4096);
+    assert_eq!(plan.extents.len(), 3);
+    assert!(matches!(plan.extents[0].source, ReadSource::Zero));
+    assert!(matches!(plan.extents[1].source, ReadSource::Segment { .. }));
+    assert!(matches!(plan.extents[2].source, ReadSource::Zero));
+
+    let mut bytes = vec![0xff; 3 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes[..4096], &[0; 4096]);
+    assert_eq!(&bytes[4096..8192], payload.as_slice());
+    assert_eq!(&bytes[8192..], &[0; 4096]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_read_plan_assembles_multiple_segment_extents() {
+    let root = durable_temp_dir("read-plan-multi-block");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let first = repeated_blocks(1, 21);
+    let second = repeated_blocks(1, 22);
+    store
+        .write_device(device_id, 0, &first, WriteDurability::Flushed)
+        .unwrap();
+    store
+        .write_device(device_id, 4096, &second, WriteDurability::Flushed)
+        .unwrap();
+
+    let plan = store
+        .local
+        .resolve_block_read(device_id, ByteRange::new(0, 2 * 4096))
+        .unwrap();
+    assert_eq!(
+        plan.extents
+            .iter()
+            .filter(|extent| matches!(extent.source, ReadSource::Segment { .. }))
+            .count(),
+        2
+    );
+
+    let mut bytes = vec![0; 2 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes[..4096], first.as_slice());
+    assert_eq!(&bytes[4096..], second.as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_native_read_plan_assembles_segments_and_published_append_runs() {
+    let root = durable_temp_dir("read-plan-native-append-run");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let segment_bytes = repeated_blocks(1, 31);
+    let run_bytes = repeated_blocks(1, 32);
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, segment_bytes.clone())],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        file_id,
+        &run_bytes,
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+
+    let plan = store
+        .local
+        .resolve_file_read(keyspace_id, file_id, ByteRange::new(0, 2 * 4096))
+        .unwrap();
+    assert!(
+        plan.extents
+            .iter()
+            .any(|extent| matches!(extent.source, ReadSource::Segment { .. }))
+    );
+    assert!(
+        plan.extents
+            .iter()
+            .any(|extent| matches!(extent.source, ReadSource::AppendRun { .. }))
+    );
+
+    let mut bytes = vec![0; 2 * 4096];
+    store
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, 2 * 4096),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(&bytes[..4096], segment_bytes.as_slice());
+    assert_eq!(&bytes[4096..], run_bytes.as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_native_read_ignores_flushed_unpublished_append_stream_bytes() {
+    let root = durable_temp_dir("read-plan-unpublished-stream");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let payload = repeated_blocks(1, 41);
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    let mark = store.flush_append_stream(&stream).unwrap();
+
+    let mut bytes = vec![0; 4096];
+    assert!(
+        store
+            .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+            .is_err()
+    );
+
+    store.publish_append_stream(&stream, &mark).unwrap();
+    store
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_read_fails_when_storage_node_catalog_placement_is_missing() {
+    let root = durable_temp_dir("read-plan-missing-placement");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let payload = repeated_blocks(1, 51);
+    store
+        .write_device(device_id, 0, &payload, WriteDurability::Flushed)
+        .unwrap();
+
+    let segment_id = first_device_segment(&store, device_id);
+    let placement = store.durable.placement_for_test(segment_id).unwrap();
+    let catalog = store
+        .local
+        .segment_catalog_for_node(placement.storage_node)
+        .unwrap();
+    lock(&catalog.inner).unwrap().entries.remove(&segment_id);
+
+    let mut bytes = vec![0; 4096];
+    assert!(
+        store
+            .read_device(device_id, ByteRange::new(0, 4096), &mut bytes)
             .is_err()
     );
     let _ = fs::remove_dir_all(root);

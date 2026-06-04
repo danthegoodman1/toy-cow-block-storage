@@ -1963,21 +1963,28 @@ impl DurableSqliteStore {
         Ok((run, append, profile))
     }
 
-    fn read_append_run_range_payload(
+    fn read_append_run_source_payload(
         &self,
-        run: &AppendLogRunRange,
+        storage_node: StorageNodeId,
+        log_id: u64,
+        range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
         verification: ReadVerification,
-    ) -> Result<Vec<u8>> {
-        run.validate()?;
-        let path = data_log_path(&self.paths.data_dir, run.storage_node, run.log_id);
+        buf: &mut [u8],
+    ) -> Result<()> {
+        if usize::try_from(range.len)
+            .map_err(|_| StorageError::corrupt("append run range length overflows usize"))?
+            != buf.len()
+        {
+            return Err(StorageError::invalid_argument(
+                "append run read buffer length disagrees with source range",
+            ));
+        }
+        let path = data_log_path(&self.paths.data_dir, storage_node, log_id);
         let mut file = File::open(&path).map_err(fs_error)?;
-        file.seek(SeekFrom::Start(run.log_payload_offset))
-            .map_err(fs_error)?;
-        let len = usize::try_from(run.payload_len)
-            .map_err(|_| StorageError::corrupt("append run range length overflows usize"))?;
-        let mut bytes = vec![0; len];
-        file.read_exact(&mut bytes).map_err(fs_error)?;
-        match run.integrity {
+        file.seek(SeekFrom::Start(range.offset)).map_err(fs_error)?;
+        file.read_exact(buf).map_err(fs_error)?;
+        match integrity {
             SegmentPayloadIntegrity::Unchecked => {
                 if matches!(verification, ReadVerification::RequireVerified) {
                     return Err(StorageError::conflict(
@@ -1987,11 +1994,11 @@ impl DurableSqliteStore {
             }
             integrity @ SegmentPayloadIntegrity::Crc32c(_) => {
                 if !matches!(verification, ReadVerification::Skip) {
-                    verify_segment_payload_integrity(integrity, &bytes)?;
+                    verify_segment_payload_integrity(integrity, buf)?;
                 }
             }
         }
-        Ok(bytes)
+        Ok(())
     }
 
     fn append_segments_profiled_with_state(

@@ -67,7 +67,7 @@ fn setup_context(
             })?);
         }
         let device_id = devices[0];
-        let hot_blocks = if matches!(workload, Workload::BlockRead4k) {
+        let hot_blocks = if matches!(workload, Workload::BlockRead4k | Workload::BlockRead1m) {
             seed_block_read_workload(&store, device_id, args, &payload)?
         } else {
             args.device_blocks
@@ -95,7 +95,7 @@ fn setup_context(
                     spec: FileSpec { name: None },
                 },
             )?;
-            if matches!(workload, Workload::NativeRead4k) {
+            if matches!(workload, Workload::NativeRead4k | Workload::NativeRead1m) {
                 store.commit_file_batch(
                     keyspace_id,
                     file_id,
@@ -126,12 +126,24 @@ fn seed_block_read_workload(
     args: &Args,
     payload: &[u8],
 ) -> Result<u64> {
-    let hot_blocks = args.device_blocks.min(4096);
+    let read_blocks = u64::try_from(payload.len())
+        .map_err(|_| StorageError::invalid_argument("read payload length overflows u64"))?
+        .checked_div(u64::from(BLOCK_SIZE))
+        .ok_or_else(|| StorageError::invalid_argument("block size must not be zero"))?;
+    if read_blocks == 0 || read_blocks > args.device_blocks {
+        return Err(StorageError::invalid_argument(
+            "block read workload exceeds device size",
+        ));
+    }
+    let hot_blocks = args.device_blocks.min(4096_u64.max(read_blocks));
+    let block_payload = payload
+        .get(..usize::try_from(BLOCK_SIZE).expect("block size fits usize"))
+        .ok_or_else(|| StorageError::invalid_argument("read payload is smaller than one block"))?;
     for block in 0..hot_blocks {
         store.write_device(
             device_id,
             block * u64::from(BLOCK_SIZE),
-            payload,
+            block_payload,
             WriteDurability::Acknowledged,
             args.payload_integrity,
         )?;

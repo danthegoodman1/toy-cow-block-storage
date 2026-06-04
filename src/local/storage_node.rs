@@ -9,6 +9,29 @@ pub(super) struct LocalStorageNode {
 }
 
 impl LocalStorageNode {
+    fn read_segment_with_integrity(
+        &self,
+        segment_id: SegmentId,
+        range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
+        verification: ReadVerification,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let receipt = self.segment_catalog.receipt_for_segment(segment_id)?;
+        if receipt.storage_node != self.storage_node
+            || receipt.segment_id != segment_id
+            || receipt.integrity != integrity
+        {
+            return Err(StorageError::corrupt(
+                "read plan segment source disagrees with storage-node catalog",
+            ));
+        }
+        verify_read_integrity_policy(integrity, verification)?;
+        self.segment_store
+            .verify_segment_payload_for_read(segment_id, verification)?;
+        self.segment_store.read_segment(segment_id, range, buf)
+    }
+
     fn write_segment_profiled(
         &self,
         grant: WriteGrant,
@@ -765,6 +788,24 @@ impl StorageNodeRegistry {
         }
         buf.copy_from_slice(&bytes);
         Ok(())
+    }
+
+    fn read_segment_from_node(
+        &self,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        range: ByteRange,
+        integrity: SegmentPayloadIntegrity,
+        verification: ReadVerification,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        self.node(storage_node)?.read_segment_with_integrity(
+            segment_id,
+            range,
+            integrity,
+            verification,
+            buf,
+        )
     }
 
     fn diagnostics_nodes(
