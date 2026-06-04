@@ -351,6 +351,7 @@ pub(super) struct AppendStreamState {
     durable_through: u64,
     published_through: u64,
     status: AppendStreamStatus,
+    // Commit order by stream offset; append_stream_run_record enforces it.
     records: Vec<AppendStreamRunRecord>,
 }
 
@@ -382,9 +383,7 @@ impl AppendStreamState {
 
     fn contiguous_record_tail_from(&self, start: u64) -> Result<u64> {
         let mut expected = start;
-        let mut records = self.records.clone();
-        records.sort_by_key(|record| record.offset);
-        for record in records {
+        for record in &self.records {
             let end = record.end_exclusive()?;
             if end <= expected {
                 continue;
@@ -405,9 +404,7 @@ impl AppendStreamState {
         }
         let mut expected = start;
         let mut selected = Vec::new();
-        let mut records = self.records.clone();
-        records.sort_by_key(|record| record.offset);
-        for record in records {
+        for record in &self.records {
             let record_end = record.end_exclusive()?;
             if record_end <= expected {
                 continue;
@@ -438,9 +435,7 @@ impl AppendStreamState {
         let mut expected = self.durable_through;
         let mut payload_bytes = 0_u64;
         let mut selected = Vec::new();
-        let mut records = self.records.clone();
-        records.sort_by_key(|record| record.offset);
-        for record in records {
+        for record in &self.records {
             let end = record.end_exclusive()?;
             if end <= expected {
                 continue;
@@ -461,7 +456,7 @@ impl AppendStreamState {
                 .checked_add(record_payload_bytes)
                 .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
             expected = end;
-            selected.push(record);
+            selected.push(record.clone());
         }
         Ok(AppendStreamPrefixPersistBatch {
             records: selected,
@@ -551,7 +546,7 @@ struct AppendPublishTicketRecord {
 
 #[derive(Debug, Clone)]
 enum AppendPublishTicketStatus {
-    Pending(AppendStreamState),
+    Pending(AppendStream),
     Completed(AppendPublishCommit),
 }
 
@@ -1007,6 +1002,13 @@ impl InMemoryMetadataPlane {
                 "append stream record exceeds reserved tail",
             ));
         }
+        if let Some(last) = state.records.last()
+            && range.offset < last.end_exclusive()?
+        {
+            return Err(StorageError::conflict(
+                "append stream records must commit in stream order",
+            ));
+        }
         let record = AppendStreamRunRecord {
             ticket_id,
             offset: range.offset,
@@ -1135,7 +1137,7 @@ impl InMemoryMetadataPlane {
         {
             return Err(StorageError::conflict("stale append publish ticket"));
         }
-        Ok(AppendPublishTicketStatus::Pending(state.clone()))
+        Ok(AppendPublishTicketStatus::Pending(state.public_stream()))
     }
 
     fn complete_append_publish_ticket(
@@ -1169,6 +1171,41 @@ impl InMemoryMetadataPlane {
             return Ok(None);
         }
         Ok(Some(state.durable_through))
+    }
+
+    fn append_stream_publish_records(
+        &self,
+        stream: &AppendStream,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<AppendStreamRunRecord>> {
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        if start != state.published_through {
+            return Err(StorageError::conflict(
+                "append publish start no longer matches stream high-water",
+            ));
+        }
+        if end <= state.published_through {
+            return Err(StorageError::invalid_argument(
+                "append publish target must advance published stream prefix",
+            ));
+        }
+        if end > state.reserved_tail {
+            return Err(StorageError::conflict(
+                "append publish target exceeds accepted stream bytes",
+            ));
+        }
+        if end > state.contiguous_record_tail_from(state.published_through)? {
+            return Err(StorageError::conflict(
+                "append publish target exceeds contiguous stream records",
+            ));
+        }
+        state.publish_records(start, end)
     }
 
     fn append_stream_prefix_persist_plans_for(

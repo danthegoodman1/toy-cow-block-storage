@@ -1783,21 +1783,17 @@ impl LocalCoordinator {
         ticket: &AppendPublishTicket,
         durability: crate::api::WriteDurability,
     ) -> Result<AppendPublishCommit> {
-        let state = match self.metadata.append_publish_ticket_status(ticket)? {
+        let stream = match self.metadata.append_publish_ticket_status(ticket)? {
             AppendPublishTicketStatus::Completed(commit) => return Ok(commit),
-            AppendPublishTicketStatus::Pending(state) => state,
+            AppendPublishTicketStatus::Pending(stream) => stream,
         };
-        let stream = state.public_stream();
         let head = self
             .metadata
             .get_file_head(ticket.keyspace_id, ticket.file_id)?;
-        if head.size != state.published_through {
-            return Err(StorageError::conflict(
-                "append stream no longer matches visible file head",
-            ));
-        }
 
-        let unpublished = state.publish_records(state.published_through, ticket.publish_through)?;
+        let unpublished =
+            self.metadata
+                .append_stream_publish_records(&stream, head.size, ticket.publish_through)?;
         let run_extents: Vec<_> = unpublished
             .iter()
             .map(|record| {

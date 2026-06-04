@@ -1672,11 +1672,10 @@ impl DurableCoordinator {
         &self,
         ticket: &AppendPublishTicket,
     ) -> Result<AppendPublishCommit> {
-        let state = match self.local.metadata.append_publish_ticket_status(ticket)? {
+        let stream = match self.local.metadata.append_publish_ticket_status(ticket)? {
             AppendPublishTicketStatus::Completed(commit) => return Ok(commit),
-            AppendPublishTicketStatus::Pending(state) => state,
+            AppendPublishTicketStatus::Pending(stream) => stream,
         };
-        let stream = state.public_stream();
         self.persist_append_stream_prefix(&stream, ticket.publish_through)?;
         let commit = self
             .local
