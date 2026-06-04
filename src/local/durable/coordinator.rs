@@ -1441,6 +1441,120 @@ impl DurableCoordinator {
         Ok(delta)
     }
 
+    fn append_publish_plan_log_refs(
+        plans: &[AppendPublishPlan],
+    ) -> BTreeSet<DurableDataLogRef> {
+        plans
+            .iter()
+            .flat_map(|plan| {
+                plan.run_extents
+                    .iter()
+                    .filter(|extent| {
+                        extent
+                            .file_offset_start
+                            .saturating_add(extent.payload_len)
+                            > plan.payload_persist_start
+                    })
+                    .map(|extent| DurableDataLogRef {
+                        storage_node: extent.run.storage_node,
+                        log_id: extent.run.log_id,
+                    })
+            })
+            .collect()
+    }
+
+    fn pending_append_for_append_publish_plans(
+        &self,
+        plans: &[AppendPublishPlan],
+    ) -> Result<(PendingDataLogAppend, u64)> {
+        let run_log_refs = Self::append_publish_plan_log_refs(plans);
+        let mut pending_lock_wait_nanos = 0_u64;
+        let mut pending_stream_append = PendingDataLogAppend::default();
+        for plan in plans {
+            let Some(lane) = self.existing_stream_append_lane(plan.stream.stream_id)? else {
+                continue;
+            };
+            let plan_log_refs: BTreeSet<_> = plan
+                .run_extents
+                .iter()
+                .filter(|extent| {
+                    extent
+                        .file_offset_start
+                        .saturating_add(extent.payload_len)
+                        > plan.payload_persist_start
+                })
+                .map(|extent| DurableDataLogRef {
+                    storage_node: extent.run.storage_node,
+                    log_id: extent.run.log_id,
+                })
+                .collect();
+            let pending_lock_started = Instant::now();
+            let pending_stream = lock(&lane.pending)?;
+            pending_lock_wait_nanos = pending_lock_wait_nanos
+                .saturating_add(duration_nanos_u64(pending_lock_started.elapsed()));
+            pending_stream_append.merge(pending_stream.selected_log_refs(&plan_log_refs));
+        }
+
+        let mut pending_log_refs = pending_stream_append.log_refs();
+        let missing_log_refs: Vec<_> = run_log_refs
+            .difference(&pending_log_refs)
+            .copied()
+            .collect();
+        for log_ref in missing_log_refs {
+            let path = data_log_path(
+                &self.durable.paths.data_dir,
+                log_ref.storage_node,
+                log_ref.log_id,
+            );
+            let total_bytes = path.metadata().map_err(fs_error)?.len();
+            pending_stream_append.logs.insert(
+                log_ref,
+                PendingDataLogManifest {
+                    storage_node: log_ref.storage_node,
+                    log_id: log_ref.log_id,
+                    state: STREAM_DATA_LOG_STATE_ACTIVE.to_string(),
+                    total_bytes,
+                    needs_dir_sync: false,
+                },
+            );
+            pending_log_refs.insert(log_ref);
+        }
+
+        Ok((pending_stream_append, pending_lock_wait_nanos))
+    }
+
+    fn remove_pending_append_log_refs_for_publish_plans(
+        &self,
+        plans: &[AppendPublishPlan],
+    ) -> Result<u64> {
+        let mut pending_lock_wait_nanos = 0_u64;
+        for plan in plans {
+            let Some(lane) = self.existing_stream_append_lane(plan.stream.stream_id)? else {
+                continue;
+            };
+            let plan_log_refs: BTreeSet<_> = plan
+                .run_extents
+                .iter()
+                .filter(|extent| {
+                    extent
+                        .file_offset_start
+                        .saturating_add(extent.payload_len)
+                        > plan.payload_persist_start
+                })
+                .map(|extent| DurableDataLogRef {
+                    storage_node: extent.run.storage_node,
+                    log_id: extent.run.log_id,
+                })
+                .collect();
+            let pending_lock_started = Instant::now();
+            let mut pending_stream = lock(&lane.pending)?;
+            pending_lock_wait_nanos = pending_lock_wait_nanos
+                .saturating_add(duration_nanos_u64(pending_lock_started.elapsed()));
+            pending_stream.remove_log_refs(&plan_log_refs);
+        }
+        Ok(pending_lock_wait_nanos)
+    }
+
     fn persist_prepared_append_publish_plans(
         &self,
         plans: &[AppendPublishPlan],
@@ -1450,6 +1564,8 @@ impl DurableCoordinator {
         let snapshot_started = Instant::now();
         let previous_segments = lock(&self.persisted_segments)?.clone();
         let delta = Self::merged_append_publish_plan_delta(plans)?;
+        let (pending_stream_append, mut stream_prefix_pending_lock_wait_nanos) =
+            self.pending_append_for_append_publish_plans(plans)?;
         let changed_segments = delta.referenced_segment_ids.clone();
         if changed_segments
             .iter()
@@ -1464,9 +1580,44 @@ impl DurableCoordinator {
             .selected_state_for_segment_ids(&changed_segments)?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
-        let mut profile =
-            self.durable
-                .persist_native_metadata_delta(&delta, &nodes, &changed_segments, Vec::new())?;
+        let new_run_count = usize_to_u64(
+            plans
+                .iter()
+                .flat_map(|plan| {
+                    plan.run_extents.iter().filter(|extent| {
+                        extent
+                            .file_offset_start
+                            .saturating_add(extent.payload_len)
+                            > plan.payload_persist_start
+                    })
+                })
+                .count(),
+        );
+        let new_run_bytes = plans
+            .iter()
+            .map(|plan| plan.ticket.publish_through.saturating_sub(plan.payload_persist_start))
+            .fold(0_u64, u64::saturating_add);
+        let stream_prefix_storage_node_count = usize_to_u64(
+            plans
+                .iter()
+                .flat_map(|plan| {
+                    plan.run_extents.iter().filter(|extent| {
+                        extent
+                            .file_offset_start
+                            .saturating_add(extent.payload_len)
+                            > plan.payload_persist_start
+                    })
+                })
+                .map(|extent| extent.run.storage_node)
+                .collect::<BTreeSet<_>>()
+                .len(),
+        );
+        let mut profile = self.durable.persist_preingested_append_publish_delta(
+            &delta,
+            &nodes,
+            &changed_segments,
+            pending_stream_append,
+        )?;
         let durable_high_water = CommitSeq::from_raw(profile.durable_commit_high_water);
         let target_commit = plans
             .last()
@@ -1478,8 +1629,18 @@ impl DurableCoordinator {
             ));
         }
         lock(&self.persisted_segments)?.extend(changed_segments);
+        stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos
+            .saturating_add(self.remove_pending_append_log_refs_for_publish_plans(plans)?);
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.stream_prefix_request_count = usize_to_u64(plans.len());
+        profile.stream_prefix_plan_count = usize_to_u64(plans.len());
+        profile.stream_prefix_record_count = new_run_count;
+        profile.stream_prefix_payload_bytes = new_run_bytes;
+        profile.stream_prefix_storage_node_count = stream_prefix_storage_node_count;
+        profile.stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos;
+        profile.new_segment_count = profile.new_segment_count.saturating_add(new_run_count);
+        profile.new_segment_bytes = profile.new_segment_bytes.saturating_add(new_run_bytes);
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
@@ -1507,6 +1668,16 @@ impl DurableCoordinator {
             drop(state);
 
             let total_started = Instant::now();
+            let needs_payload_persist = self.local.append_publish_tickets_need_payload_persist(&tickets)?;
+            let persist_lock_started = Instant::now();
+            let (persist_guard, lock_wait_nanos) = if needs_payload_persist {
+                (
+                    Some(lock(&self.persist_lock)?),
+                    duration_nanos_u64(persist_lock_started.elapsed()),
+                )
+            } else {
+                (None, 0)
+            };
             let result = (|| {
                 if self.append_publish_requires_full_persist_before_plan()? {
                     return Ok(BatchStep::NeedsFullPersist);
@@ -1518,15 +1689,17 @@ impl DurableCoordinator {
                 let mut planned_files = BTreeSet::new();
                 let mut plans = Vec::new();
                 for ticket in &tickets {
+                    let file_key = (ticket.keyspace_id, ticket.file_id);
+                    if planned_files.contains(&file_key) {
+                        continue;
+                    }
                     if matches!(
                         self.local.metadata.append_publish_ticket_status(ticket)?,
                         AppendPublishTicketStatus::Completed(_)
                     ) {
                         continue;
                     }
-                    if !planned_files.insert((ticket.keyspace_id, ticket.file_id)) {
-                        continue;
-                    }
+                    planned_files.insert(file_key);
                     let plan = match self.local.prepare_append_publish_plan_with_drafts(
                         ticket,
                         WriteDurability::Flushed,
@@ -1551,7 +1724,11 @@ impl DurableCoordinator {
                     )));
                 }
                 let durable_high_water =
-                    match self.persist_prepared_append_publish_plans(&plans, total_started, 0) {
+                    match self.persist_prepared_append_publish_plans(
+                        &plans,
+                        total_started,
+                        lock_wait_nanos,
+                    ) {
                         Ok(durable_high_water) => durable_high_water,
                         Err(error) => {
                             for plan in &plans {
@@ -1565,6 +1742,7 @@ impl DurableCoordinator {
                 }
                 Ok(BatchStep::Published(durable_high_water))
             })();
+            drop(persist_guard);
 
             let mut state = lock(&self.persist_coordinator.inner)?;
             state.in_flight = false;
@@ -2170,7 +2348,7 @@ impl DurableCoordinator {
                 }
                 observed_generation = state.generation;
             }
-            let stream = match self.local.metadata.append_publish_ticket_status(ticket)? {
+            match self.local.metadata.append_publish_ticket_status(ticket)? {
                 AppendPublishTicketStatus::Completed(commit) => {
                     if registered {
                         let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
@@ -2178,9 +2356,8 @@ impl DurableCoordinator {
                     }
                     return Ok(commit);
                 }
-                AppendPublishTicketStatus::Pending(stream) => stream,
-            };
-            self.persist_append_stream_prefix(&stream, ticket.publish_through)?;
+                AppendPublishTicketStatus::Pending(_) => {}
+            }
 
             if !registered {
                 let mut state = lock(&self.append_publish_persist_coordinator.inner)?;

@@ -3531,14 +3531,10 @@ fn durable_append_stream_publish_prefix_profiles_are_bounded_sync_groups() {
 
     store.publish_append_stream(&stream, total_bytes).unwrap();
     let profiles = store.drain_persist_profiles(16).unwrap();
-    assert!(
-        profiles.len() >= 2,
-        "cap-plus stream publish should require multiple bounded physical persists"
-    );
-    assert!(
-        profiles
-            .iter()
-            .all(|profile| profile.new_segment_bytes <= MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES)
+    assert_eq!(
+        profiles.len(),
+        1,
+        "foreground publish should persist payload refs and visible metadata in one durable operation"
     );
     assert_eq!(
         profiles
@@ -3749,8 +3745,8 @@ fn durable_concurrent_append_stream_publishes_do_not_overdrain_other_streams() {
         .filter(|profile| profile.new_segment_bytes > 0)
         .collect();
     assert!(
-        (2..=4).contains(&data_profiles.len()),
-        "publish waiters may batch prefix persistence, but must not overdrain non-waiters"
+        (1..=4).contains(&data_profiles.len()),
+        "publish waiters may collapse into one foreground publish, but must not overdrain non-waiters"
     );
     assert_eq!(
         data_profiles
@@ -3758,11 +3754,6 @@ fn durable_concurrent_append_stream_publishes_do_not_overdrain_other_streams() {
             .map(|profile| profile.new_segment_bytes)
             .sum::<u64>(),
         4 * 16 * 1024 * 1024
-    );
-    assert!(
-        data_profiles
-            .iter()
-            .all(|profile| profile.new_segment_bytes <= MAX_STREAM_DATA_LOG_SYNC_GROUP_BYTES)
     );
     assert!(
         profiles
@@ -3916,20 +3907,13 @@ fn durable_append_stream_publish_delta_does_not_reappend_persisted_payloads() {
         .unwrap();
     store.publish_append_stream(&stream, 4096).unwrap();
     let publish_profiles = store.drain_persist_profiles(8).unwrap();
-    assert_eq!(publish_profiles.len(), 2);
+    assert_eq!(publish_profiles.len(), 1);
     assert_eq!(publish_profiles[0].new_segment_bytes, 4096);
     assert!(publish_profiles[0].data_log_files_synced > 0);
     assert!(publish_profiles[0].data_log_file_sync_max_nanos > 0);
     assert!(publish_profiles[0].node_catalog_manifest_rows > 0);
     assert_eq!(publish_profiles[0].node_catalog_placement_rows, 0);
     assert_eq!(publish_profiles[0].node_catalog_segment_rows, 0);
-    assert_eq!(publish_profiles[1].new_segment_count, 0);
-    assert_eq!(publish_profiles[1].new_segment_bytes, 0);
-    assert_eq!(publish_profiles[1].data_log_append_sync_nanos, 0);
-    assert_eq!(publish_profiles[1].data_log_encode_nanos, 0);
-    assert_eq!(publish_profiles[1].data_log_write_nanos, 0);
-    assert_eq!(publish_profiles[1].data_log_file_sync_nanos, 0);
-    assert_eq!(publish_profiles[1].data_log_dir_sync_nanos, 0);
     let head = store
         .local
         .metadata
@@ -4135,8 +4119,10 @@ fn durable_append_stream_publish_delta_does_not_wait_for_data_log_persist_lock()
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].new_segment_bytes, 0);
-    assert_eq!(profiles[0].data_log_append_sync_nanos, 0);
-    assert_eq!(profiles[0].lock_wait_nanos, 0);
+    assert_eq!(profiles[0].data_log_files_synced, 0);
+    assert_eq!(profiles[0].data_log_file_sync_nanos, 0);
+    assert_eq!(profiles[0].data_log_dir_sync_nanos, 0);
+    assert!(profiles[0].lock_wait_nanos < 1_000_000);
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -8188,6 +8174,76 @@ fn durable_submitted_publish_captures_prefix_while_later_appends_continue() {
         .unwrap();
     assert_eq!(&all_bytes[..first.len()], first.as_slice());
     assert_eq!(&all_bytes[first.len()..], second.as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_same_file_publish_tickets_serialize_without_inflight_conflict() {
+    let root = durable_temp_dir("native-ticket-same-file-serializes");
+    let cfg = config();
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let first = repeated_blocks(1, 71);
+    let second = repeated_blocks(1, 72);
+    store
+        .append_stream(&stream, &first, WriteDurability::Acknowledged)
+        .unwrap();
+    let first_ticket = store
+        .submit_append_publish(&stream, first.len() as u64)
+        .unwrap();
+    store
+        .append_stream(&stream, &second, WriteDurability::Acknowledged)
+        .unwrap();
+    let total_len = (first.len() + second.len()) as u64;
+    let second_ticket = store.submit_append_publish(&stream, total_len).unwrap();
+
+    let persist_guard = lock(&store.persist_lock).unwrap();
+    let first_wait = {
+        let store = Arc::clone(&store);
+        thread::spawn(move || store.wait_append_publish(&first_ticket))
+    };
+    thread::sleep(Duration::from_millis(20));
+    let second_wait = {
+        let store = Arc::clone(&store);
+        thread::spawn(move || store.wait_append_publish(&second_ticket))
+    };
+    thread::sleep(Duration::from_millis(20));
+    drop(persist_guard);
+    let first_commit = first_wait.join().unwrap().unwrap();
+    let second_commit = second_wait.join().unwrap().unwrap();
+
+    assert_eq!(first_commit.range, ByteRange::new(0, first.len() as u64));
+    assert_eq!(
+        second_commit.range,
+        ByteRange::new(first.len() as u64, second.len() as u64)
+    );
+    let mut all_bytes = vec![0; first.len() + second.len()];
+    store
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, total_len),
+            &mut all_bytes,
+        )
+        .unwrap();
+    assert_eq!(&all_bytes[..first.len()], first.as_slice());
+    assert_eq!(&all_bytes[first.len()..], second.as_slice());
+    drop(store);
     let _ = fs::remove_dir_all(root);
 }
 

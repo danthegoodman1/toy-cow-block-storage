@@ -401,9 +401,9 @@ pub(super) struct AppendPublishPlan {
     commit_group: CommitGroup,
     keyspace_commit: KeyspaceCommit,
     file_commit: FileCommit,
-    planned_stream: AppendStreamState,
     commit: AppendPublishCommit,
     publish_range: ByteRange,
+    payload_persist_start: u64,
     run_extents: Vec<RunBackedFileExtent>,
     delta: NativeMetadataDelta,
     in_flight: AppendPublishInFlight,
@@ -548,12 +548,8 @@ impl AppendStreamState {
                 "append stream publish export cannot regress",
             ));
         }
-        if publish_through > self.durable_through {
-            return Err(StorageError::conflict(
-                "append stream publish export exceeds durable prefix",
-            ));
-        }
-        let mut exported = self.durable_export_at(self.durable_through)?;
+        let durable_through = self.durable_through.max(publish_through);
+        let mut exported = self.durable_export_at(durable_through)?;
         exported.published_through = publish_through;
         let mut retained = Vec::new();
         for record in &exported.records {
@@ -1266,6 +1262,39 @@ impl InMemoryMetadataPlane {
             ));
         }
         Ok(AppendPublishTicketStatus::Pending(state.public_stream()))
+    }
+
+    fn append_publish_ticket_needs_payload_persist(
+        &self,
+        ticket: &AppendPublishTicket,
+    ) -> Result<bool> {
+        let record = lock(&self.append_publish_tickets)?
+            .get(&ticket.ticket_id)
+            .cloned()
+            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
+        if record.ticket != *ticket {
+            return Err(StorageError::conflict("stale append publish ticket"));
+        }
+        if record.completed.is_some() {
+            return Ok(false);
+        }
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&ticket.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
+        if state.keyspace_id != ticket.keyspace_id
+            || state.file_id != ticket.file_id
+            || state.stream_id != ticket.stream_id
+            || state.writer_epoch != ticket.writer_epoch
+            || state.status != AppendStreamStatus::Active
+            || ticket.publish_through <= state.published_through
+            || ticket.publish_through > state.reserved_tail
+            || ticket.publish_through > state.contiguous_record_tail_from(state.published_through)?
+        {
+            return Err(StorageError::conflict("stale append publish ticket"));
+        }
+        Ok(state.durable_through < ticket.publish_through)
     }
 
     fn complete_append_publish_ticket(

@@ -1536,8 +1536,14 @@ impl DurableSqliteStore {
             .fold(0_u64, u64::saturating_add);
 
         let started = Instant::now();
-        let data_log_profile = self.sync_pending_data_log_append(&appended)?;
-        let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
+        let (data_log_profile, data_log_append_sync_nanos) = if appended.is_empty() {
+            (DataLogAppendProfile::default(), 0)
+        } else {
+            (
+                self.sync_pending_data_log_append(&appended)?,
+                duration_nanos_u64(started.elapsed()),
+            )
+        };
 
         let started = Instant::now();
         let mut catalog_profile = self.persist_data_log_manifests_only(&appended)?;
@@ -1692,6 +1698,92 @@ impl DurableSqliteStore {
             root_sqlite_commit_nanos,
             new_segment_count,
             new_segment_bytes,
+            touched_node_count: catalog_profile.touched_node_count(),
+            durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
+            ..DurablePersistProfile::default()
+        })
+    }
+
+    fn persist_preingested_append_publish_delta(
+        &self,
+        delta: &NativeMetadataDelta,
+        nodes: &SelectedStorageNodeState,
+        changed_segments: &BTreeSet<SegmentId>,
+        appended: PendingDataLogAppend,
+    ) -> Result<DurablePersistProfile> {
+        let total_started = Instant::now();
+        #[cfg(test)]
+        {
+            let delay = *lock(&self.persist_delay)?;
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable persist failure",
+                ));
+            }
+        }
+
+        let started = Instant::now();
+        let (data_log_profile, data_log_append_sync_nanos) = if appended.is_empty() {
+            (DataLogAppendProfile::default(), 0)
+        } else {
+            (
+                self.sync_pending_data_log_append(&appended)?,
+                duration_nanos_u64(started.elapsed()),
+            )
+        };
+
+        let started = Instant::now();
+        let mut catalog_profile = self.persist_data_log_manifests_only(&appended)?;
+        catalog_profile.merge(self.persist_selected_node_catalog_publish(
+            nodes,
+            changed_segments,
+            appended.clone(),
+            changed_segments,
+        )?);
+        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
+
+        let sqlite_lock_started = Instant::now();
+        let mut conn = lock(&self.conn)?;
+        let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
+        let previous_cursor = load_export_cursor(&conn)?;
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let started = Instant::now();
+        persist_row_native_metadata_delta(&tx, previous_cursor.as_ref(), delta)?;
+        let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
+        tx.commit().map_err(sqlite_error)?;
+        let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
+
+        Ok(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            data_log_append_sync_nanos,
+            sqlite_lock_wait_nanos,
+            data_log_encode_nanos: data_log_profile.encode_nanos,
+            data_log_write_nanos: data_log_profile.write_nanos,
+            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
+            data_log_files_synced: data_log_profile.files_synced,
+            data_log_sync_bytes: data_log_profile.sync_bytes,
+            data_log_records_written: data_log_profile.records_written,
+            data_log_write_bytes: data_log_profile.write_bytes,
+            node_catalog_publish_nanos,
+            node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
+            node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
+            node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
+            node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
+            node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
+            node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
+            node_catalog_manifest_rows: catalog_profile.manifest_rows,
+            node_catalog_sealed_rows: catalog_profile.sealed_rows,
+            node_catalog_placement_rows: catalog_profile.placement_rows,
+            node_catalog_segment_rows: catalog_profile.segment_rows,
+            root_sqlite_row_sync_nanos,
+            root_sqlite_commit_nanos,
             touched_node_count: catalog_profile.touched_node_count(),
             durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()

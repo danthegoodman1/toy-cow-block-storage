@@ -1848,6 +1848,21 @@ impl LocalCoordinator {
         Ok(commit)
     }
 
+    fn append_publish_tickets_need_payload_persist(
+        &self,
+        tickets: &[AppendPublishTicket],
+    ) -> Result<bool> {
+        for ticket in tickets {
+            if self
+                .metadata
+                .append_publish_ticket_needs_payload_persist(ticket)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[cfg(test)]
     fn prepare_append_publish_plan(
         &self,
@@ -2006,7 +2021,6 @@ impl LocalCoordinator {
             || ticket.publish_through > stream_state.reserved_tail
             || ticket.publish_through
                 > stream_state.contiguous_record_tail_from(stream_state.published_through)?
-            || ticket.publish_through > stream_state.durable_through
         {
             self.metadata.record_publish_profile(MetadataPublishProfile {
                 lock_wait_nanos: publish_lock_wait_nanos,
@@ -2018,6 +2032,7 @@ impl LocalCoordinator {
             ));
         }
         let planned_stream = stream_state.published_export_at(ticket.publish_through)?;
+        let payload_persist_start = stream_state.durable_through.min(ticket.publish_through);
 
         let new_root_node = metadata
             .metadata_nodes
@@ -2190,9 +2205,9 @@ impl LocalCoordinator {
             commit_group,
             keyspace_commit,
             file_commit,
-            planned_stream,
             commit,
             publish_range,
+            payload_persist_start,
             run_extents,
             delta,
             in_flight,
@@ -2283,13 +2298,28 @@ impl LocalCoordinator {
             .get_mut(&plan.ticket.stream_id)
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         stream.validate_token(&plan.stream)?;
-        if stream.published_through != plan.old_head.size
-            || stream.durable_through < plan.ticket.publish_through
-        {
+        if stream.published_through != plan.old_head.size {
             return Err(StorageError::corrupt(
                 "prepared append publish stream state changed before apply",
             ));
         }
+        stream.durable_through = stream.durable_through.max(plan.ticket.publish_through);
+        stream.published_through = plan.ticket.publish_through;
+        let mut retained = Vec::new();
+        for record in &stream.records {
+            let record_end = record.end_exclusive()?;
+            if record_end <= plan.ticket.publish_through {
+                continue;
+            }
+            if record.offset < plan.ticket.publish_through {
+                if let Some(suffix) = record.slice(plan.ticket.publish_through, record_end)? {
+                    retained.push(suffix);
+                }
+            } else {
+                retained.push(record.clone());
+            }
+        }
+        stream.records = retained;
 
         metadata
             .keyspace_heads
@@ -2305,9 +2335,6 @@ impl LocalCoordinator {
         metadata
             .file_writer_epochs
             .insert((plan.ticket.keyspace_id, plan.ticket.file_id), plan.ticket.writer_epoch);
-        metadata
-            .append_streams
-            .insert(plan.ticket.stream_id, plan.planned_stream.clone());
         metadata
             .append_publish_in_flight
             .remove(&plan.ticket.ticket_id);
