@@ -21,6 +21,12 @@ pub(super) struct BlockBatchCommitWithDelta {
     delta: Option<BlockDeltaCommit>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct BlockMappingCommitWithDelta {
+    commit: WriteCommit,
+    delta: Option<BlockDeltaCommit>,
+}
+
 /// In-process coordinator that owns request orchestration across metadata and
 /// storage-node roles.
 #[derive(Debug, Clone)]
@@ -1340,8 +1346,10 @@ impl LocalCoordinator {
                 delta_entries.push(BlockDeltaEntry {
                     shard_id,
                     range: edit.range,
-                    segment_id: edit.receipt.descriptor.segment_id,
-                    segment_offset: BlockIndex::from_raw(0),
+                    replacement: BlockDeltaReplacement::Segment {
+                        segment_id: edit.receipt.descriptor.segment_id,
+                        segment_offset: BlockIndex::from_raw(0),
+                    },
                 });
             }
             if root != shard.old_root {
@@ -1461,25 +1469,31 @@ impl LocalCoordinator {
                 .ok_or_else(|| StorageError::corrupt("block delta shard is outside device"))?;
             let old_root = root;
             for entry in entries {
-                let Some(segment_base_raw) = entry
-                    .range
-                    .start
-                    .raw()
-                    .checked_sub(entry.segment_offset.raw())
-                else {
-                    return Err(StorageError::corrupt(
-                        "block delta segment offset exceeds logical start",
-                    ));
+                let replacement = match entry.replacement {
+                    BlockDeltaReplacement::Segment {
+                        segment_id,
+                        segment_offset,
+                    } => {
+                        let Some(segment_base_raw) =
+                            entry.range.start.raw().checked_sub(segment_offset.raw())
+                        else {
+                            return Err(StorageError::corrupt(
+                                "block delta segment offset exceeds logical start",
+                            ));
+                        };
+                        Some(SegmentReplacement {
+                            segment_id,
+                            segment_base: BlockIndex::from_raw(segment_base_raw),
+                        })
+                    }
+                    BlockDeltaReplacement::Sparse => None,
                 };
                 root = self
                     .replace_tree_range_with_receipts(
                         root,
                         TreeRangeEdit {
                             range: entry.range,
-                            replacement: Some(SegmentReplacement {
-                                segment_id: entry.segment_id,
-                                segment_base: BlockIndex::from_raw(segment_base_raw),
-                            }),
+                            replacement,
                         },
                         &all_receipts,
                     )?
@@ -1518,15 +1532,17 @@ impl LocalCoordinator {
     }
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
-        let zeroes = usize::try_from(len)
-            .map_err(|_| StorageError::invalid_argument("zero range length overflows usize"))?;
-        let bytes = vec![0; zeroes];
-        self.write_device(
-            device_id,
-            offset,
-            &bytes,
-            crate::api::WriteDurability::Acknowledged,
-        )
+        self.write_zeroes_with_delta(device_id, offset, len)
+            .map(|committed| committed.commit)
+    }
+
+    fn write_zeroes_with_delta(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        len: u64,
+    ) -> Result<BlockMappingCommitWithDelta> {
+        self.discard_device_with_delta(device_id, offset, len)
     }
 
     pub fn discard_device(
@@ -1535,22 +1551,36 @@ impl LocalCoordinator {
         offset: u64,
         len: u64,
     ) -> Result<WriteCommit> {
+        self.discard_device_with_delta(device_id, offset, len)
+            .map(|committed| committed.commit)
+    }
+
+    fn discard_device_with_delta(
+        &self,
+        device_id: DeviceId,
+        offset: u64,
+        len: u64,
+    ) -> Result<BlockMappingCommitWithDelta> {
         let info = self.metadata.device_info(device_id)?;
         let range = ByteRange::new(offset, len);
         range.validate_for_device(&info.spec)?;
 
         if len == 0 {
-            return Ok(WriteCommit {
-                device_id,
-                commit_seq: info.latest_commit,
-                range,
-                durability: crate::api::WriteDurability::Acknowledged,
+            return Ok(BlockMappingCommitWithDelta {
+                commit: WriteCommit {
+                    device_id,
+                    commit_seq: info.latest_commit,
+                    range,
+                    durability: crate::api::WriteDurability::Acknowledged,
+                },
+                delta: None,
             });
         }
 
         let chunks = self.split_device_range(&info, range)?;
         let owner = MappingOwner::BlockDevice(device_id);
         let mut updates = Vec::with_capacity(chunks.len());
+        let mut delta_entries = Vec::new();
 
         for chunk in chunks {
             let edit = TreeRangeEdit {
@@ -1564,15 +1594,23 @@ impl LocalCoordinator {
                     old_root: chunk.old_root,
                     new_root: edit_result.root,
                 }));
+                delta_entries.push(BlockDeltaEntry {
+                    shard_id: chunk.shard_id,
+                    range: chunk.range,
+                    replacement: BlockDeltaReplacement::Sparse,
+                });
             }
         }
 
         if updates.is_empty() {
-            return Ok(WriteCommit {
-                device_id,
-                commit_seq: info.latest_commit,
-                range,
-                durability: crate::api::WriteDurability::Acknowledged,
+            return Ok(BlockMappingCommitWithDelta {
+                commit: WriteCommit {
+                    device_id,
+                    commit_seq: info.latest_commit,
+                    range,
+                    durability: crate::api::WriteDurability::Acknowledged,
+                },
+                delta: None,
             });
         }
         self.observability.record_with_update(
@@ -1594,11 +1632,21 @@ impl LocalCoordinator {
             updates,
         })?;
 
-        Ok(WriteCommit {
-            device_id,
-            commit_seq: commit_group.commit_seq,
-            range,
-            durability: crate::api::WriteDurability::Acknowledged,
+        Ok(BlockMappingCommitWithDelta {
+            commit: WriteCommit {
+                device_id,
+                commit_seq: commit_group.commit_seq,
+                range,
+                durability: crate::api::WriteDurability::Acknowledged,
+            },
+            delta: Some(BlockDeltaCommit {
+                device_id,
+                commit_seq: commit_group.commit_seq,
+                write_count: 1,
+                collapsed_range_count: usize_to_u64(delta_entries.len()),
+                committed_bytes: len,
+                entries: delta_entries,
+            }),
         })
     }
 

@@ -3275,6 +3275,56 @@ fn durable_stream_auto_persist_does_not_block_append_ack() {
 }
 
 #[test]
+fn stream_auto_persist_keeps_requests_queued_while_publish_is_active() {
+    let root = durable_temp_dir("stream-auto-persist-retains-during-publish");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let mut worker_state = StreamAutoPersistWorkerState {
+        requests: BTreeMap::from([(stream.stream_id, (stream.clone(), 4096))]),
+        shutdown: false,
+    };
+
+    {
+        let mut publish_state = lock(&store.append_publish_persist_coordinator.inner).unwrap();
+        publish_state.in_flight = true;
+    }
+    assert!(
+        stream_auto_persist_drain_ready_requests(&store, &mut worker_state).is_none(),
+        "active publish demand must not drain and drop background prefix requests"
+    );
+    assert_eq!(worker_state.requests.len(), 1);
+    assert_eq!(worker_state.requests[&stream.stream_id].1, 4096);
+
+    {
+        let mut publish_state = lock(&store.append_publish_persist_coordinator.inner).unwrap();
+        publish_state.in_flight = false;
+    }
+    let drained = stream_auto_persist_drain_ready_requests(&store, &mut worker_state).unwrap();
+    assert_eq!(drained, vec![(stream, 4096)]);
+    assert!(worker_state.requests.is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_stream_auto_persist_failure_does_not_poison_publish_retry() {
     let root = durable_temp_dir("stream-auto-persist-failure-retry");
     let cfg = LocalStoreConfig {
@@ -4893,6 +4943,60 @@ fn durable_sqlite_rejects_corrupt_block_delta_payload() {
 }
 
 #[test]
+fn durable_zero_and_discard_use_metadata_only_block_deltas() {
+    let root = durable_temp_dir("metadata-only-zero-discard");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.enable_persist_profiling(32).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(8, 9),
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    let _ = store.drain_persist_profiles(32).unwrap();
+
+    store.write_zeroes(device_id, 2 * 4096, 4096).unwrap();
+    let zero_profiles = store.drain_persist_profiles(32).unwrap();
+    assert_metadata_only_block_delta_profiles(&zero_profiles, 4096);
+
+    store.discard_device(device_id, 5 * 4096, 2 * 4096).unwrap();
+    let discard_profiles = store.drain_persist_profiles(32).unwrap();
+    assert_metadata_only_block_delta_profiles(&discard_profiles, 2 * 4096);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut actual = vec![0; 8 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 8 * 4096), &mut actual)
+        .unwrap();
+    assert_eq!(&actual[0..2 * 4096], repeated_blocks(2, 9).as_slice());
+    assert_eq!(&actual[2 * 4096..3 * 4096], vec![0; 4096].as_slice());
+    assert_eq!(
+        &actual[3 * 4096..5 * 4096],
+        repeated_blocks(2, 9).as_slice()
+    );
+    assert_eq!(&actual[5 * 4096..7 * 4096], vec![0; 2 * 4096].as_slice());
+    assert_eq!(
+        &actual[7 * 4096..8 * 4096],
+        repeated_blocks(1, 9).as_slice()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_native_flush_after_block_ack_falls_back_to_full_persist() {
     let root = durable_temp_dir("block-native-gap-full-persist");
     let cfg = config();
@@ -5783,6 +5887,90 @@ fn durable_append_run_payload_writes_without_segment_placement() {
         .unwrap();
     assert_eq!(read, bytes);
     assert!(store.local.segment_ids().unwrap().is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_store_selects_append_run_manifests_and_sealed_refs() {
+    let root = durable_temp_dir("append-run-manifest-selection");
+    let cfg = config();
+    let store = DurableCoordinator::open_with_data_log_policy(
+        &root,
+        cfg,
+        DurableDataLogPolicy {
+            target_data_log_bytes: 4096,
+            min_reclaimable_ratio_ppm: 1,
+            min_reclaimable_bytes: 1,
+            max_compaction_copy_bytes: u64::MAX,
+        },
+    )
+    .unwrap();
+
+    let stream_id = AppendStreamId::from_raw(88);
+    let first_payload = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(77),
+        storage_node: cfg.storage_node,
+        stream_id,
+        writer_epoch: WriterEpoch::from_raw(3),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(5),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![Arc::from(repeated_blocks(1, 11))],
+    };
+    let (first_run, first_pending, _) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(first_payload, None)
+        .unwrap();
+    let second_payload = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(78),
+        storage_node: cfg.storage_node,
+        stream_id,
+        writer_epoch: WriterEpoch::from_raw(3),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(5),
+        file_offset_start: 4096,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![Arc::from(repeated_blocks(1, 12))],
+    };
+    let (second_run, second_pending, _) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(second_payload, Some(&first_pending))
+        .unwrap();
+    assert_ne!(first_run.log_id, second_run.log_id);
+
+    let mut lane_pending = first_pending;
+    lane_pending.merge(second_pending);
+    let selected = BTreeSet::from([
+        DurableDataLogRef {
+            storage_node: first_run.storage_node,
+            log_id: first_run.log_id,
+        },
+        DurableDataLogRef {
+            storage_node: second_run.storage_node,
+            log_id: second_run.log_id,
+        },
+    ]);
+    let manifests = store
+        .durable
+        .pending_append_run_manifests_for_log_refs(&selected, Some(&lane_pending))
+        .unwrap();
+    assert_eq!(manifests.logs.len(), 2);
+    assert_eq!(manifests.sealed_logs.len(), 1);
+    assert!(manifests.sealed_logs.contains(&DurableDataLogRef {
+        storage_node: first_run.storage_node,
+        log_id: first_run.log_id,
+    }));
+    assert!(manifests.placements.is_empty());
+
+    let fallback = store
+        .durable
+        .pending_append_run_manifests_for_log_refs(&selected, None)
+        .unwrap();
+    assert_eq!(fallback.logs.len(), 2);
+    assert!(fallback.sealed_logs.is_empty());
+    assert!(fallback.placements.is_empty());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -8260,6 +8448,100 @@ fn durable_same_file_publish_tickets_serialize_without_inflight_conflict() {
             .any(|profile| profile.cvar_waits > 0 && profile.coordinator_wait_nanos > 0)
     );
     drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_publish_wait_batches_submitted_pending_tickets() {
+    let root = durable_temp_dir("native-ticket-batches-submitted-pending");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let first_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("first".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let second_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("second".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let first_stream = store.open_append_stream(keyspace_id, first_file).unwrap();
+    let second_stream = store.open_append_stream(keyspace_id, second_file).unwrap();
+    let first_payload = repeated_blocks(1, 91);
+    let second_payload = repeated_blocks(1, 92);
+    store
+        .append_stream(&first_stream, &first_payload, WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .append_stream(
+            &second_stream,
+            &second_payload,
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    let first_ticket = store.submit_append_publish(&first_stream, 4096).unwrap();
+    let second_ticket = store.submit_append_publish(&second_stream, 4096).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+    store.enable_append_publish_wait_profiling(16).unwrap();
+
+    let first_commit = store.wait_append_publish(&first_ticket).unwrap();
+    assert_eq!(first_commit.range, ByteRange::new(0, 4096));
+    let second_commit = store.wait_append_publish(&second_ticket).unwrap();
+    assert_eq!(second_commit.range, ByteRange::new(0, 4096));
+
+    let mut bytes = vec![0; 4096];
+    store
+        .read_file(keyspace_id, first_file, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, first_payload);
+    store
+        .read_file(
+            keyspace_id,
+            second_file,
+            ByteRange::new(0, 4096),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, second_payload);
+
+    let persist_profiles = store.drain_persist_profiles(16).unwrap();
+    assert_eq!(
+        persist_profiles.len(),
+        1,
+        "one waiter should drive one physical publish for all submitted pending tickets"
+    );
+    assert_eq!(persist_profiles[0].stream_prefix_plan_count, 2);
+
+    let wait_profiles = store.drain_append_publish_wait_profiles(16).unwrap();
+    assert_eq!(wait_profiles.len(), 2);
+    assert!(
+        wait_profiles
+            .iter()
+            .any(|profile| profile.persist_batches_started == 1
+                && profile.max_batch_ticket_count >= 2)
+    );
+    assert!(
+        wait_profiles
+            .iter()
+            .any(|profile| profile.completed_without_register)
+    );
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -13735,6 +14017,38 @@ fn block_delta_commit_count(root: &Path) -> i64 {
         row.get(0)
     })
     .unwrap()
+}
+
+fn assert_metadata_only_block_delta_profiles(profiles: &[DurablePersistProfile], bytes: u64) {
+    assert!(!profiles.is_empty());
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.block_delta_selected_bytes)
+            .sum::<u64>(),
+        bytes
+    );
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.data_log_write_bytes)
+            .sum::<u64>(),
+        0
+    );
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.data_log_sync_bytes)
+            .sum::<u64>(),
+        0
+    );
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.new_segment_bytes)
+            .sum::<u64>(),
+        0
+    );
 }
 
 fn keyspace_shard_payloads_for_test(conn: &Connection) -> BTreeMap<String, Vec<u8>> {

@@ -1298,6 +1298,14 @@ impl InMemoryMetadataPlane {
         Ok(state.durable_through < ticket.publish_through)
     }
 
+    fn pending_append_publish_tickets(&self) -> Result<Vec<AppendPublishTicket>> {
+        Ok(lock(&self.append_publish_tickets)?
+            .values()
+            .filter(|record| record.completed.is_none())
+            .map(|record| record.ticket.clone())
+            .collect())
+    }
+
     fn complete_append_publish_ticket(
         &self,
         ticket: &AppendPublishTicket,

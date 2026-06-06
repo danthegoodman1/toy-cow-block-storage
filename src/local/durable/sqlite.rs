@@ -297,6 +297,25 @@ pub(super) struct DurablePersistOutcome {
     profile: DurablePersistProfile,
 }
 
+enum DurableBundlePayload {
+    NewSegments(Vec<DurableSegmentPayload>),
+    Preingested(PendingDataLogAppend),
+    PrestagedBlockDelta {
+        pending_append: PendingDataLogAppend,
+        segments: Vec<DurableSegmentPayload>,
+    },
+}
+
+struct PreparedDurableBundlePayload {
+    appended: PendingDataLogAppend,
+    data_log_profile: DataLogAppendProfile,
+    data_log_append_sync_nanos: u64,
+    new_segment_count: u64,
+    new_segment_bytes: u64,
+    pre_root_pending_segments: BTreeSet<SegmentId>,
+    sync_storage_node_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DataLogAppendProfile {
     encode_nanos: u64,
@@ -1414,6 +1433,40 @@ impl DurableSqliteStore {
         })
     }
 
+    fn selected_node_catalog_publish_nodes(
+        nodes: &SelectedStorageNodeState,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> BTreeSet<StorageNodeId> {
+        nodes
+            .iter()
+            .filter_map(|(node_id, (_, node))| {
+                segment_ids
+                    .iter()
+                    .any(|segment_id| node.segment_catalog.entries.contains_key(segment_id))
+                    .then_some(*node_id)
+            })
+            .collect()
+    }
+
+    fn persist_durable_bundle_catalog(
+        &self,
+        nodes: &SelectedStorageNodeState,
+        changed_segments: &BTreeSet<SegmentId>,
+        appended: PendingDataLogAppend,
+        pre_root_pending_segments: &BTreeSet<SegmentId>,
+    ) -> Result<NodeCatalogPublishProfile> {
+        let selected_nodes = Self::selected_node_catalog_publish_nodes(nodes, changed_segments);
+        let mut profile = self.persist_selected_node_catalog_publish(
+            nodes,
+            changed_segments,
+            appended.clone(),
+            pre_root_pending_segments,
+        )?;
+        let manifest_only = appended.manifest_storage_nodes_except(&selected_nodes);
+        profile.merge(self.persist_data_log_manifests_only(&manifest_only)?);
+        Ok(profile)
+    }
+
     fn persist_selected_node_catalog_publish_for_node(
         node_catalogs: &NodeCatalogs,
         node_id: StorageNodeId,
@@ -1589,31 +1642,17 @@ impl DurableSqliteStore {
             }
         }
 
-        let new_segment_count = usize_to_u64(appended.placements.len());
-        let new_segment_bytes = appended
-            .placements
-            .iter()
-            .map(|placement| placement.payload_bytes)
-            .fold(0_u64, u64::saturating_add);
-
         let started = Instant::now();
-        let (data_log_profile, data_log_append_sync_nanos) = if appended.is_empty() {
-            (DataLogAppendProfile::default(), 0)
-        } else {
-            (
-                self.sync_pending_data_log_append(&appended)?,
-                duration_nanos_u64(started.elapsed()),
-            )
-        };
-
-        let started = Instant::now();
-        let mut catalog_profile = self.persist_data_log_manifests_only(&appended)?;
-        catalog_profile.merge(self.persist_selected_node_catalog_publish(
+        let prepared = self.prepare_durable_bundle_payload(
+            DurableBundlePayload::Preingested(appended),
+            segment_ids,
+        )?;
+        let catalog_profile = self.persist_durable_bundle_catalog(
             nodes,
             segment_ids,
-            appended.clone(),
-            segment_ids,
-        )?);
+            prepared.appended,
+            &prepared.pre_root_pending_segments,
+        )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
         let sqlite_lock_started = Instant::now();
@@ -1635,18 +1674,18 @@ impl DurableSqliteStore {
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
-            data_log_append_sync_nanos,
+            data_log_append_sync_nanos: prepared.data_log_append_sync_nanos,
             sqlite_lock_wait_nanos,
-            data_log_encode_nanos: data_log_profile.encode_nanos,
-            data_log_write_nanos: data_log_profile.write_nanos,
-            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
-            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
-            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
-            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
-            data_log_files_synced: data_log_profile.files_synced,
-            data_log_sync_bytes: data_log_profile.sync_bytes,
-            data_log_records_written: data_log_profile.records_written,
-            data_log_write_bytes: data_log_profile.write_bytes,
+            data_log_encode_nanos: prepared.data_log_profile.encode_nanos,
+            data_log_write_nanos: prepared.data_log_profile.write_nanos,
+            data_log_file_sync_nanos: prepared.data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: prepared.data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: prepared.data_log_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: prepared.data_log_profile.dir_sync_nanos,
+            data_log_files_synced: prepared.data_log_profile.files_synced,
+            data_log_sync_bytes: prepared.data_log_profile.sync_bytes,
+            data_log_records_written: prepared.data_log_profile.records_written,
+            data_log_write_bytes: prepared.data_log_profile.write_bytes,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1660,20 +1699,116 @@ impl DurableSqliteStore {
             node_catalog_segment_rows: catalog_profile.segment_rows,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
-            new_segment_count,
-            new_segment_bytes,
+            new_segment_count: prepared.new_segment_count,
+            new_segment_bytes: prepared.new_segment_bytes,
             touched_node_count: catalog_profile.touched_node_count(),
             durable_commit_high_water: stream_cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()
         })
     }
 
-    fn persist_native_metadata_delta(
+    fn prepare_durable_bundle_payload(
+        &self,
+        payload: DurableBundlePayload,
+        preingested_pre_root_segments: &BTreeSet<SegmentId>,
+    ) -> Result<PreparedDurableBundlePayload> {
+        let started = Instant::now();
+        match payload {
+            DurableBundlePayload::NewSegments(segments) => {
+                let new_segment_count = usize_to_u64(segments.len());
+                let new_segment_bytes = segments
+                    .iter()
+                    .map(|segment| usize_to_u64(segment.bytes.len()))
+                    .fold(0_u64, u64::saturating_add);
+                let (appended, data_log_profile) = if segments.is_empty() {
+                    (PendingDataLogAppend::default(), DataLogAppendProfile::default())
+                } else {
+                    self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?
+                };
+                let data_log_append_sync_nanos = if appended.is_empty() {
+                    0
+                } else {
+                    duration_nanos_u64(started.elapsed())
+                };
+                let pre_root_pending_segments = appended.segment_ids();
+                let sync_storage_node_count = appended.storage_node_count();
+                Ok(PreparedDurableBundlePayload {
+                    appended,
+                    data_log_profile,
+                    data_log_append_sync_nanos,
+                    new_segment_count,
+                    new_segment_bytes,
+                    pre_root_pending_segments,
+                    sync_storage_node_count,
+                })
+            }
+            DurableBundlePayload::Preingested(appended) => {
+                let (data_log_profile, data_log_append_sync_nanos) = if appended.is_empty() {
+                    (DataLogAppendProfile::default(), 0)
+                } else {
+                    (
+                        self.sync_pending_data_log_append(&appended)?,
+                        duration_nanos_u64(started.elapsed()),
+                    )
+                };
+                let sync_storage_node_count = appended.storage_node_count();
+                let pre_root_pending_segments = preingested_pre_root_segments.clone();
+                Ok(PreparedDurableBundlePayload {
+                    appended,
+                    data_log_profile,
+                    data_log_append_sync_nanos,
+                    new_segment_count: 0,
+                    new_segment_bytes: 0,
+                    pre_root_pending_segments,
+                    sync_storage_node_count,
+                })
+            }
+            DurableBundlePayload::PrestagedBlockDelta {
+                mut pending_append,
+                segments,
+            } => {
+                let new_segment_count = usize_to_u64(segments.len());
+                let new_segment_bytes = segments
+                    .iter()
+                    .map(|segment| usize_to_u64(segment.bytes.len()))
+                    .fold(0_u64, u64::saturating_add);
+                let mut data_log_profile = DataLogAppendProfile::default();
+                if !segments.is_empty() {
+                    let (appended, profile) = self.append_segments_profiled(
+                        segments,
+                        DataLogSyncMode::NoSync,
+                        Some(&pending_append),
+                    )?;
+                    data_log_profile.merge(profile);
+                    pending_append.merge(appended);
+                }
+                let sync_storage_node_count = pending_append.storage_node_count();
+                let data_log_append_sync_nanos = if pending_append.is_empty() {
+                    0
+                } else {
+                    data_log_profile.merge(self.sync_pending_data_log_append(&pending_append)?);
+                    duration_nanos_u64(started.elapsed())
+                };
+                let pre_root_pending_segments = pending_append.segment_ids();
+                Ok(PreparedDurableBundlePayload {
+                    appended: pending_append,
+                    data_log_profile,
+                    data_log_append_sync_nanos,
+                    new_segment_count,
+                    new_segment_bytes,
+                    pre_root_pending_segments,
+                    sync_storage_node_count,
+                })
+            }
+        }
+    }
+
+    fn persist_native_metadata_delta_bundle(
         &self,
         delta: &NativeMetadataDelta,
         nodes: &SelectedStorageNodeState,
         changed_segments: &BTreeSet<SegmentId>,
-        segments: Vec<DurableSegmentPayload>,
+        payload: DurableBundlePayload,
     ) -> Result<DurablePersistProfile> {
         let total_started = Instant::now();
         #[cfg(test)]
@@ -1689,32 +1824,13 @@ impl DurableSqliteStore {
             }
         }
 
-        let new_segment_count = usize_to_u64(segments.len());
-        let new_segment_bytes = segments
-            .iter()
-            .map(|segment| usize_to_u64(segment.bytes.len()))
-            .fold(0_u64, u64::saturating_add);
-
+        let prepared = self.prepare_durable_bundle_payload(payload, changed_segments)?;
         let started = Instant::now();
-        let (appended, data_log_profile, data_log_append_sync_nanos) = if segments.is_empty() {
-            (
-                PendingDataLogAppend::default(),
-                DataLogAppendProfile::default(),
-                0,
-            )
-        } else {
-            let (appended, profile) =
-                self.append_segments_profiled(segments, DataLogSyncMode::Sync, None)?;
-            (appended, profile, duration_nanos_u64(started.elapsed()))
-        };
-        let pre_root_pending_segments = appended.segment_ids();
-
-        let started = Instant::now();
-        let catalog_profile = self.persist_selected_node_catalog_publish(
+        let catalog_profile = self.persist_durable_bundle_catalog(
             nodes,
             changed_segments,
-            appended,
-            &pre_root_pending_segments,
+            prepared.appended,
+            &prepared.pre_root_pending_segments,
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
@@ -1732,18 +1848,18 @@ impl DurableSqliteStore {
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
-            data_log_append_sync_nanos,
+            data_log_append_sync_nanos: prepared.data_log_append_sync_nanos,
             sqlite_lock_wait_nanos,
-            data_log_encode_nanos: data_log_profile.encode_nanos,
-            data_log_write_nanos: data_log_profile.write_nanos,
-            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
-            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
-            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
-            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
-            data_log_files_synced: data_log_profile.files_synced,
-            data_log_sync_bytes: data_log_profile.sync_bytes,
-            data_log_records_written: data_log_profile.records_written,
-            data_log_write_bytes: data_log_profile.write_bytes,
+            data_log_encode_nanos: prepared.data_log_profile.encode_nanos,
+            data_log_write_nanos: prepared.data_log_profile.write_nanos,
+            data_log_file_sync_nanos: prepared.data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: prepared.data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: prepared.data_log_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: prepared.data_log_profile.dir_sync_nanos,
+            data_log_files_synced: prepared.data_log_profile.files_synced,
+            data_log_sync_bytes: prepared.data_log_profile.sync_bytes,
+            data_log_records_written: prepared.data_log_profile.records_written,
+            data_log_write_bytes: prepared.data_log_profile.write_bytes,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1757,12 +1873,27 @@ impl DurableSqliteStore {
             node_catalog_segment_rows: catalog_profile.segment_rows,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
-            new_segment_count,
-            new_segment_bytes,
+            new_segment_count: prepared.new_segment_count,
+            new_segment_bytes: prepared.new_segment_bytes,
             touched_node_count: catalog_profile.touched_node_count(),
             durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
             ..DurablePersistProfile::default()
         })
+    }
+
+    fn persist_native_metadata_delta(
+        &self,
+        delta: &NativeMetadataDelta,
+        nodes: &SelectedStorageNodeState,
+        changed_segments: &BTreeSet<SegmentId>,
+        segments: Vec<DurableSegmentPayload>,
+    ) -> Result<DurablePersistProfile> {
+        self.persist_native_metadata_delta_bundle(
+            delta,
+            nodes,
+            changed_segments,
+            DurableBundlePayload::NewSegments(segments),
+        )
     }
 
     fn persist_preingested_append_publish_delta(
@@ -1772,83 +1903,12 @@ impl DurableSqliteStore {
         changed_segments: &BTreeSet<SegmentId>,
         appended: PendingDataLogAppend,
     ) -> Result<DurablePersistProfile> {
-        let total_started = Instant::now();
-        #[cfg(test)]
-        {
-            let delay = *lock(&self.persist_delay)?;
-            if let Some(delay) = delay {
-                thread::sleep(delay);
-            }
-            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
-                return Err(StorageError::unavailable(
-                    "injected durable persist failure",
-                ));
-            }
-        }
-
-        let started = Instant::now();
-        let (data_log_profile, data_log_append_sync_nanos) = if appended.is_empty() {
-            (DataLogAppendProfile::default(), 0)
-        } else {
-            (
-                self.sync_pending_data_log_append(&appended)?,
-                duration_nanos_u64(started.elapsed()),
-            )
-        };
-
-        let started = Instant::now();
-        let mut catalog_profile = self.persist_data_log_manifests_only(&appended)?;
-        catalog_profile.merge(self.persist_selected_node_catalog_publish(
+        self.persist_native_metadata_delta_bundle(
+            delta,
             nodes,
             changed_segments,
-            appended.clone(),
-            changed_segments,
-        )?);
-        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
-
-        let sqlite_lock_started = Instant::now();
-        let mut conn = lock(&self.conn)?;
-        let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
-        let previous_cursor = load_export_cursor(&conn)?;
-        let tx = conn.transaction().map_err(sqlite_error)?;
-        let started = Instant::now();
-        persist_row_native_metadata_delta(&tx, previous_cursor.as_ref(), delta)?;
-        let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
-        let started = Instant::now();
-        tx.commit().map_err(sqlite_error)?;
-        let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
-
-        Ok(DurablePersistProfile {
-            total_nanos: duration_nanos_u64(total_started.elapsed()),
-            data_log_append_sync_nanos,
-            sqlite_lock_wait_nanos,
-            data_log_encode_nanos: data_log_profile.encode_nanos,
-            data_log_write_nanos: data_log_profile.write_nanos,
-            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
-            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
-            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
-            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
-            data_log_files_synced: data_log_profile.files_synced,
-            data_log_sync_bytes: data_log_profile.sync_bytes,
-            data_log_records_written: data_log_profile.records_written,
-            data_log_write_bytes: data_log_profile.write_bytes,
-            node_catalog_publish_nanos,
-            node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
-            node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
-            node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
-            node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
-            node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
-            node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
-            node_catalog_manifest_rows: catalog_profile.manifest_rows,
-            node_catalog_sealed_rows: catalog_profile.sealed_rows,
-            node_catalog_placement_rows: catalog_profile.placement_rows,
-            node_catalog_segment_rows: catalog_profile.segment_rows,
-            root_sqlite_row_sync_nanos,
-            root_sqlite_commit_nanos,
-            touched_node_count: catalog_profile.touched_node_count(),
-            durable_commit_high_water: delta.cursor.next_commit_seq.saturating_sub(1),
-            ..DurablePersistProfile::default()
-        })
+            DurableBundlePayload::Preingested(appended),
+        )
     }
 
     fn persist_block_delta_commits(
@@ -1878,7 +1938,6 @@ impl DurableSqliteStore {
             ));
         }
 
-        let new_segment_count = usize_to_u64(segments.len());
         let new_segment_bytes = segments
             .iter()
             .map(|segment| usize_to_u64(segment.bytes.len()))
@@ -1889,25 +1948,20 @@ impl DurableSqliteStore {
         let sync_only_bytes = prestaged_segment_bytes;
         let flush_write_bytes = new_segment_bytes;
 
-        let started = Instant::now();
-        let mut data_log_profile = DataLogAppendProfile::default();
-        if !segments.is_empty() {
-            let (appended, profile) =
-                self.append_segments_profiled(segments, DataLogSyncMode::NoSync, Some(&pending_append))?;
-            data_log_profile.merge(profile);
-            pending_append.merge(appended);
-        }
-        let sync_storage_node_count = pending_append.storage_node_count();
-        data_log_profile.merge(self.sync_pending_data_log_append(&pending_append)?);
-        let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
-        let pre_root_pending_segments = pending_append.segment_ids();
+        let prepared = self.prepare_durable_bundle_payload(
+            DurableBundlePayload::PrestagedBlockDelta {
+                pending_append,
+                segments,
+            },
+            segment_ids,
+        )?;
 
         let started = Instant::now();
-        let catalog_profile = self.persist_selected_node_catalog_publish(
+        let catalog_profile = self.persist_durable_bundle_catalog(
             nodes,
             segment_ids,
-            pending_append,
-            &pre_root_pending_segments,
+            prepared.appended,
+            &prepared.pre_root_pending_segments,
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
@@ -1931,23 +1985,23 @@ impl DurableSqliteStore {
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
-            data_log_append_sync_nanos,
+            data_log_append_sync_nanos: prepared.data_log_append_sync_nanos,
             sqlite_lock_wait_nanos,
-            data_log_encode_nanos: data_log_profile.encode_nanos,
-            data_log_write_nanos: data_log_profile.write_nanos,
-            data_log_file_sync_nanos: data_log_profile.file_sync_nanos,
-            data_log_file_sync_sum_nanos: data_log_profile.file_sync_sum_nanos,
-            data_log_file_sync_max_nanos: data_log_profile.file_sync_max_nanos,
-            data_log_dir_sync_nanos: data_log_profile.dir_sync_nanos,
-            data_log_files_synced: data_log_profile.files_synced,
-            data_log_sync_bytes: data_log_profile.sync_bytes,
-            data_log_records_written: data_log_profile.records_written,
-            data_log_write_bytes: data_log_profile.write_bytes,
+            data_log_encode_nanos: prepared.data_log_profile.encode_nanos,
+            data_log_write_nanos: prepared.data_log_profile.write_nanos,
+            data_log_file_sync_nanos: prepared.data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: prepared.data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: prepared.data_log_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: prepared.data_log_profile.dir_sync_nanos,
+            data_log_files_synced: prepared.data_log_profile.files_synced,
+            data_log_sync_bytes: prepared.data_log_profile.sync_bytes,
+            data_log_records_written: prepared.data_log_profile.records_written,
+            data_log_write_bytes: prepared.data_log_profile.write_bytes,
             data_log_prestaged_segment_count: prestaged_segment_count,
             data_log_prestaged_segment_bytes: prestaged_segment_bytes,
             data_log_sync_only_bytes: sync_only_bytes,
             data_log_flush_write_bytes: flush_write_bytes,
-            data_log_sync_storage_node_count: sync_storage_node_count,
+            data_log_sync_storage_node_count: prepared.sync_storage_node_count,
             node_catalog_publish_nanos,
             node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
             node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
@@ -1961,8 +2015,8 @@ impl DurableSqliteStore {
             node_catalog_segment_rows: catalog_profile.segment_rows,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
-            new_segment_count,
-            new_segment_bytes,
+            new_segment_count: prepared.new_segment_count,
+            new_segment_bytes: prepared.new_segment_bytes,
             touched_node_count: catalog_profile.touched_node_count(),
             durable_commit_high_water,
             ..DurablePersistProfile::default()
@@ -2147,6 +2201,32 @@ impl DurableSqliteStore {
         };
         run.validate()?;
         Ok((run, append, profile))
+    }
+
+    fn pending_append_run_manifests_for_log_refs(
+        &self,
+        log_refs: &BTreeSet<DurableDataLogRef>,
+        pending_base: Option<&PendingDataLogAppend>,
+    ) -> Result<PendingDataLogAppend> {
+        let mut pending = pending_base
+            .map(|pending| pending.selected_log_refs(log_refs))
+            .unwrap_or_default();
+        let pending_refs = pending.log_refs();
+        for log_ref in log_refs.difference(&pending_refs) {
+            let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
+            let total_bytes = path.metadata().map_err(fs_error)?.len();
+            pending.logs.insert(
+                *log_ref,
+                PendingDataLogManifest {
+                    storage_node: log_ref.storage_node,
+                    log_id: log_ref.log_id,
+                    state: STREAM_DATA_LOG_STATE_ACTIVE.to_string(),
+                    total_bytes,
+                    needs_dir_sync: false,
+                },
+            );
+        }
+        Ok(pending)
     }
 
     fn read_append_run_source_payload(

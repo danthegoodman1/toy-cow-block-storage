@@ -281,6 +281,20 @@ impl Workload {
         ]
     }
 
+    fn durable_publish_suite() -> Vec<Self> {
+        vec![
+            Self::NativeStreamPublishInterval1m,
+            Self::NativeStreamPublishInterval4m,
+            Self::NativeStreamPublishInterval32m,
+            Self::NativeStreamPublishAtEnd1m,
+            Self::NativeStreamPublishAtEnd4m,
+            Self::NativeStreamPublishAtEnd32m,
+            Self::NativeStreamPublishBarrierAtEnd1m,
+            Self::NativeStreamPublishBarrierAtEnd4m,
+            Self::NativeStreamPublishBarrierAtEnd32m,
+        ]
+    }
+
     fn block_metadata_suite() -> Vec<Self> {
         vec![
             Self::BlockWrite4kSameShardContended,
@@ -317,6 +331,22 @@ impl Workload {
 
     fn block_writeback_prestaged_suite() -> Vec<Self> {
         vec![
+            Self::BlockWritebackPrestagedFsync1m,
+            Self::BlockWritebackPrestagedFsync2m,
+            Self::BlockWritebackPrestagedFsync4m,
+            Self::BlockWritebackPrestagedFsync16m,
+        ]
+    }
+
+    fn block_durable_boundary_suite() -> Vec<Self> {
+        vec![
+            Self::BlockWrite4k,
+            Self::BlockWrite1m,
+            Self::BlockBatchFsyncInterval,
+            Self::BlockWritebackFsync1m,
+            Self::BlockWritebackFsync2m,
+            Self::BlockWritebackFsync4m,
+            Self::BlockWritebackFsync16m,
             Self::BlockWritebackPrestagedFsync1m,
             Self::BlockWritebackPrestagedFsync2m,
             Self::BlockWritebackPrestagedFsync4m,

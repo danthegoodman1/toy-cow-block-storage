@@ -337,6 +337,41 @@ native publish p99 is still higher than the fio `--fsync=128` write-latency
 proxy. fio reported an empty sync histogram for these shapes, so the fio tail
 numbers are only a rough proxy for final durability latency.
 
+External Rapid Storage spot checks from June 6, 2026, using same-zone VMs and
+Rapid Storage buckets in `us-central1-a`, with 512 MiB per worker. For GCS
+appendable objects, `Flush()` is the closest comparison to native
+publish-at-end because the object remains appendable after the boundary;
+`Close()` is a separate release/finalization-shaped boundary. The first run used
+`c3-standard-22`, and the follow-up used `c3-standard-88` with gVNIC and per-VM
+Tier 1 networking.
+
+| Shape | Throughput | Boundary tail |
+| --- | --- | --- |
+| Rapid c3-22 `at-end`, 4 MiB appends, c16/c32 | 0.55 / 1.92 GiB/s | flush p99 110 / 73 ms |
+| Rapid c3-22 `at-end`, 32 MiB appends, c16/c32 | 1.26 / 2.27 GiB/s | flush p99 86 / 114 ms |
+| Rapid c3-88 Tier1 `at-end`, 4 MiB appends, c16/c32/c64 | 1.19 / 4.30 / 7.75 GiB/s | flush p99 32 / 20 / 28 ms |
+| Rapid c3-88 Tier1 `at-end`, 32 MiB appends, c16/c32/c64 | 1.84 / 4.87 / 9.35 GiB/s | flush p99 109 / 121 / 122 ms |
+| Rapid c3-88 Tier1 `interval`, 4 MiB appends, c16/c32/c64 | 2.60 / 6.09 / 6.95 GiB/s | flush p99 20 / 20 / 46 ms |
+| Rapid c3-88 Tier1 `interval`, 32 MiB appends, c16/c32/c64 | 3.64 / 5.64 / 7.41 GiB/s | flush p99 80 / 88 / 126 ms |
+| Rapid c3-88 Tier1 `close-at-end`, 4 MiB appends, c16/c32/c64 | 3.25 / 5.11 / 6.53 GiB/s | close p99 19 / 24 / 33 ms |
+| Rapid c3-88 Tier1 `close-at-end`, 32 MiB appends, c16/c32/c64 | 2.90 / 5.75 / 7.74 GiB/s | close p99 142 / 114 / 167 ms |
+
+The c3-22 Rapid run was VM-network-limited for throughput: that shape has a
+documented default egress ceiling of up to `23 Gbps`, roughly `2.68 GiB/s`
+before protocol overhead, and the fastest rows reached about `2.42 GiB/s`.
+The c3-88/Tier1 rerun raised the documented ceiling to up to `100 Gbps`, or
+roughly `11.6 GiB/s`, and publish-at-end throughput reached about `9.35 GiB/s`
+while publish p99 stayed in the tens-to-low-hundreds of milliseconds range. Raw
+Rapid artifacts live in `infra/gcp-rapidstorage-bench/results/`.
+
+Treat the c3-88/Tier1 Rapid rows as an external north-star for native durable
+append publish until local measurements prove a lower hardware ceiling. For
+publish-at-end, the target shape is multi-GiB/s visible durable throughput with
+sub-500 ms p99, and the stretch target is the c64 32 MiB Rapid row: about
+`9.35 GiB/s` with about `122 ms` publish p99. Do not conclude that the native
+path is hardware-limited just because it matches local fio throughput while
+publish p99 remains seconds-class.
+
 `cargo bench --bench regression` is the Criterion mechanism suite.
 `loadbench` is the integration runner for public block/native API behavior,
 modeled RTT, concurrency, latency percentiles, conflicts, and errors.
@@ -371,12 +406,13 @@ docker compose exec dev cargo run --release --bin loadbench -- \
   --concurrency 1,4,16 \
   --files 128 \
   --storage-nodes 4 \
-  --workloads native-stream-ingest-32m,native-stream-publish-interval-4m,native-stream-publish-at-end-4m \
+  --workloads native-stream-ingest-32m,durable-publish \
   --rtt-us 200 \
   --stream-total-mib 1024 \
   --stream-publish-mib 128 \
   --matrix-csv target/loadbench/native-publish-boundary/matrix.csv \
-  --durable-profile-csv target/loadbench/native-publish-boundary/profile.csv
+  --durable-profile-csv target/loadbench/native-publish-boundary/profile.csv \
+  --append-publish-profile-csv target/loadbench/native-publish-boundary/append-publish-profile.csv
 ```
 
 `success_iops` is successful operations per second. `mbps` is submitted payload
@@ -400,8 +436,10 @@ Useful workload aliases:
 | Alias | Use it for |
 | --- | --- |
 | `north-star` | Broad block/native API comparison. |
+| `durable-publish` | Native stream publish-at-end, interval, and barrier-at-end durable boundaries. |
 | `append-batch` | Client-side append payload size effects. |
 | `append-stream` | Private ingest and publish-prefix behavior. |
+| `block-durable-boundary` | Block write, batch fsync, writeback fsync, and prestaged fsync boundaries. |
 | `block-writeback` | Filesystem-style dirty window plus fsync behavior. |
 | `block-metadata` | Same-shard conflicts versus different-shard/device convergence. |
 | `native-file-batch` | Client-sized random-write commit boundaries. |

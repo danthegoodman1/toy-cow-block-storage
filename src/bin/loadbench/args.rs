@@ -319,7 +319,7 @@ options:\n\
                                            default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, append-batch, append-stream, block-metadata, block-batch, block-writeback, block-writeback-prestaged, native-metadata, native-file-batch\n\
+                                           aliases: north-star, durable-publish, append-batch, append-stream, block-metadata, block-batch, block-durable-boundary, block-writeback, block-writeback-prestaged, native-metadata, native-file-batch\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-same-shard-contended,\n\
                                            block-write-4k-same-shard-serialized,\n\
@@ -500,10 +500,16 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
     for part in value.split(',') {
         match part {
             "north-star" | "all" => workloads.extend(Workload::north_star_suite()),
+            "durable-publish" | "native-durable-publish" => {
+                workloads.extend(Workload::durable_publish_suite())
+            }
             "append-batch" => workloads.extend(Workload::append_batch_suite()),
             "append-stream" => workloads.extend(Workload::append_stream_suite()),
             "block-metadata" => workloads.extend(Workload::block_metadata_suite()),
             "block-batch" => workloads.extend(Workload::block_batch_suite()),
+            "block-durable-boundary" => {
+                workloads.extend(Workload::block_durable_boundary_suite())
+            }
             "block-writeback" => workloads.extend(Workload::block_writeback_suite()),
             "block-writeback-prestaged" => {
                 workloads.extend(Workload::block_writeback_prestaged_suite())

@@ -78,6 +78,26 @@ mod tests {
     }
 
     #[test]
+    fn durable_publish_suite_names_visible_publish_boundaries() {
+        let suite = parse_workloads("durable-publish").unwrap();
+        assert_eq!(
+            suite,
+            vec![
+                Workload::NativeStreamPublishInterval1m,
+                Workload::NativeStreamPublishInterval4m,
+                Workload::NativeStreamPublishInterval32m,
+                Workload::NativeStreamPublishAtEnd1m,
+                Workload::NativeStreamPublishAtEnd4m,
+                Workload::NativeStreamPublishAtEnd32m,
+                Workload::NativeStreamPublishBarrierAtEnd1m,
+                Workload::NativeStreamPublishBarrierAtEnd4m,
+                Workload::NativeStreamPublishBarrierAtEnd32m,
+            ]
+        );
+        assert_eq!(parse_workloads("native-durable-publish").unwrap(), suite);
+    }
+
+    #[test]
     fn fixed_stream_publish_workloads_parse_explicit_names() {
         assert_eq!(
             Workload::from_str("native-stream-publish-interval-1m").unwrap(),
@@ -278,6 +298,27 @@ mod tests {
     }
 
     #[test]
+    fn block_durable_boundary_suite_names_flush_boundary_shapes() {
+        let suite = parse_workloads("block-durable-boundary").unwrap();
+        assert_eq!(
+            suite,
+            vec![
+                Workload::BlockWrite4k,
+                Workload::BlockWrite1m,
+                Workload::BlockBatchFsyncInterval,
+                Workload::BlockWritebackFsync1m,
+                Workload::BlockWritebackFsync2m,
+                Workload::BlockWritebackFsync4m,
+                Workload::BlockWritebackFsync16m,
+                Workload::BlockWritebackPrestagedFsync1m,
+                Workload::BlockWritebackPrestagedFsync2m,
+                Workload::BlockWritebackPrestagedFsync4m,
+                Workload::BlockWritebackPrestagedFsync16m,
+            ]
+        );
+    }
+
+    #[test]
     fn prestaged_block_writeback_suite_names_fsync_only_shapes() {
         let suite = parse_workloads("block-writeback-prestaged").unwrap();
         assert_eq!(
@@ -360,5 +401,41 @@ mod tests {
         assert_eq!(report.bytes, 300);
         assert_eq!(report.durable_bytes, 192);
         assert_eq!(report.published_bytes, 128);
+    }
+
+    #[test]
+    fn csv_append_writes_header_for_new_file() {
+        let path = env::temp_dir().join(format!(
+            "toy-cow-block-storage-loadbench-csv-new-{}.csv",
+            NEXT_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut file = open_csv_append(&path, "first,second").unwrap();
+            writeln!(file, "1,2").unwrap();
+        }
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "first,second\n1,2\n");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn csv_append_rejects_mismatched_header() {
+        let path = env::temp_dir().join(format!(
+            "toy-cow-block-storage-loadbench-csv-mismatch-{}.csv",
+            NEXT_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, "old,header\n1,2\n").unwrap();
+
+        let error = open_csv_append(&path, "new,header").unwrap_err();
+        assert!(
+            error.to_string().contains("CSV header mismatch"),
+            "unexpected error: {error}"
+        );
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "old,header\n1,2\n");
+        let _ = fs::remove_file(&path);
     }
 }

@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl git build-essential
+
+if ! /usr/local/go/bin/go version | grep -q "go${go_version}"; then
+  rm -rf /usr/local/go
+  curl -fsSL "https://go.dev/dl/go${go_version}.linux-amd64.tar.gz" -o /tmp/go.tgz
+  tar -C /usr/local -xzf /tmp/go.tgz
+  rm -f /tmp/go.tgz
+fi
+
+cat >/etc/profile.d/go-path.sh <<'EOF'
+export PATH=/usr/local/go/bin:$PATH
+EOF

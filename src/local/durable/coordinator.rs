@@ -1,5 +1,7 @@
 /// Durable in-process coordinator using SQLite metadata and node-scoped rolled
 /// data logs.
+const APPEND_PUBLISH_BATCH_COALESCE_DELAY: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Clone)]
 pub struct DurableCoordinator {
     local: LocalCoordinator,
@@ -92,6 +94,11 @@ impl StreamAutoPersistWorker {
         }
     }
 
+    fn notify(&self) {
+        let (_, cvar) = &*self.state;
+        cvar.notify_one();
+    }
+
     fn shutdown(&self) {
         let (lock_state, cvar) = &*self.state;
         if let Ok(mut state) = lock_state.lock() {
@@ -123,22 +130,27 @@ fn stream_auto_persist_worker_loop(
                 Ok(guard) => guard,
                 Err(_) => return,
             };
-            while !guard.shutdown && guard.requests.is_empty() {
+            loop {
+                while !guard.shutdown && guard.requests.is_empty() {
+                    guard = match cvar.wait(guard) {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                }
+                if guard.shutdown {
+                    return;
+                }
+                if let Some(requests) =
+                    stream_auto_persist_drain_ready_requests(&store, &mut guard)
+                {
+                    break requests;
+                }
                 guard = match cvar.wait(guard) {
                     Ok(guard) => guard,
                     Err(_) => return,
                 };
             }
-            if guard.shutdown {
-                return;
-            }
-            let requests = guard.requests.values().cloned().collect::<Vec<_>>();
-            guard.requests.clear();
-            requests
         };
-        if store.has_append_publish_persist_demand() {
-            continue;
-        }
         if store
             .persist_append_stream_prefix_background_batch(&requests)
             .unwrap_or(false)
@@ -148,14 +160,23 @@ fn stream_auto_persist_worker_loop(
     }
 }
 
+fn stream_auto_persist_drain_ready_requests(
+    store: &DurableCoordinator,
+    state: &mut StreamAutoPersistWorkerState,
+) -> Option<Vec<(AppendStream, u64)>> {
+    if state.shutdown || state.requests.is_empty() || store.has_append_publish_persist_demand() {
+        return None;
+    }
+    let requests = state.requests.values().cloned().collect::<Vec<_>>();
+    state.requests.clear();
+    Some(requests)
+}
+
 fn stream_auto_persist_requeue_unreached(
     store: &DurableCoordinator,
     state: &Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
     requests: &[(AppendStream, u64)],
 ) {
-    if store.has_append_publish_persist_demand() {
-        return;
-    }
     let remaining = requests
         .iter()
         .filter_map(|(stream, target)| {
@@ -435,6 +456,12 @@ impl DurableCoordinator {
         lock(&self.append_publish_persist_coordinator.inner)
             .map(|state| state.in_flight || !state.requests.is_empty())
             .unwrap_or(true)
+    }
+
+    fn notify_stream_auto_persist_worker(&self) {
+        if let Some(worker) = &self.stream_auto_persist_worker {
+            worker.notify();
+        }
     }
 
     pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
@@ -1182,15 +1209,6 @@ impl DurableCoordinator {
             return Ok(false);
         }
         let segment_ids: BTreeSet<SegmentId> = BTreeSet::new();
-        let run_log_refs: BTreeSet<_> = plans
-            .iter()
-            .flat_map(|plan| {
-                plan.batch
-                    .records
-                    .iter()
-                    .map(AppendStreamRunRecord::log_ref)
-            })
-            .collect();
         let stream_prefix_storage_node_count = usize_to_u64(
             plans
                 .iter()
@@ -1226,31 +1244,27 @@ impl DurableCoordinator {
             let pending_stream = lock(&lane.pending)?;
             stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos
                 .saturating_add(duration_nanos_u64(pending_lock_started.elapsed()));
-            pending_stream_append.merge(pending_stream.selected_log_refs(&plan_log_refs));
+            pending_stream_append.merge(
+                self.durable.pending_append_run_manifests_for_log_refs(
+                    &plan_log_refs,
+                    Some(&pending_stream),
+                )?,
+            );
         }
-        let mut pending_log_refs = pending_stream_append.log_refs();
-        let missing_log_refs: Vec<_> = run_log_refs
-            .difference(&pending_log_refs)
-            .copied()
-            .collect();
-        for log_ref in missing_log_refs {
-            let path = data_log_path(
-                &self.durable.paths.data_dir,
-                log_ref.storage_node,
-                log_ref.log_id,
+        for plan in &plans {
+            if self.existing_stream_append_lane(plan.stream.stream_id)?.is_some() {
+                continue;
+            }
+            let plan_log_refs: BTreeSet<_> = plan
+                .batch
+                .records
+                .iter()
+                .map(AppendStreamRunRecord::log_ref)
+                .collect();
+            pending_stream_append.merge(
+                self.durable
+                    .pending_append_run_manifests_for_log_refs(&plan_log_refs, None)?,
             );
-            let total_bytes = path.metadata().map_err(fs_error)?.len();
-            pending_stream_append.logs.insert(
-                log_ref,
-                PendingDataLogManifest {
-                    storage_node: log_ref.storage_node,
-                    log_id: log_ref.log_id,
-                    state: STREAM_DATA_LOG_STATE_ACTIVE.to_string(),
-                    total_bytes,
-                    needs_dir_sync: false,
-                },
-            );
-            pending_log_refs.insert(log_ref);
         }
         let nodes = self.local.selected_state_for_segment_ids(&segment_ids)?;
         let cursor = self.local.durable_export_cursor()?;
@@ -1545,32 +1559,24 @@ impl DurableCoordinator {
             let pending_stream = lock(&lane.pending)?;
             pending_lock_wait_nanos = pending_lock_wait_nanos
                 .saturating_add(duration_nanos_u64(pending_lock_started.elapsed()));
-            pending_stream_append.merge(pending_stream.selected_log_refs(&plan_log_refs));
+            pending_stream_append.merge(
+                self.durable.pending_append_run_manifests_for_log_refs(
+                    &plan_log_refs,
+                    Some(&pending_stream),
+                )?,
+            );
         }
 
-        let mut pending_log_refs = pending_stream_append.log_refs();
-        let missing_log_refs: Vec<_> = run_log_refs
-            .difference(&pending_log_refs)
-            .copied()
-            .collect();
-        for log_ref in missing_log_refs {
-            let path = data_log_path(
-                &self.durable.paths.data_dir,
-                log_ref.storage_node,
-                log_ref.log_id,
+        let pending_log_refs = pending_stream_append.log_refs();
+        if !run_log_refs.is_subset(&pending_log_refs) {
+            let missing_log_refs = run_log_refs
+                .difference(&pending_log_refs)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            pending_stream_append.merge(
+                self.durable
+                    .pending_append_run_manifests_for_log_refs(&missing_log_refs, None)?,
             );
-            let total_bytes = path.metadata().map_err(fs_error)?.len();
-            pending_stream_append.logs.insert(
-                log_ref,
-                PendingDataLogManifest {
-                    storage_node: log_ref.storage_node,
-                    log_id: log_ref.log_id,
-                    state: STREAM_DATA_LOG_STATE_ACTIVE.to_string(),
-                    total_bytes,
-                    needs_dir_sync: false,
-                },
-            );
-            pending_log_refs.insert(log_ref);
         }
 
         Ok((pending_stream_append, pending_lock_wait_nanos))
@@ -1823,6 +1829,20 @@ impl DurableCoordinator {
                 }
             }
         }
+    }
+
+    fn append_publish_ticket_batch(
+        &self,
+        waiter_tickets: Vec<AppendPublishTicket>,
+    ) -> Result<Vec<AppendPublishTicket>> {
+        let mut tickets = BTreeMap::new();
+        for ticket in waiter_tickets {
+            tickets.insert(ticket.ticket_id, ticket);
+        }
+        for ticket in self.local.metadata.pending_append_publish_tickets()? {
+            tickets.entry(ticket.ticket_id).or_insert(ticket);
+        }
+        Ok(tickets.into_values().collect())
     }
 
     /// Return the maintenance policy configured for this store.
@@ -2188,9 +2208,15 @@ impl DurableCoordinator {
         let admission = self.admit_write(len, true)?;
         let result = self
             .local
-            .write_zeroes(device_id, offset, len)
-            .and_then(|commit| {
-                self.persist_until(commit.commit_seq)?;
+            .write_zeroes_with_delta(device_id, offset, len)
+            .and_then(|committed| {
+                let commit = committed.commit;
+                if let Some(delta) = committed.delta {
+                    self.record_pending_block_delta(Some(delta))?;
+                    self.persist_block_deltas_until(commit.commit_seq)?;
+                } else {
+                    self.persist_until(commit.commit_seq)?;
+                }
                 Ok(commit)
             });
         if result.is_ok() {
@@ -2208,9 +2234,15 @@ impl DurableCoordinator {
         let admission = self.admit_write(len, true)?;
         let result = self
             .local
-            .discard_device(device_id, offset, len)
-            .and_then(|commit| {
-                self.persist_until(commit.commit_seq)?;
+            .discard_device_with_delta(device_id, offset, len)
+            .and_then(|committed| {
+                let commit = committed.commit;
+                if let Some(delta) = committed.delta {
+                    self.record_pending_block_delta(Some(delta))?;
+                    self.persist_block_deltas_until(commit.commit_seq)?;
+                } else {
+                    self.persist_until(commit.commit_seq)?;
+                }
                 Ok(commit)
             });
         if result.is_ok() {
@@ -2414,6 +2446,7 @@ impl DurableCoordinator {
                     && error_generation > observed_generation
                 {
                     state.requests.remove(&ticket.ticket_id);
+                    self.notify_stream_auto_persist_worker();
                     self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }
@@ -2433,6 +2466,7 @@ impl DurableCoordinator {
                             .coordinator_lock_wait_nanos
                             .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                         state.requests.remove(&ticket.ticket_id);
+                        self.notify_stream_auto_persist_worker();
                     } else {
                         profile.completed_without_register = true;
                     }
@@ -2464,6 +2498,7 @@ impl DurableCoordinator {
                 && error_generation > observed_generation
             {
                 state.requests.remove(&ticket.ticket_id);
+                self.notify_stream_auto_persist_worker();
                 self.finish_append_publish_wait_profile(profile, total_started, false);
                 return Err(error);
             }
@@ -2481,12 +2516,33 @@ impl DurableCoordinator {
                 continue;
             }
             state.in_flight = true;
-            let tickets = state.requests.values().cloned().collect::<Vec<_>>();
+            let waiter_tickets = state.requests.values().cloned().collect::<Vec<_>>();
+            profile.persist_batches_started = profile.persist_batches_started.saturating_add(1);
+            drop(state);
+
+            thread::sleep(APPEND_PUBLISH_BATCH_COALESCE_DELAY);
+            let tickets = match self.append_publish_ticket_batch(waiter_tickets) {
+                Ok(tickets) => tickets,
+                Err(error) => {
+                    let lock_started = Instant::now();
+                    let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                    profile.coordinator_lock_wait_nanos = profile
+                        .coordinator_lock_wait_nanos
+                        .saturating_add(duration_nanos_u64(lock_started.elapsed()));
+                    state.in_flight = false;
+                    state.generation = state.generation.saturating_add(1);
+                    let generation = state.generation;
+                    state.last_error = Some((generation, error.clone()));
+                    state.requests.remove(&ticket.ticket_id);
+                    self.append_publish_persist_coordinator.cvar.notify_all();
+                    self.notify_stream_auto_persist_worker();
+                    self.finish_append_publish_wait_profile(profile, total_started, false);
+                    return Err(error);
+                }
+            };
             profile.max_batch_ticket_count = profile
                 .max_batch_ticket_count
                 .max(usize_to_u64(tickets.len()));
-            profile.persist_batches_started = profile.persist_batches_started.saturating_add(1);
-            drop(state);
 
             let persist_started = Instant::now();
             let result = self.persist_append_publish_ticket_batch(tickets);
@@ -2506,6 +2562,7 @@ impl DurableCoordinator {
                 Ok(()) => {
                     state.last_error = None;
                     self.append_publish_persist_coordinator.cvar.notify_all();
+                    self.notify_stream_auto_persist_worker();
                     observed_generation = generation;
                     continue;
                 }
@@ -2513,6 +2570,7 @@ impl DurableCoordinator {
                     state.last_error = Some((generation, error.clone()));
                     state.requests.remove(&ticket.ticket_id);
                     self.append_publish_persist_coordinator.cvar.notify_all();
+                    self.notify_stream_auto_persist_worker();
                     self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }

@@ -38,6 +38,26 @@ impl PendingDataLogAppend {
         )
     }
 
+    fn manifest_storage_nodes_except(&self, excluded: &BTreeSet<StorageNodeId>) -> Self {
+        let logs = self
+            .logs
+            .iter()
+            .filter(|(log_ref, _)| !excluded.contains(&log_ref.storage_node))
+            .map(|(log_ref, manifest)| (*log_ref, manifest.clone()))
+            .collect();
+        let sealed_logs = self
+            .sealed_logs
+            .iter()
+            .copied()
+            .filter(|log_ref| !excluded.contains(&log_ref.storage_node))
+            .collect();
+        Self {
+            placements: Vec::new(),
+            logs,
+            sealed_logs,
+        }
+    }
+
     fn selected_log_refs(&self, selected: &BTreeSet<DurableDataLogRef>) -> Self {
         let logs = self
             .logs
