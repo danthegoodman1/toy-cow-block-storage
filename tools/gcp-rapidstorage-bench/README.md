@@ -13,6 +13,13 @@ closest semantic mapping is:
 - `mode=close-at-end`: write all chunks, then use `Writer.Close()` as the
   measured boundary. Add `--finalize-on-close` to make the object non-appendable
   at close.
+- `mode=tcp-probe`: resolve `--probe-target` once per worker, then measure TCP
+  connect time to that address. This is the closest service-endpoint RTT proxy.
+- `mode=metadata-probe`: create one small object per worker, then measure
+  `Object.Attrs()` calls. This is API-operation latency, not raw network RTT.
+- `mode=tiny-flush-probe`: create one small appendable object per sample and
+  measure a tiny `Flush()` plus `Close()`. This is API-operation latency, not raw
+  network RTT.
 
 Example:
 
@@ -27,10 +34,11 @@ go run . \
   --csv=rapid-results.csv
 ```
 
-The important columns are `published_mibps`, `flush_p50_ms`, `flush_p99_ms`,
-`close_p50_ms`, and `close_p99_ms`. For `mode=at-end` and `mode=interval`,
-`Flush()` is the measured publish boundary. For `mode=close-at-end`, `Close()`
-is the measured boundary.
+The important workload columns are `published_mibps`, `flush_p50_ms`,
+`flush_p99_ms`, `close_p50_ms`, and `close_p99_ms`. For `mode=at-end` and
+`mode=interval`, `Flush()` is the measured publish boundary. For
+`mode=close-at-end`, `Close()` is the measured boundary. Probe modes report
+their latency in `probe_p50_ms` and `probe_p99_ms`.
 
 ## June 6, 2026 Spot Checks
 
@@ -43,6 +51,8 @@ Raw CSVs:
 
 - `infra/gcp-rapidstorage-bench/results/rapid-results.csv`
 - `infra/gcp-rapidstorage-bench/results/rapid-results-c3-88-tier1.csv`
+- `infra/gcp-rapidstorage-bench/results/rapid-tcp-rtt-c3-88-tier1.csv`
+- `infra/gcp-rapidstorage-bench/results/rapid-latency-c3-88-tier1.csv`
 
 ### `c3-standard-22`
 
@@ -101,3 +111,23 @@ The c3-88/Tier1 run strongly suggests the c3-22 run was VM-network-limited for
 throughput. The best publish-at-end row rose from about `2.27 GiB/s` to about
 `9.35 GiB/s`, while the publish boundary p99 stayed in the tens-to-low-hundreds
 of milliseconds range.
+
+### Service Endpoint Latency Checks
+
+The c3-88/Tier1 throughput rows should not be treated as if they ran under the
+local loadbench `--rtt-us 200` assumption. A follow-up TCP-connect probe from
+the same VM shape resolved `storage.googleapis.com:443` once per worker and then
+timed only TCP handshakes:
+
+| Mode | Workers | Samples | Probe p50 | Probe p99 |
+| --- | ---: | ---: | ---: | ---: |
+| `tcp-probe` | 1 | 256 | 0.303 ms | 0.663 ms |
+| `tcp-probe` | 16 | 4096 | 0.396 ms | 0.832 ms |
+| `tcp-probe` | 64 | 16384 | 1.226 ms | 3.616 ms |
+
+An earlier API-operation probe is kept in
+`infra/gcp-rapidstorage-bench/results/rapid-latency-c3-88-tier1.csv` for
+context. It measured object metadata and tiny flush operations, not network RTT.
+Those rows showed minimum API-operation p50s in the tens of milliseconds, which
+should be compared with storage-service operation tails, not with modeled
+network delay.

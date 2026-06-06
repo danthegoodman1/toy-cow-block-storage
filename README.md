@@ -343,7 +343,11 @@ appendable objects, `Flush()` is the closest comparison to native
 publish-at-end because the object remains appendable after the boundary;
 `Close()` is a separate release/finalization-shaped boundary. The first run used
 `c3-standard-22`, and the follow-up used `c3-standard-88` with gVNIC and per-VM
-Tier 1 networking.
+Tier 1 networking. The Rapid runs were not run under the local loadbench
+`--rtt-us 200` assumption: a same-shape TCP-connect probe to
+`storage.googleapis.com:443`, resolving DNS outside the timed samples, measured
+about `0.303/0.663 ms` p50/p99 at c1, `0.396/0.832 ms` at c16, and
+`1.226/3.616 ms` at c64.
 
 | Shape | Throughput | Boundary tail |
 | --- | --- | --- |
@@ -363,6 +367,11 @@ The c3-88/Tier1 rerun raised the documented ceiling to up to `100 Gbps`, or
 roughly `11.6 GiB/s`, and publish-at-end throughput reached about `9.35 GiB/s`
 while publish p99 stayed in the tens-to-low-hundreds of milliseconds range. Raw
 Rapid artifacts live in `infra/gcp-rapidstorage-bench/results/`.
+
+The TCP probe is the service-endpoint RTT proxy. The separate
+`rapid-latency-c3-88-tier1.csv` artifact measures metadata and tiny-flush API
+operations; those rows are useful service-operation context but are not raw
+network RTT.
 
 Treat the c3-88/Tier1 Rapid rows as an external north-star for native durable
 append publish until local measurements prove a lower hardware ceiling. For

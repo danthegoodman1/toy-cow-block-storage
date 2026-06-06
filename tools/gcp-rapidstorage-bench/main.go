@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -21,19 +22,22 @@ import (
 const mib = 1024 * 1024
 
 type config struct {
-	bucket          string
-	prefix          string
-	modes           []string
-	workers         []int
-	opMiB           []int
-	totalMiB        int
-	publishMiB      int
-	chunkMiB        int
-	finalizeOnClose bool
-	cleanup         bool
-	timeout         time.Duration
-	csvPath         string
-	jsonOutput      bool
+	bucket           string
+	prefix           string
+	modes            []string
+	workers          []int
+	opMiB            []int
+	totalMiB         int
+	publishMiB       int
+	chunkMiB         int
+	finalizeOnClose  bool
+	cleanup          bool
+	timeout          time.Duration
+	csvPath          string
+	jsonOutput       bool
+	latencySamples   int
+	latencyObjectKiB int
+	probeTarget      string
 }
 
 type workerResult struct {
@@ -44,7 +48,8 @@ type workerResult struct {
 	writeLatencies []time.Duration
 	flushLatencies []time.Duration
 	closeLatencies []time.Duration
-	objectName     string
+	probeLatencies []time.Duration
+	objectNames    []string
 }
 
 type resultRow struct {
@@ -71,6 +76,9 @@ type resultRow struct {
 	FlushP99Ms      float64 `json:"flush_p99_ms"`
 	CloseP50Ms      float64 `json:"close_p50_ms"`
 	CloseP99Ms      float64 `json:"close_p99_ms"`
+	ProbeSamples    int     `json:"probe_samples"`
+	ProbeP50Ms      float64 `json:"probe_p50_ms"`
+	ProbeP99Ms      float64 `json:"probe_p99_ms"`
 	Errors          string  `json:"errors,omitempty"`
 }
 
@@ -84,12 +92,16 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
 
-	client, err := storage.NewGRPCClient(ctx, experimental.WithZonalBucketAPIs())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "storage.NewGRPCClient: %v\n", err)
-		os.Exit(1)
+	var client *storage.Client
+	if requiresStorageClient(cfg.modes) {
+		var err error
+		client, err = storage.NewGRPCClient(ctx, experimental.WithZonalBucketAPIs())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "storage.NewGRPCClient: %v\n", err)
+			os.Exit(1)
+		}
+		defer client.Close()
 	}
-	defer client.Close()
 
 	rows := make([]resultRow, 0, len(cfg.modes)*len(cfg.workers)*len(cfg.opMiB))
 	exitCode := 0
@@ -126,7 +138,7 @@ func parseConfig() (config, error) {
 
 	flag.StringVar(&cfg.bucket, "bucket", "", "Rapid Storage bucket name")
 	flag.StringVar(&cfg.prefix, "prefix", "rapidbench", "object prefix for benchmark data")
-	flag.StringVar(&modes, "mode", "at-end", "comma-separated modes: at-end,interval,close-at-end")
+	flag.StringVar(&modes, "mode", "at-end", "comma-separated modes: at-end,interval,close-at-end,metadata-probe,tcp-probe,tiny-flush-probe")
 	flag.StringVar(&workers, "workers", "16", "comma-separated worker counts")
 	flag.StringVar(&opMiB, "op-mib", "4", "comma-separated append sizes in MiB")
 	flag.IntVar(&cfg.totalMiB, "total-mib", 1024, "total MiB written per worker")
@@ -137,21 +149,23 @@ func parseConfig() (config, error) {
 	flag.DurationVar(&cfg.timeout, "timeout", 30*time.Minute, "overall benchmark timeout")
 	flag.StringVar(&cfg.csvPath, "csv", "", "optional CSV output path")
 	flag.BoolVar(&cfg.jsonOutput, "json", false, "emit one JSON result object per run")
+	flag.IntVar(&cfg.latencySamples, "latency-samples", 128, "latency probe samples per worker")
+	flag.IntVar(&cfg.latencyObjectKiB, "latency-object-kib", 4, "object size in KiB for latency probe objects")
+	flag.StringVar(&cfg.probeTarget, "probe-target", "storage.googleapis.com:443", "TCP target for tcp-probe mode")
 	flag.Parse()
-
-	cfg.bucket = strings.TrimSpace(cfg.bucket)
-	if cfg.bucket == "" {
-		return cfg, errors.New("--bucket is required")
-	}
-	cfg.prefix = strings.Trim(strings.TrimSpace(cfg.prefix), "/")
-	if cfg.prefix == "" {
-		return cfg, errors.New("--prefix must not be empty")
-	}
 
 	var err error
 	cfg.modes, err = parseModes(modes)
 	if err != nil {
 		return cfg, err
+	}
+	cfg.bucket = strings.TrimSpace(cfg.bucket)
+	if cfg.bucket == "" && requiresStorageClient(cfg.modes) {
+		return cfg, errors.New("--bucket is required")
+	}
+	cfg.prefix = strings.Trim(strings.TrimSpace(cfg.prefix), "/")
+	if cfg.prefix == "" {
+		return cfg, errors.New("--prefix must not be empty")
 	}
 	cfg.workers, err = parsePositiveIntList(workers, "--workers")
 	if err != nil {
@@ -173,7 +187,25 @@ func parseConfig() (config, error) {
 	if cfg.timeout <= 0 {
 		return cfg, errors.New("--timeout must be positive")
 	}
+	if cfg.latencySamples <= 0 {
+		return cfg, errors.New("--latency-samples must be positive")
+	}
+	if cfg.latencyObjectKiB <= 0 {
+		return cfg, errors.New("--latency-object-kib must be positive")
+	}
+	if strings.TrimSpace(cfg.probeTarget) == "" {
+		return cfg, errors.New("--probe-target must not be empty")
+	}
 	return cfg, nil
+}
+
+func requiresStorageClient(modes []string) bool {
+	for _, mode := range modes {
+		if mode != "tcp-probe" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseModes(raw string) ([]string, error) {
@@ -182,7 +214,7 @@ func parseModes(raw string) ([]string, error) {
 	for _, part := range parts {
 		mode := strings.TrimSpace(part)
 		switch mode {
-		case "at-end", "interval", "close-at-end":
+		case "at-end", "interval", "close-at-end", "metadata-probe", "tcp-probe", "tiny-flush-probe":
 			modes = append(modes, mode)
 		case "":
 		default:
@@ -230,6 +262,14 @@ func runOnce(ctx context.Context, client *storage.Client, cfg config, mode strin
 	if row.ChunkMiB == 0 {
 		row.ChunkMiB = opMiB
 	}
+	switch mode {
+	case "metadata-probe":
+		return runMetadataProbe(ctx, client, cfg, row)
+	case "tcp-probe":
+		return runTCPProbe(ctx, cfg, row)
+	case "tiny-flush-probe":
+		return runTinyFlushProbe(ctx, client, cfg, row)
+	}
 	if cfg.totalMiB%opMiB != 0 {
 		row.Errors = fmt.Sprintf("--total-mib=%d must be a multiple of --op-mib=%d", cfg.totalMiB, opMiB)
 		return row
@@ -269,13 +309,13 @@ func runOnce(ctx context.Context, client *storage.Client, cfg config, mode strin
 	close(results)
 
 	var errs []string
-	var writeLatencies, flushLatencies, closeLatencies []time.Duration
+	var writeLatencies, flushLatencies, closeLatencies, probeLatencies []time.Duration
 	var maxPublishDone time.Time
 	var objectNames []string
 	for result := range results {
 		row.Bytes += result.bytes
 		row.PublishedBytes += result.publishedBytes
-		objectNames = append(objectNames, result.objectName)
+		objectNames = append(objectNames, result.objectNames...)
 		if result.publishDone.After(maxPublishDone) {
 			maxPublishDone = result.publishDone
 		}
@@ -285,6 +325,7 @@ func runOnce(ctx context.Context, client *storage.Client, cfg config, mode strin
 		writeLatencies = append(writeLatencies, result.writeLatencies...)
 		flushLatencies = append(flushLatencies, result.flushLatencies...)
 		closeLatencies = append(closeLatencies, result.closeLatencies...)
+		probeLatencies = append(probeLatencies, result.probeLatencies...)
 	}
 
 	if maxPublishDone.IsZero() {
@@ -304,6 +345,9 @@ func runOnce(ctx context.Context, client *storage.Client, cfg config, mode strin
 	row.FlushP99Ms = percentileMillis(flushLatencies, 99)
 	row.CloseP50Ms = percentileMillis(closeLatencies, 50)
 	row.CloseP99Ms = percentileMillis(closeLatencies, 99)
+	row.ProbeSamples = len(probeLatencies)
+	row.ProbeP50Ms = percentileMillis(probeLatencies, 50)
+	row.ProbeP99Ms = percentileMillis(probeLatencies, 99)
 	if row.PublishedBytes != row.Bytes && len(errs) == 0 {
 		errs = append(errs, fmt.Sprintf("published_bytes=%d does not equal bytes=%d", row.PublishedBytes, row.Bytes))
 	}
@@ -318,7 +362,7 @@ func runOnce(ctx context.Context, client *storage.Client, cfg config, mode strin
 }
 
 func runWorker(ctx context.Context, client *storage.Client, bucket string, objectName string, mode string, payload []byte, totalBytes int64, publishBytes int64, chunkBytes int, finalizeOnClose bool) workerResult {
-	result := workerResult{objectName: objectName}
+	result := workerResult{objectNames: []string{objectName}}
 	writer := client.Bucket(bucket).Object(objectName).NewWriter(ctx)
 	writer.Append = true
 	writer.FinalizeOnClose = finalizeOnClose
@@ -390,6 +434,223 @@ func runWorker(ctx context.Context, client *storage.Client, bucket string, objec
 	return result
 }
 
+func runMetadataProbe(ctx context.Context, client *storage.Client, cfg config, row resultRow) resultRow {
+	runPrefix := fmt.Sprintf("%s/%s/metadata-probe-w%d", cfg.prefix, time.Now().UTC().Format("20060102T150405.000000000Z"), row.Workers)
+	payload := makePayload(cfg.latencyObjectKiB * 1024)
+	results := make(chan workerResult, row.Workers)
+	start := make(chan struct{})
+	ready := make(chan struct{}, row.Workers)
+	var wg sync.WaitGroup
+	wg.Add(row.Workers)
+	for worker := 0; worker < row.Workers; worker++ {
+		objectName := fmt.Sprintf("%s/worker-%04d-probe", runPrefix, worker)
+		go func(objectName string) {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			results <- runMetadataProbeWorker(ctx, client, cfg.bucket, objectName, payload, cfg.latencySamples)
+		}(objectName)
+	}
+	for i := 0; i < row.Workers; i++ {
+		<-ready
+	}
+	startedAt := time.Now()
+	close(start)
+	wg.Wait()
+	close(results)
+	return finishProbeRow(ctx, client, cfg, row, startedAt, results)
+}
+
+func runMetadataProbeWorker(ctx context.Context, client *storage.Client, bucket string, objectName string, payload []byte, samples int) workerResult {
+	result := workerResult{objectNames: []string{objectName}}
+	if err := createProbeObject(ctx, client, bucket, objectName, payload); err != nil {
+		result.err = err
+		return result
+	}
+	for i := 0; i < samples; i++ {
+		started := time.Now()
+		_, err := client.Bucket(bucket).Object(objectName).Attrs(ctx)
+		result.probeLatencies = append(result.probeLatencies, time.Since(started))
+		if err != nil {
+			result.err = fmt.Errorf("%s attrs sample %d: %w", objectName, i, err)
+			return result
+		}
+	}
+	result.publishDone = time.Now()
+	return result
+}
+
+func runTCPProbe(ctx context.Context, cfg config, row resultRow) resultRow {
+	results := make(chan workerResult, row.Workers)
+	start := make(chan struct{})
+	ready := make(chan struct{}, row.Workers)
+	var wg sync.WaitGroup
+	wg.Add(row.Workers)
+	for worker := 0; worker < row.Workers; worker++ {
+		go func() {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			results <- runTCPProbeWorker(ctx, cfg.probeTarget, cfg.latencySamples)
+		}()
+	}
+	for i := 0; i < row.Workers; i++ {
+		<-ready
+	}
+	startedAt := time.Now()
+	close(start)
+	wg.Wait()
+	close(results)
+	return finishProbeRow(ctx, nil, cfg, row, startedAt, results)
+}
+
+func runTCPProbeWorker(ctx context.Context, target string, samples int) workerResult {
+	var dialer net.Dialer
+	result := workerResult{}
+	addr, err := net.ResolveTCPAddr("tcp", target)
+	if err != nil {
+		result.err = fmt.Errorf("%s resolve: %w", target, err)
+		return result
+	}
+	for i := 0; i < samples; i++ {
+		started := time.Now()
+		conn, err := dialer.DialContext(ctx, "tcp", addr.String())
+		result.probeLatencies = append(result.probeLatencies, time.Since(started))
+		if err != nil {
+			result.err = fmt.Errorf("%s tcp sample %d: %w", target, i, err)
+			return result
+		}
+		_ = conn.Close()
+	}
+	result.publishDone = time.Now()
+	return result
+}
+
+func runTinyFlushProbe(ctx context.Context, client *storage.Client, cfg config, row resultRow) resultRow {
+	runPrefix := fmt.Sprintf("%s/%s/tiny-flush-probe-w%d", cfg.prefix, time.Now().UTC().Format("20060102T150405.000000000Z"), row.Workers)
+	payload := makePayload(cfg.latencyObjectKiB * 1024)
+	results := make(chan workerResult, row.Workers)
+	start := make(chan struct{})
+	ready := make(chan struct{}, row.Workers)
+	var wg sync.WaitGroup
+	wg.Add(row.Workers)
+	for worker := 0; worker < row.Workers; worker++ {
+		workerPrefix := fmt.Sprintf("%s/worker-%04d", runPrefix, worker)
+		go func(workerPrefix string) {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			results <- runTinyFlushProbeWorker(ctx, client, cfg.bucket, workerPrefix, payload, cfg.latencySamples)
+		}(workerPrefix)
+	}
+	for i := 0; i < row.Workers; i++ {
+		<-ready
+	}
+	startedAt := time.Now()
+	close(start)
+	wg.Wait()
+	close(results)
+	return finishProbeRow(ctx, client, cfg, row, startedAt, results)
+}
+
+func runTinyFlushProbeWorker(ctx context.Context, client *storage.Client, bucket string, workerPrefix string, payload []byte, samples int) workerResult {
+	result := workerResult{}
+	chunkBytes := max(256*1024, len(payload))
+	for i := 0; i < samples; i++ {
+		objectName := fmt.Sprintf("%s/sample-%04d", workerPrefix, i)
+		result.objectNames = append(result.objectNames, objectName)
+		writer := client.Bucket(bucket).Object(objectName).NewWriter(ctx)
+		writer.Append = true
+		writer.ChunkSize = chunkBytes
+		started := time.Now()
+		n, err := writer.Write(payload)
+		result.writeLatencies = append(result.writeLatencies, time.Since(started))
+		result.bytes += int64(n)
+		if err != nil {
+			result.err = fmt.Errorf("%s write: %w", objectName, err)
+			return result
+		}
+		if n != len(payload) {
+			result.err = fmt.Errorf("%s short write: wrote %d want %d", objectName, n, len(payload))
+			return result
+		}
+		size, err := flushWriter(writer, &result)
+		if err != nil {
+			result.err = fmt.Errorf("%s flush: %w", objectName, err)
+			return result
+		}
+		result.publishedBytes += size
+		if err := closeWriter(writer, &result); err != nil {
+			result.err = fmt.Errorf("%s close: %w", objectName, err)
+			return result
+		}
+		result.publishDone = time.Now()
+	}
+	return result
+}
+
+func finishProbeRow(ctx context.Context, client *storage.Client, cfg config, row resultRow, startedAt time.Time, results <-chan workerResult) resultRow {
+	var errs []string
+	var writeLatencies, flushLatencies, closeLatencies, probeLatencies []time.Duration
+	var maxPublishDone time.Time
+	var objectNames []string
+	for result := range results {
+		row.Bytes += result.bytes
+		row.PublishedBytes += result.publishedBytes
+		objectNames = append(objectNames, result.objectNames...)
+		if result.publishDone.After(maxPublishDone) {
+			maxPublishDone = result.publishDone
+		}
+		if result.err != nil {
+			errs = append(errs, result.err.Error())
+		}
+		writeLatencies = append(writeLatencies, result.writeLatencies...)
+		flushLatencies = append(flushLatencies, result.flushLatencies...)
+		closeLatencies = append(closeLatencies, result.closeLatencies...)
+		probeLatencies = append(probeLatencies, result.probeLatencies...)
+	}
+	if maxPublishDone.IsZero() {
+		maxPublishDone = time.Now()
+	}
+	row.Seconds = maxPublishDone.Sub(startedAt).Seconds()
+	if row.Seconds > 0 {
+		row.WriteMiBps = (float64(row.Bytes) / mib) / row.Seconds
+		row.PublishedMiBps = (float64(row.PublishedBytes) / mib) / row.Seconds
+	}
+	row.Writes = len(writeLatencies)
+	row.Flushes = len(flushLatencies)
+	row.Closes = len(closeLatencies)
+	row.WriteP50Ms = percentileMillis(writeLatencies, 50)
+	row.WriteP99Ms = percentileMillis(writeLatencies, 99)
+	row.FlushP50Ms = percentileMillis(flushLatencies, 50)
+	row.FlushP99Ms = percentileMillis(flushLatencies, 99)
+	row.CloseP50Ms = percentileMillis(closeLatencies, 50)
+	row.CloseP99Ms = percentileMillis(closeLatencies, 99)
+	row.ProbeSamples = len(probeLatencies)
+	row.ProbeP50Ms = percentileMillis(probeLatencies, 50)
+	row.ProbeP99Ms = percentileMillis(probeLatencies, 99)
+	if len(errs) > 0 {
+		row.Errors = strings.Join(errs, "; ")
+	}
+	if cfg.cleanup && client != nil {
+		cleanupObjects(ctx, client, cfg.bucket, objectNames)
+	}
+	return row
+}
+
+func createProbeObject(ctx context.Context, client *storage.Client, bucket string, objectName string, payload []byte) error {
+	writer := client.Bucket(bucket).Object(objectName).NewWriter(ctx)
+	writer.Append = true
+	writer.ChunkSize = max(256*1024, len(payload))
+	if _, err := writer.Write(payload); err != nil {
+		return fmt.Errorf("%s setup write: %w", objectName, err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("%s setup close: %w", objectName, err)
+	}
+	return nil
+}
+
 func flushWriter(writer *storage.Writer, result *workerResult) (int64, error) {
 	started := time.Now()
 	size, err := writer.Flush()
@@ -438,7 +699,7 @@ func cleanupObjects(ctx context.Context, client *storage.Client, bucket string, 
 
 func printTextRow(row resultRow) {
 	fmt.Printf(
-		"mode=%s workers=%d op_mib=%d total_mib=%d seconds=%.3f published_mibps=%.1f flush_p50_ms=%.2f flush_p99_ms=%.2f close_p50_ms=%.2f close_p99_ms=%.2f errors=%q\n",
+		"mode=%s workers=%d op_mib=%d total_mib=%d seconds=%.3f published_mibps=%.1f flush_p50_ms=%.2f flush_p99_ms=%.2f close_p50_ms=%.2f close_p99_ms=%.2f probe_samples=%d probe_p50_ms=%.2f probe_p99_ms=%.2f errors=%q\n",
 		row.Mode,
 		row.Workers,
 		row.OpMiB,
@@ -449,6 +710,9 @@ func printTextRow(row resultRow) {
 		row.FlushP99Ms,
 		row.CloseP50Ms,
 		row.CloseP99Ms,
+		row.ProbeSamples,
+		row.ProbeP50Ms,
+		row.ProbeP99Ms,
 		row.Errors,
 	)
 }
@@ -498,6 +762,9 @@ func csvHeader() []string {
 		"flush_p99_ms",
 		"close_p50_ms",
 		"close_p99_ms",
+		"probe_samples",
+		"probe_p50_ms",
+		"probe_p99_ms",
 		"errors",
 	}
 }
@@ -527,6 +794,9 @@ func csvFields(row resultRow) []string {
 		fmt.Sprintf("%.3f", row.FlushP99Ms),
 		fmt.Sprintf("%.3f", row.CloseP50Ms),
 		fmt.Sprintf("%.3f", row.CloseP99Ms),
+		strconv.Itoa(row.ProbeSamples),
+		fmt.Sprintf("%.3f", row.ProbeP50Ms),
+		fmt.Sprintf("%.3f", row.ProbeP99Ms),
 		row.Errors,
 	}
 }

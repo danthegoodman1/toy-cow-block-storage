@@ -712,6 +712,8 @@ Raw artifacts:
 
 - `infra/gcp-rapidstorage-bench/results/rapid-results.csv`
 - `infra/gcp-rapidstorage-bench/results/rapid-results-c3-88-tier1.csv`
+- `infra/gcp-rapidstorage-bench/results/rapid-tcp-rtt-c3-88-tier1.csv`
+- `infra/gcp-rapidstorage-bench/results/rapid-latency-c3-88-tier1.csv`
 
 Benchmark shape:
 
@@ -722,6 +724,14 @@ Benchmark shape:
 - workers `16,32,64`, append sizes `4 MiB,32 MiB`
 - GCS `Writer.Flush()` is the closest comparison to native publish because the
   appendable object remains appendable after the boundary.
+- This is not the same network model as local loadbench `--rtt-us 200`. A
+  follow-up TCP-connect probe from the same c3-88/Tier1 shape resolved
+  `storage.googleapis.com:443` once per worker and then timed only TCP
+  handshakes. It measured `0.303/0.663 ms` p50/p99 at c1, `0.396/0.832 ms` at
+  c16, and `1.226/3.616 ms` at c64.
+- The `rapid-latency-c3-88-tier1.csv` artifact is API-operation latency
+  context: object metadata probes and tiny appendable-object flushes. It is not
+  raw network RTT and should not be compared to `--rtt-us` directly.
 
 Target rows:
 
