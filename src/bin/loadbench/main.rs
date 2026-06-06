@@ -14,12 +14,12 @@ use toy_cow_block_storage::provider::{
     MetadataPlane,
 };
 use toy_cow_block_storage::{
-    AppendStream, AppendTicket, BlockBatchCommit, BlockBatchWrite, ByteRange, CreateDeviceRequest,
-    CreateFileRequest, CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableCoordinator,
-    DurableDataLogPolicy, DurablePersistProfile, FileBatchWrite, FileId, FileSpec, FlushResult,
-    KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile,
-    PayloadIntegrity, ReadProfile, ReadVerification, Result, StorageError, StorageNodeId,
-    TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
+    AppendPublishWaitProfile, AppendStream, AppendTicket, BlockBatchCommit, BlockBatchWrite,
+    ByteRange, CreateDeviceRequest, CreateFileRequest, CreateKeyspaceRequest, DeviceId, DeviceSpec,
+    DurableCoordinator, DurableDataLogPolicy, DurablePersistProfile, FileBatchWrite, FileId,
+    FileSpec, FlushResult, KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode,
+    MetadataTxnProfile, PayloadIntegrity, ReadProfile, ReadVerification, Result, StorageError,
+    StorageNodeId, TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);

@@ -17,10 +17,12 @@ struct Args {
     samples_per_worker: usize,
     matrix_csv: Option<PathBuf>,
     durable_profile_csv: Option<PathBuf>,
+    append_publish_profile_csv: Option<PathBuf>,
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
     block_batch_profile_csv: Option<PathBuf>,
     read_profile_csv: Option<PathBuf>,
+    target_data_log_bytes: u64,
     stream_publish_bytes: Option<u64>,
     stream_total_bytes: u64,
     stream_auto_persist_bytes: Option<u64>,
@@ -56,10 +58,12 @@ impl Args {
             samples_per_worker: 200_000,
             matrix_csv: None,
             durable_profile_csv: None,
+            append_publish_profile_csv: None,
             metadata_profile_csv: None,
             block_write_profile_csv: None,
             block_batch_profile_csv: None,
             read_profile_csv: None,
+            target_data_log_bytes: 64 * 1024 * 1024,
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,
             stream_auto_persist_bytes: None,
@@ -126,6 +130,12 @@ impl Args {
                         "--durable-profile-csv",
                     )?));
                 }
+                "--append-publish-profile-csv" => {
+                    args.append_publish_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--append-publish-profile-csv",
+                    )?));
+                }
                 "--metadata-profile-csv" => {
                     args.metadata_profile_csv = Some(PathBuf::from(parse_next::<String>(
                         &mut raw,
@@ -149,6 +159,10 @@ impl Args {
                         &mut raw,
                         "--read-profile-csv",
                     )?));
+                }
+                "--target-data-log-mib" => {
+                    let mib: u64 = parse_next(&mut raw, "--target-data-log-mib")?;
+                    args.target_data_log_bytes = mib_to_bytes(mib, "--target-data-log-mib")?;
                 }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
@@ -365,10 +379,12 @@ options:\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
   --matrix-csv PATH                        append main loadbench rows to CSV\n\
   --durable-profile-csv PATH               append durable persist profiles to CSV\n\
+  --append-publish-profile-csv PATH        append durable append publish wait profiles to CSV\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --block-batch-profile-csv PATH           append block batch commit profiles to CSV\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
+  --target-data-log-mib N                  durable data-log roll target, default: 64\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --stream-auto-persist-mib N              durable provider internal stream dirty-tail threshold\n\

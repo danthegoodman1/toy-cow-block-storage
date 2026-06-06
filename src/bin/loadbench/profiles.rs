@@ -116,6 +116,66 @@ fn append_profile_csv(
     Ok(())
 }
 
+fn append_append_publish_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.append_publish_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_append_publish_wait_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,ticket_id,stream_id,publish_through,total_nanos,status_check_nanos,coordinator_lock_wait_nanos,coordinator_wait_nanos,persist_batch_nanos,wait_loops,cvar_waits,persist_batches_started,max_batch_ticket_count,registered,completed_without_register,success"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in profiles {
+        let row = [
+            workload.name().to_string(),
+            args.provider.to_string(),
+            args.durability.to_string(),
+            args.rtt.as_micros().to_string(),
+            args.serial_rtts.to_string(),
+            concurrency.to_string(),
+            workload.op_size(args)?.to_string(),
+            profile.sequence.to_string(),
+            profile.ticket_id.to_string(),
+            profile.stream_id.to_string(),
+            profile.publish_through.to_string(),
+            profile.total_nanos.to_string(),
+            profile.status_check_nanos.to_string(),
+            profile.coordinator_lock_wait_nanos.to_string(),
+            profile.coordinator_wait_nanos.to_string(),
+            profile.persist_batch_nanos.to_string(),
+            profile.wait_loops.to_string(),
+            profile.cvar_waits.to_string(),
+            profile.persist_batches_started.to_string(),
+            profile.max_batch_ticket_count.to_string(),
+            profile.registered.to_string(),
+            profile.completed_without_register.to_string(),
+            profile.success.to_string(),
+        ];
+        writeln!(file, "{}", row.join(",")).map_err(fs_error)?;
+    }
+    Ok(())
+}
+
 fn append_metadata_profile_csv(
     args: &Args,
     workload: Workload,

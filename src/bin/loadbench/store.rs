@@ -54,11 +54,17 @@ impl BenchStore {
                         root,
                         args.config(),
                         args.storage_node_ids(),
-                        DurableDataLogPolicy::default(),
+                        DurableDataLogPolicy {
+                            target_data_log_bytes: args.target_data_log_bytes,
+                            ..DurableDataLogPolicy::default()
+                        },
                     )?,
                 );
                 if args.durable_profile_csv.is_some() {
                     store.enable_persist_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                if args.append_publish_profile_csv.is_some() {
+                    store.enable_append_publish_wait_profiling(DEFAULT_PROFILE_CAPACITY)?;
                 }
                 if args.read_profile_csv.is_some() {
                     store.enable_read_profiling(DEFAULT_PROFILE_CAPACITY)?;
@@ -318,6 +324,17 @@ impl BenchStore {
         match self {
             Self::Local(_) => Ok(Vec::new()),
             Self::Durable(store) => store.drain_persist_profiles(max),
+            Self::Txn(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn drain_append_publish_wait_profiles(
+        &self,
+        max: usize,
+    ) -> Result<Vec<AppendPublishWaitProfile>> {
+        match self {
+            Self::Local(_) => Ok(Vec::new()),
+            Self::Durable(store) => store.drain_append_publish_wait_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }

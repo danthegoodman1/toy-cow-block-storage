@@ -16,6 +16,7 @@ pub struct DurableCoordinator {
     append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
     stream_auto_persist_worker: Option<Arc<StreamAutoPersistWorker>>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
+    append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
@@ -135,6 +136,9 @@ fn stream_auto_persist_worker_loop(
             guard.requests.clear();
             requests
         };
+        if store.has_append_publish_persist_demand() {
+            continue;
+        }
         if store
             .persist_append_stream_prefix_background_batch(&requests)
             .unwrap_or(false)
@@ -149,6 +153,9 @@ fn stream_auto_persist_requeue_unreached(
     state: &Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
     requests: &[(AppendStream, u64)],
 ) {
+    if store.has_append_publish_persist_demand() {
+        return;
+    }
     let remaining = requests
         .iter()
         .filter_map(|(stream, target)| {
@@ -278,6 +285,7 @@ impl DurableCoordinator {
             append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
             stream_auto_persist_worker: None,
             persist_profiler: Arc::new(Mutex::new(None)),
+            append_publish_wait_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
             maintenance_policy,
             maintenance_cursor,
@@ -334,6 +342,7 @@ impl DurableCoordinator {
             ),
             stream_auto_persist_worker: None,
             persist_profiler: Arc::clone(&self.persist_profiler),
+            append_publish_wait_profiler: Arc::clone(&self.append_publish_wait_profiler),
             read_profiler: Arc::clone(&self.read_profiler),
             maintenance_policy: self.maintenance_policy,
             maintenance_cursor: Arc::clone(&self.maintenance_cursor),
@@ -382,6 +391,50 @@ impl DurableCoordinator {
             profiler.record(profile);
         }
         Ok(())
+    }
+
+    pub fn enable_append_publish_wait_profiling(&self, capacity: usize) -> Result<()> {
+        *lock(&self.append_publish_wait_profiler)? =
+            Some(AppendPublishWaitProfiler::new(capacity)?);
+        Ok(())
+    }
+
+    pub fn drain_append_publish_wait_profiles(
+        &self,
+        max: usize,
+    ) -> Result<Vec<AppendPublishWaitProfile>> {
+        let mut profiler = lock(&self.append_publish_wait_profiler)?;
+        Ok(profiler
+            .as_mut()
+            .map(|profiler| profiler.drain(max))
+            .unwrap_or_default())
+    }
+
+    fn record_append_publish_wait_profile(
+        &self,
+        profile: AppendPublishWaitProfile,
+    ) -> Result<()> {
+        if let Some(profiler) = lock(&self.append_publish_wait_profiler)?.as_mut() {
+            profiler.record(profile);
+        }
+        Ok(())
+    }
+
+    fn finish_append_publish_wait_profile(
+        &self,
+        mut profile: AppendPublishWaitProfile,
+        total_started: Instant,
+        success: bool,
+    ) {
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        profile.success = success;
+        let _ = self.record_append_publish_wait_profile(profile);
+    }
+
+    fn has_append_publish_persist_demand(&self) -> bool {
+        lock(&self.append_publish_persist_coordinator.inner)
+            .map(|state| state.in_flight || !state.requests.is_empty())
+            .unwrap_or(true)
     }
 
     pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
@@ -2332,62 +2385,120 @@ impl DurableCoordinator {
         &self,
         ticket: &AppendPublishTicket,
     ) -> Result<AppendPublishCommit> {
+        let total_started = Instant::now();
+        let mut profile = AppendPublishWaitProfile {
+            ticket_id: ticket.ticket_id.raw(),
+            stream_id: ticket.stream_id.raw(),
+            publish_through: ticket.publish_through,
+            ..AppendPublishWaitProfile::default()
+        };
         let mut registered = false;
         let mut observed_generation = 0_u64;
         loop {
+            profile.wait_loops = profile.wait_loops.saturating_add(1);
             if registered {
+                let lock_started = Instant::now();
                 let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                profile.coordinator_lock_wait_nanos = profile
+                    .coordinator_lock_wait_nanos
+                    .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                 while state.in_flight {
+                    let wait_started = Instant::now();
+                    profile.cvar_waits = profile.cvar_waits.saturating_add(1);
                     state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                    profile.coordinator_wait_nanos = profile
+                        .coordinator_wait_nanos
+                        .saturating_add(duration_nanos_u64(wait_started.elapsed()));
                 }
                 if let Some((error_generation, error)) = state.last_error.clone()
                     && error_generation > observed_generation
                 {
                     state.requests.remove(&ticket.ticket_id);
+                    self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }
                 observed_generation = state.generation;
             }
-            match self.local.metadata.append_publish_ticket_status(ticket)? {
+            let status_started = Instant::now();
+            let status = self.local.metadata.append_publish_ticket_status(ticket)?;
+            profile.status_check_nanos = profile
+                .status_check_nanos
+                .saturating_add(duration_nanos_u64(status_started.elapsed()));
+            match status {
                 AppendPublishTicketStatus::Completed(commit) => {
                     if registered {
+                        let lock_started = Instant::now();
                         let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                        profile.coordinator_lock_wait_nanos = profile
+                            .coordinator_lock_wait_nanos
+                            .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                         state.requests.remove(&ticket.ticket_id);
+                    } else {
+                        profile.completed_without_register = true;
                     }
+                    profile.registered = registered;
+                    self.finish_append_publish_wait_profile(profile, total_started, true);
                     return Ok(commit);
                 }
                 AppendPublishTicketStatus::Pending(_) => {}
             }
 
             if !registered {
+                let lock_started = Instant::now();
                 let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                profile.coordinator_lock_wait_nanos = profile
+                    .coordinator_lock_wait_nanos
+                    .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                 state.requests.insert(ticket.ticket_id, ticket.clone());
                 observed_generation = state.generation;
                 registered = true;
+                profile.registered = true;
             }
 
+            let lock_started = Instant::now();
             let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+            profile.coordinator_lock_wait_nanos = profile
+                .coordinator_lock_wait_nanos
+                .saturating_add(duration_nanos_u64(lock_started.elapsed()));
             if let Some((error_generation, error)) = state.last_error.clone()
                 && error_generation > observed_generation
             {
                 state.requests.remove(&ticket.ticket_id);
+                self.finish_append_publish_wait_profile(profile, total_started, false);
                 return Err(error);
             }
             if state.in_flight {
                 let generation = state.generation;
                 while state.in_flight && state.generation == generation {
+                    let wait_started = Instant::now();
+                    profile.cvar_waits = profile.cvar_waits.saturating_add(1);
                     state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                    profile.coordinator_wait_nanos = profile
+                        .coordinator_wait_nanos
+                        .saturating_add(duration_nanos_u64(wait_started.elapsed()));
                 }
                 observed_generation = state.generation;
                 continue;
             }
             state.in_flight = true;
             let tickets = state.requests.values().cloned().collect::<Vec<_>>();
+            profile.max_batch_ticket_count = profile
+                .max_batch_ticket_count
+                .max(usize_to_u64(tickets.len()));
+            profile.persist_batches_started = profile.persist_batches_started.saturating_add(1);
             drop(state);
 
+            let persist_started = Instant::now();
             let result = self.persist_append_publish_ticket_batch(tickets);
+            profile.persist_batch_nanos = profile
+                .persist_batch_nanos
+                .saturating_add(duration_nanos_u64(persist_started.elapsed()));
 
+            let lock_started = Instant::now();
             let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+            profile.coordinator_lock_wait_nanos = profile
+                .coordinator_lock_wait_nanos
+                .saturating_add(duration_nanos_u64(lock_started.elapsed()));
             state.in_flight = false;
             state.generation = state.generation.saturating_add(1);
             let generation = state.generation;
@@ -2402,6 +2513,7 @@ impl DurableCoordinator {
                     state.last_error = Some((generation, error.clone()));
                     state.requests.remove(&ticket.ticket_id);
                     self.append_publish_persist_coordinator.cvar.notify_all();
+                    self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }
             }

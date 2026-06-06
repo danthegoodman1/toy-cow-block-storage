@@ -108,8 +108,12 @@ impl NodeCatalogs {
 pub(super) fn open_node_catalog(paths: &DurableStorePaths, storage_node: StorageNodeId) -> Result<Connection> {
     let data_dir = node_data_log_dir(&paths.data_dir, storage_node);
     let catalog_path = node_catalog_path(&paths.data_dir, storage_node);
+    let data_dir_existed = data_dir.exists();
     let existed = catalog_path.exists();
     fs::create_dir_all(&data_dir).map_err(fs_error)?;
+    if !data_dir_existed {
+        sync_dir(&paths.data_dir)?;
+    }
     let conn = Connection::open(&catalog_path).map_err(sqlite_error)?;
     configure_sqlite_connection(&conn)?;
     initialize_node_catalog_schema(&conn)?;

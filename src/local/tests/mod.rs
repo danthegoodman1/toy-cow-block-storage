@@ -8182,6 +8182,7 @@ fn durable_same_file_publish_tickets_serialize_without_inflight_conflict() {
     let root = durable_temp_dir("native-ticket-same-file-serializes");
     let cfg = config();
     let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    store.enable_append_publish_wait_profiling(16).unwrap();
     let keyspace_id = store
         .create_keyspace(CreateKeyspaceRequest {
             name: Some("ks".to_string()),
@@ -8243,6 +8244,21 @@ fn durable_same_file_publish_tickets_serialize_without_inflight_conflict() {
         .unwrap();
     assert_eq!(&all_bytes[..first.len()], first.as_slice());
     assert_eq!(&all_bytes[first.len()..], second.as_slice());
+    let profiles = store.drain_append_publish_wait_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.iter().all(|profile| profile.success));
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.persist_batches_started > 0
+                && profile.persist_batch_nanos > 0
+                && profile.max_batch_ticket_count >= 1)
+    );
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.cvar_waits > 0 && profile.coordinator_wait_nanos > 0)
+    );
     drop(store);
     let _ = fs::remove_dir_all(root);
 }

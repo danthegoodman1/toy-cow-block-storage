@@ -74,6 +74,31 @@ pub struct DurablePersistProfile {
     pub durable_commit_high_water: u64,
 }
 
+/// Process-local timing for one append publish wait call.
+///
+/// This profiles the client-visible wait path around append publish
+/// coalescing. It complements `DurablePersistProfile`, which profiles the
+/// physical durable batch that one waiter may drive on behalf of many tickets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendPublishWaitProfile {
+    pub sequence: u64,
+    pub ticket_id: u128,
+    pub stream_id: u128,
+    pub publish_through: u64,
+    pub total_nanos: u64,
+    pub status_check_nanos: u64,
+    pub coordinator_lock_wait_nanos: u64,
+    pub coordinator_wait_nanos: u64,
+    pub persist_batch_nanos: u64,
+    pub wait_loops: u64,
+    pub cvar_waits: u64,
+    pub persist_batches_started: u64,
+    pub max_batch_ticket_count: u64,
+    pub registered: bool,
+    pub completed_without_register: bool,
+    pub success: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct NodeCatalogPublishProfile {
     manifest_lock_wait_nanos: u64,
@@ -225,6 +250,42 @@ impl PersistProfiler {
     }
 
     fn drain(&mut self, max: usize) -> Vec<DurablePersistProfile> {
+        let count = max.min(self.profiles.len());
+        self.profiles.drain(..count).collect()
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct AppendPublishWaitProfiler {
+    capacity: usize,
+    next_sequence: u64,
+    profiles: VecDeque<AppendPublishWaitProfile>,
+}
+
+impl AppendPublishWaitProfiler {
+    fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "append publish wait profile capacity must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            capacity,
+            next_sequence: 1,
+            profiles: VecDeque::with_capacity(capacity.min(1024)),
+        })
+    }
+
+    fn record(&mut self, mut profile: AppendPublishWaitProfile) {
+        profile.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.profiles.len() == self.capacity {
+            self.profiles.pop_front();
+        }
+        self.profiles.push_back(profile);
+    }
+
+    fn drain(&mut self, max: usize) -> Vec<AppendPublishWaitProfile> {
         let count = max.min(self.profiles.len());
         self.profiles.drain(..count).collect()
     }
@@ -2397,27 +2458,39 @@ impl DurableSqliteStore {
                 File::open(&path).map_err(fs_error)?,
             )?);
         }
+        let dirs_to_sync = storage_nodes_needing_dir_sync
+            .into_iter()
+            .map(|storage_node| node_data_log_dir(&self.paths.data_dir, storage_node))
+            .collect::<Vec<_>>();
+        let dir_sync_handle = if dirs_to_sync.is_empty() {
+            None
+        } else {
+            Some(thread::spawn(move || {
+                let started = Instant::now();
+                for dir in dirs_to_sync {
+                    sync_dir(&dir)?;
+                }
+                Ok::<_, StorageError>(duration_nanos_u64(started.elapsed()))
+            }))
+        };
+
         let started = Instant::now();
-        let sync_profile = sync_data_log_files(files)?;
-        profile.file_sync_nanos = duration_nanos_u64(started.elapsed());
+        let sync_result = sync_data_log_files(files);
+        let file_sync_nanos = duration_nanos_u64(started.elapsed());
+        let dir_sync_result = match dir_sync_handle {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| StorageError::unavailable("data-log dir sync worker panicked"))?,
+            None => Ok(0),
+        };
+
+        let sync_profile = sync_result?;
+        profile.file_sync_nanos = file_sync_nanos;
         profile.file_sync_sum_nanos = sync_profile.sync_sum_nanos;
         profile.file_sync_max_nanos = sync_profile.sync_max_nanos;
         profile.files_synced = sync_profile.files_synced;
         profile.sync_bytes = sync_profile.sync_bytes;
-        if !storage_nodes_needing_dir_sync.is_empty() {
-            let started = Instant::now();
-            sync_dir(&self.paths.data_dir)?;
-            profile.dir_sync_nanos = profile
-                .dir_sync_nanos
-                .saturating_add(duration_nanos_u64(started.elapsed()));
-        }
-        for storage_node in storage_nodes_needing_dir_sync {
-            let started = Instant::now();
-            sync_dir(&node_data_log_dir(&self.paths.data_dir, storage_node))?;
-            profile.dir_sync_nanos = profile
-                .dir_sync_nanos
-                .saturating_add(duration_nanos_u64(started.elapsed()));
-        }
+        profile.dir_sync_nanos = dir_sync_result?;
         Ok(profile)
     }
 
