@@ -12,14 +12,17 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     }
 
     let store = BenchStore::open(args, &root)?;
-    let context = setup_context(args, workload, concurrency, store)?;
+    let context = setup_context(args, workload, concurrency, store, &root)?;
     let profile_store = context.store.clone();
     let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_append_publish_wait_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
-    if !workload.is_native_stream_publish_fixed() && !args.warmup.is_zero() {
+    if !workload.is_native_stream_publish_fixed()
+        && !workload.is_append_log_microbench()
+        && !args.warmup.is_zero()
+    {
         let _ = execute_load(args, workload, concurrency, context.clone(), args.warmup)?;
         let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_append_publish_wait_profiles(DEFAULT_PROFILE_CAPACITY)?;
@@ -27,7 +30,9 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
         let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
     }
-    let mut report = if workload.is_native_stream_publish_fixed() {
+    let mut report = if workload.is_append_log_microbench() {
+        execute_append_log_microbench_load(args, workload, concurrency, context)?
+    } else if workload.is_native_stream_publish_fixed() {
         execute_fixed_stream_publish_load(args, workload, concurrency, context)?
     } else {
         execute_load(args, workload, concurrency, context, args.duration)?
@@ -45,6 +50,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     append_block_write_profile_csv(args, workload, concurrency, &profile_store)?;
     append_read_profile_csv(args, workload, concurrency, &profile_store)?;
     append_block_batch_profile_csv(args, &report)?;
+    append_append_log_profile_csv(args, &report)?;
 
     if matches!(args.provider, ProviderKind::Durable) {
         let _ = fs::remove_dir_all(&root);
@@ -57,10 +63,15 @@ fn setup_context(
     workload: Workload,
     concurrency: usize,
     store: BenchStore,
+    root: &Path,
 ) -> Result<BenchContext> {
     let op_size = workload.op_size(args)?;
     let payload = Arc::new(make_payload(op_size));
-    let target = if workload.is_block() {
+    let target = if workload.is_append_log_microbench() {
+        Target::AppendLogMicrobench {
+            root: Arc::new(root.join("append-log-microbench")),
+        }
+    } else if workload.is_block() {
         let device_count = if workload.is_block_device_lanes() {
             concurrency.max(1)
         } else {

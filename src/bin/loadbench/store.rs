@@ -384,4 +384,7 @@ enum Target {
         keyspace_id: KeyspaceId,
         files: Arc<Vec<FileId>>,
     },
+    AppendLogMicrobench {
+        root: Arc<PathBuf>,
+    },
 }

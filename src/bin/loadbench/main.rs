@@ -57,6 +57,7 @@ include!("args.rs");
 include!("workload.rs");
 include!("store.rs");
 include!("runner.rs");
+include!("append_log_microbench.rs");
 include!("profiles.rs");
 include!("worker.rs");
 include!("report.rs");

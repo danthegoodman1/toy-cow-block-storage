@@ -176,6 +176,61 @@ fn append_append_publish_profile_csv(
     Ok(())
 }
 
+fn append_append_log_profile_csv(args: &Args, report: &BenchReport) -> Result<()> {
+    let Some(path) = &args.append_log_profile_csv else {
+        return Ok(());
+    };
+    if report.append_log_profiles.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+    }
+    let write_header = !path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(fs_error)?;
+    if write_header {
+        writeln!(
+            file,
+            "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,strategy,total_nanos,append_nanos,file_sync_nanos,file_sync_sum_nanos,file_sync_max_nanos,dir_sync_nanos,bytes_written,sync_bytes,append_record_count,estimated_run_count,files_synced,dirs_synced,storage_nodes,stream_count,max_file_bytes,target_data_log_bytes"
+        )
+        .map_err(fs_error)?;
+    }
+    for profile in &report.append_log_profiles {
+        let row = [
+            report.workload.name().to_string(),
+            report.provider.to_string(),
+            report.durability.to_string(),
+            report.rtt_us.to_string(),
+            report.serial_rtts.to_string(),
+            report.concurrency.to_string(),
+            report.op_size.to_string(),
+            profile.strategy.to_string(),
+            profile.total_nanos.to_string(),
+            profile.append_nanos.to_string(),
+            profile.file_sync_nanos.to_string(),
+            profile.file_sync_sum_nanos.to_string(),
+            profile.file_sync_max_nanos.to_string(),
+            profile.dir_sync_nanos.to_string(),
+            profile.bytes_written.to_string(),
+            profile.sync_bytes.to_string(),
+            profile.append_record_count.to_string(),
+            profile.estimated_run_count.to_string(),
+            profile.files_synced.to_string(),
+            profile.dirs_synced.to_string(),
+            profile.storage_nodes.to_string(),
+            profile.stream_count.to_string(),
+            profile.max_file_bytes.to_string(),
+            profile.target_data_log_bytes.to_string(),
+        ];
+        writeln!(file, "{}", row.join(",")).map_err(fs_error)?;
+    }
+    Ok(())
+}
+
 fn append_metadata_profile_csv(
     args: &Args,
     workload: Workload,

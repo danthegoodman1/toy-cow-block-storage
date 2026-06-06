@@ -118,6 +118,18 @@ mod tests {
     }
 
     #[test]
+    fn append_log_microbench_workloads_parse_explicit_names() {
+        assert_eq!(
+            Workload::from_str("append-log-microbench-stream-private-4m").unwrap(),
+            Workload::AppendLogMicrobenchStreamPrivate4m
+        );
+        assert_eq!(
+            Workload::from_str("append-log-microbench-node-shared-4m").unwrap(),
+            Workload::AppendLogMicrobenchNodeShared4m
+        );
+    }
+
+    #[test]
     fn fixed_stream_total_must_match_workload_boundaries() {
         assert!(validate_fixed_stream_total_bytes(1024 * 1024 * 1024, 32 * 1024 * 1024).is_ok());
         assert!(validate_fixed_stream_total_bytes(1025 * 1024 * 1024, 32 * 1024 * 1024).is_err());

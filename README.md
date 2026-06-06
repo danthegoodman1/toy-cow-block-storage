@@ -319,6 +319,24 @@ separate phase, while shell wall timing includes process setup and cleanup, so
 read it as a rough local filesystem bracket rather than an exact phase-by-phase
 accounting.
 
+Fresh at-end/fio check from June 6, 2026, after the append publish tail-latency
+work, using 4 MiB writes, 512 MiB per worker, 4 storage nodes for native rows,
+`--stream-auto-persist-mib 64`, and `200us` modeled RTT:
+
+| Shape | Throughput | Tail |
+| --- | --- | --- |
+| Native `native-stream-publish-at-end-4m`, c16 | `published_mbps` 3.51-3.63 GB/s | publish p99 1.27-1.88 s |
+| Native `native-stream-publish-at-end-4m`, c32 | `published_mbps` 3.49-3.65 GB/s | publish p99 1.85-2.23 s |
+| Native `native-stream-publish-barrier-at-end-4m`, c32 | `published_mbps` 3.70 GB/s | publish p99 1.52 s |
+| fio buffered `--end_fsync=1`, c16/c32 | 1.70 / 2.43 GB/s | fio did not expose end-fsync latency separately |
+| fio direct `--end_fsync=1`, c16/c32 | 2.10 / 3.27 GB/s | fio did not expose end-fsync latency separately |
+| fio buffered `--fsync=128`, c16/c32 | 3.98 / 5.80 GB/s | write p99 73 / 101 ms, write max 145 ms / 1.10 s |
+
+For that run, native publish-at-end throughput is fio-end-fsync class, but
+native publish p99 is still higher than the fio `--fsync=128` write-latency
+proxy. fio reported an empty sync histogram for these shapes, so the fio tail
+numbers are only a rough proxy for final durability latency.
+
 `cargo bench --bench regression` is the Criterion mechanism suite.
 `loadbench` is the integration runner for public block/native API behavior,
 modeled RTT, concurrency, latency percentiles, conflicts, and errors.

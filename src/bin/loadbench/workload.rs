@@ -230,6 +230,8 @@ enum Workload {
     NativeStreamPublishBarrierAtEnd1m,
     NativeStreamPublishBarrierAtEnd4m,
     NativeStreamPublishBarrierAtEnd32m,
+    AppendLogMicrobenchStreamPrivate4m,
+    AppendLogMicrobenchNodeShared4m,
     NativeHotAppend4k,
 }
 
@@ -418,6 +420,10 @@ impl Workload {
             Self::NativeStreamPublishBarrierAtEnd32m => {
                 "native-stream-publish-barrier-at-end-32m"
             }
+            Self::AppendLogMicrobenchStreamPrivate4m => {
+                "append-log-microbench-stream-private-4m"
+            }
+            Self::AppendLogMicrobenchNodeShared4m => "append-log-microbench-node-shared-4m",
             Self::NativeHotAppend4k => "native-hot-append-4k",
         }
     }
@@ -461,7 +467,9 @@ impl Workload {
             | Self::NativeStreamPublishPrefix4m
             | Self::NativeStreamPublishInterval4m
             | Self::NativeStreamPublishAtEnd4m
-            | Self::NativeStreamPublishBarrierAtEnd4m => 4 * 1024 * 1024,
+            | Self::NativeStreamPublishBarrierAtEnd4m
+            | Self::AppendLogMicrobenchStreamPrivate4m
+            | Self::AppendLogMicrobenchNodeShared4m => 4 * 1024 * 1024,
             Self::NativeWrite32m
             | Self::NativeAppend32m
             | Self::NativeStreamIngest32m
@@ -775,6 +783,17 @@ impl Workload {
             || self.is_native_stream_publish_barrier_at_end()
     }
 
+    fn is_append_log_microbench(self) -> bool {
+        matches!(
+            self,
+            Self::AppendLogMicrobenchStreamPrivate4m | Self::AppendLogMicrobenchNodeShared4m
+        )
+    }
+
+    fn is_append_log_microbench_node_shared(self) -> bool {
+        matches!(self, Self::AppendLogMicrobenchNodeShared4m)
+    }
+
     fn is_block(self) -> bool {
         matches!(
             self,
@@ -888,6 +907,12 @@ impl FromStr for Workload {
             }
             "native-stream-publish-barrier-at-end-32m" => {
                 Ok(Self::NativeStreamPublishBarrierAtEnd32m)
+            }
+            "append-log-microbench-stream-private-4m" => {
+                Ok(Self::AppendLogMicrobenchStreamPrivate4m)
+            }
+            "append-log-microbench-node-shared-4m" => {
+                Ok(Self::AppendLogMicrobenchNodeShared4m)
             }
             "native-hot-append-4k" => Ok(Self::NativeHotAppend4k),
             _ => Err(StorageError::invalid_argument(format!(

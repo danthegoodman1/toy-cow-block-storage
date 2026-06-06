@@ -1488,5 +1488,6 @@ fn maybe_flush(
                 .flush_file(*keyspace_id, file_id)
                 .map(|_| OpProgress::default())
         }
+        Target::AppendLogMicrobench { .. } => Ok(OpProgress::default()),
     }
 }

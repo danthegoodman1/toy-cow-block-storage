@@ -21,6 +21,7 @@ struct Args {
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
     block_batch_profile_csv: Option<PathBuf>,
+    append_log_profile_csv: Option<PathBuf>,
     read_profile_csv: Option<PathBuf>,
     target_data_log_bytes: u64,
     stream_publish_bytes: Option<u64>,
@@ -62,6 +63,7 @@ impl Args {
             metadata_profile_csv: None,
             block_write_profile_csv: None,
             block_batch_profile_csv: None,
+            append_log_profile_csv: None,
             read_profile_csv: None,
             target_data_log_bytes: 64 * 1024 * 1024,
             stream_publish_bytes: None,
@@ -152,6 +154,12 @@ impl Args {
                     args.block_batch_profile_csv = Some(PathBuf::from(parse_next::<String>(
                         &mut raw,
                         "--block-batch-profile-csv",
+                    )?));
+                }
+                "--append-log-profile-csv" => {
+                    args.append_log_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--append-log-profile-csv",
                     )?));
                 }
                 "--read-profile-csv" => {
@@ -365,6 +373,8 @@ options:\n\
                                            native-stream-publish-barrier-at-end-1m,\n\
                                            native-stream-publish-barrier-at-end-4m,\n\
                                            native-stream-publish-barrier-at-end-32m,\n\
+                                           append-log-microbench-stream-private-4m,\n\
+                                           append-log-microbench-node-shared-4m,\n\
                                            native-hot-append-4k\n\
   --concurrency LIST                       default: 1,4,16\n\
   --duration-ms N                          default: 1000\n\
@@ -383,6 +393,7 @@ options:\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --block-batch-profile-csv PATH           append block batch commit profiles to CSV\n\
+  --append-log-profile-csv PATH            append append-log microbench profiles to CSV\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
   --target-data-log-mib N                  durable data-log roll target, default: 64\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
