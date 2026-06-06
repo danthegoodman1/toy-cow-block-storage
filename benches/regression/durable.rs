@@ -121,6 +121,7 @@ fn maintenance_bench_policy(mode: MaintenanceMode) -> MaintenancePolicy {
         mode,
         data_log_policy: DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -655,6 +656,7 @@ fn bench_durable_provider(c: &mut Criterion) {
                 store
                     .compact_data_logs(DurableDataLogPolicy {
                         target_data_log_bytes: 64 * 1024 * 1024,
+                        file_sync_fanout: 4,
                         min_reclaimable_ratio_ppm: 0,
                         min_reclaimable_bytes: 0,
                         max_compaction_copy_bytes: u64::MAX,

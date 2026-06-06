@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableDataLogPolicy {
     pub target_data_log_bytes: u64,
+    pub file_sync_fanout: usize,
     pub min_reclaimable_ratio_ppm: u32,
     pub min_reclaimable_bytes: u64,
     pub max_compaction_copy_bytes: u64,
@@ -10,6 +11,7 @@ impl Default for DurableDataLogPolicy {
     fn default() -> Self {
         Self {
             target_data_log_bytes: 64 * 1024 * 1024,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 500_000,
             min_reclaimable_bytes: 4 * 1024 * 1024,
             max_compaction_copy_bytes: 64 * 1024 * 1024,
@@ -22,6 +24,11 @@ impl DurableDataLogPolicy {
         if self.target_data_log_bytes == 0 {
             return Err(StorageError::invalid_argument(
                 "target_data_log_bytes must be greater than zero",
+            ));
+        }
+        if self.file_sync_fanout == 0 {
+            return Err(StorageError::invalid_argument(
+                "file_sync_fanout must be greater than zero",
             ));
         }
         if self.min_reclaimable_ratio_ppm > 1_000_000 {
@@ -41,6 +48,7 @@ impl DurableDataLogPolicy {
     fn compact_everything_for_test() -> Self {
         Self {
             target_data_log_bytes: 8 * 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -474,4 +482,3 @@ impl MaintenanceScheduler {
             && reclaimable_ratio >= u64::from(self.policy.data_log_policy.min_reclaimable_ratio_ppm)
     }
 }
-

@@ -699,6 +699,85 @@ Interpretation:
   current contract still keeps unrelated unpublished stream bytes non-recovered
   and invisible after reopen.
 
+## Local Architecture Tail-Latency Chase
+
+Measurement directories:
+
+- Baseline, fanout 4:
+  `target/loadbench/local-architecture-baseline/full/`
+- Payload-only append-log controls:
+  `target/loadbench/local-architecture-baseline/append-log/`
+- Larger data-log target experiment:
+  `target/loadbench/local-architecture-baseline/target-log-size/`
+- File-sync fanout experiments:
+  `target/loadbench/local-architecture-fanout/`
+- Rejected round-robin ordering experiment:
+  `target/loadbench/local-architecture-roundrobin/`
+
+All rows used 4 simulated storage nodes, RTT `0`, `512 MiB` per worker, and
+`128 MiB` publish interval. The purpose was to separate local filesystem sync
+limits from avoidable durable-provider scheduling overhead.
+
+Baseline no-auto rows:
+
+| Workload | c | `published_mbps` | publish p99 | append p99 |
+| --- | ---: | ---: | ---: | ---: |
+| at-end 4m | 32 | 2029 | 3575 ms | 414 ms |
+| at-end 4m | 64 | 2760 | 4588 ms | 1669 ms |
+| at-end 32m | 32 | 3174 | 4534 ms | 2208 ms |
+| at-end 32m | 64 | 3057 | 5874 ms | 2612 ms |
+| barrier-at-end 4m | 32 | 3458 | 2411 ms | 48 ms |
+| barrier-at-end 4m | 64 | 3377 | 1803 ms | 1476 ms |
+| barrier-at-end 32m | 32 | 3264 | 2272 ms | 1729 ms |
+| barrier-at-end 32m | 64 | 3281 | 3292 ms | 1989 ms |
+
+Payload-only controls were also seconds-class. With 4 MiB appends, stream-private
+append-log sync reported `3316 MB/s` / `3002 ms` publish p99 at c32 and
+`3522 MB/s` / `1502 ms` at c64. Node-shared append-log sync reported
+`3642 MB/s` / `2362 ms` at c32 and `3773 MB/s` / `2336 ms` at c64. This means
+the local filesystem sync layer is a real ceiling, but full native still has
+avoidable scheduling sensitivity.
+
+The kept code change is a provider/loadbench knob:
+`--data-log-file-sync-fanout N`. The default remains `4`. Fanout `16` improved
+4 MiB at-end throughput and c32 p99, but it was not a universal win:
+
+| Shape | fanout | c | `published_mbps` | publish p99 | Interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| at-end 4m | 4 | 32 | 2029 | 3575 ms | baseline |
+| at-end 4m | 16 | 32 | 3683 | 2372 ms | useful local win |
+| at-end 4m | 4 | 64 | 2760 | 4588 ms | baseline |
+| at-end 4m | 16 | 64 | 3653 | 4906 ms | throughput win, p99 flat/worse |
+| barrier-at-end 4m | 4 | 64 | 3377 | 1803 ms | baseline |
+| barrier-at-end 4m | 16 | 64 | 3392 | 1743 ms | small p99 win |
+| at-end 32m | 4 | 64 | 3057 | 5874 ms | baseline |
+| at-end 32m | 16 | 64 | 3372 | 7269 ms | p99 regression |
+| barrier-at-end 32m | 4 | 64 | 3281 | 3292 ms | baseline |
+| barrier-at-end 32m | 16 | 64 | 3563 | 2301 ms | useful win |
+
+Rejected experiments:
+
+- Increasing `--target-data-log-mib` to `512` reduced file count but introduced
+  very slow single-file sync outliers; c32 at-end 4m publish p99 rose to
+  `8707 ms`.
+- Letting the auto-persist worker drain while publish demand existed caused
+  foreground publish to wait behind background work. The bad c64 at-end 32m row
+  spent about `4111 ms` in `persist_lock_wait_nanos`, so the old queueing rule
+  was restored.
+- Storage-node round-robin sync ordering was mixed and mostly worse for
+  barrier rows, so it was removed.
+
+Current conclusion:
+
+- The local host/container sync layer is a real tail-latency ceiling: even
+  payload-only append-log controls are seconds-class.
+- The durable-provider architecture still has avoidable sensitivity to fanout,
+  log sizing, and foreground/background scheduling.
+- The next useful architecture proof is not another global fanout tweak. It is a
+  storage-node append-log service with per-node sync/backpressure lanes, so
+  publish can observe bounded dirty payload per storage node without letting
+  background work sit in front of foreground publish.
+
 ## External North-Star Targets
 
 The June 6, 2026 Rapid Storage c3-88/Tier1 run is the current external

@@ -2443,7 +2443,8 @@ impl DurableSqliteStore {
         }
         if sync_mode == DataLogSyncMode::Sync {
             let started = Instant::now();
-            let sync_profile = sync_data_log_files(files_to_sync)?;
+            let sync_profile =
+                sync_data_log_files_with_fanout(files_to_sync, self.policy.file_sync_fanout)?;
             profile.file_sync_nanos = profile
                 .file_sync_nanos
                 .saturating_add(duration_nanos_u64(started.elapsed()));
@@ -2555,7 +2556,7 @@ impl DurableSqliteStore {
         };
 
         let started = Instant::now();
-        let sync_result = sync_data_log_files(files);
+        let sync_result = sync_data_log_files_with_fanout(files, self.policy.file_sync_fanout);
         let file_sync_nanos = duration_nanos_u64(started.elapsed());
         let dir_sync_result = match dir_sync_handle {
             Some(handle) => handle

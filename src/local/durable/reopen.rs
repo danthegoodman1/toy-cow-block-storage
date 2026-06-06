@@ -1091,8 +1091,18 @@ pub(super) fn delete_data_log(data_dir: &Path, log_ref: DurableDataLogRef) -> Re
 pub(super) fn sync_data_log_files(
     files: Vec<DataLogFileToSync>,
 ) -> Result<DataLogFileSyncProfile> {
-    const MAX_DATA_LOG_SYNC_FANOUT: usize = 4;
+    sync_data_log_files_with_fanout(files, 4)
+}
 
+pub(super) fn sync_data_log_files_with_fanout(
+    files: Vec<DataLogFileToSync>,
+    fanout: usize,
+) -> Result<DataLogFileSyncProfile> {
+    if fanout == 0 {
+        return Err(StorageError::invalid_argument(
+            "data-log file sync fanout must be greater than zero",
+        ));
+    }
     let mut profile = DataLogFileSyncProfile::default();
     if files.len() <= 1 {
         if let Some(file) = files.into_iter().next() {
@@ -1104,8 +1114,8 @@ pub(super) fn sync_data_log_files(
 
     let mut files = files.into_iter();
     loop {
-        let mut handles = Vec::with_capacity(MAX_DATA_LOG_SYNC_FANOUT);
-        for _ in 0..MAX_DATA_LOG_SYNC_FANOUT {
+        let mut handles = Vec::with_capacity(fanout);
+        for _ in 0..fanout {
             let Some(file) = files.next() else {
                 break;
             };

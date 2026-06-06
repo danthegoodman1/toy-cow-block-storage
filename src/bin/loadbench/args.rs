@@ -24,6 +24,7 @@ struct Args {
     append_log_profile_csv: Option<PathBuf>,
     read_profile_csv: Option<PathBuf>,
     target_data_log_bytes: u64,
+    data_log_file_sync_fanout: usize,
     stream_publish_bytes: Option<u64>,
     stream_total_bytes: u64,
     stream_auto_persist_bytes: Option<u64>,
@@ -66,6 +67,7 @@ impl Args {
             append_log_profile_csv: None,
             read_profile_csv: None,
             target_data_log_bytes: 64 * 1024 * 1024,
+            data_log_file_sync_fanout: 4,
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,
             stream_auto_persist_bytes: None,
@@ -172,6 +174,9 @@ impl Args {
                     let mib: u64 = parse_next(&mut raw, "--target-data-log-mib")?;
                     args.target_data_log_bytes = mib_to_bytes(mib, "--target-data-log-mib")?;
                 }
+                "--data-log-file-sync-fanout" => {
+                    args.data_log_file_sync_fanout = parse_next(&mut raw, flag.as_str())?;
+                }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
                     args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
@@ -265,6 +270,11 @@ impl Args {
         if args.storage_nodes == 0 {
             return Err(StorageError::invalid_argument(
                 "storage-nodes must be greater than zero",
+            ));
+        }
+        if args.data_log_file_sync_fanout == 0 {
+            return Err(StorageError::invalid_argument(
+                "data-log-file-sync-fanout must be greater than zero",
             ));
         }
         if args.device_blocks < args.shards as u64 {
@@ -396,6 +406,7 @@ options:\n\
   --append-log-profile-csv PATH            append append-log microbench profiles to CSV\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
   --target-data-log-mib N                  durable data-log roll target, default: 64\n\
+  --data-log-file-sync-fanout N            concurrent durable data-log file syncs, default: 4\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --stream-auto-persist-mib N              durable provider internal stream dirty-tail threshold\n\

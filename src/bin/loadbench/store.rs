@@ -56,6 +56,7 @@ impl BenchStore {
                         args.storage_node_ids(),
                         DurableDataLogPolicy {
                             target_data_log_bytes: args.target_data_log_bytes,
+                            file_sync_fanout: args.data_log_file_sync_fanout,
                             ..DurableDataLogPolicy::default()
                         },
                     )?,

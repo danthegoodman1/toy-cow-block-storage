@@ -2590,6 +2590,7 @@ fn durable_multi_node_reopens_block_and_native_placements() {
         node_ids.clone(),
         DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -5900,6 +5901,7 @@ fn durable_store_selects_append_run_manifests_and_sealed_refs() {
         cfg,
         DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -5984,6 +5986,7 @@ fn durable_batched_flush_persists_many_segments_in_one_data_log() {
         cfg,
         DurableDataLogPolicy {
             target_data_log_bytes: 1024 * 1024,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -6024,6 +6027,7 @@ fn durable_batched_flush_persists_many_segments_in_one_data_log() {
         cfg,
         DurableDataLogPolicy {
             target_data_log_bytes: 1024 * 1024,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -6049,6 +6053,7 @@ fn durable_batched_flush_rolls_logs_and_reopens_every_segment() {
     let cfg = config();
     let policy = DurableDataLogPolicy {
         target_data_log_bytes: 4096,
+        file_sync_fanout: 4,
         min_reclaimable_ratio_ppm: 1,
         min_reclaimable_bytes: 1,
         max_compaction_copy_bytes: u64::MAX,
@@ -6831,6 +6836,7 @@ fn durable_data_log_compaction_relocates_partial_logs_and_deletes_dead_logs() {
     let cfg = config();
     let policy = DurableDataLogPolicy {
         target_data_log_bytes: 9 * 1024,
+        file_sync_fanout: 4,
         min_reclaimable_ratio_ppm: 1,
         min_reclaimable_bytes: 1,
         max_compaction_copy_bytes: u64::MAX,
@@ -6916,6 +6922,7 @@ fn durable_data_log_compaction_honors_pitr_retention_until_gc_releases_segment()
     let cfg = config();
     let policy = DurableDataLogPolicy {
         target_data_log_bytes: 4096,
+        file_sync_fanout: 4,
         min_reclaimable_ratio_ppm: 1,
         min_reclaimable_bytes: 1,
         max_compaction_copy_bytes: u64::MAX,
@@ -7134,6 +7141,7 @@ fn durable_data_logs_are_scoped_to_storage_nodes_and_reopen() {
         nodes.clone(),
         DurableDataLogPolicy {
             target_data_log_bytes: 1024 * 1024,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -7187,6 +7195,17 @@ fn durable_data_logs_are_scoped_to_storage_nodes_and_reopen() {
 }
 
 #[test]
+fn durable_data_log_policy_rejects_zero_file_sync_fanout() {
+    let root = durable_temp_dir("data-log-zero-sync-fanout");
+    let policy = DurableDataLogPolicy {
+        file_sync_fanout: 0,
+        ..DurableDataLogPolicy::default()
+    };
+    assert!(DurableCoordinator::open_with_data_log_policy(&root, config(), policy).is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn maintenance_throttles_writes_until_manual_tick_reclaims_debt() {
     let root = durable_temp_dir("maintenance-throttle");
     let cfg = config();
@@ -7194,6 +7213,7 @@ fn maintenance_throttles_writes_until_manual_tick_reclaims_debt() {
         mode: MaintenanceMode::Manual,
         data_log_policy: DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -7284,6 +7304,7 @@ fn scheduled_compaction_matches_manual_compaction() {
                 mode: MaintenanceMode::Manual,
                 data_log_policy: DurableDataLogPolicy {
                     target_data_log_bytes: 4096,
+                    file_sync_fanout: 4,
                     min_reclaimable_ratio_ppm: 1,
                     min_reclaimable_bytes: 1,
                     max_compaction_copy_bytes: u64::MAX,
@@ -7390,6 +7411,7 @@ fn repeated_maintenance_ticks_are_idempotent_and_restart_safe() {
         mode: MaintenanceMode::Manual,
         data_log_policy: DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -7460,6 +7482,7 @@ fn maintenance_cursor_persists_across_reopen() {
         mode: MaintenanceMode::Manual,
         data_log_policy: DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -7531,6 +7554,7 @@ fn opportunistic_maintenance_runs_before_the_admitted_write() {
         mode: MaintenanceMode::Opportunistic,
         data_log_policy: DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -7603,6 +7627,7 @@ fn always_on_maintenance_worker_shuts_down_and_reopens_cleanly() {
         mode: MaintenanceMode::AlwaysOn,
         data_log_policy: DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -7657,6 +7682,7 @@ fn always_on_startup_plan_detects_clean_and_dirty_state_without_hidden_work() {
         mode: MaintenanceMode::AlwaysOn,
         data_log_policy: DurableDataLogPolicy {
             target_data_log_bytes: 4096,
+            file_sync_fanout: 4,
             min_reclaimable_ratio_ppm: 1,
             min_reclaimable_bytes: 1,
             max_compaction_copy_bytes: u64::MAX,
@@ -7725,6 +7751,7 @@ fn generated_maintenance_interleavings_preserve_durable_contents() {
             mode: MaintenanceMode::Manual,
             data_log_policy: DurableDataLogPolicy {
                 target_data_log_bytes: 4096,
+                file_sync_fanout: 4,
                 min_reclaimable_ratio_ppm: 1,
                 min_reclaimable_bytes: 1,
                 max_compaction_copy_bytes: u64::MAX,
