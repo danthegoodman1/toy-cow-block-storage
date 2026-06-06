@@ -1,168 +1,103 @@
 # AGENTS.md
 
-This project uses a "build it like NASA" workflow: small modules,
-deterministic behavior, exhaustive simulation, and no advancement to the next
-layer until the current layer is boringly correct.
+This project optimizes for scalable durable storage through simplicity: small
+explicit state machines, immutable published metadata, deterministic tests, and
+clean internal evolution.
 
-The core doctrine is scalability through simplicity. We should reach scale by
-keeping the copy-on-write state machine small, explicit, immutable, and
-testable enough to exhaustively simulate, not by adding distributed machinery,
-compatibility scaffolding, or clever allocation policies before a simple model
-proves they are necessary.
+## Project Focus
 
-The block device is the first compatibility mapping layer, not the whole storage
-system. Native extent/file APIs should develop beside the block API over the
-same segment substrate whenever shared write-intent, segment lifecycle,
-metadata, or custodian behavior changes. Do not force file-level append
-sessions, writer epochs, or stale-writer fencing through block writes.
+- Native file and append-stream APIs are first-class storage APIs beside the
+  block API, not wrappers around it.
+- Durable file-write throughput and publish latency are the primary performance
+  goals. Prefer `published_mbps`, publish p50/p99, and end-to-end time through
+  the durable publish boundary when evaluating native append/file work.
+- Accepted-but-private append throughput is useful diagnostic data, but it is
+  not the main optimization target unless the user explicitly asks about
+  buffered ingest behavior.
+- Preserve scalability through simplicity: prefer fewer durable operations,
+  fewer metadata passes, and simpler state transitions before adding scheduling
+  or concurrency machinery.
+- Keep replication below the public block/native APIs. Clients may request a
+  durability policy later, but they must not choose storage nodes or fan out
+  replica writes.
+- Follow the "no tombstones" principle for internal code and formats. Replace
+  old paths cleanly; do not leave deprecated APIs, compatibility wrappers, dual
+  representations, or half-removed abstractions.
 
-This project also follows a "no tombstones" principle. Because this is a toy
-system with no promised external compatibility yet, internal formats and APIs
-should evolve cleanly. Do not leave deprecated paths, compatibility wrappers,
-dual representations, or half-removed abstractions scattered through the
-codebase. This principle is about code and format evolution, not about GC mark
-state or device deletion records.
+## Reading Before Changes
 
-## Required Reading
-
-Before changing code, read:
-
-1. `docs/cow-block-storage-design.md`
-2. `docs/implementation-plan.md`
-3. The module you are about to touch and its tests
-
-If the implementation plan and design spec disagree, stop and update the docs
-before adding code.
+- Read `docs/cow-block-storage-design.md` when changing storage semantics,
+  public APIs, durable ordering, metadata layout, or provider guarantees.
+- Read the module you are about to touch and its relevant tests before editing
+  code.
+- Read `docs/implementation-plan.md` only when changing the roadmap, starting a
+  new implementation phase, or resolving a design/spec conflict.
+- If docs and code disagree in an area you are changing, update the docs in the
+  same change.
 
 ## Development Environment
 
-- Run development commands and tests inside the Linux container defined by
-  `Dockerfile` and `docker-compose.yml`.
-- Start the container with `docker compose up -d dev`, then run work through
-  `docker compose exec dev ...` or one-shot commands through
-  `docker compose run --rm dev ...`.
-- The development container runs privileged as root so future Linux-only mount
-  and block device integration work, such as FUSE or ublk adapters, can be
-  exercised inside Docker. Kernel features still depend on the Docker host
-  exposing the relevant device, such as `/dev/fuse` or `/dev/ublk-control`.
-- Run the full Rust gate from inside the container:
-  `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo test`, `cargo doc --no-deps`, and
+- Run development commands and tests inside the Linux container:
+  `docker compose up -d dev`, then `docker compose exec dev ...`.
+- Run the full Rust gate inside the container when a change is ready:
+  `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test`,
+  `cargo doc --no-deps`, and
   `cargo bench --bench regression -- --test`.
-- Criterion comparison data is persisted in the `criterion-history` Docker
-  volume at `target/criterion`. The `-- --test` benchmark smoke checks that the
-  suite runs; use `cargo bench --bench regression` when you want Criterion to
-  record measurements for comparison. Normal `docker compose down` keeps the
-  history; use `docker compose down -v` only when intentionally discarding Cargo
-  caches, Linux build artifacts, and benchmark history.
+- Keep git operations on the macOS host: `git status`, `git diff`, `git add`,
+  `git commit`, and `git push`.
 - Shut the development container down with `docker compose down` when finished.
-- Keep git operations on the macOS host, such as `git status`, `git diff`,
-  `git add`, `git commit`, and `git push`. The repo is bind-mounted into the
-  container, while Cargo caches and Linux build artifacts live in Docker
-  volumes.
+  Do not use `docker compose down -v` unless intentionally discarding Docker
+  volumes and benchmark history.
 
-## Operating Rules
+## Determinism And API Discipline
 
-- Build in the order defined by `docs/implementation-plan.md`.
-- Do not skip ahead to integration work while an earlier module lacks its
-  correctness gates.
-- Keep the storage core deterministic: no wall-clock reads, no async, no
-  network, no filesystem or database I/O, no background tasks, no
-  process-global randomness.
-- Prefer pure state transitions shaped like
-  `step(command) -> effects`.
-- Use injected time, seeded randomness, and explicit ordered operation traces.
+- Keep deterministic storage-core code free of wall-clock reads, hidden I/O,
+  background tasks, process-global randomness, async runtimes, and network
+  access.
+- Prefer pure state transitions shaped like `step(command) -> effects` where
+  practical.
 - Make immutable objects the default: segments, metadata nodes, and committed
   roots are never mutated in place.
-- Keep forks O(1): copy shard-root pointers only, with no tree walk and no deep
-  refcount updates.
-- Keep writes local: append fresh segment data, copy one shard's root-to-leaf
-  metadata path, and publish one new shard root.
-- Keep reclamation explicit: GC traces from committed roots and sweeps only
-  unreachable objects.
-- Treat PITR as append-only shard-root history plus checkpoints.
 - Keep native file/extent semantics as a sibling mapping layer over the shared
-  substrate, not as a wrapper around `BlockDevice`.
-- Keep replication below the public block/native APIs. Clients may request
-  durability policy later, but they must not fan out replica writes or choose
-  storage nodes.
-- Preserve scalability through simplicity: prefer sharded roots, immutable
-  objects, append-only records, and deterministic replay over clever
-  coordination.
-- Add abstractions only when a deterministic test, conformance suite, or real
-  duplication demonstrates the need.
-- Public traits and provider interfaces must document their minimal
-  implementor guarantees. Each method should say what success makes durable or
-  visible, what failure must not expose, and which details remain
+  substrate. Do not force append streams, writer epochs, or stale-writer
+  fencing through block writes.
+- Public traits and provider interfaces must document what success makes
+  durable or visible, what failure must not expose, and which details remain
   implementation-private.
 
-## Module Exit Criteria
+## Testing And Benchmarks
 
-A module is not done until it has:
-
-- A narrow public API with documented invariants.
-- Table-driven deterministic tests for normal behavior.
-- Fault/race tests for stale, duplicate, delayed, reordered, failed, and
-  conflicting effects when relevant.
-- Generated deterministic simulation tests when the module owns state
-  transitions.
-- Reproducible failing seeds for generated tests.
-- Validation checks for object graph invariants when the module touches
-  metadata, segments, roots, PITR, or GC.
-- Performance measurements when the module is on the read, write, fork, restore,
-  or GC hot path.
-- No hidden I/O, global randomness, background tasks, or wall-clock reads in
-  deterministic code.
-
-## Testing Discipline
-
-- Every bug fix should add a deterministic regression test first, or in the same
-  change.
-- Generated simulation tests must print or record the seed and minimized trace
-  for failures.
-- Prefer small model checks over large opaque integration tests.
-- Compare storage behavior against a simple reference model whenever practical.
-- Run the narrowest relevant tests while developing, then the full gate for the
-  current module before moving on.
-- Keep Criterion regression benchmarks current for public API validation and
-  every implemented hot path.
-- Use `cargo run --release --bin loadbench -- ...` as the final happy-path
-  integration performance benchmark for block/native API IOPS, throughput,
-  latency, modeled RTT, concurrency, and conflict/error behavior. Criterion is
-  the mechanism-level regression suite; `loadbench` is the north-star
-  integration baseline.
-- When evaluating native file and append-stream performance, keep durable
-  throughput and durable latency as the primary goal. Prefer metrics such as
-  `published_mbps`, publish p50/p99, and end-to-end time through the durable
-  publish boundary. Treat accepted-but-private append throughput as a
-  diagnostic for durable write performance, not as the primary optimization
-  target.
-- GC tests must include adversarial interleavings with writes, forks, deletes,
-  PITR retention changes, and sweep boundaries.
-- PITR tests must verify restored contents, not only restored root IDs.
+- Every bug fix should add a deterministic regression test first, or in the
+  same change.
+- Prefer small model checks and focused tests while developing, then run the
+  full relevant gate before calling the work done.
+- Generated simulation tests should print or record failing seeds and minimized
+  traces.
+- Use Criterion for mechanism-level regression checks.
+- Use `cargo run --release --bin loadbench -- ...` as the north-star
+  integration benchmark for block/native IOPS, durable throughput, latency,
+  modeled RTT, concurrency, and error behavior.
+- For hot-path changes, keep before/after measurements and investigate durable
+  throughput or publish p99 regressions over 10% unless the regression is
+  deliberately explained.
 
 ## Change Discipline
 
-- Keep changes scoped to the current implementation phase.
-- Do not introduce production adapters before their deterministic model and
-  provider conformance tests exist.
+- Keep changes scoped to the current problem. Leave unrelated refactors and
+  metadata churn alone.
+- Add abstractions only when a deterministic test, conformance suite, benchmark,
+  or real duplication demonstrates the need.
 - Do not add provider-specific behavior to metadata tree logic.
-- Do not make shared segment lifecycle, write-intent, custodian, or commit-group
-  changes only for block storage while leaving the native extent/file path
-  unmodeled.
-- Do not add a second cross-shard atomicity mechanism beyond commit groups,
-  online shard splitting, segment compaction, deduplication, compression,
-  encryption, or durable providers unless the design spec is updated with a
-  failing simulation, benchmark, or correctness gap.
-- Do not add compatibility layers for old internal formats. Replace the old path
-  and update tests and docs in the same change.
+- Do not add new cross-shard atomicity mechanisms, production adapters,
+  compression, encryption, or distributed machinery without updating the design
+  docs and providing a correctness or benchmark reason.
 - Temporary migration code is allowed only inside an explicit migration phase,
   and that phase must include an exit gate that removes the temporary path.
-- If a phase cannot meet its gate, update the implementation plan with the
-  blocker and the next smallest proof step.
 
 ## Done Means
 
-"Done" means the module can be trusted in isolation: its invariants are
-explicit, its behavior is deterministic, its failure cases are simulated, its
-object graph is validated, and its hot-path costs are measured when relevant.
+The changed module has explicit invariants, deterministic tests for normal and
+failure behavior, docs updated where the contract changed, and hot-path costs
+measured when performance matters.
