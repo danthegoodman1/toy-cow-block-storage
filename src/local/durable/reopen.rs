@@ -1091,31 +1091,43 @@ pub(super) fn delete_data_log(data_dir: &Path, log_ref: DurableDataLogRef) -> Re
 pub(super) fn sync_data_log_files(
     files: Vec<DataLogFileToSync>,
 ) -> Result<DataLogFileSyncProfile> {
+    const MAX_DATA_LOG_SYNC_FANOUT: usize = 4;
+
     let mut profile = DataLogFileSyncProfile::default();
     if files.len() <= 1 {
         if let Some(file) = files.into_iter().next() {
-            let started = Instant::now();
-            file.file.sync_data().map_err(fs_error)?;
-            profile.record_file(file.bytes, duration_nanos_u64(started.elapsed()));
+            let (bytes, nanos) = sync_data_log_file(file)?;
+            profile.record_file(bytes, nanos);
         }
         return Ok(profile);
     }
 
-    let mut handles = Vec::with_capacity(files.len());
-    for file in files {
-        handles.push(thread::spawn(move || {
-            let started = Instant::now();
-            file.file.sync_data().map_err(fs_error)?;
-            Ok::<_, StorageError>((file.bytes, duration_nanos_u64(started.elapsed())))
-        }));
-    }
-    for handle in handles {
-        let (bytes, nanos) = handle
-            .join()
-            .map_err(|_| StorageError::unavailable("data-log sync worker panicked"))??;
-        profile.record_file(bytes, nanos);
+    let mut files = files.into_iter();
+    loop {
+        let mut handles = Vec::with_capacity(MAX_DATA_LOG_SYNC_FANOUT);
+        for _ in 0..MAX_DATA_LOG_SYNC_FANOUT {
+            let Some(file) = files.next() else {
+                break;
+            };
+            handles.push(thread::spawn(move || sync_data_log_file(file)));
+        }
+        if handles.is_empty() {
+            break;
+        }
+        for handle in handles {
+            let (bytes, nanos) = handle
+                .join()
+                .map_err(|_| StorageError::unavailable("data-log sync worker panicked"))??;
+            profile.record_file(bytes, nanos);
+        }
     }
     Ok(profile)
+}
+
+fn sync_data_log_file(file: DataLogFileToSync) -> Result<(u64, u64)> {
+    let started = Instant::now();
+    file.file.sync_data().map_err(fs_error)?;
+    Ok((file.bytes, duration_nanos_u64(started.elapsed())))
 }
 
 pub(super) fn sync_pending_data_logs(

@@ -131,6 +131,12 @@ A module is not done until it has:
   latency, modeled RTT, concurrency, and conflict/error behavior. Criterion is
   the mechanism-level regression suite; `loadbench` is the north-star
   integration baseline.
+- When evaluating native file and append-stream performance, keep durable
+  throughput and durable latency as the primary goal. Prefer metrics such as
+  `published_mbps`, publish p50/p99, and end-to-end time through the durable
+  publish boundary. Treat accepted-but-private append throughput as a
+  diagnostic for durable write performance, not as the primary optimization
+  target.
 - GC tests must include adversarial interleavings with writes, forks, deletes,
   PITR retention changes, and sweep boundaries.
 - PITR tests must verify restored contents, not only restored root IDs.
