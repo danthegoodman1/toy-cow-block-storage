@@ -1,6 +1,6 @@
 # Durable Append-Run Architecture Plan
 
-Status: implemented and measured checkpoint
+Status: implemented and measured checkpoint; visible publish decoupling needed
 Scope: native append streams, private ingest, publish-prefix persistence, stream GC
 Goal: make append performance scale with large sequential log writes and compact
 metadata publishes, not with per-append segment placement or full-state durable
@@ -62,6 +62,15 @@ p99 about 14.9 ms; c16 `native-stream-ingest-32m` 32 MiB prefix-persist rows had
 p50/p99 about 5.6/15.7 ms, lock wait p99 below 1 ms, and file-sync p99 about
 13.1 ms. The higher zero-byte profile tail is publish metadata waiting behind
 an in-flight bounded data-log sync, not publish metadata fanout.
+
+Later local Docker c64 follow-up runs moved payload sync out of the measured
+publish p99 but still showed publish tails in the hundreds of milliseconds.
+The dominant remaining structure is the single visible native metadata journal:
+append publishes allocate from one global commit sequence, merge every prepared
+publish into one native metadata delta, sync that journal frame, and only then
+apply the prepared file heads locally. The compact journal is better than root
+SQLite materialization, but it still serializes independent file publishes
+through one durable replay cursor.
 
 Read verification was measured separately in
 `target/loadbench/append-run-read-verification/`. At c16 and 200 us RTT,
@@ -131,6 +140,7 @@ AppendStreamState {
   stream_id
   keyspace_id
   file_id
+  base_writer_epoch
   writer_epoch
   visible_base_version
   visible_base_size
@@ -320,6 +330,98 @@ Remove or replace:
 The final code should have one native stream storage model: durable append runs
 plus compact visible extents.
 
+## Resolved Limitation: Global Visible Publish Journal
+
+The append-run data plane is now separate from ordinary segment writes, and the
+visible publish control plane has moved off the former global CoW metadata
+delta. That former path mutated a draft keyspace/file head, allocated a global
+commit sequence, exported a `NativeMetadataDelta` containing cursor state,
+keyspace heads, keyspace catalog shards, writer epochs, append stream state,
+metadata nodes, commit groups, keyspace commits, and file commits, then synced
+one native publish journal frame. Reopen required the retained native publish
+journal records to replay as a contiguous global commit sequence above the
+materialized cursor. The replacement keeps the records file-scoped for replay
+but writes them as one append-visible batch frame per publish batch, avoiding
+per-file sync fanout while preserving incomplete-tail replay semantics.
+
+That replay rule is the main correctness reason a simple per-file journal
+cannot be added as a small optimization. If file A commits sequence 101 and file
+B commits sequence 102 in different journals, replay cannot safely expose 102
+when 101 is missing, and the current cursor would not know which IDs, file
+versions, metadata nodes, or keyspace shard roots are safe to reuse. Keeping the
+global cursor while spreading journal files would only move the sync target; it
+would not remove the global durable prefix requirement.
+
+The next architecture should make native append publish records the source of
+truth for append-created file suffixes and treat CoW file roots as materialized
+indexes/checkpoints, not as the synchronous durable commit boundary for stream
+publish. The durable publish record should be scoped to the file lineage:
+
+```text
+AppendVisiblePublish {
+  record_id
+  commit_seq
+  keyspace_id
+  file_id
+  base_writer_epoch
+  writer_epoch
+  base_file_version
+  new_file_version
+  old_size
+  new_size
+  publish_through
+  run_extents
+}
+```
+
+Replay can then rebuild a file's visible append suffix by sorting and validating
+that file's publish records:
+
+- `base_file_version`, `old_size`, and prior `latest_commit` must match the
+  reconstructed head, and `commit_seq` must advance it;
+- `writer_epoch` is replayed as a monotonic file-writer fencing high-water:
+  materialization may preserve a higher already-durable private-stream epoch
+  while applying an earlier visible append record for the same unchanged file
+  head;
+- `run_extents` must cover exactly `old_size..new_size` with no gaps or
+  overlaps;
+- every referenced run payload and catalog record must already be durable;
+- records for different files may replay independently because they no longer
+  share one visibility cursor.
+
+The keyspace catalog still needs a discoverable file entry, but append-only
+suffix publication should not require rewriting and syncing the keyspace shard
+root on every publish. A checkpoint/materializer can fold per-file append
+records into ordinary run-backed file trees for fast reads, snapshots, PITR
+anchors, and GC traversal. That materialization may keep a global sequence for
+audit and checkpoint ordering, but the public append publish wait path should
+only need to sync one append-visible batch frame containing file-scoped publish
+records after payload durability.
+
+The must-preserve invariants are:
+
+- a successful publish is atomic at file-version granularity;
+- stale writer epochs cannot publish over a newer file head;
+- a crash before the file-scoped publish record sync exposes no bytes;
+- a crash after the publish record sync exposes the complete prefix after
+  reopen, even if checkpoint materialization did not run;
+- ordinary `write_at`, fork, restore, delete, and PITR either fence or
+  explicitly checkpoint outstanding append records before changing the same file
+  lineage;
+- GC treats synced append publish records as visible roots until they are folded
+  into a durable materialized file root.
+
+Rejected directions for this limitation:
+
+- Do not move append publishes back through root SQLite rows; measured c64 p99
+  was worse than the compact native journal.
+- Do not only shard the existing `NativeMetadataDelta` journal; the global
+  cursor and contiguous replay requirement would remain.
+- Do not use longer fixed coalescing windows as the architecture answer; short
+  tuning helped one local point but did not remove the serialization boundary.
+- Do not make accepted private bytes recoverable through the public API just to
+  simplify replay; publish remains the first public durability boundary.
+
 ## Implementation Stages
 
 Each stage must be committed separately with benchmark CSV under ignored
@@ -329,7 +431,8 @@ Each stage must be committed separately with benchmark CSV under ignored
 
 - Record current stream ingest, publish-prefix, native write, and block write
   matrix at 200 us RTT.
-- Add this plan to the implementation plan as the next native append phase.
+- Keep this plan linked from the implementation plan as the native append
+  publish phase evolves.
 - Update the design spec to state that native append publish uses run-backed
   extents, not ordinary block-style segments.
 - Keep current code behavior unchanged in this stage.

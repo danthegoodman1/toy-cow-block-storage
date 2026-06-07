@@ -367,6 +367,7 @@ pub(super) struct AppendStreamState {
     keyspace_id: KeyspaceId,
     file_id: FileId,
     stream_id: AppendStreamId,
+    base_writer_epoch: WriterEpoch,
     writer_epoch: WriterEpoch,
     base_version: FileVersion,
     visible_base_size: u64,
@@ -405,7 +406,7 @@ pub(super) struct AppendPublishPlan {
     publish_range: ByteRange,
     payload_persist_start: u64,
     run_extents: Vec<RunBackedFileExtent>,
-    delta: NativeMetadataDelta,
+    visible_publish: AppendVisiblePublish,
     in_flight: AppendPublishInFlight,
 }
 
@@ -545,32 +546,6 @@ impl AppendStreamState {
         Ok(exported)
     }
 
-    fn published_export_at(&self, publish_through: u64) -> Result<Self> {
-        if publish_through < self.published_through {
-            return Err(StorageError::conflict(
-                "append stream publish export cannot regress",
-            ));
-        }
-        let durable_through = self.durable_through.max(publish_through);
-        let mut exported = self.durable_export_at(durable_through)?;
-        exported.published_through = publish_through;
-        let mut retained = Vec::new();
-        for record in &exported.records {
-            let record_end = record.end_exclusive()?;
-            if record_end <= publish_through {
-                continue;
-            }
-            if record.offset < publish_through {
-                if let Some(suffix) = record.slice(publish_through, record_end)? {
-                    retained.push(suffix);
-                }
-            } else {
-                retained.push(record.clone());
-            }
-        }
-        exported.records = retained;
-        Ok(exported)
-    }
 }
 
 impl AppendStreamPrefixPersistBatch {
@@ -980,6 +955,19 @@ impl InMemoryMetadataPlane {
             .get(&key)
             .copied()
             .unwrap_or_else(|| WriterEpoch::from_raw(0));
+        let replay_base_epoch = inner
+            .append_streams
+            .values()
+            .filter(|stream| stream.keyspace_id == keyspace_id && stream.file_id == file_id)
+            .map(|stream| {
+                if stream.durable_through > stream.visible_base_size {
+                    stream.writer_epoch
+                } else {
+                    stream.base_writer_epoch
+                }
+            })
+            .max_by_key(|epoch| epoch.raw())
+            .unwrap_or(persisted_epoch);
         let current_epoch = inner
             .append_streams
             .values()
@@ -1011,6 +999,7 @@ impl InMemoryMetadataPlane {
             keyspace_id,
             file_id,
             stream_id,
+            base_writer_epoch: replay_base_epoch,
             writer_epoch,
             base_version: head.version,
             visible_base_size: head.size,

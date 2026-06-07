@@ -1302,55 +1302,6 @@ impl DurableCoordinator {
         Ok(previous_cursor.next_commit_seq != local_cursor.next_commit_seq)
     }
 
-    fn merged_append_publish_plan_delta(plans: &[AppendPublishPlan]) -> Result<NativeMetadataDelta> {
-        let Some(first) = plans.first() else {
-            return Err(StorageError::invalid_argument(
-                "append publish batch must include at least one plan",
-            ));
-        };
-        let mut delta = first.delta.clone();
-        for plan in &plans[1..] {
-            delta.cursor = plan.delta.cursor.clone();
-            delta
-                .keyspace_heads
-                .extend(plan.delta.keyspace_heads.iter().map(|(key, value)| (*key, value.clone())));
-            delta.keyspace_roots.extend(
-                plan.delta
-                    .keyspace_roots
-                    .iter()
-                    .map(|(key, value)| (*key, value.clone())),
-            );
-            delta.keyspace_catalog_shards.extend(
-                plan.delta
-                    .keyspace_catalog_shards
-                    .iter()
-                    .map(|(key, value)| (*key, value.clone())),
-            );
-            delta
-                .file_writer_epochs
-                .extend(plan.delta.file_writer_epochs.iter().copied());
-            delta.append_streams.extend(plan.delta.append_streams.clone());
-            delta.metadata_nodes.extend(
-                plan.delta
-                    .metadata_nodes
-                    .iter()
-                    .map(|(key, value)| (*key, value.clone())),
-            );
-            delta
-                .referenced_segment_ids
-                .extend(plan.delta.referenced_segment_ids.iter().copied());
-            delta.commit_groups.extend(
-                plan.delta
-                    .commit_groups
-                    .iter()
-                    .map(|(key, value)| (*key, value.clone())),
-            );
-            delta.keyspace_commits.extend(plan.delta.keyspace_commits.clone());
-            delta.file_commits.extend(plan.delta.file_commits.clone());
-        }
-        Ok(delta)
-    }
-
     fn append_publish_plan_log_refs(
         plans: &[AppendPublishPlan],
     ) -> BTreeSet<DurableDataLogRef> {
@@ -1464,22 +1415,10 @@ impl DurableCoordinator {
         mut lock_wait_nanos: u64,
     ) -> Result<(CommitSeq, AppendPublishBatchDiagnostics)> {
         let snapshot_started = Instant::now();
-        let previous_segments = lock(&self.persisted_segments)?.clone();
-        let delta = Self::merged_append_publish_plan_delta(plans)?;
         let (pending_stream_append, mut stream_prefix_pending_lock_wait_nanos) =
             self.pending_append_for_append_publish_plans(plans)?;
-        let changed_segments = delta.referenced_segment_ids.clone();
-        if changed_segments
-            .iter()
-            .any(|segment_id| !previous_segments.contains(segment_id))
-        {
-            return Err(StorageError::conflict(
-                "prepared append publish references unpersisted segments",
-            ));
-        }
-        let nodes = self
-            .local
-            .selected_state_for_segment_ids(&changed_segments)?;
+        let changed_segments = BTreeSet::new();
+        let nodes = self.local.selected_state_for_segment_ids(&changed_segments)?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
         let new_run_count = usize_to_u64(
@@ -1531,10 +1470,13 @@ impl DurableCoordinator {
         } else {
             None
         };
-        let mut profile = self.durable.persist_synced_append_publish_delta(
-            &delta,
+        let records = plans
+            .iter()
+            .map(|plan| plan.visible_publish.clone())
+            .collect::<Vec<_>>();
+        let mut profile = self.durable.persist_synced_append_visible_publish_records(
+            &records,
             &nodes,
-            &changed_segments,
             pending_stream_append,
             sync_profile,
             sync_nanos,
@@ -1550,7 +1492,6 @@ impl DurableCoordinator {
                 "prepared append publish persist did not reach required commit sequence",
             ));
         }
-        lock(&self.persisted_segments)?.extend(changed_segments);
         stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos
             .saturating_add(self.remove_pending_append_log_refs_for_publish_plans(plans)?);
         profile.lock_wait_nanos = lock_wait_nanos;
@@ -1632,7 +1573,13 @@ impl DurableCoordinator {
                         }
                         Err(error) => return Err(error),
                     };
-                    cursor = plan.delta.cursor.clone();
+                    cursor.next_commit_seq = plan
+                        .commit
+                        .commit_seq
+                        .raw()
+                        .checked_add(1)
+                        .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?
+                        .max(cursor.next_commit_seq);
                     plans.push(plan);
                 }
                 if plans.is_empty() {

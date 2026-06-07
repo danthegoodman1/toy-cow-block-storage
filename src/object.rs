@@ -4,10 +4,10 @@ use std::sync::Arc;
 use crate::api::BlockRange;
 use crate::error::{Result, StorageError};
 use crate::id::{
-    AppendRunId, AppendStreamId, BlockCount, BlockIndex, CheckpointId, CommitGroupId, CommitSeq,
-    DeviceGeneration, DeviceId, FileId, FileVersion, KeyspaceCatalogShardId, KeyspaceGeneration,
-    KeyspaceId, KeyspaceRootId, LogicalTime, MetadataNodeId, SegmentId, ShardId, StorageNodeId,
-    WriterEpoch,
+    AppendPublishTicketId, AppendRunId, AppendStreamId, BlockCount, BlockIndex, CheckpointId,
+    CommitGroupId, CommitSeq, DeviceGeneration, DeviceId, FileId, FileVersion,
+    KeyspaceCatalogShardId, KeyspaceGeneration, KeyspaceId, KeyspaceRootId, LogicalTime,
+    MetadataNodeId, SegmentId, ShardId, StorageNodeId, WriterEpoch,
 };
 
 /// Stored payload integrity for one immutable data segment.
@@ -534,6 +534,211 @@ impl RunBackedFileExtent {
         }
         Ok(())
     }
+}
+
+/// File-scoped durable record for one visible native append publish.
+///
+/// This is the replay primitive for decoupling append publish from the global
+/// native metadata delta journal. The record is scoped to a single file lineage:
+/// replay may apply it only when the reconstructed file head still matches the
+/// base version and size, and all extents cover the appended suffix exactly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppendVisiblePublish {
+    pub record_id: AppendPublishTicketId,
+    pub commit_seq: CommitSeq,
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
+    pub base_writer_epoch: WriterEpoch,
+    pub writer_epoch: WriterEpoch,
+    pub base_file_version: FileVersion,
+    pub new_file_version: FileVersion,
+    pub old_size: u64,
+    pub new_size: u64,
+    pub publish_through: u64,
+    pub run_extents: Vec<RunBackedFileExtent>,
+}
+
+impl AppendVisiblePublish {
+    pub fn validate(&self) -> Result<()> {
+        if self.commit_seq.raw() == 0 {
+            return Err(StorageError::invalid_argument(
+                "append visible publish commit sequence must be nonzero",
+            ));
+        }
+        if self.new_size <= self.old_size {
+            return Err(StorageError::invalid_argument(
+                "append visible publish must advance file size",
+            ));
+        }
+        if self.writer_epoch.raw() < self.base_writer_epoch.raw() {
+            return Err(StorageError::invalid_argument(
+                "append visible publish writer epoch must not precede base epoch",
+            ));
+        }
+        if self.publish_through != self.new_size {
+            return Err(StorageError::invalid_argument(
+                "append visible publish target must match new file size",
+            ));
+        }
+        let expected_version = self.base_file_version.raw().checked_add(1).ok_or_else(|| {
+            StorageError::invalid_argument("append visible publish file version overflows")
+        })?;
+        if self.new_file_version.raw() != expected_version {
+            return Err(StorageError::invalid_argument(
+                "append visible publish must advance file version once",
+            ));
+        }
+        if self.run_extents.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "append visible publish must include run extents",
+            ));
+        }
+
+        let mut next_offset = self.old_size;
+        for extent in &self.run_extents {
+            extent.validate()?;
+            if extent.file_offset_start != next_offset {
+                return Err(StorageError::invalid_argument(
+                    "append visible publish extents must be contiguous",
+                ));
+            }
+            if extent.run.keyspace_id != self.keyspace_id
+                || extent.run.file_id != self.file_id
+                || extent.run.writer_epoch != self.writer_epoch
+            {
+                return Err(StorageError::invalid_argument(
+                    "append visible publish extent belongs to a different file lineage",
+                ));
+            }
+            next_offset = next_offset.checked_add(extent.payload_len).ok_or_else(|| {
+                StorageError::invalid_argument("append visible publish extent range overflows")
+            })?;
+            if next_offset > self.new_size {
+                return Err(StorageError::invalid_argument(
+                    "append visible publish extents exceed new file size",
+                ));
+            }
+        }
+        if next_offset != self.new_size {
+            return Err(StorageError::invalid_argument(
+                "append visible publish extents do not cover published suffix",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_reconstructed_head(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        _file_writer_epoch: WriterEpoch,
+        file_version: FileVersion,
+        size: u64,
+        latest_commit: CommitSeq,
+    ) -> Result<()> {
+        self.validate()?;
+        if self.keyspace_id != keyspace_id
+            || self.file_id != file_id
+            || self.base_file_version != file_version
+            || self.old_size != size
+        {
+            return Err(StorageError::invalid_argument(
+                "append visible publish record does not match reconstructed file head",
+            ));
+        }
+        if self.commit_seq.raw() <= latest_commit.raw() {
+            return Err(StorageError::invalid_argument(
+                "append visible publish commit sequence does not advance reconstructed file head",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Result of replaying file-scoped visible append publish records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendVisiblePublishReplay {
+    pub keyspace_id: KeyspaceId,
+    pub file_id: FileId,
+    pub base_writer_epoch: WriterEpoch,
+    pub base_file_version: FileVersion,
+    pub base_size: u64,
+    pub base_commit_seq: CommitSeq,
+    pub latest_writer_epoch: WriterEpoch,
+    pub latest_file_version: FileVersion,
+    pub latest_size: u64,
+    pub latest_commit_seq: CommitSeq,
+    pub run_extents: Vec<RunBackedFileExtent>,
+}
+
+/// Replay one file lineage's append-visible records without a global cursor.
+///
+/// Records may arrive in any deterministic storage order. Replay applies the
+/// record whose base version and old size match the current file state, then
+/// advances to that record's new version and size. Any leftover record is a gap,
+/// duplicate, stale publish, or foreign-file record and is rejected.
+pub fn replay_append_visible_publishes_for_file(
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+    base_writer_epoch: WriterEpoch,
+    base_file_version: FileVersion,
+    base_size: u64,
+    base_commit_seq: CommitSeq,
+    records: &[AppendVisiblePublish],
+) -> Result<AppendVisiblePublishReplay> {
+    let mut remaining = records.to_vec();
+    remaining.sort_by_key(|record| {
+        (
+            record.base_file_version.raw(),
+            record.old_size,
+            record.new_file_version.raw(),
+            record.record_id.raw(),
+        )
+    });
+
+    let mut latest_writer_epoch = base_writer_epoch;
+    let mut latest_file_version = base_file_version;
+    let mut latest_size = base_size;
+    let mut latest_commit_seq = base_commit_seq;
+    let mut run_extents = Vec::new();
+    while let Some(index) = remaining.iter().position(|record| {
+        record.base_file_version == latest_file_version && record.old_size == latest_size
+    }) {
+        let record = remaining.remove(index);
+        record.validate_for_reconstructed_head(
+            keyspace_id,
+            file_id,
+            latest_writer_epoch,
+            latest_file_version,
+            latest_size,
+            latest_commit_seq,
+        )?;
+        latest_writer_epoch = latest_writer_epoch.max(record.writer_epoch);
+        latest_file_version = record.new_file_version;
+        latest_size = record.new_size;
+        latest_commit_seq = record.commit_seq;
+        run_extents.extend(record.run_extents);
+    }
+
+    if !remaining.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "append visible publish replay is not contiguous",
+        ));
+    }
+
+    Ok(AppendVisiblePublishReplay {
+        keyspace_id,
+        file_id,
+        base_writer_epoch,
+        base_file_version,
+        base_size,
+        base_commit_seq,
+        latest_writer_epoch,
+        latest_file_version,
+        latest_size,
+        latest_commit_seq,
+        run_extents,
+    })
 }
 
 /// Immutable data segment descriptor.
@@ -1093,6 +1298,265 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    fn run_extent(file_offset_start: u64, payload_len: u64) -> RunBackedFileExtent {
+        RunBackedFileExtent {
+            file_offset_start,
+            payload_len,
+            run: append_run_range(file_offset_start, payload_len),
+        }
+    }
+
+    fn append_visible_publish(extents: Vec<RunBackedFileExtent>) -> AppendVisiblePublish {
+        AppendVisiblePublish {
+            record_id: AppendPublishTicketId::from_raw(101),
+            commit_seq: CommitSeq::from_raw(101),
+            keyspace_id: KeyspaceId::from_raw(13),
+            file_id: FileId::from_raw(15),
+            base_writer_epoch: WriterEpoch::from_raw(10),
+            writer_epoch: WriterEpoch::from_raw(11),
+            base_file_version: FileVersion::from_raw(4),
+            new_file_version: FileVersion::from_raw(5),
+            old_size: 4096,
+            new_size: 4096 + 8192,
+            publish_through: 4096 + 8192,
+            run_extents: extents,
+        }
+    }
+
+    fn append_visible_publish_record(
+        record_id: u128,
+        base_file_version: u64,
+        old_size: u64,
+        payload_len: u64,
+    ) -> AppendVisiblePublish {
+        AppendVisiblePublish {
+            record_id: AppendPublishTicketId::from_raw(record_id),
+            commit_seq: CommitSeq::from_raw(
+                100 + u64::try_from(record_id).expect("test record id fits u64"),
+            ),
+            keyspace_id: KeyspaceId::from_raw(13),
+            file_id: FileId::from_raw(15),
+            base_writer_epoch: WriterEpoch::from_raw(11),
+            writer_epoch: WriterEpoch::from_raw(11),
+            base_file_version: FileVersion::from_raw(base_file_version),
+            new_file_version: FileVersion::from_raw(base_file_version + 1),
+            old_size,
+            new_size: old_size + payload_len,
+            publish_through: old_size + payload_len,
+            run_extents: vec![run_extent(old_size, payload_len)],
+        }
+    }
+
+    #[test]
+    fn append_visible_publish_validation_requires_exact_file_suffix() {
+        let publish = append_visible_publish(vec![run_extent(4096, 4096), run_extent(8192, 4096)]);
+        assert!(publish.validate().is_ok());
+        assert!(
+            publish
+                .validate_for_reconstructed_head(
+                    KeyspaceId::from_raw(13),
+                    FileId::from_raw(15),
+                    WriterEpoch::from_raw(10),
+                    FileVersion::from_raw(4),
+                    4096,
+                    CommitSeq::from_raw(100),
+                )
+                .is_ok()
+        );
+
+        assert!(
+            AppendVisiblePublish {
+                publish_through: publish.new_size + 1,
+                ..publish.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AppendVisiblePublish {
+                new_file_version: FileVersion::from_raw(6),
+                ..publish.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AppendVisiblePublish {
+                writer_epoch: WriterEpoch::from_raw(12),
+                ..publish.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        let mut skipped_epoch_extents = vec![run_extent(4096, 4096), run_extent(8192, 4096)];
+        for extent in &mut skipped_epoch_extents {
+            extent.run.writer_epoch = WriterEpoch::from_raw(12);
+        }
+        let skipped_epoch = AppendVisiblePublish {
+            writer_epoch: WriterEpoch::from_raw(12),
+            run_extents: skipped_epoch_extents,
+            ..publish.clone()
+        };
+        assert!(skipped_epoch.validate().is_ok());
+        assert!(
+            skipped_epoch
+                .validate_for_reconstructed_head(
+                    KeyspaceId::from_raw(13),
+                    FileId::from_raw(15),
+                    WriterEpoch::from_raw(12),
+                    FileVersion::from_raw(4),
+                    4096,
+                    CommitSeq::from_raw(100),
+                )
+                .is_ok()
+        );
+        assert!(
+            AppendVisiblePublish {
+                run_extents: vec![run_extent(8192, 4096)],
+                ..publish.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AppendVisiblePublish {
+                run_extents: vec![run_extent(4096, 4096), run_extent(12_288, 4096)],
+                ..publish.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            publish
+                .validate_for_reconstructed_head(
+                    KeyspaceId::from_raw(13),
+                    FileId::from_raw(15),
+                    WriterEpoch::from_raw(9),
+                    FileVersion::from_raw(4),
+                    4096,
+                    CommitSeq::from_raw(100),
+                )
+                .is_ok()
+        );
+        assert!(
+            publish
+                .validate_for_reconstructed_head(
+                    KeyspaceId::from_raw(13),
+                    FileId::from_raw(15),
+                    WriterEpoch::from_raw(10),
+                    FileVersion::from_raw(4),
+                    4096,
+                    CommitSeq::from_raw(101),
+                )
+                .is_err()
+        );
+
+        let mut wrong_file = run_extent(4096, 8192);
+        wrong_file.run.file_id = FileId::from_raw(99);
+        assert!(
+            AppendVisiblePublish {
+                run_extents: vec![wrong_file],
+                ..publish
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn append_visible_publish_replay_applies_file_local_chain_without_global_order() {
+        let second = append_visible_publish_record(2, 5, 8192, 4096);
+        let first = append_visible_publish_record(1, 4, 4096, 4096);
+
+        let replay = replay_append_visible_publishes_for_file(
+            KeyspaceId::from_raw(13),
+            FileId::from_raw(15),
+            WriterEpoch::from_raw(11),
+            FileVersion::from_raw(4),
+            4096,
+            CommitSeq::from_raw(100),
+            &[second, first],
+        )
+        .unwrap();
+
+        assert_eq!(replay.base_file_version, FileVersion::from_raw(4));
+        assert_eq!(replay.base_size, 4096);
+        assert_eq!(replay.base_commit_seq, CommitSeq::from_raw(100));
+        assert_eq!(replay.base_writer_epoch, WriterEpoch::from_raw(11));
+        assert_eq!(replay.latest_writer_epoch, WriterEpoch::from_raw(11));
+        assert_eq!(replay.latest_file_version, FileVersion::from_raw(6));
+        assert_eq!(replay.latest_size, 12_288);
+        assert_eq!(replay.latest_commit_seq, CommitSeq::from_raw(102));
+        assert_eq!(
+            replay
+                .run_extents
+                .iter()
+                .map(|extent| extent.file_offset_start)
+                .collect::<Vec<_>>(),
+            vec![4096, 8192]
+        );
+    }
+
+    #[test]
+    fn append_visible_publish_replay_rejects_gaps_duplicates_and_foreign_records() {
+        let first = append_visible_publish_record(1, 4, 4096, 4096);
+        let duplicate = append_visible_publish_record(2, 4, 4096, 4096);
+        assert!(
+            replay_append_visible_publishes_for_file(
+                KeyspaceId::from_raw(13),
+                FileId::from_raw(15),
+                WriterEpoch::from_raw(11),
+                FileVersion::from_raw(4),
+                4096,
+                CommitSeq::from_raw(100),
+                &[first.clone(), duplicate],
+            )
+            .is_err()
+        );
+
+        let gap = append_visible_publish_record(3, 6, 12_288, 4096);
+        assert!(
+            replay_append_visible_publishes_for_file(
+                KeyspaceId::from_raw(13),
+                FileId::from_raw(15),
+                WriterEpoch::from_raw(11),
+                FileVersion::from_raw(4),
+                4096,
+                CommitSeq::from_raw(100),
+                &[first.clone(), gap],
+            )
+            .is_err()
+        );
+
+        let mut foreign = first;
+        foreign.file_id = FileId::from_raw(99);
+        assert!(
+            replay_append_visible_publishes_for_file(
+                KeyspaceId::from_raw(13),
+                FileId::from_raw(15),
+                WriterEpoch::from_raw(11),
+                FileVersion::from_raw(4),
+                4096,
+                CommitSeq::from_raw(100),
+                &[foreign],
+            )
+            .is_err()
+        );
+
+        let first = append_visible_publish_record(4, 4, 4096, 4096);
+        let replay = replay_append_visible_publishes_for_file(
+            KeyspaceId::from_raw(13),
+            FileId::from_raw(15),
+            WriterEpoch::from_raw(12),
+            FileVersion::from_raw(4),
+            4096,
+            CommitSeq::from_raw(100),
+            &[first],
+        )
+        .unwrap();
+        assert_eq!(replay.latest_writer_epoch, WriterEpoch::from_raw(12));
     }
 
     #[test]

@@ -1383,6 +1383,81 @@ skip-verify read measurements live under
 `target/loadbench/append-run-read-verification/` and show checksum verification
 is not a meaningful read bottleneck at 200 us RTT.
 
+## Phase 23B: File-Scoped Native Append Publish Records
+
+Status: in progress; record, codec, deterministic replay, durable-open
+materialization, and the synchronous append-publish hot path now use
+file-scoped append-visible records instead of the global native metadata delta
+journal.
+
+Remove the remaining global visible-publish serialization from native append
+streams. Phase 23A made append payloads run-backed, but append publish
+previously exported a merged `NativeMetadataDelta` through one native publish
+journal and reopen required those records to be contiguous in the global commit
+sequence.
+The local Docker c64 follow-up shows payload sync is no longer the publish p99
+center; the tail is now the single visible metadata journal sync and waiters
+queued behind it. This phase makes file-scoped append publish records the
+durable source of truth for append-created suffixes and demotes CoW file roots
+to materialized indexes/checkpoints for this path.
+
+Non-goals:
+
+- No public API change beyond any internal diagnostics needed for profiling.
+- No public recovery guarantee for accepted-but-unpublished private append
+  bytes.
+- No root SQLite publish materialization on the synchronous append-publish hot
+  path.
+- No simple sharding of the existing `NativeMetadataDelta` journal while keeping
+  one global replay cursor.
+- No block write rewrite.
+
+Deliverables:
+
+- [x] Define an `AppendVisiblePublish` durable record scoped to one keyspace
+  file lineage, carrying commit sequence, base/publish writer epochs, base/new
+  file version, old/new size, publish range, run-backed extents, and a stable
+  record identity.
+- [x] Add deterministic replay that rebuilds visible append suffixes from
+  file-scoped records without requiring unrelated files to have a contiguous
+  global commit prefix.
+- [x] Keep stale-writer fencing by validating each record against the
+  reconstructed file head: base version, old size, commit sequence, and run
+  extent coverage must match before the record becomes visible. Writer epochs
+  replay as a monotonic fencing high-water so later durable private-stream
+  fences are not regressed.
+- [x] Convert the synchronous append-publish wait path to persist payload runs,
+  sync one append-visible journal batch containing file-scoped publish records,
+  and return without syncing the global native metadata delta journal.
+- [ ] Add a checkpoint/materialization path that folds file-scoped append
+  records into ordinary run-backed file roots for reads, PITR anchors, snapshots,
+  restores, and GC traversal.
+- [ ] Make ordinary native writes, fork, restore, delete, and PITR either fence
+  or explicitly materialize outstanding append records for the affected file
+  lineage before changing non-append file metadata.
+- [ ] Treat synced append publish records as visible GC roots until they are
+  folded into a durable materialized file root.
+- [ ] Delete the old append-publish use of global `NativeMetadataDelta` once
+  the file-scoped path passes the exit gate; do not leave dual durable publish
+  representations.
+
+Exit gate:
+
+- [ ] Crash before the file-scoped publish record sync exposes no appended
+  bytes after reopen.
+- [ ] Crash after the file-scoped publish record sync exposes the whole prefix
+  after reopen, even when materialization/checkpointing did not run.
+- [ ] Independent files can publish and replay without waiting for a contiguous
+  global native append-publish commit sequence.
+- [ ] Stale stream, fenced stream, same-file ordinary write, fork, restore,
+  delete, PITR, and GC tests cover outstanding append publish records.
+- [ ] c16 keeps Rapid-range publish p99, and c32/c64 materially reduce publish
+  p99 versus the Phase 23A 20 ms coalescing checkpoint without losing more than
+  10 percent `published_mbps`.
+- [ ] Durable profile rows show append publish no longer spends p99 in the
+  global visible metadata journal sync path.
+- [ ] Full Rust gate passes inside the dev container.
+
 ## Phase 24: Background Compaction Scheduling and Backpressure Policy
 
 Status: complete.

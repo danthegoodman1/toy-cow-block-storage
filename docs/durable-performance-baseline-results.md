@@ -954,8 +954,14 @@ sync and waiters queued behind that single journal. The local `diskprobe`
 control on `/tmp` also shows high concurrent fsync tails: c16 32 MiB raw groups
 reported sync p99 around `157 ms`, and framed-copy c16 32 MiB groups reported
 sync p99 around `325 ms`. That sync substrate is materially worse than the
-Rapid Storage p99 target, but the single global visible-publish journal remains
-the main storage-layer scaling limit.
+Rapid Storage p99 target, and before the append-visible conversion the single
+global visible-publish journal remained the main storage-layer scaling limit.
+
+Profile naming caveat for the compact native journal path:
+`root_sqlite_row_sync_nanos` and `root_sqlite_commit_nanos` were the compact
+native publish journal frame write and `sync_data` timings. They were not root
+SQLite row materialization timings unless the experiment explicitly routed
+append publish back through root SQLite.
 
 A follow-up durable-profile field, `visible_metadata_write_bytes`, showed that
 the c64 compact native journal frames are not large enough to explain the tail:
@@ -963,10 +969,80 @@ average frame size was about `178 KiB`, p90 about `469 KiB`, and max about
 `478 KiB` for the profiled row. Small frames still hit large sync outliers
 (`23 KiB` frame with `166 ms` sync, `14 KiB` frame with `137 ms` sync), so
 record compaction alone is unlikely to move local c64 p99 into Rapid range.
-The same interval/32 MiB/auto32 shape on the current code path reached about
-`3.62 GB/s` with publish p99 `15.5 ms` at c16, and about `3.68 GB/s` with
-publish p99 `233 ms` at c32. Local c16 is already Rapid-range for p99; c32/c64
-remain limited by high-concurrency sync waves.
+Before the append-visible conversion, the same interval/32 MiB/auto32 shape on
+the compact native journal code path reached about `3.62 GB/s` with publish p99
+`15.5 ms` at c16, and about `3.68 GB/s` with publish p99 `233 ms` at c32. Local
+c16 was already Rapid-range for p99; c32/c64 remained limited by
+high-concurrency sync waves.
+
+## Append-Visible Hot Path Smoke
+
+After converting durable append publish from the compact global native metadata
+journal to file-scoped `AppendVisiblePublish` records, the first implementation
+physically wrote one small journal file per file. A quick local Docker 4-node
+screen used `--rtt-us 200`, `--stream-total-mib 512`,
+`--stream-publish-mib 128`, and `--stream-auto-persist-mib 32`. CSVs are under
+`target/loadbench/append-visible-hotpath/`.
+
+| Workload | c | `published_mbps` | publish p99 | final drain p99 | append p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `native-stream-publish-interval-32m` | 16 | 2591.17 | 90.1 ms | 14.7 ms | 246.3 ms |
+| `native-stream-publish-interval-32m` | 32 | 2783.13 | 287.3 ms | 46.5 ms | 772.0 ms |
+| `native-stream-publish-at-end-32m` | 16 | 3717.51 | 36.1 ms | 36.1 ms | 159.8 ms |
+| `native-stream-publish-at-end-32m` | 32 | 3340.87 | 316.3 ms | 316.3 ms | 503.6 ms |
+
+Read:
+
+- The at-end shape no longer has the prior multi-second local publish tail in
+  this c16/c32 smoke; c32 final drain p99 is `316 ms`, below the local
+  `<500 ms` pass target used for native publish-at-end.
+- Throughput remains in the local Docker `2.6-3.7 GiB/s` range, so this does
+  not close the gap to the Rapid c64 `~9.35 GiB/s` stretch row.
+- The interval c32 row still shows a larger append-phase p99, which now points
+  more at append-side dirty-tail/background sync and scheduling shape than at a
+  global visible metadata delta.
+- In durable profiles for this code path, `root_sqlite_row_sync_nanos` and
+  `root_sqlite_commit_nanos` now profile append-visible journal frame write and
+  `sync_data`, not SQLite row materialization and not the old native metadata
+  delta journal.
+
+## Append-Visible Batch Journal Follow-Up
+
+The per-file physical journal was then replaced with one append-visible batch
+journal frame containing independent file-scoped publish records. This keeps
+file-local replay while removing per-file `sync_data` fanout and avoiding
+partial-batch success if one file journal append succeeds before another fails.
+Same local Docker shape as above; CSVs are under
+`target/loadbench/append-visible-batch-journal/`.
+
+| Workload | c | `published_mbps` | publish p99 | final drain p99 | append p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `native-stream-publish-interval-32m` | 16 | 3677.86 | 13.2 ms | 4.3 ms | 172.4 ms |
+| `native-stream-publish-interval-32m` | 32 | 3304.00 | 512.1 ms | 16.4 ms | 682.4 ms |
+| `native-stream-publish-interval-32m` | 64 | 2970.33 | 659.7 ms | 10.9 ms | 915.5 ms |
+| `native-stream-publish-at-end-32m` | 16 | 3679.97 | 9.0 ms | 9.0 ms | 156.8 ms |
+| `native-stream-publish-at-end-32m` | 32 | 3940.00 | 292.3 ms | 292.3 ms | 394.1 ms |
+| `native-stream-publish-at-end-32m` | 64 | 3168.42 | 202.6 ms | 202.6 ms | 1008.8 ms |
+
+Read:
+
+- The final publish boundary is now in the Rapid p99 range on this local Docker
+  system for the bulk at-end shape: c64 final drain p99 is `203 ms`.
+- The remaining c64 interval p99 is append-side: final drain p99 is `10.9 ms`,
+  while append p99 is `915 ms` and interval publish p99 is `660 ms`.
+- Durable profile rows have sub-millisecond append-visible frame write time;
+  the outliers are `sync_data` on the append-visible journal. c64 interval had
+  a max visible-journal sync around `646 ms`; c64 at-end had max around
+  `200 ms`.
+- This is not SQLite-limited on the append publish path: there is no root
+  SQLite row materialization in the synchronous visible boundary. The remaining
+  local throughput ceiling and c64 append tail line up with Docker filesystem
+  write/sync controls, which show concurrent 16/32 MiB raw/framed groups around
+  `2.2-2.5 GiB/s` and group p99 up to roughly `117-325 ms` in this environment.
+- Further local-Docker improvements are more likely to come from changing the
+  physical I/O substrate or environment than from replacing SQLite for this
+  append-publish path. SQLite may still matter for other metadata-heavy paths,
+  but it is not the limiter evidenced by these native append publish rows.
 
 ## External North-Star Targets
 

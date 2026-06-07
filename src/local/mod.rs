@@ -42,11 +42,12 @@ use crate::id::{
     TenantId, WriteIntentId, WriterEpoch,
 };
 use crate::object::{
-    AppendLogRun, AppendLogRunRange, Checkpoint, CheckpointRoots, CommitGroup, DeleteRecord,
-    DeviceHead, FileCommit, FileHead, ForkRecord, KeyspaceCatalogShard, KeyspaceCommit,
-    KeyspaceFile, KeyspaceHead, KeyspaceRoot, LeafEntry, MappingOwner, MetadataChild, MetadataNode,
-    MetadataNodeKind, RootUpdate, RunBackedFileExtent, SegmentDescriptor, SegmentPayloadIntegrity,
-    ShardCommit, ShardRootUpdate, coalesce_append_log_run_ranges,
+    AppendLogRun, AppendLogRunRange, AppendVisiblePublish, Checkpoint, CheckpointRoots,
+    CommitGroup, DeleteRecord, DeviceHead, FileCommit, FileHead, ForkRecord, KeyspaceCatalogShard,
+    KeyspaceCommit, KeyspaceFile, KeyspaceHead, KeyspaceRoot, LeafEntry, MappingOwner,
+    MetadataChild, MetadataNode, MetadataNodeKind, RootUpdate, RunBackedFileExtent,
+    SegmentDescriptor, SegmentPayloadIntegrity, ShardCommit, ShardRootUpdate,
+    coalesce_append_log_run_ranges,
 };
 use crate::provider::{
     CommitGroupIntent, DiagnosticsCounters, DiagnosticsGauges, DiagnosticsNodeSnapshot,

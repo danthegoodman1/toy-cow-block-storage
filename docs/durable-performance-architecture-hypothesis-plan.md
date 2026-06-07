@@ -370,8 +370,13 @@ answer for whether an operation committed despite an error.
 1. Fix benchmark suite and profile reporting.
 2. Fix auto-persist request retention and measure publish-tail impact.
 3. Move append-run payload writes behind storage-node receipts.
-4. Introduce the shared durable visible commit bundle for native append publish.
-5. Port block delta flush to the shared durable commit bundle.
+4. Replace native append publish's global `NativeMetadataDelta` journal with
+   file-scoped visible append publish records. The measured c64 tail shows the
+   compact global journal is now the native append bottleneck; sharding it
+   without changing replay would preserve the same global durable prefix.
+5. Keep block delta flush on its own ordered durable boundary unless native
+   append publish proves a smaller shared primitive that does not reintroduce
+   global append serialization.
 6. Add metadata-only zero/discard block deltas.
 7. Decide whether block deltas or CoW roots are the block hot-path source of
    truth.

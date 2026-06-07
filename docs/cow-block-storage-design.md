@@ -195,12 +195,14 @@ metadata. That background sync must be paced by the dirty-tail budget rather
 than by every internal copy/write chunk, so larger budgets do not create
 unbounded active-log sync pressure. Explicit flushed appends and manual prefix
 persistence remain responsible for persisting private stream metadata. The
-visible append-publish boundary is a compact native publish journal record:
-after the relevant
-append-log payload and node catalog references are durable, the provider
-appends and syncs a small metadata delta that advances the public file head.
-SQLite row-native metadata is a materialized checkpoint for reopen, inspection,
-and later pruning; it is not on the synchronous append-publish hot path.
+visible append-publish boundary is an append-visible journal batch containing
+file-scoped publish records: after the relevant append-log payload and node
+catalog references are durable, the provider appends and syncs one framed batch
+whose records carry commit sequence, file version transition, size transition,
+writer-epoch fencing high-water, and run-backed suffix extents. SQLite
+row-native metadata is a materialized checkpoint for inspection and later
+pruning; durable reopen can materialize synced append-visible records before
+exposing the store.
 Append-publish group commit is demand-driven: a leader may wait briefly for
 submitted or waiting peer publishes, but a lone publish must not pay the full
 barrier coalescing window.
@@ -1356,9 +1358,12 @@ A native append publish:
 2. Persists append-log bytes and manifests through the captured prefix.
 3. Verifies the visible file head still matches the stream's published boundary.
 4. Coalesces the persisted private range into compact run-backed file extents.
-5. Publishes the new file root with append-stream and writer-epoch fencing.
-6. Marks the stream range published after metadata publish succeeds.
-7. Returns the new file version.
+5. Syncs an append-visible journal batch containing the file-scoped publish
+   record for the suffix.
+6. Materializes the new in-memory file root with append-stream and
+   writer-epoch fencing.
+7. Marks the stream range published after metadata publish succeeds.
+8. Returns the new file version.
 
 Invariants:
 

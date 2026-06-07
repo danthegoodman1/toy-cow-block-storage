@@ -7,6 +7,7 @@ pub(super) struct DurableSqliteStore {
     data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     append_log_service: Arc<StorageNodeAppendLogService>,
     native_publish_journal_lock: Arc<Mutex<()>>,
+    append_visible_publish_journal_lock: Arc<Mutex<()>>,
     #[cfg(test)]
     persist_delay: Arc<Mutex<Option<Duration>>>,
     #[cfg(test)]
@@ -1243,13 +1244,6 @@ pub(super) struct NativeMetadataDeltaCommit {
     delta: NativeMetadataDelta,
 }
 
-impl NativeMetadataDeltaCommit {
-    fn from_delta(delta: NativeMetadataDelta) -> Result<Self> {
-        let commit_seq = native_metadata_delta_high_water(&delta)?;
-        Ok(Self { commit_seq, delta })
-    }
-}
-
 impl DurableCodec for DurableExportCursor {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         1u8.encode(out)?;
@@ -1395,53 +1389,107 @@ impl DurableCodec for NativeMetadataDeltaCommit {
     }
 }
 
+const DURABLE_JOURNAL_HEADER_BYTES: usize = 24;
+const MAX_DURABLE_JOURNAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"TCPJNL01";
-const NATIVE_PUBLISH_JOURNAL_HEADER_BYTES: usize = 24;
-const MAX_NATIVE_PUBLISH_JOURNAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"AVPJNL01";
 
-fn native_publish_journal_frame(commit: &NativeMetadataDeltaCommit) -> Result<Vec<u8>> {
-    let payload = encode_row(commit)?;
+fn durable_journal_frame<T: DurableCodec>(
+    record: &T,
+    magic: &[u8; 8],
+    too_large_reason: &'static str,
+) -> Result<Vec<u8>> {
+    let payload = encode_row(record)?;
     let payload_len = usize_to_u64(payload.len());
-    if payload_len > MAX_NATIVE_PUBLISH_JOURNAL_PAYLOAD_BYTES {
-        return Err(StorageError::conflict(
-            "native publish journal record exceeds durable payload limit",
-        ));
+    if payload_len > MAX_DURABLE_JOURNAL_PAYLOAD_BYTES {
+        return Err(StorageError::conflict(too_large_reason));
     }
-    let mut frame = Vec::with_capacity(NATIVE_PUBLISH_JOURNAL_HEADER_BYTES + payload.len());
-    frame.extend_from_slice(&NATIVE_PUBLISH_JOURNAL_MAGIC);
+    let mut frame = Vec::with_capacity(DURABLE_JOURNAL_HEADER_BYTES + payload.len());
+    frame.extend_from_slice(magic);
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&data_log_checksum(&payload).to_le_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
 }
 
-fn decode_native_publish_journal_header(
-    header: &[u8; NATIVE_PUBLISH_JOURNAL_HEADER_BYTES],
+fn decode_durable_journal_header(
+    header: &[u8; DURABLE_JOURNAL_HEADER_BYTES],
+    magic: &[u8; 8],
+    invalid_magic_reason: &'static str,
+    too_large_reason: &'static str,
 ) -> Result<(u64, u64)> {
-    if header[0..8] != NATIVE_PUBLISH_JOURNAL_MAGIC {
-        return Err(StorageError::corrupt(
-            "native publish journal has invalid frame magic",
-        ));
+    if header[0..8] != *magic {
+        return Err(StorageError::corrupt(invalid_magic_reason));
     }
     let mut len = [0_u8; 8];
     len.copy_from_slice(&header[8..16]);
     let payload_len = u64::from_le_bytes(len);
-    if payload_len > MAX_NATIVE_PUBLISH_JOURNAL_PAYLOAD_BYTES {
-        return Err(StorageError::corrupt(
-            "native publish journal frame exceeds durable payload limit",
-        ));
+    if payload_len > MAX_DURABLE_JOURNAL_PAYLOAD_BYTES {
+        return Err(StorageError::corrupt(too_large_reason));
     }
     let mut checksum = [0_u8; 8];
     checksum.copy_from_slice(&header[16..24]);
     Ok((payload_len, u64::from_le_bytes(checksum)))
 }
 
-fn append_native_publish_journal_commit(
+fn load_durable_journal_records<T: DurableCodec>(
     path: &Path,
-    commit: &NativeMetadataDeltaCommit,
+    magic: &[u8; 8],
+    invalid_magic_reason: &'static str,
+    too_large_reason: &'static str,
+    length_overflow_reason: &'static str,
+    checksum_mismatch_reason: &'static str,
+) -> Result<Vec<T>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut file = File::open(path).map_err(fs_error)?;
+    let mut records = Vec::new();
+    loop {
+        let mut header = [0_u8; DURABLE_JOURNAL_HEADER_BYTES];
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(fs_error(error)),
+        }
+        let (payload_len, expected_checksum) = decode_durable_journal_header(
+            &header,
+            magic,
+            invalid_magic_reason,
+            too_large_reason,
+        )?;
+        let payload_len = usize::try_from(payload_len)
+            .map_err(|_| StorageError::corrupt(length_overflow_reason))?;
+        let mut payload = vec![0_u8; payload_len];
+        match file.read_exact(&mut payload) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(fs_error(error)),
+        }
+        if data_log_checksum(&payload) != expected_checksum {
+            return Err(StorageError::corrupt(checksum_mismatch_reason));
+        }
+        records.push(decode_row(&payload)?);
+    }
+    Ok(records)
+}
+
+fn append_durable_journal_record<T: DurableCodec>(
+    path: &Path,
+    record: &T,
+    magic: &[u8; 8],
+    too_large_reason: &'static str,
 ) -> Result<(u64, u64, u64)> {
-    let frame = native_publish_journal_frame(commit)?;
+    let frame = durable_journal_frame(record, magic, too_large_reason)?;
     let frame_bytes = usize_to_u64(frame.len());
+    let parent = path
+        .parent()
+        .ok_or_else(|| StorageError::invalid_argument("journal path has no parent directory"))?;
+    let parent_existed = parent.exists();
+    if !parent_existed {
+        fs::create_dir_all(parent).map_err(fs_error)?;
+        sync_parent_dir(parent)?;
+    }
     let existed = path.exists();
     let started = Instant::now();
     let mut file = OpenOptions::new()
@@ -1460,42 +1508,64 @@ fn append_native_publish_journal_commit(
     Ok((write_nanos, sync_nanos, frame_bytes))
 }
 
+fn native_publish_journal_frame(commit: &NativeMetadataDeltaCommit) -> Result<Vec<u8>> {
+    durable_journal_frame(
+        commit,
+        &NATIVE_PUBLISH_JOURNAL_MAGIC,
+        "native publish journal record exceeds durable payload limit",
+    )
+}
+
 fn load_native_publish_journal_commits_since(
     path: &Path,
     next_commit_seq: u64,
 ) -> Result<Vec<NativeMetadataDeltaCommit>> {
-    if !path.exists() {
-        return Ok(Vec::new());
+    Ok(load_durable_journal_records(
+        path,
+        &NATIVE_PUBLISH_JOURNAL_MAGIC,
+        "native publish journal has invalid frame magic",
+        "native publish journal frame exceeds durable payload limit",
+        "native publish journal frame length overflows",
+        "native publish journal frame checksum mismatch",
+    )?
+    .into_iter()
+    .filter(|commit: &NativeMetadataDeltaCommit| commit.commit_seq.raw() >= next_commit_seq)
+    .collect())
+}
+
+pub(super) fn append_append_visible_publish_journal_records(
+    path: &Path,
+    records: &[AppendVisiblePublish],
+) -> Result<(u64, u64, u64)> {
+    if records.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "append visible publish journal batch must include records",
+        ));
     }
-    let mut file = File::open(path).map_err(fs_error)?;
-    let mut commits = Vec::new();
-    loop {
-        let mut header = [0_u8; NATIVE_PUBLISH_JOURNAL_HEADER_BYTES];
-        match file.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(fs_error(error)),
-        }
-        let (payload_len, expected_checksum) = decode_native_publish_journal_header(&header)?;
-        let payload_len = usize::try_from(payload_len)
-            .map_err(|_| StorageError::corrupt("native publish journal frame length overflows"))?;
-        let mut payload = vec![0_u8; payload_len];
-        match file.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(fs_error(error)),
-        }
-        if data_log_checksum(&payload) != expected_checksum {
-            return Err(StorageError::corrupt(
-                "native publish journal frame checksum mismatch",
-            ));
-        }
-        let commit: NativeMetadataDeltaCommit = decode_row(&payload)?;
-        if commit.commit_seq.raw() >= next_commit_seq {
-            commits.push(commit);
-        }
+    for record in records {
+        record.validate()?;
     }
-    Ok(commits)
+    let records = records.to_vec();
+    append_durable_journal_record(
+        path,
+        &records,
+        &APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC,
+        "append visible publish journal record exceeds durable payload limit",
+    )
+}
+
+pub(super) fn load_append_visible_publish_journal_records(
+    path: &Path,
+) -> Result<Vec<AppendVisiblePublish>> {
+    let batches = load_durable_journal_records::<Vec<AppendVisiblePublish>>(
+        path,
+        &APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC,
+        "append visible publish journal has invalid frame magic",
+        "append visible publish journal frame exceeds durable payload limit",
+        "append visible publish journal frame length overflows",
+        "append visible publish journal frame checksum mismatch",
+    )?;
+    Ok(batches.into_iter().flatten().collect())
 }
 
 fn prune_native_publish_journal_through(path: &Path, commit_seq: CommitSeq) -> Result<()> {
@@ -1553,6 +1623,22 @@ fn native_metadata_delta_high_water(delta: &NativeMetadataDelta) -> Result<Commi
         }
     }
     Ok(high_water)
+}
+
+fn advance_cursor_for_append_visible_publish_records(
+    cursor: &mut DurableExportCursor,
+    records: &[AppendVisiblePublish],
+) -> Result<()> {
+    for record in records {
+        record.validate()?;
+        let next_commit_seq = record
+            .commit_seq
+            .raw()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?;
+        cursor.next_commit_seq = cursor.next_commit_seq.max(next_commit_seq);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1737,6 +1823,7 @@ impl DurableSqliteStore {
             data_log_allocation_locks,
             append_log_service,
             native_publish_journal_lock: Arc::new(Mutex::new(())),
+            append_visible_publish_journal_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             persist_delay: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -1922,6 +2009,11 @@ impl DurableSqliteStore {
         let Some(cursor) = load_export_cursor(&conn)? else {
             reject_legacy_current_state_if_present(&conn)?;
             reject_orphan_row_native_rows_if_present(&conn)?;
+            if !self.all_append_visible_publish_journal_records()?.is_empty() {
+                return Err(StorageError::corrupt(
+                    "append visible publish records exist without materialized metadata",
+                ));
+            }
             let (mut storage_nodes, next_write_intent) =
                 self.load_storage_registry_from_node_catalogs(1, 0, 1)?;
             if storage_nodes.node_order.is_empty() {
@@ -1957,7 +2049,7 @@ impl DurableSqliteStore {
         let effective_cursor =
             apply_native_metadata_delta_commits(&mut metadata, &cursor, &native_delta_commits)?;
         metadata.append_streams.clear();
-        let (mut storage_nodes, next_write_intent) = self
+        let (storage_nodes, next_write_intent) = self
             .load_storage_registry_from_node_catalogs(
                 effective_cursor.next_segment_id,
                 effective_cursor.next_placement_index,
@@ -1979,15 +2071,26 @@ impl DurableSqliteStore {
         metadata.next_commit_seq = effective_cursor.next_commit_seq;
         metadata.next_checkpoint_id = effective_cursor.next_checkpoint_id;
         metadata.next_gc_epoch = effective_cursor.next_gc_epoch;
-        let repairs = reconcile_catalog_references_from_metadata(&metadata, &mut storage_nodes);
-
         let image = DurableStoreState {
             config: runtime_config,
             metadata,
+            storage_nodes: storage_nodes.clone(),
+            next_write_intent,
+            next_extent_id: effective_cursor.next_extent_id,
+        };
+        validate_row_native_state(&image)?;
+        let local = LocalCoordinator::from_durable_state(image)?;
+        let append_visible_records = self.all_append_visible_publish_journal_records()?;
+        local.materialize_append_visible_publish_records(&append_visible_records)?;
+        let mut image = DurableStoreState {
+            config: runtime_config,
+            metadata: local.metadata.state_inner()?,
             storage_nodes,
             next_write_intent,
             next_extent_id: effective_cursor.next_extent_id,
         };
+        let repairs =
+            reconcile_catalog_references_from_metadata(&image.metadata, &mut image.storage_nodes);
         validate_row_native_state(&image)?;
         self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
         let local = LocalCoordinator::from_durable_state(image)?;
@@ -2028,10 +2131,13 @@ impl DurableSqliteStore {
         };
         let native_delta_commits =
             self.native_publish_journal_commits_since(&conn, cursor.next_commit_seq)?;
-        Ok(Some(effective_cursor_from_native_metadata_delta_commits(
+        let mut effective = effective_cursor_from_native_metadata_delta_commits(
             &cursor,
             &native_delta_commits,
-        )?))
+        )?;
+        let append_visible_records = self.all_append_visible_publish_journal_records()?;
+        advance_cursor_for_append_visible_publish_records(&mut effective, &append_visible_records)?;
+        Ok(Some(effective))
     }
 
     fn native_publish_journal_commits_since(
@@ -2046,17 +2152,42 @@ impl DurableSqliteStore {
         )
     }
 
-    fn append_native_publish_journal_commit(
-        &self,
-        commit: &NativeMetadataDeltaCommit,
-    ) -> Result<(u64, u64, u64)> {
-        let _journal_guard = lock(&self.native_publish_journal_lock)?;
-        append_native_publish_journal_commit(&self.paths.native_publish_journal, commit)
-    }
-
     fn prune_native_publish_journal_through(&self, commit_seq: CommitSeq) -> Result<()> {
         let _journal_guard = lock(&self.native_publish_journal_lock)?;
         prune_native_publish_journal_through(&self.paths.native_publish_journal, commit_seq)
+    }
+
+    #[cfg(test)]
+    pub(super) fn append_visible_publish_journal_path(&self) -> PathBuf {
+        self.paths.append_visible_publish_journal.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn append_append_visible_publish_journal_record(
+        &self,
+        record: &AppendVisiblePublish,
+    ) -> Result<(u64, u64, u64)> {
+        self.append_append_visible_publish_journal_records(std::slice::from_ref(record))
+    }
+
+    pub(super) fn append_append_visible_publish_journal_records(
+        &self,
+        records: &[AppendVisiblePublish],
+    ) -> Result<(u64, u64, u64)> {
+        let _journal_guard = lock(&self.append_visible_publish_journal_lock)?;
+        append_append_visible_publish_journal_records(
+            &self.paths.append_visible_publish_journal,
+            records,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn append_visible_publish_journal_records(&self) -> Result<Vec<AppendVisiblePublish>> {
+        load_append_visible_publish_journal_records(&self.paths.append_visible_publish_journal)
+    }
+
+    fn all_append_visible_publish_journal_records(&self) -> Result<Vec<AppendVisiblePublish>> {
+        load_append_visible_publish_journal_records(&self.paths.append_visible_publish_journal)
     }
 
     fn persist_catalog_reference_repairs(
@@ -2949,13 +3080,34 @@ impl DurableSqliteStore {
         })
     }
 
-    fn persist_native_metadata_delta_journal_bundle(
+    fn persist_native_metadata_delta(
         &self,
-        delta: NativeMetadataDelta,
+        delta: &NativeMetadataDelta,
         nodes: &SelectedStorageNodeState,
         changed_segments: &BTreeSet<SegmentId>,
-        payload: DurableBundlePayload,
+        segments: Vec<DurableSegmentPayload>,
     ) -> Result<DurablePersistProfile> {
+        self.persist_native_metadata_delta_bundle(
+            delta,
+            nodes,
+            changed_segments,
+            DurableBundlePayload::NewSegments(segments),
+        )
+    }
+
+    fn persist_synced_append_visible_publish_records(
+        &self,
+        records: &[AppendVisiblePublish],
+        nodes: &SelectedStorageNodeState,
+        appended: PendingDataLogAppend,
+        sync_profile: DataLogAppendProfile,
+        sync_nanos: u64,
+    ) -> Result<DurablePersistProfile> {
+        if records.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "append visible publish persist requires records",
+            ));
+        }
         let total_started = Instant::now();
         #[cfg(test)]
         {
@@ -2970,23 +3122,34 @@ impl DurableSqliteStore {
             }
         }
 
-        let prepared = self.prepare_durable_bundle_payload(payload, changed_segments)?;
+        for record in records {
+            record.validate()?;
+        }
+        let segment_ids = BTreeSet::new();
+        let prepared = self.prepare_durable_bundle_payload(
+            DurableBundlePayload::PreingestedSynced {
+                appended,
+                sync_profile,
+                sync_nanos,
+            },
+            &segment_ids,
+        )?;
         let started = Instant::now();
         let catalog_profile = self.persist_durable_bundle_catalog(
             nodes,
-            changed_segments,
+            &segment_ids,
             prepared.appended,
             &prepared.pre_root_pending_segments,
         )?;
         let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
 
-        let commit_started = Instant::now();
-        let delta_commit = NativeMetadataDeltaCommit::from_delta(delta)?;
-        let commit_prepare_nanos = duration_nanos_u64(commit_started.elapsed());
+        let durable_high_water = records
+            .iter()
+            .map(|record| record.commit_seq)
+            .max()
+            .unwrap_or_else(|| CommitSeq::from_raw(0));
         let (root_sqlite_row_sync_nanos, root_sqlite_commit_nanos, visible_metadata_write_bytes) =
-            self.append_native_publish_journal_commit(&delta_commit)?;
-        let root_sqlite_row_sync_nanos =
-            root_sqlite_row_sync_nanos.saturating_add(commit_prepare_nanos);
+            self.append_append_visible_publish_journal_records(records)?;
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
@@ -3018,45 +3181,9 @@ impl DurableSqliteStore {
             new_segment_count: prepared.new_segment_count,
             new_segment_bytes: prepared.new_segment_bytes,
             touched_node_count: catalog_profile.touched_node_count(),
-            durable_commit_high_water: delta_commit.commit_seq.raw(),
+            durable_commit_high_water: durable_high_water.raw(),
             ..DurablePersistProfile::default()
         })
-    }
-
-    fn persist_native_metadata_delta(
-        &self,
-        delta: &NativeMetadataDelta,
-        nodes: &SelectedStorageNodeState,
-        changed_segments: &BTreeSet<SegmentId>,
-        segments: Vec<DurableSegmentPayload>,
-    ) -> Result<DurablePersistProfile> {
-        self.persist_native_metadata_delta_bundle(
-            delta,
-            nodes,
-            changed_segments,
-            DurableBundlePayload::NewSegments(segments),
-        )
-    }
-
-    fn persist_synced_append_publish_delta(
-        &self,
-        delta: &NativeMetadataDelta,
-        nodes: &SelectedStorageNodeState,
-        changed_segments: &BTreeSet<SegmentId>,
-        appended: PendingDataLogAppend,
-        sync_profile: DataLogAppendProfile,
-        sync_nanos: u64,
-    ) -> Result<DurablePersistProfile> {
-        self.persist_native_metadata_delta_journal_bundle(
-            delta.clone(),
-            nodes,
-            changed_segments,
-            DurableBundlePayload::PreingestedSynced {
-                appended,
-                sync_profile,
-                sync_nanos,
-            },
-        )
     }
 
     fn persist_block_delta_commits(

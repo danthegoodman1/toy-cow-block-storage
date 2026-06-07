@@ -5,7 +5,7 @@ use crate::api::{
 };
 use crate::extent::{CreateFileRequest, CreateKeyspaceRequest, FileSpec};
 use crate::id::{ClientEpoch, LogicalDeadline, ShardId, WriteIntentId};
-use crate::object::{LeafEntry, ShardRootUpdate};
+use crate::object::{LeafEntry, ShardRootUpdate, replay_append_visible_publishes_for_file};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(1);
@@ -2381,7 +2381,25 @@ fn durable_row_payload_codecs_round_trip_real_block_and_native_rows() {
     assert_durable_row_round_trip(&RunBackedFileExtent {
         file_offset_start: run_range.file_offset_start,
         payload_len: run_range.payload_len,
-        run: run_range,
+        run: run_range.clone(),
+    });
+    assert_durable_row_round_trip(&AppendVisiblePublish {
+        record_id: AppendPublishTicketId::from_raw(9),
+        commit_seq: CommitSeq::from_raw(10),
+        keyspace_id,
+        file_id: _file_id,
+        base_writer_epoch: WriterEpoch::from_raw(2),
+        writer_epoch: WriterEpoch::from_raw(3),
+        base_file_version: FileVersion::from_raw(1),
+        new_file_version: FileVersion::from_raw(2),
+        old_size: 0,
+        new_size: run_range.payload_len,
+        publish_through: run_range.payload_len,
+        run_extents: vec![RunBackedFileExtent {
+            file_offset_start: run_range.file_offset_start,
+            payload_len: run_range.payload_len,
+            run: run_range,
+        }],
     });
 }
 
@@ -5858,8 +5876,13 @@ fn durable_sqlite_persists_native_stream_run_extents_on_publish() {
     drop(conn);
     assert_eq!(
         native_publish_journal_commit_count(&root, 0),
+        0,
+        "append publish should not persist a native metadata delta"
+    );
+    assert_eq!(
+        append_visible_publish_journal_count(&root, keyspace_id, file_id),
         1,
-        "append publish should persist a compact native metadata journal record"
+        "append publish should persist one compact file-scoped visible record"
     );
     drop(store);
 
@@ -5869,14 +5892,24 @@ fn durable_sqlite_persists_native_stream_run_extents_on_publish() {
     assert_eq!(reopened_run_extents, run_extents);
     assert_eq!(
         native_publish_journal_commit_count(&root, 0),
+        0,
+        "reopen should not synthesize native metadata deltas"
+    );
+    assert_eq!(
+        append_visible_publish_journal_count(&root, keyspace_id, file_id),
         1,
-        "reopen should replay, not eagerly materialize, native metadata deltas"
+        "reopen should keep the append-visible journal available for idempotent replay"
     );
     reopened.persist_now().unwrap();
     assert_eq!(
         native_publish_journal_commit_count(&root, 0),
         0,
-        "full native persist should fold and prune replayed native deltas"
+        "full native persist should leave the native metadata delta journal empty"
+    );
+    assert_eq!(
+        append_visible_publish_journal_count(&root, keyspace_id, file_id),
+        1,
+        "append-visible pruning is separate from full row-native persistence"
     );
     reopened
         .durable
@@ -5892,8 +5925,8 @@ fn durable_sqlite_persists_native_stream_run_extents_on_publish() {
 }
 
 #[test]
-fn durable_native_publish_journal_rejects_committed_record_corruption() {
-    let root = durable_temp_dir("native-publish-journal-corruption");
+fn durable_append_visible_publish_hot_path_rejects_committed_record_corruption() {
+    let root = durable_temp_dir("append-visible-publish-hot-path-corruption");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let keyspace_id = store
@@ -5917,7 +5950,7 @@ fn durable_native_publish_journal_rejects_committed_record_corruption() {
     .unwrap();
     drop(store);
 
-    let journal = root.join("native-publish.journal");
+    let journal = append_visible_publish_journal_path_for_test(&root, keyspace_id, file_id);
     let mut bytes = fs::read(&journal).unwrap();
     let last = bytes.last_mut().unwrap();
     *last ^= 0xff;
@@ -5928,8 +5961,8 @@ fn durable_native_publish_journal_rejects_committed_record_corruption() {
 }
 
 #[test]
-fn durable_native_publish_journal_ignores_incomplete_tail() {
-    let root = durable_temp_dir("native-publish-journal-incomplete-tail");
+fn durable_append_visible_publish_hot_path_ignores_incomplete_tail() {
+    let root = durable_temp_dir("append-visible-publish-hot-path-incomplete-tail");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     let keyspace_id = store
@@ -5956,7 +5989,11 @@ fn durable_native_publish_journal_ignores_incomplete_tail() {
 
     let mut journal = OpenOptions::new()
         .append(true)
-        .open(root.join("native-publish.journal"))
+        .open(append_visible_publish_journal_path_for_test(
+            &root,
+            keyspace_id,
+            file_id,
+        ))
         .unwrap();
     journal.write_all(b"incomplete").unwrap();
     journal.sync_data().unwrap();
@@ -5973,6 +6010,310 @@ fn durable_native_publish_journal_ignores_incomplete_tail() {
         )
         .unwrap();
     assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+fn append_visible_publish_for_journal(
+    record_id: u128,
+    base_file_version: u64,
+    base_writer_epoch: u64,
+    writer_epoch: u64,
+    old_size: u64,
+    payload_len: u64,
+) -> AppendVisiblePublish {
+    let keyspace_id = KeyspaceId::from_raw(41);
+    let file_id = FileId::from_raw(42);
+    let base_writer_epoch = WriterEpoch::from_raw(base_writer_epoch);
+    let writer_epoch = WriterEpoch::from_raw(writer_epoch);
+    let run = AppendLogRunRange {
+        run_id: AppendRunId::from_raw(record_id),
+        storage_node: StorageNodeId::from_raw(44),
+        stream_id: AppendStreamId::from_raw(45),
+        writer_epoch,
+        keyspace_id,
+        file_id,
+        file_offset_start: old_size,
+        payload_len,
+        log_id: 46,
+        log_payload_offset: old_size,
+        integrity: SegmentPayloadIntegrity::Unchecked,
+    };
+    AppendVisiblePublish {
+        record_id: AppendPublishTicketId::from_raw(record_id),
+        commit_seq: CommitSeq::from_raw(
+            100 + u64::try_from(record_id).expect("test record id fits u64"),
+        ),
+        keyspace_id,
+        file_id,
+        base_writer_epoch,
+        writer_epoch,
+        base_file_version: FileVersion::from_raw(base_file_version),
+        new_file_version: FileVersion::from_raw(base_file_version + 1),
+        old_size,
+        new_size: old_size + payload_len,
+        publish_through: old_size + payload_len,
+        run_extents: vec![RunBackedFileExtent {
+            file_offset_start: old_size,
+            payload_len,
+            run,
+        }],
+    }
+}
+
+#[test]
+fn durable_append_visible_publish_journal_round_trips_and_ignores_incomplete_tail() {
+    let root = durable_temp_dir("append-visible-publish-journal-tail");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let first = append_visible_publish_for_journal(1, 4, 42, 43, 4096, 4096);
+    let second = append_visible_publish_for_journal(2, 5, 43, 43, 8192, 4096);
+    store
+        .durable
+        .append_append_visible_publish_journal_record(&first)
+        .unwrap();
+    store
+        .durable
+        .append_append_visible_publish_journal_record(&second)
+        .unwrap();
+    let journal = store.durable.append_visible_publish_journal_path();
+    let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+    file.write_all(b"incomplete").unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+
+    let records = store
+        .durable
+        .append_visible_publish_journal_records()
+        .unwrap();
+    assert_eq!(records, vec![first, second]);
+    let replay = replay_append_visible_publishes_for_file(
+        KeyspaceId::from_raw(41),
+        FileId::from_raw(42),
+        WriterEpoch::from_raw(42),
+        FileVersion::from_raw(4),
+        4096,
+        CommitSeq::from_raw(100),
+        &records,
+    )
+    .unwrap();
+    assert_eq!(replay.latest_file_version, FileVersion::from_raw(6));
+    assert_eq!(replay.latest_size, 12_288);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_visible_publish_journal_rejects_committed_record_corruption() {
+    let root = durable_temp_dir("append-visible-publish-journal-corruption");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let record = append_visible_publish_for_journal(1, 4, 42, 43, 4096, 4096);
+    store
+        .durable
+        .append_append_visible_publish_journal_record(&record)
+        .unwrap();
+    let journal = store.durable.append_visible_publish_journal_path();
+
+    let mut bytes = fs::read(&journal).unwrap();
+    let last = bytes.last_mut().unwrap();
+    *last ^= 0xff;
+    fs::write(&journal, bytes).unwrap();
+
+    assert!(
+        store
+            .durable
+            .append_visible_publish_journal_records()
+            .is_err()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_visible_publish_record_materializes_on_reopen() {
+    let root = durable_temp_dir("append-visible-publish-materialize-reopen");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let base_head = store
+        .metadata()
+        .get_file_head(keyspace_id, file_id)
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 91);
+    let ticket = store
+        .append_stream(&stream, &payload, WriteDurability::Flushed)
+        .unwrap();
+    assert!(file_run_extents(&store.metadata(), keyspace_id, file_id).is_empty());
+
+    let publish_records = store
+        .local
+        .metadata
+        .append_stream_publish_records(
+            &stream,
+            base_head.size,
+            ticket.range.end_exclusive().unwrap(),
+        )
+        .unwrap();
+    let run_extents = publish_records
+        .into_iter()
+        .map(|record| RunBackedFileExtent {
+            file_offset_start: record.offset,
+            payload_len: record.len,
+            run: record.run.full_range(),
+        })
+        .collect::<Vec<_>>();
+    let metadata = store.metadata().state_inner().unwrap();
+    let base_writer_epoch = metadata
+        .file_writer_epochs
+        .get(&(keyspace_id, file_id))
+        .copied()
+        .unwrap();
+    let commit_seq = CommitSeq::from_raw(metadata.next_commit_seq);
+    drop(metadata);
+    let visible = AppendVisiblePublish {
+        record_id: AppendPublishTicketId::from_raw(900),
+        commit_seq,
+        keyspace_id,
+        file_id,
+        base_writer_epoch,
+        writer_epoch: stream.writer_epoch,
+        base_file_version: base_head.version,
+        new_file_version: FileVersion::from_raw(base_head.version.raw() + 1),
+        old_size: base_head.size,
+        new_size: ticket.range.end_exclusive().unwrap(),
+        publish_through: ticket.range.end_exclusive().unwrap(),
+        run_extents,
+    };
+    visible.validate().unwrap();
+    store
+        .durable
+        .append_append_visible_publish_journal_record(&visible)
+        .unwrap();
+    assert_eq!(native_publish_journal_commit_count(&root, 0), 0);
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(native_publish_journal_commit_count(&root, 0), 0);
+    let reopened_head = reopened
+        .metadata()
+        .get_file_head(keyspace_id, file_id)
+        .unwrap();
+    assert_eq!(reopened_head.version, visible.new_file_version);
+    assert_eq!(reopened_head.size, visible.new_size);
+    assert_eq!(reopened_head.latest_commit, visible.commit_seq);
+    assert_eq!(
+        reopened
+            .metadata()
+            .state_inner()
+            .unwrap()
+            .file_writer_epochs
+            .get(&(keyspace_id, file_id)),
+        Some(&visible.writer_epoch)
+    );
+    assert_eq!(
+        file_run_extents(&reopened.metadata(), keyspace_id, file_id),
+        visible.run_extents
+    );
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    reopened.persist_now().unwrap();
+    drop(reopened);
+
+    let reopened_again = DurableCoordinator::open(&root, cfg).unwrap();
+    let reopened_again_head = reopened_again
+        .metadata()
+        .get_file_head(keyspace_id, file_id)
+        .unwrap();
+    assert_eq!(reopened_again_head.version, visible.new_file_version);
+    assert_eq!(reopened_again_head.size, visible.new_size);
+    assert_eq!(reopened_again_head.latest_commit, visible.commit_seq);
+    let mut bytes_after_fold = vec![0; payload.len()];
+    reopened_again
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes_after_fold,
+        )
+        .unwrap();
+    assert_eq!(bytes_after_fold, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_visible_publish_replays_unpersisted_writer_epoch_skip() {
+    let root = durable_temp_dir("append-visible-publish-writer-epoch-skip");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let stale = store.open_append_stream(keyspace_id, file_id).unwrap();
+    assert_eq!(stale.writer_epoch, WriterEpoch::from_raw(1));
+    let fresh = store.open_append_stream(keyspace_id, file_id).unwrap();
+    assert_eq!(fresh.writer_epoch, WriterEpoch::from_raw(2));
+    let payload = repeated_blocks(1, 55);
+    store
+        .append_stream(&fresh, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .publish_append_stream(&fresh, payload.len() as u64)
+        .unwrap();
+    assert_eq!(native_publish_journal_commit_count(&root, 0), 0);
+    let records = load_append_visible_publish_journal_records(
+        &append_visible_publish_journal_path_for_test(&root, keyspace_id, file_id),
+    )
+    .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].base_writer_epoch, WriterEpoch::from_raw(0));
+    assert_eq!(records[0].writer_epoch, WriterEpoch::from_raw(2));
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    assert_eq!(
+        reopened
+            .metadata()
+            .state_inner()
+            .unwrap()
+            .file_writer_epochs
+            .get(&(keyspace_id, file_id)),
+        Some(&WriterEpoch::from_raw(2))
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -14866,6 +15207,7 @@ fn metadata_file_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
         "metadata.sqlite",
         "metadata.sqlite-wal",
         "native-publish.journal",
+        "append-visible-publish.journal",
     ]
     .into_iter()
     .filter_map(|file_name| {
@@ -14882,6 +15224,7 @@ fn restore_metadata_file_snapshot(root: &Path, snapshot: &[(String, Vec<u8>)]) {
         "metadata.sqlite-wal",
         "metadata.sqlite-shm",
         "native-publish.journal",
+        "append-visible-publish.journal",
     ] {
         let _ = fs::remove_file(root.join(file_name));
     }
@@ -14894,6 +15237,28 @@ fn native_publish_journal_commit_count(root: &Path, next_commit_seq: u64) -> usi
     load_native_publish_journal_commits_since(&root.join("native-publish.journal"), next_commit_seq)
         .unwrap()
         .len()
+}
+
+fn append_visible_publish_journal_path_for_test(
+    root: &Path,
+    _keyspace_id: KeyspaceId,
+    _file_id: FileId,
+) -> PathBuf {
+    root.join("append-visible-publish.journal")
+}
+
+fn append_visible_publish_journal_count(
+    root: &Path,
+    keyspace_id: KeyspaceId,
+    file_id: FileId,
+) -> usize {
+    load_append_visible_publish_journal_records(&append_visible_publish_journal_path_for_test(
+        root,
+        keyspace_id,
+        file_id,
+    ))
+    .unwrap()
+    .len()
 }
 
 fn device_segment_ids(

@@ -758,6 +758,46 @@ impl DurableCodec for RunBackedFileExtent {
     }
 }
 
+impl DurableCodec for AppendVisiblePublish {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        1u8.encode(out)?;
+        self.record_id.encode(out)?;
+        self.commit_seq.encode(out)?;
+        self.keyspace_id.encode(out)?;
+        self.file_id.encode(out)?;
+        self.base_writer_epoch.encode(out)?;
+        self.writer_epoch.encode(out)?;
+        self.base_file_version.encode(out)?;
+        self.new_file_version.encode(out)?;
+        self.old_size.encode(out)?;
+        self.new_size.encode(out)?;
+        self.publish_through.encode(out)?;
+        self.run_extents.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => Ok(Self {
+                record_id: AppendPublishTicketId::decode(input)?,
+                commit_seq: CommitSeq::decode(input)?,
+                keyspace_id: KeyspaceId::decode(input)?,
+                file_id: FileId::decode(input)?,
+                base_writer_epoch: WriterEpoch::decode(input)?,
+                writer_epoch: WriterEpoch::decode(input)?,
+                base_file_version: FileVersion::decode(input)?,
+                new_file_version: FileVersion::decode(input)?,
+                old_size: u64::decode(input)?,
+                new_size: u64::decode(input)?,
+                publish_through: u64::decode(input)?,
+                run_extents: Vec::<RunBackedFileExtent>::decode(input)?,
+            }),
+            _ => Err(durable_codec_error(
+                "invalid append visible publish version",
+            )),
+        }
+    }
+}
+
 impl DurableCodec for MetadataNodeKind {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         match self {
@@ -2114,6 +2154,7 @@ impl DurableCodec for AppendStreamState {
         self.keyspace_id.encode(out)?;
         self.file_id.encode(out)?;
         self.stream_id.encode(out)?;
+        self.base_writer_epoch.encode(out)?;
         self.writer_epoch.encode(out)?;
         self.base_version.encode(out)?;
         self.visible_base_size.encode(out)?;
@@ -2129,6 +2170,7 @@ impl DurableCodec for AppendStreamState {
             keyspace_id: KeyspaceId::decode(input)?,
             file_id: FileId::decode(input)?,
             stream_id: AppendStreamId::decode(input)?,
+            base_writer_epoch: WriterEpoch::decode(input)?,
             writer_epoch: WriterEpoch::decode(input)?,
             base_version: FileVersion::decode(input)?,
             visible_base_size: u64::decode(input)?,
