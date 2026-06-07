@@ -166,6 +166,119 @@ pub(super) fn load_block_delta_commits_since(
     Ok(out)
 }
 
+pub(super) fn effective_cursor_from_native_metadata_delta_commits(
+    materialized: &DurableExportCursor,
+    commits: &[NativeMetadataDeltaCommit],
+) -> Result<DurableExportCursor> {
+    let mut cursor = materialized.clone();
+    for commit in commits {
+        if commit.delta.cursor.next_commit_seq <= cursor.next_commit_seq {
+            continue;
+        }
+        if commit.delta.cursor.config != materialized.config {
+            return Err(StorageError::corrupt(
+                "native metadata delta config disagrees with store cursor",
+            ));
+        }
+        cursor = commit.delta.cursor.clone();
+    }
+    Ok(cursor)
+}
+
+pub(super) fn apply_native_metadata_delta_commits(
+    metadata: &mut MetadataInner,
+    materialized: &DurableExportCursor,
+    commits: &[NativeMetadataDeltaCommit],
+) -> Result<DurableExportCursor> {
+    let mut cursor = materialized.clone();
+    for commit in commits {
+        if commit.delta.cursor.config != materialized.config {
+            return Err(StorageError::corrupt(
+                "native metadata delta config disagrees with store cursor",
+            ));
+        }
+        if commit.delta.cursor.next_commit_seq <= cursor.next_commit_seq {
+            continue;
+        }
+        let first_commit = commit
+            .delta
+            .keyspace_commits
+            .iter()
+            .map(|record| record.commit_seq.raw())
+            .chain(commit.delta.file_commits.iter().map(|record| record.commit_seq.raw()))
+            .min()
+            .ok_or_else(|| StorageError::corrupt("native metadata delta has no timeline rows"))?;
+        if first_commit != cursor.next_commit_seq {
+            return Err(StorageError::corrupt(
+                "native metadata delta replay is not contiguous",
+            ));
+        }
+        metadata
+            .keyspace_heads
+            .extend(commit.delta.keyspace_heads.iter().map(|(key, value)| (*key, value.clone())));
+        metadata.keyspace_roots.extend(
+            commit
+                .delta
+                .keyspace_roots
+                .iter()
+                .map(|(key, value)| (*key, value.clone())),
+        );
+        metadata.keyspace_catalog_shards.extend(
+            commit
+                .delta
+                .keyspace_catalog_shards
+                .iter()
+                .map(|(key, value)| (*key, value.clone())),
+        );
+        metadata
+            .file_writer_epochs
+            .extend(commit.delta.file_writer_epochs.iter().copied());
+        metadata
+            .append_streams
+            .extend(commit.delta.append_streams.iter().map(|stream| (stream.stream_id, stream.clone())));
+        metadata.metadata_nodes.extend(
+            commit
+                .delta
+                .metadata_nodes
+                .iter()
+                .map(|(key, value)| (*key, value.clone())),
+        );
+        metadata.commit_groups.extend(
+            commit
+                .delta
+                .commit_groups
+                .iter()
+                .map(|(key, value)| (*key, value.clone())),
+        );
+        metadata
+            .keyspace_commits
+            .extend(commit.delta.keyspace_commits.iter().cloned());
+        metadata
+            .file_commits
+            .extend(commit.delta.file_commits.iter().cloned());
+        cursor = commit.delta.cursor.clone();
+    }
+    metadata.next_device_id = metadata.next_device_id.max(cursor.next_device_id);
+    metadata.next_keyspace_id = metadata.next_keyspace_id.max(cursor.next_keyspace_id);
+    metadata.next_file_id = metadata.next_file_id.max(cursor.next_file_id);
+    metadata.next_metadata_node_id = metadata
+        .next_metadata_node_id
+        .max(cursor.next_metadata_node_id);
+    metadata.next_keyspace_root_id = metadata
+        .next_keyspace_root_id
+        .max(cursor.next_keyspace_root_id);
+    metadata.next_keyspace_catalog_shard_id = metadata
+        .next_keyspace_catalog_shard_id
+        .max(cursor.next_keyspace_catalog_shard_id);
+    metadata.next_commit_group_id = metadata
+        .next_commit_group_id
+        .max(cursor.next_commit_group_id);
+    metadata.next_commit_seq = metadata.next_commit_seq.max(cursor.next_commit_seq);
+    metadata.next_checkpoint_id = metadata.next_checkpoint_id.max(cursor.next_checkpoint_id);
+    metadata.next_gc_epoch = metadata.next_gc_epoch.max(cursor.next_gc_epoch);
+    Ok(cursor)
+}
+
 pub(super) fn load_device_specs(conn: &Connection) -> Result<BTreeMap<DeviceId, crate::api::DeviceSpec>> {
     let mut out = BTreeMap::new();
     for (key, payload) in load_payload_rows(conn, "device_specs", "device_id", "device_id")? {

@@ -145,7 +145,8 @@ pub(super) fn persist_row_native_state(
             .map(|(id, epoch)| (id.raw().to_string(), *epoch))
             .collect(),
     )?;
-    persist_export_cursor(tx, &DurableExportCursor::from_state(image))
+    let cursor = DurableExportCursor::from_state(image);
+    persist_export_cursor(tx, &cursor)
 }
 
 pub(super) fn stream_prefix_persist_cursor(

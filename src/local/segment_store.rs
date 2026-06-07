@@ -14,7 +14,7 @@ pub(super) struct DurableSegmentPayload {
 }
 
 #[derive(Debug)]
-pub(super) struct DurableAppendRunChunkPayload {
+pub(super) struct DurableAppendRunChunkPayload<'a> {
     run_id: AppendRunId,
     storage_node: StorageNodeId,
     stream_id: AppendStreamId,
@@ -23,7 +23,8 @@ pub(super) struct DurableAppendRunChunkPayload {
     file_id: FileId,
     file_offset_start: u64,
     payload_integrity: PayloadIntegrity,
-    chunks: Vec<Arc<[u8]>>,
+    chunks: Vec<&'a [u8]>,
+    background_sync_step_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

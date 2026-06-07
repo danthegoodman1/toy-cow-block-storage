@@ -494,10 +494,13 @@ impl AppendStreamState {
             if end <= expected {
                 continue;
             }
-            if record.offset != expected {
+            if record.offset > expected {
                 break;
             }
-            let record_payload_bytes = record.payload_bytes();
+            let Some(slice) = record.slice(expected, end)? else {
+                continue;
+            };
+            let record_payload_bytes = slice.payload_bytes();
             let would_exceed = !selected.is_empty()
                 && payload_bytes
                     .checked_add(record_payload_bytes)
@@ -510,7 +513,7 @@ impl AppendStreamState {
                 .checked_add(record_payload_bytes)
                 .ok_or_else(|| StorageError::invalid_argument("append batch bytes overflow"))?;
             expected = end;
-            selected.push(record.clone());
+            selected.push(slice);
         }
         Ok(AppendStreamPrefixPersistBatch {
             records: selected,
@@ -1169,6 +1172,36 @@ impl InMemoryMetadataPlane {
         Ok(Some(contiguous))
     }
 
+    fn append_stream_private_records_from_durable_through(
+        &self,
+        stream: &AppendStream,
+        end: u64,
+    ) -> Result<(u64, Vec<AppendStreamRunRecord>)> {
+        let inner = lock(&self.inner)?;
+        let state = inner
+            .append_streams
+            .get(&stream.stream_id)
+            .ok_or_else(|| StorageError::conflict("stale append stream"))?;
+        state.validate_token(stream)?;
+        if end <= state.durable_through {
+            return Ok((state.durable_through, Vec::new()));
+        }
+        if end > state.accepted_tail {
+            return Err(StorageError::conflict(
+                "append private sync target exceeds accepted stream bytes",
+            ));
+        }
+        if end > state.contiguous_record_tail_from(state.durable_through)? {
+            return Err(StorageError::conflict(
+                "append private sync target exceeds contiguous stream records",
+            ));
+        }
+        Ok((
+            state.durable_through,
+            state.publish_records(state.durable_through, end)?,
+        ))
+    }
+
     pub fn submit_append_publish(
         &self,
         stream: &AppendStream,
@@ -1422,9 +1455,10 @@ impl InMemoryMetadataPlane {
             .get_mut(&stream.stream_id)
             .ok_or_else(|| StorageError::conflict("stale append stream"))?;
         state.validate_token(stream)?;
-        if durable_through < state.durable_through
-            || durable_through > state.contiguous_record_tail_from(state.durable_through)?
-        {
+        if durable_through <= state.durable_through {
+            return Ok(state.durable_through);
+        }
+        if durable_through > state.contiguous_record_tail_from(state.durable_through)? {
             return Err(StorageError::conflict(
                 "append stream durable high-water is not valid",
             ));

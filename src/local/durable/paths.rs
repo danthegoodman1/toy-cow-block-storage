@@ -2,6 +2,7 @@
 pub(super) struct DurableStorePaths {
     metadata: PathBuf,
     data_dir: PathBuf,
+    native_publish_journal: PathBuf,
 }
 
 impl DurableStorePaths {
@@ -14,6 +15,7 @@ impl DurableStorePaths {
         Ok(Self {
             metadata: root.join("metadata.sqlite"),
             data_dir,
+            native_publish_journal: root.join("native-publish.journal"),
         })
     }
 }

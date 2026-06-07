@@ -409,7 +409,7 @@ options:\n\
   --data-log-file-sync-fanout N            concurrent durable data-log file syncs, default: 4\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
-  --stream-auto-persist-mib N              durable provider internal stream dirty-tail threshold\n\
+  --stream-auto-persist-mib N              durable stream payload dirty-tail sync threshold\n\
   --block-batch-ops N                      override writes per block batch workload\n\
   --block-batch-bytes N                    override bytes per write inside block batch workloads\n\
   --block-batch-overlap sequential|random|overwrite-hotset\n\

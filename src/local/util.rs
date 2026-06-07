@@ -9,6 +9,17 @@ pub(super) fn wait_on_cvar<'a, T>(cvar: &Condvar, guard: MutexGuard<'a, T>) -> R
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
 }
 
+pub(super) fn wait_timeout_on_cvar<'a, T>(
+    cvar: &Condvar,
+    guard: MutexGuard<'a, T>,
+    timeout: Duration,
+) -> Result<(MutexGuard<'a, T>, bool)> {
+    let (guard, timeout) = cvar
+        .wait_timeout(guard, timeout)
+        .map_err(|_| StorageError::unavailable("local provider lock poisoned"))?;
+    Ok((guard, timeout.timed_out()))
+}
+
 pub(super) fn server_lock_stripes() -> Vec<Mutex<()>> {
     (0..SERVER_LOCK_STRIPES).map(|_| Mutex::new(())).collect()
 }
@@ -87,7 +98,7 @@ pub(super) fn data_log_checksum(bytes: &[u8]) -> u64 {
     u64::from(crc32c::crc32c(bytes))
 }
 
-pub(super) fn data_log_checksum_chunks(chunks: &[Arc<[u8]>]) -> u64 {
+pub(super) fn data_log_checksum_chunks(chunks: &[&[u8]]) -> u64 {
     let mut checksum = 0_u32;
     for chunk in chunks {
         checksum = crc32c::crc32c_append(checksum, chunk);
@@ -104,7 +115,7 @@ pub(super) fn segment_payload_integrity(mode: PayloadIntegrity, bytes: &[u8]) ->
 
 pub(super) fn segment_payload_integrity_chunks(
     mode: PayloadIntegrity,
-    chunks: &[Arc<[u8]>],
+    chunks: &[&[u8]],
 ) -> SegmentPayloadIntegrity {
     match mode {
         PayloadIntegrity::Verified => {

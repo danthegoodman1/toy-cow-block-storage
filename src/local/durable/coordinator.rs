@@ -1,6 +1,12 @@
 /// Durable in-process coordinator using SQLite metadata and node-scoped rolled
 /// data logs.
-const APPEND_PUBLISH_BATCH_COALESCE_DELAY: Duration = Duration::from_millis(1);
+// Demand-driven group commit lets barrier-like append publishes share one
+// durable metadata journal sync without imposing the full window on lone
+// publishes.
+const APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY: Duration = Duration::from_millis(1);
+const APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY: Duration = Duration::from_millis(5);
+const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DurableCoordinator {
@@ -16,7 +22,6 @@ pub struct DurableCoordinator {
     persist_coordinator: Arc<PersistCoordinator>,
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
     append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
-    stream_auto_persist_worker: Option<Arc<StreamAutoPersistWorker>>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
@@ -64,175 +69,6 @@ impl AppendPublishBatchDiagnostics {
                 .saturating_add(profile.root_sqlite_commit_nanos),
             catalog_manifest_publish_nanos: profile.node_catalog_publish_nanos,
         }
-    }
-}
-
-#[derive(Debug)]
-struct StreamAutoPersistWorkerState {
-    shutdown: bool,
-    requests: BTreeMap<AppendStreamId, (AppendStream, u64)>,
-}
-
-struct StreamAutoPersistWorker {
-    state: Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl std::fmt::Debug for StreamAutoPersistWorker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamAutoPersistWorker")
-            .finish_non_exhaustive()
-    }
-}
-
-impl StreamAutoPersistWorker {
-    fn start(store: DurableCoordinator) -> Result<Arc<Self>> {
-        let state = Arc::new((
-            Mutex::new(StreamAutoPersistWorkerState {
-                shutdown: false,
-                requests: BTreeMap::new(),
-            }),
-            Condvar::new(),
-        ));
-        let worker_state = Arc::clone(&state);
-        let handle = thread::Builder::new()
-            .name("toy-cow-stream-auto-persist".to_string())
-            .spawn(move || stream_auto_persist_worker_loop(store, worker_state))
-            .map_err(|error| {
-                StorageError::unavailable(format!(
-                    "failed to start stream auto-persist worker: {error}"
-                ))
-            })?;
-        Ok(Arc::new(Self {
-            state,
-            handle: Mutex::new(Some(handle)),
-        }))
-    }
-
-    fn request(&self, stream: &AppendStream, target: u64) {
-        let (lock_state, cvar) = &*self.state;
-        if let Ok(mut state) = lock_state.lock() {
-            state
-                .requests
-                .entry(stream.stream_id)
-                .and_modify(|(_, existing)| *existing = (*existing).max(target))
-                .or_insert_with(|| (stream.clone(), target));
-            cvar.notify_one();
-        }
-    }
-
-    fn notify(&self) {
-        let (_, cvar) = &*self.state;
-        cvar.notify_one();
-    }
-
-    fn shutdown(&self) {
-        let (lock_state, cvar) = &*self.state;
-        if let Ok(mut state) = lock_state.lock() {
-            state.shutdown = true;
-            cvar.notify_one();
-        }
-        if let Ok(mut handle) = self.handle.lock()
-            && let Some(handle) = handle.take()
-        {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for StreamAutoPersistWorker {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-fn stream_auto_persist_worker_loop(
-    store: DurableCoordinator,
-    state: Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
-) {
-    loop {
-        let requests = {
-            let (lock_state, cvar) = &*state;
-            let mut guard = match lock_state.lock() {
-                Ok(guard) => guard,
-                Err(_) => return,
-            };
-            loop {
-                while !guard.shutdown && guard.requests.is_empty() {
-                    guard = match cvar.wait(guard) {
-                        Ok(guard) => guard,
-                        Err(_) => return,
-                    };
-                }
-                if guard.shutdown {
-                    return;
-                }
-                if let Some(requests) =
-                    stream_auto_persist_drain_ready_requests(&store, &mut guard)
-                {
-                    break requests;
-                }
-                guard = match cvar.wait(guard) {
-                    Ok(guard) => guard,
-                    Err(_) => return,
-                };
-            }
-        };
-        if store
-            .persist_append_stream_prefix_background_batch(&requests)
-            .unwrap_or(false)
-        {
-            stream_auto_persist_requeue_unreached(&store, &state, &requests);
-        }
-    }
-}
-
-fn stream_auto_persist_drain_ready_requests(
-    store: &DurableCoordinator,
-    state: &mut StreamAutoPersistWorkerState,
-) -> Option<Vec<(AppendStream, u64)>> {
-    if state.shutdown || state.requests.is_empty() || store.has_append_publish_persist_demand() {
-        return None;
-    }
-    let requests = state.requests.values().cloned().collect::<Vec<_>>();
-    state.requests.clear();
-    Some(requests)
-}
-
-fn stream_auto_persist_requeue_unreached(
-    store: &DurableCoordinator,
-    state: &Arc<(Mutex<StreamAutoPersistWorkerState>, Condvar)>,
-    requests: &[(AppendStream, u64)],
-) {
-    let remaining = requests
-        .iter()
-        .filter_map(|(stream, target)| {
-            match store
-                .local
-                .metadata
-                .append_stream_durable_high_water_if_reached(stream, *target)
-            {
-                Ok(Some(_)) | Err(_) => None,
-                Ok(None) => Some((stream.clone(), *target)),
-            }
-        })
-        .collect::<Vec<_>>();
-    if remaining.is_empty() {
-        return;
-    }
-    let (lock_state, cvar) = &**state;
-    if let Ok(mut guard) = lock_state.lock() {
-        if guard.shutdown {
-            return;
-        }
-        for (stream, target) in remaining {
-            guard
-                .requests
-                .entry(stream.stream_id)
-                .and_modify(|(_, existing)| *existing = (*existing).max(target))
-                .or_insert((stream, target));
-        }
-        cvar.notify_one();
     }
 }
 
@@ -331,7 +167,6 @@ impl DurableCoordinator {
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
             append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
-            stream_auto_persist_worker: None,
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
@@ -340,7 +175,6 @@ impl DurableCoordinator {
             maintenance_worker: None,
         };
         store.start_maintenance_worker_if_needed()?;
-        store.start_stream_auto_persist_worker_if_needed()?;
         Ok(store)
     }
 
@@ -363,39 +197,6 @@ impl DurableCoordinator {
 
     fn startup_maintenance_has_work(&self) -> Result<bool> {
         self.maintenance_plan_has_commands(self.maintenance_policy)
-    }
-
-    fn start_stream_auto_persist_worker_if_needed(&mut self) -> Result<()> {
-        if self.local.config().stream_auto_persist_bytes.is_some() {
-            self.stream_auto_persist_worker = Some(StreamAutoPersistWorker::start(self.worker_view())?);
-        }
-        Ok(())
-    }
-
-    fn worker_view(&self) -> Self {
-        Self {
-            local: self.local.clone(),
-            durable: self.durable.clone(),
-            persisted_segments: Arc::clone(&self.persisted_segments),
-            pending_block_deltas: Arc::clone(&self.pending_block_deltas),
-            pending_data_log_append: Arc::clone(&self.pending_data_log_append),
-            block_delta_staging_lock: Arc::clone(&self.block_delta_staging_lock),
-            block_delta_prestage: Arc::clone(&self.block_delta_prestage),
-            stream_append_lanes: Arc::clone(&self.stream_append_lanes),
-            persist_lock: Arc::clone(&self.persist_lock),
-            persist_coordinator: Arc::clone(&self.persist_coordinator),
-            stream_prefix_persist_coordinator: Arc::clone(&self.stream_prefix_persist_coordinator),
-            append_publish_persist_coordinator: Arc::clone(
-                &self.append_publish_persist_coordinator,
-            ),
-            stream_auto_persist_worker: None,
-            persist_profiler: Arc::clone(&self.persist_profiler),
-            append_publish_wait_profiler: Arc::clone(&self.append_publish_wait_profiler),
-            read_profiler: Arc::clone(&self.read_profiler),
-            maintenance_policy: self.maintenance_policy,
-            maintenance_cursor: Arc::clone(&self.maintenance_cursor),
-            maintenance_worker: None,
-        }
     }
 
     fn maintenance_plan_has_commands(&self, policy: MaintenancePolicy) -> Result<bool> {
@@ -479,16 +280,72 @@ impl DurableCoordinator {
         let _ = self.record_append_publish_wait_profile(profile);
     }
 
-    fn has_append_publish_persist_demand(&self) -> bool {
-        lock(&self.append_publish_persist_coordinator.inner)
-            .map(|state| state.in_flight || !state.requests.is_empty())
-            .unwrap_or(true)
+    fn maybe_auto_persist_append_stream(
+        &self,
+        stream: &AppendStream,
+        threshold: u64,
+    ) -> Result<()> {
+        let Ok(Some(target)) = self
+            .local
+            .metadata
+            .append_stream_auto_persist_target(stream, threshold)
+        else {
+            return Ok(());
+        };
+        if self.sync_append_stream_payload_prefix(stream, target).is_ok() {
+            let _ = self
+                .local
+                .metadata
+                .mark_append_stream_durable_through(stream, target);
+        } else {
+            let _ = self.request_append_stream_payload_sync(stream, target);
+        }
+        Ok(())
     }
 
-    fn notify_stream_auto_persist_worker(&self) {
-        if let Some(worker) = &self.stream_auto_persist_worker {
-            worker.notify();
+    fn pending_append_for_stream_payload_prefix(
+        &self,
+        stream: &AppendStream,
+        target: u64,
+    ) -> Result<PendingDataLogAppend> {
+        let (_, records) = self
+            .local
+            .metadata
+            .append_stream_private_records_from_durable_through(stream, target)?;
+        if records.is_empty() {
+            return Ok(PendingDataLogAppend::default());
         }
+        let log_refs = records
+            .iter()
+            .map(AppendStreamRunRecord::log_ref)
+            .collect::<BTreeSet<_>>();
+        let Some(lane) = self.existing_stream_append_lane(stream.stream_id)? else {
+            return self
+                .durable
+                .pending_append_run_manifests_for_log_refs(&log_refs, None);
+        };
+        let pending_stream = lock(&lane.pending)?;
+        self.durable
+            .pending_append_run_manifests_for_log_refs(&log_refs, Some(&pending_stream))
+    }
+
+    fn request_append_stream_payload_sync(
+        &self,
+        stream: &AppendStream,
+        target: u64,
+    ) -> Result<()> {
+        let pending = self.pending_append_for_stream_payload_prefix(stream, target)?;
+        self.durable.request_pending_append_payload_sync(&pending)
+    }
+
+    fn sync_append_stream_payload_prefix(
+        &self,
+        stream: &AppendStream,
+        target: u64,
+    ) -> Result<()> {
+        let pending = self.pending_append_for_stream_payload_prefix(stream, target)?;
+        self.durable.sync_pending_append_payload(&pending)?;
+        Ok(())
     }
 
     pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
@@ -1142,47 +999,6 @@ impl DurableCoordinator {
         Ok(())
     }
 
-    fn persist_append_stream_prefix_background_batch(
-        &self,
-        requests: &[(AppendStream, u64)],
-    ) -> Result<bool> {
-        if requests.is_empty() {
-            return Ok(false);
-        }
-        let snapshot = {
-            let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
-            if state.in_flight {
-                return Ok(false);
-            }
-            for (stream, target) in requests {
-                state.add_request(stream, *target);
-            }
-            state.in_flight = true;
-            state.snapshot_requests()
-        };
-
-        let result = self.persist_one_append_stream_request_batch(&snapshot);
-
-        let mut state = lock(&self.stream_prefix_persist_coordinator.inner)?;
-        state.in_flight = false;
-        state.generation = state.generation.saturating_add(1);
-        for (stream, _) in requests {
-            state.release_request(stream.stream_id);
-        }
-        match result {
-            Ok(made_progress) => {
-                state.last_error = None;
-                self.stream_prefix_persist_coordinator.cvar.notify_all();
-                Ok(made_progress)
-            }
-            Err(error) => {
-                state.last_error = Some((state.generation, error.clone()));
-                self.stream_prefix_persist_coordinator.cvar.notify_all();
-                Err(error)
-            }
-        }
-    }
-
     fn persist_append_stream_batches_until(&self, requests: &[(AppendStream, u64)]) -> Result<()> {
         let mut made_progress = false;
         for _ in 0..MAX_STREAM_PREFIX_PERSIST_GROUPS_PER_RUN {
@@ -1476,7 +1292,7 @@ impl DurableCoordinator {
     }
 
     fn append_publish_requires_full_persist_before_plan(&self) -> Result<bool> {
-        let Some(previous_cursor) = self.durable.export_cursor()? else {
+        let Some(previous_cursor) = self.durable.effective_export_cursor()? else {
             return Ok(true);
         };
         if !lock(&self.pending_data_log_append)?.is_empty() || self.has_unfolded_block_deltas()? {
@@ -1783,7 +1599,7 @@ impl DurableCoordinator {
                 if self.append_publish_requires_full_persist_before_plan()? {
                     return Ok(BatchStep::NeedsFullPersist);
                 }
-                let mut cursor = self.durable.export_cursor()?.ok_or_else(|| {
+                let mut cursor = self.durable.effective_export_cursor()?.ok_or_else(|| {
                     StorageError::conflict("prepared append publish requires durable cursor")
                 })?;
                 let mut draft_keyspace_heads = BTreeMap::new();
@@ -1881,6 +1697,67 @@ impl DurableCoordinator {
             tickets.entry(ticket.ticket_id).or_insert(ticket);
         }
         Ok(tickets.into_values().collect())
+    }
+
+    fn append_publish_batch_demand(
+        &self,
+        state: &AppendPublishPersistCoordinatorState,
+    ) -> Result<usize> {
+        Ok(state
+            .requests
+            .len()
+            .max(self.local.metadata.pending_append_publish_tickets()?.len()))
+    }
+
+    fn coalesce_append_publish_waiters(
+        &self,
+        mut state: MutexGuard<'_, AppendPublishPersistCoordinatorState>,
+        profile: &mut AppendPublishWaitProfile,
+    ) -> Result<Vec<AppendPublishTicket>> {
+        let started = Instant::now();
+        let mut demand = self.append_publish_batch_demand(&state)?;
+        let mut saw_peer = demand > 1;
+        loop {
+            let elapsed = started.elapsed();
+            if saw_peer && elapsed >= APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY {
+                break;
+            }
+            let remaining = APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY.saturating_sub(elapsed);
+            let delay = if saw_peer {
+                APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY.min(remaining)
+            } else {
+                APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY
+            };
+            if delay.is_zero() {
+                break;
+            }
+
+            let wait_started = Instant::now();
+            profile.cvar_waits = profile.cvar_waits.saturating_add(1);
+            let (next_state, timed_out) = wait_timeout_on_cvar(
+                &self.append_publish_persist_coordinator.cvar,
+                state,
+                delay,
+            )?;
+            state = next_state;
+            profile.coordinator_wait_nanos = profile
+                .coordinator_wait_nanos
+                .saturating_add(duration_nanos_u64(wait_started.elapsed()));
+
+            let next_demand = self.append_publish_batch_demand(&state)?;
+            if next_demand > demand {
+                demand = next_demand;
+                saw_peer = saw_peer || demand > 1;
+                continue;
+            }
+            if timed_out || !saw_peer {
+                break;
+            }
+        }
+
+        let waiter_tickets = state.requests.values().cloned().collect::<Vec<_>>();
+        drop(state);
+        self.append_publish_ticket_batch(waiter_tickets)
     }
 
     /// Return the maintenance policy configured for this store.
@@ -2382,6 +2259,28 @@ impl DurableCoordinator {
         Ok(())
     }
 
+    fn append_stream_payload_chunks<'a>(&self, data: &'a [u8]) -> Vec<&'a [u8]> {
+        if self.local.config().stream_auto_persist_bytes.is_none()
+            || data.len() <= APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES
+        {
+            return vec![data];
+        }
+        data.chunks(APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES).collect()
+    }
+
+    fn append_stream_background_sync_step_bytes(&self, data_len: usize) -> Option<u64> {
+        let threshold = self.local.config().stream_auto_persist_bytes?;
+        if data_len <= APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES {
+            return None;
+        }
+        Some(
+            threshold
+                .saturating_div(4)
+                .max(usize_to_u64(APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES))
+                .min(APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES),
+        )
+    }
+
     pub fn append_stream_with_integrity(
         &self,
         stream: &AppendStream,
@@ -2405,6 +2304,7 @@ impl DurableCoordinator {
                     crate::api::WriteDurability::Acknowledged,
                 )
                 .and_then(|prepared| {
+                    let chunks = self.append_stream_payload_chunks(data);
                     let payload = DurableAppendRunChunkPayload {
                         run_id: prepared.run_id,
                         storage_node: prepared.storage_node,
@@ -2414,7 +2314,9 @@ impl DurableCoordinator {
                         file_id: prepared.stream.file_id,
                         file_offset_start: prepared.range.offset,
                         payload_integrity,
-                        chunks: vec![Arc::from(data)],
+                        chunks,
+                        background_sync_step_bytes: self
+                            .append_stream_background_sync_step_bytes(data.len()),
                     };
                     let pending_base = lock(&lane.pending)?.clone();
                     let (run, append, _) = self
@@ -2438,14 +2340,8 @@ impl DurableCoordinator {
         let ticket = result?;
         if flushed {
             self.persist_append_stream(stream)?;
-        } else if let Some(threshold) = self.local.config().stream_auto_persist_bytes
-            && let Some(target) = self
-                .local
-                .metadata
-                .append_stream_auto_persist_target(stream, threshold)?
-            && let Some(worker) = &self.stream_auto_persist_worker
-        {
-            worker.request(stream, target);
+        } else if let Some(threshold) = self.local.config().stream_auto_persist_bytes {
+            self.maybe_auto_persist_append_stream(stream, threshold)?;
         }
         Ok(ticket)
     }
@@ -2455,7 +2351,9 @@ impl DurableCoordinator {
         stream: &AppendStream,
         publish_through: u64,
     ) -> Result<AppendPublishTicket> {
-        self.local.submit_append_publish(stream, publish_through)
+        let ticket = self.local.submit_append_publish(stream, publish_through)?;
+        self.append_publish_persist_coordinator.cvar.notify_all();
+        Ok(ticket)
     }
 
     pub fn wait_append_publish(
@@ -2491,7 +2389,6 @@ impl DurableCoordinator {
                     && error_generation > observed_generation
                 {
                     state.requests.remove(&ticket.ticket_id);
-                    self.notify_stream_auto_persist_worker();
                     self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }
@@ -2527,7 +2424,6 @@ impl DurableCoordinator {
                             .coordinator_lock_wait_nanos
                             .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                         state.requests.remove(&ticket.ticket_id);
-                        self.notify_stream_auto_persist_worker();
                     } else {
                         profile.completed_without_register = true;
                     }
@@ -2545,6 +2441,7 @@ impl DurableCoordinator {
                     .coordinator_lock_wait_nanos
                     .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                 state.requests.insert(ticket.ticket_id, ticket.clone());
+                self.append_publish_persist_coordinator.cvar.notify_all();
                 observed_generation = state.generation;
                 registered = true;
                 profile.registered = true;
@@ -2559,7 +2456,6 @@ impl DurableCoordinator {
                 && error_generation > observed_generation
             {
                 state.requests.remove(&ticket.ticket_id);
-                self.notify_stream_auto_persist_worker();
                 self.finish_append_publish_wait_profile(profile, total_started, false);
                 return Err(error);
             }
@@ -2577,12 +2473,9 @@ impl DurableCoordinator {
                 continue;
             }
             state.in_flight = true;
-            let waiter_tickets = state.requests.values().cloned().collect::<Vec<_>>();
             profile.persist_batches_started = profile.persist_batches_started.saturating_add(1);
-            drop(state);
 
-            thread::sleep(APPEND_PUBLISH_BATCH_COALESCE_DELAY);
-            let tickets = match self.append_publish_ticket_batch(waiter_tickets) {
+            let tickets = match self.coalesce_append_publish_waiters(state, &mut profile) {
                 Ok(tickets) => tickets,
                 Err(error) => {
                     let lock_started = Instant::now();
@@ -2596,7 +2489,6 @@ impl DurableCoordinator {
                     state.last_error = Some((generation, error.clone()));
                     state.requests.remove(&ticket.ticket_id);
                     self.append_publish_persist_coordinator.cvar.notify_all();
-                    self.notify_stream_auto_persist_worker();
                     self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }
@@ -2640,7 +2532,6 @@ impl DurableCoordinator {
                 Ok(_) => {
                     state.last_error = None;
                     self.append_publish_persist_coordinator.cvar.notify_all();
-                    self.notify_stream_auto_persist_worker();
                     observed_generation = generation;
                     continue;
                 }
@@ -2648,7 +2539,6 @@ impl DurableCoordinator {
                     state.last_error = Some((generation, error.clone()));
                     state.requests.remove(&ticket.ticket_id);
                     self.append_publish_persist_coordinator.cvar.notify_all();
-                    self.notify_stream_auto_persist_worker();
                     self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }

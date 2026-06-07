@@ -3092,13 +3092,11 @@ fn durable_stream_auto_persist_keeps_private_bytes_invisible_after_reopen() {
             },
         )
         .unwrap();
-    store.enable_persist_profiling(8).unwrap();
     let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
     let payload = repeated_blocks(1, 37);
     store
         .append_stream(&stream, &payload, WriteDurability::Acknowledged)
         .unwrap();
-    store.persist_append_stream_prefix(&stream, 4096).unwrap();
 
     assert_eq!(
         store
@@ -3117,10 +3115,6 @@ fn durable_stream_auto_persist_keeps_private_bytes_invisible_after_reopen() {
             .size,
         0
     );
-    let profiles = store.drain_persist_profiles(8).unwrap();
-    assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0].stream_prefix_payload_bytes, 4096);
-    assert_eq!(profiles[0].new_segment_bytes, 4096);
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -3196,11 +3190,15 @@ fn durable_stream_auto_persist_publish_does_not_reappend_payload() {
     store
         .append_stream(&stream, &payload, WriteDurability::Acknowledged)
         .unwrap();
-    store.persist_append_stream_prefix(&stream, 4096).unwrap();
-    let auto_profiles = store.drain_persist_profiles(8).unwrap();
-    assert_eq!(auto_profiles.len(), 1);
-    assert_eq!(auto_profiles[0].new_segment_bytes, 4096);
-    assert!(auto_profiles[0].data_log_files_synced > 0);
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .append_stream_durable_high_water_if_reached(&stream, 4096)
+            .unwrap(),
+        Some(4096),
+        "dirty-tail threshold should sync private payload before publish"
+    );
 
     store.publish_append_stream(&stream, 4096).unwrap();
     let publish_profiles = store.drain_persist_profiles(8).unwrap();
@@ -3225,6 +3223,305 @@ fn durable_stream_auto_persist_publish_does_not_reappend_payload() {
         )
         .unwrap();
     assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_stream_auto_persist_syncs_payload_at_threshold_before_publish() {
+    let root = durable_temp_dir("stream-auto-persist-syncs-at-threshold");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 93);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .append_stream_durable_high_water_if_reached(&stream, 4096)
+            .unwrap(),
+        Some(4096),
+        "dirty-tail threshold should make append payload durable before publish"
+    );
+
+    store.enable_persist_profiling(8).unwrap();
+    store.publish_append_stream(&stream, 4096).unwrap();
+    let publish_profiles = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(publish_profiles.len(), 1);
+    assert_eq!(
+        publish_profiles[0].data_log_files_synced, 0,
+        "publish should not sync payload already forced durable by dirty-tail threshold"
+    );
+    assert_eq!(publish_profiles[0].data_log_sync_bytes, 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_payload_sync_skips_already_synced_log_bytes() {
+    let root = durable_temp_dir("append-payload-sync-skips-already-synced");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let payload = repeated_blocks(1, 84);
+    let append_payload = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(77),
+        storage_node: cfg.storage_node,
+        stream_id: AppendStreamId::from_raw(88),
+        writer_epoch: WriterEpoch::from_raw(3),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(5),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![payload.as_slice()],
+        background_sync_step_bytes: None,
+    };
+    let (_run, pending, _) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(append_payload, None)
+        .unwrap();
+
+    let (first, _) = store.durable.sync_pending_append_payload(&pending).unwrap();
+    assert!(first.files_synced > 0);
+    assert!(first.sync_bytes > 0);
+
+    let (second, _) = store.durable.sync_pending_append_payload(&pending).unwrap();
+    assert_eq!(
+        second.files_synced, 0,
+        "payload sync high-water should avoid re-syncing already durable append-log bytes"
+    );
+    assert_eq!(second.sync_bytes, 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_payload_chunks_start_background_sync_progress() {
+    let root = durable_temp_dir("append-payload-chunks-background-sync");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let first = repeated_blocks(1, 86);
+    let second = repeated_blocks(1, 87);
+    let append_payload = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(78),
+        storage_node: cfg.storage_node,
+        stream_id: AppendStreamId::from_raw(89),
+        writer_epoch: WriterEpoch::from_raw(3),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(5),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![first.as_slice(), second.as_slice()],
+        background_sync_step_bytes: Some(4096),
+    };
+    let (_run, pending, _) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(append_payload, None)
+        .unwrap();
+    let (log_ref, manifest) = pending.logs.iter().next().unwrap();
+    assert!(
+        store
+            .durable
+            .wait_for_synced_append_log_for_test(
+                *log_ref,
+                manifest.total_bytes,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        "multi-chunk append writes should pipeline private append-log sync"
+    );
+
+    let (sync, _) = store.durable.sync_pending_append_payload(&pending).unwrap();
+    assert_eq!(sync.files_synced, 0);
+    assert_eq!(sync.sync_bytes, 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_publish_skips_presynced_payload_without_private_persist() {
+    let root = durable_temp_dir("append-publish-skips-presynced-payload");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 85);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+
+    let records = store
+        .local
+        .metadata
+        .append_stream_publish_records(&stream, 0, payload.len() as u64)
+        .unwrap();
+    let log_refs = records
+        .iter()
+        .map(AppendStreamRunRecord::log_ref)
+        .collect::<BTreeSet<_>>();
+    let pending = store
+        .durable
+        .pending_append_run_manifests_for_log_refs(&log_refs, None)
+        .unwrap();
+    let (presync, _) = store.durable.sync_pending_append_payload(&pending).unwrap();
+    assert!(presync.files_synced > 0);
+
+    store.enable_persist_profiling(8).unwrap();
+    store
+        .publish_append_stream(&stream, payload.len() as u64)
+        .unwrap();
+    let publish_profiles = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(publish_profiles.len(), 1);
+    assert_eq!(
+        publish_profiles[0].data_log_files_synced, 0,
+        "publish should trust process-local pre-synced append payload high-water"
+    );
+    assert_eq!(publish_profiles[0].data_log_sync_bytes, 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_publish_skips_background_synced_sealed_log() {
+    let root = durable_temp_dir("append-publish-skips-background-synced-sealed-log");
+    let cfg = config();
+    let store = DurableCoordinator::open_with_data_log_policy(
+        &root,
+        cfg,
+        DurableDataLogPolicy {
+            target_data_log_bytes: 4096,
+            ..DurableDataLogPolicy::default()
+        },
+    )
+    .unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload_a = repeated_blocks(1, 86);
+    let payload_b = repeated_blocks(1, 87);
+    store
+        .append_stream(&stream, &payload_a, WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .append_stream(&stream, &payload_b, WriteDurability::Acknowledged)
+        .unwrap();
+
+    let records = store
+        .local
+        .metadata
+        .append_stream_publish_records(&stream, 0, payload_a.len() as u64)
+        .unwrap();
+    let first_log_ref = records[0].log_ref();
+    let log_refs = BTreeSet::from([first_log_ref]);
+    let pending = store
+        .durable
+        .pending_append_run_manifests_for_log_refs(&log_refs, None)
+        .unwrap();
+    let first_log_bytes = pending.logs[&first_log_ref].total_bytes;
+    assert!(
+        store
+            .durable
+            .wait_for_synced_append_log_for_test(
+                first_log_ref,
+                first_log_bytes,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        "sealed append log should be pre-synced by the background worker"
+    );
+
+    store.enable_persist_profiling(8).unwrap();
+    store
+        .publish_append_stream(&stream, payload_a.len() as u64)
+        .unwrap();
+    let publish_profiles = store.drain_persist_profiles(8).unwrap();
+    assert_eq!(publish_profiles.len(), 1);
+    assert_eq!(
+        publish_profiles[0].data_log_files_synced, 0,
+        "publish should skip payload already synced by the background worker"
+    );
+    assert_eq!(publish_profiles[0].data_log_sync_bytes, 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload_a.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload_a.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload_a);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3276,13 +3573,13 @@ fn durable_stream_auto_persist_does_not_block_append_ack() {
 }
 
 #[test]
-fn stream_auto_persist_keeps_requests_queued_while_publish_is_active() {
-    let root = durable_temp_dir("stream-auto-persist-retains-during-publish");
+fn durable_stream_auto_persist_dirty_tail_sync_bypasses_root_persist_delay() {
+    let root = durable_temp_dir("stream-auto-persist-payload-sync-backpressure");
     let cfg = LocalStoreConfig {
         stream_auto_persist_bytes: Some(4096),
         ..config()
     };
-    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
     let keyspace_id = store
         .create_keyspace(CreateKeyspaceRequest {
             name: Some("ks".to_string()),
@@ -3298,36 +3595,54 @@ fn stream_auto_persist_keeps_requests_queued_while_publish_is_active() {
             },
         )
         .unwrap();
+    store
+        .set_persist_delay_for_test(Some(Duration::from_millis(150)))
+        .unwrap();
     let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
-    let mut worker_state = StreamAutoPersistWorkerState {
-        requests: BTreeMap::from([(stream.stream_id, (stream.clone(), 4096))]),
-        shutdown: false,
+    for byte in [44, 45, 46] {
+        store
+            .append_stream(
+                &stream,
+                &repeated_blocks(1, byte),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let store = Arc::clone(&store);
+        let stream = stream.clone();
+        thread::spawn(move || {
+            let result = store.append_stream(
+                &stream,
+                &repeated_blocks(1, 47),
+                WriteDurability::Acknowledged,
+            );
+            tx.send(result.map(|_| ())).unwrap();
+        })
     };
 
-    {
-        let mut publish_state = lock(&store.append_publish_persist_coordinator.inner).unwrap();
-        publish_state.in_flight = true;
-    }
-    assert!(
-        stream_auto_persist_drain_ready_requests(&store, &mut worker_state).is_none(),
-        "active publish demand must not drain and drop background prefix requests"
+    rx.recv_timeout(Duration::from_millis(100))
+        .expect("dirty-tail payload sync should not wait for root persist delay")
+        .unwrap();
+    worker.join().unwrap();
+    store.set_persist_delay_for_test(None).unwrap();
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .append_stream_durable_high_water_if_reached(&stream, 16 * 1024)
+            .unwrap(),
+        Some(16 * 1024),
+        "dirty-tail payload sync should advance the in-memory durable high-water"
     );
-    assert_eq!(worker_state.requests.len(), 1);
-    assert_eq!(worker_state.requests[&stream.stream_id].1, 4096);
-
-    {
-        let mut publish_state = lock(&store.append_publish_persist_coordinator.inner).unwrap();
-        publish_state.in_flight = false;
-    }
-    let drained = stream_auto_persist_drain_ready_requests(&store, &mut worker_state).unwrap();
-    assert_eq!(drained, vec![(stream, 4096)]);
-    assert!(worker_state.requests.is_empty());
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn durable_stream_auto_persist_failure_does_not_poison_publish_retry() {
-    let root = durable_temp_dir("stream-auto-persist-failure-retry");
+fn durable_stream_auto_payload_sync_failure_does_not_poison_publish_retry() {
+    let root = durable_temp_dir("stream-auto-persist-payload-sync-failure-retry");
     let cfg = LocalStoreConfig {
         stream_auto_persist_bytes: Some(4096),
         ..config()
@@ -3349,31 +3664,58 @@ fn durable_stream_auto_persist_failure_does_not_poison_publish_retry() {
         )
         .unwrap();
     let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
-    store.fail_next_persist_for_test();
+    for byte in [43, 44, 45] {
+        store
+            .append_stream(
+                &stream,
+                &repeated_blocks(1, byte),
+                WriteDurability::Acknowledged,
+            )
+            .unwrap();
+    }
+    store.fail_next_append_payload_sync_for_test();
     store
         .append_stream(
             &stream,
-            &repeated_blocks(1, 43),
+            &repeated_blocks(1, 46),
             WriteDurability::Acknowledged,
         )
         .unwrap();
-    for _ in 0..100 {
-        if !store.durable.fail_next_persist.load(Ordering::SeqCst) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
     assert!(
-        !store.durable.fail_next_persist.load(Ordering::SeqCst),
-        "background auto-persist should consume the injected failure"
+        !store
+            .durable
+            .fail_next_append_payload_sync
+            .load(Ordering::SeqCst),
+        "dirty-tail sync should consume the injected failure without rejecting append"
+    );
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .append_stream_durable_high_water_if_reached(&stream, 16 * 1024)
+            .unwrap(),
+        None,
+        "failed dirty-tail sync must not mark the private prefix durable"
     );
 
-    store.publish_append_stream(&stream, 4096).unwrap();
-    let mut bytes = vec![0; 4096];
+    store.publish_append_stream(&stream, 16 * 1024).unwrap();
+    let expected = [
+        repeated_blocks(1, 43),
+        repeated_blocks(1, 44),
+        repeated_blocks(1, 45),
+        repeated_blocks(1, 46),
+    ]
+    .concat();
+    let mut bytes = vec![0; expected.len()];
     store
-        .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, 16 * 1024),
+            &mut bytes,
+        )
         .unwrap();
-    assert_eq!(bytes, repeated_blocks(1, 43));
+    assert_eq!(bytes, expected);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -5471,12 +5813,42 @@ fn durable_sqlite_persists_native_stream_run_extents_on_publish() {
         data_log_rows[0].live_bytes > 0,
         "published append-run log bytes must remain protected from compaction"
     );
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    let delta_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'native_metadata_delta_commits'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        delta_tables, 0,
+        "append publish deltas should not live in root SQLite"
+    );
+    drop(conn);
+    assert_eq!(
+        native_publish_journal_commit_count(&root, 0),
+        1,
+        "append publish should persist a compact native metadata journal record"
+    );
     drop(store);
 
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
     assert!(file_segment_ids(&reopened.metadata(), keyspace_id, file_id).is_empty());
     let reopened_run_extents = file_run_extents(&reopened.metadata(), keyspace_id, file_id);
     assert_eq!(reopened_run_extents, run_extents);
+    assert_eq!(
+        native_publish_journal_commit_count(&root, 0),
+        1,
+        "reopen should replay, not eagerly materialize, native metadata deltas"
+    );
+    reopened.persist_now().unwrap();
+    assert_eq!(
+        native_publish_journal_commit_count(&root, 0),
+        0,
+        "full native persist should fold and prune replayed native deltas"
+    );
     reopened
         .durable
         .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
@@ -5487,6 +5859,91 @@ fn durable_sqlite_persists_native_stream_run_extents_on_publish() {
         .unwrap();
     assert_eq!(bytes, repeated_blocks(1, 12));
     drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_native_publish_journal_rejects_committed_record_corruption() {
+    let root = durable_temp_dir("native-publish-journal-corruption");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        file_id,
+        &repeated_blocks(1, 13),
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+    drop(store);
+
+    let journal = root.join("native-publish.journal");
+    let mut bytes = fs::read(&journal).unwrap();
+    let last = bytes.last_mut().unwrap();
+    *last ^= 0xff;
+    fs::write(&journal, bytes).unwrap();
+
+    assert!(DurableCoordinator::open(&root, cfg).is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_native_publish_journal_ignores_incomplete_tail() {
+    let root = durable_temp_dir("native-publish-journal-incomplete-tail");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let payload = repeated_blocks(1, 14);
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        file_id,
+        &payload,
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+    drop(store);
+
+    let mut journal = OpenOptions::new()
+        .append(true)
+        .open(root.join("native-publish.journal"))
+        .unwrap();
+    journal.write_all(b"incomplete").unwrap();
+    journal.sync_data().unwrap();
+    drop(journal);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -5944,7 +6401,8 @@ fn durable_append_run_payload_writes_without_segment_placement() {
         file_id: FileId::from_raw(5),
         file_offset_start: 4096,
         payload_integrity: PayloadIntegrity::Verified,
-        chunks: vec![Arc::from(bytes.clone())],
+        chunks: vec![bytes.as_slice()],
+        background_sync_step_bytes: None,
     };
 
     let (run, pending, profile) = store
@@ -5992,6 +6450,8 @@ fn durable_append_run_payloads_share_node_owned_active_log_across_streams() {
     )
     .unwrap();
 
+    let first_bytes = repeated_blocks(1, 11);
+    let second_bytes = repeated_blocks(1, 12);
     let first = DurableAppendRunChunkPayload {
         run_id: AppendRunId::from_raw(77),
         storage_node: cfg.storage_node,
@@ -6001,7 +6461,8 @@ fn durable_append_run_payloads_share_node_owned_active_log_across_streams() {
         file_id: FileId::from_raw(5),
         file_offset_start: 0,
         payload_integrity: PayloadIntegrity::Verified,
-        chunks: vec![Arc::from(repeated_blocks(1, 11))],
+        chunks: vec![first_bytes.as_slice()],
+        background_sync_step_bytes: None,
     };
     let second = DurableAppendRunChunkPayload {
         run_id: AppendRunId::from_raw(78),
@@ -6012,7 +6473,8 @@ fn durable_append_run_payloads_share_node_owned_active_log_across_streams() {
         file_id: FileId::from_raw(6),
         file_offset_start: 0,
         payload_integrity: PayloadIntegrity::Verified,
-        chunks: vec![Arc::from(repeated_blocks(1, 12))],
+        chunks: vec![second_bytes.as_slice()],
+        background_sync_step_bytes: None,
     };
 
     let (first_run, first_pending, _) = store
@@ -6056,6 +6518,8 @@ fn durable_store_selects_append_run_manifests_and_sealed_refs() {
     .unwrap();
 
     let stream_id = AppendStreamId::from_raw(88);
+    let first_bytes = repeated_blocks(1, 11);
+    let second_bytes = repeated_blocks(1, 12);
     let first_payload = DurableAppendRunChunkPayload {
         run_id: AppendRunId::from_raw(77),
         storage_node: cfg.storage_node,
@@ -6065,7 +6529,8 @@ fn durable_store_selects_append_run_manifests_and_sealed_refs() {
         file_id: FileId::from_raw(5),
         file_offset_start: 0,
         payload_integrity: PayloadIntegrity::Verified,
-        chunks: vec![Arc::from(repeated_blocks(1, 11))],
+        chunks: vec![first_bytes.as_slice()],
+        background_sync_step_bytes: None,
     };
     let (first_run, first_pending, _) = store
         .durable
@@ -6080,7 +6545,8 @@ fn durable_store_selects_append_run_manifests_and_sealed_refs() {
         file_id: FileId::from_raw(5),
         file_offset_start: 4096,
         payload_integrity: PayloadIntegrity::Verified,
-        chunks: vec![Arc::from(repeated_blocks(1, 12))],
+        chunks: vec![second_bytes.as_slice()],
+        background_sync_step_bytes: None,
     };
     let (second_run, second_pending, _) = store
         .durable
@@ -13239,6 +13705,80 @@ fn append_stream_prefix_persist_batches_are_bounded_per_storage_node_lane() {
 }
 
 #[test]
+fn append_stream_prefix_persist_slices_coalesced_record_after_partial_durable_mark() {
+    let cfg = config();
+    let store = LocalCoordinator::with_config(cfg).unwrap();
+    let client = create_native_client(&store);
+    let keyspace_id = create_local_keyspace(&client);
+    let (file_id, _) = create_local_file(&client, keyspace_id);
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    store
+        .append_stream(
+            &stream,
+            &repeated_blocks(1, 14),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store
+        .append_stream(
+            &stream,
+            &repeated_blocks(1, 15),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store
+        .metadata()
+        .mark_append_stream_durable_through(&stream, 4096)
+        .unwrap();
+
+    let plans = store
+        .metadata()
+        .append_stream_prefix_persist_plans_for(&[(stream, 8192)], 4096)
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].batch.durable_through, 8192);
+    assert_eq!(plans[0].batch.payload_bytes, 4096);
+    assert_eq!(plans[0].batch.records.len(), 1);
+    assert_eq!(plans[0].batch.records[0].offset, 4096);
+    assert_eq!(plans[0].batch.records[0].len, 4096);
+}
+
+#[test]
+fn append_stream_durable_mark_ignores_stale_lower_high_water() {
+    let cfg = config();
+    let store = LocalCoordinator::with_config(cfg).unwrap();
+    let client = create_native_client(&store);
+    let keyspace_id = create_local_keyspace(&client);
+    let (file_id, _) = create_local_file(&client, keyspace_id);
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    store
+        .append_stream(
+            &stream,
+            &repeated_blocks(2, 16),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store
+        .metadata()
+        .mark_append_stream_durable_through(&stream, 8192)
+        .unwrap();
+    assert_eq!(
+        store
+            .metadata()
+            .mark_append_stream_durable_through(&stream, 4096)
+            .unwrap(),
+        8192
+    );
+    assert_eq!(
+        store
+            .metadata()
+            .append_stream_durable_high_water_if_reached(&stream, 8192)
+            .unwrap(),
+        Some(8192)
+    );
+}
+
+#[test]
 fn storage_node_transport_write_receipt_stays_pending_until_reference_message() {
     let cfg = config();
     let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
@@ -14293,14 +14833,18 @@ fn node_catalog_entry(
 }
 
 fn metadata_file_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
-    ["metadata.sqlite", "metadata.sqlite-wal"]
-        .into_iter()
-        .filter_map(|file_name| {
-            fs::read(root.join(file_name))
-                .ok()
-                .map(|bytes| (file_name.to_string(), bytes))
-        })
-        .collect()
+    [
+        "metadata.sqlite",
+        "metadata.sqlite-wal",
+        "native-publish.journal",
+    ]
+    .into_iter()
+    .filter_map(|file_name| {
+        fs::read(root.join(file_name))
+            .ok()
+            .map(|bytes| (file_name.to_string(), bytes))
+    })
+    .collect()
 }
 
 fn restore_metadata_file_snapshot(root: &Path, snapshot: &[(String, Vec<u8>)]) {
@@ -14308,12 +14852,19 @@ fn restore_metadata_file_snapshot(root: &Path, snapshot: &[(String, Vec<u8>)]) {
         "metadata.sqlite",
         "metadata.sqlite-wal",
         "metadata.sqlite-shm",
+        "native-publish.journal",
     ] {
         let _ = fs::remove_file(root.join(file_name));
     }
     for (file_name, bytes) in snapshot {
         fs::write(root.join(file_name), bytes).unwrap();
     }
+}
+
+fn native_publish_journal_commit_count(root: &Path, next_commit_seq: u64) -> usize {
+    load_native_publish_journal_commits_since(&root.join("native-publish.journal"), next_commit_seq)
+        .unwrap()
+        .len()
 }
 
 fn device_segment_ids(

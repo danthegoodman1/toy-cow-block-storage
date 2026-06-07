@@ -180,10 +180,30 @@ for very large streams, not from per-append fragmentation across every node.
 Durable append-log admission should keep unsynced stream-log manifests with the
 stream lane that produced them, so prefix persistence can select only the lanes
 it is publishing without forcing unrelated streams through one shared pending
-append-log structure. Durable providers may also auto-persist active stream
-prefixes before publish as an internal dirty-tail policy. That persistence is
+append-log structure. Durable providers may also sync active stream-log payload
+prefixes before publish as an internal dirty-tail policy. That private sync is
 not a public recovery promise and does not make bytes visible; it only reduces
-the outstanding durability work a later publish must wait for.
+the outstanding payload durability work a later publish must wait for. A
+bounded dirty-tail policy applies append-side payload-sync backpressure at the
+configured private dirty-tail threshold, because durable publish latency is the
+public boundary being optimized and private append admission throughput is only
+diagnostic unless explicitly benchmarked. Large dirty-tail append payloads may
+be copied and written in provider-private chunks so active append-log payload
+sync can start while later bytes are still being admitted; this only advances a
+process-local durable high-water for the private log, not public stream
+metadata. That background sync must be paced by the dirty-tail budget rather
+than by every internal copy/write chunk, so larger budgets do not create
+unbounded active-log sync pressure. Explicit flushed appends and manual prefix
+persistence remain responsible for persisting private stream metadata. The
+visible append-publish boundary is a compact native publish journal record:
+after the relevant
+append-log payload and node catalog references are durable, the provider
+appends and syncs a small metadata delta that advances the public file head.
+SQLite row-native metadata is a materialized checkpoint for reopen, inspection,
+and later pruning; it is not on the synchronous append-publish hot path.
+Append-publish group commit is demand-driven: a leader may wait briefly for
+submitted or waiting peer publishes, but a lone publish must not pay the full
+barrier coalescing window.
 
 Each shard root points to a persistent immutable tree:
 
