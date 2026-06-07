@@ -374,6 +374,9 @@ fn run_fixed_stream_publish_worker(
     let stream = context.store.open_append_stream(*keyspace_id, file_id)?;
     let mut next_offset = stream.visible_base_size;
     let mut published_offset = stream.visible_base_size;
+    let mut first_append_started = None;
+    let mut final_append_acked = None;
+    let mut final_publish_completed = None;
     let final_offset = next_offset
         .checked_add(total_bytes)
         .ok_or_else(|| StorageError::invalid_argument("fixed stream final offset overflows"))?;
@@ -396,6 +399,7 @@ fn run_fixed_stream_publish_worker(
 
     while next_offset < final_offset {
         let append_started = Instant::now();
+        first_append_started.get_or_insert(append_started);
         if !config.modeled_delay.is_zero() {
             apply_modeled_delay(config.modeled_delay, config.delay_mode);
         }
@@ -429,6 +433,9 @@ fn run_fixed_stream_publish_worker(
             }
         };
         next_offset = ticket.range.end_exclusive()?;
+        if next_offset == final_offset {
+            final_append_acked = Some(Instant::now());
+        }
 
         if !config.workload.is_native_stream_publish_barrier_at_end()
             && let Some(publish_through) = fixed_stream_publish_target(
@@ -447,6 +454,9 @@ fn run_fixed_stream_publish_worker(
                 &mut report,
                 &mut rng,
             )?;
+            if publish_through == final_offset {
+                final_publish_completed = Some(Instant::now());
+            }
             if let Some(interval) = publish_interval {
                 while next_publish_target.is_some_and(|target| target <= published_offset) {
                     next_publish_target = published_offset.checked_add(interval);
@@ -458,7 +468,9 @@ fn run_fixed_stream_publish_worker(
     if config.workload.is_native_stream_publish_barrier_at_end() {
         let barrier = publish_barrier
             .ok_or_else(|| StorageError::corrupt("missing fixed stream publish barrier"))?;
+        let barrier_started = Instant::now();
         barrier.wait();
+        report.record_stream_barrier_wait(elapsed_nanos_u64(barrier_started), &mut rng);
         publish_fixed_stream_boundary(
             &context,
             &stream,
@@ -468,6 +480,7 @@ fn run_fixed_stream_publish_worker(
             &mut report,
             &mut rng,
         )?;
+        final_publish_completed = Some(Instant::now());
     }
 
     if published_offset != final_offset {
@@ -480,6 +493,19 @@ fn run_fixed_stream_publish_worker(
             "fixed stream publish workload did not publish every appended byte",
         ));
     }
+    let first_append_started = first_append_started.ok_or_else(|| {
+        StorageError::corrupt("fixed stream publish workload did not record append start")
+    })?;
+    let final_append_acked = final_append_acked.ok_or_else(|| {
+        StorageError::corrupt("fixed stream publish workload did not record final append ack")
+    })?;
+    let final_publish_completed = final_publish_completed.ok_or_else(|| {
+        StorageError::corrupt("fixed stream publish workload did not record final publish completion")
+    })?;
+    let append_phase_nanos = duration_between_nanos_u64(first_append_started, final_append_acked);
+    let boundary_phase_nanos = duration_between_nanos_u64(final_append_acked, final_publish_completed);
+    report.record_stream_final_drain(boundary_phase_nanos, &mut rng);
+    report.record_stream_phases(append_phase_nanos, boundary_phase_nanos);
     Ok(report)
 }
 
@@ -635,6 +661,13 @@ fn apply_modeled_delay(delay: Duration, mode: DelayMode) {
 
 fn elapsed_nanos_u64(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_between_nanos_u64(started: Instant, ended: Instant) -> u64 {
+    ended
+        .saturating_duration_since(started)
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn build_native_file_batch_writes(

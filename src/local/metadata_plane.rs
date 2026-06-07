@@ -1265,39 +1265,6 @@ impl InMemoryMetadataPlane {
         Ok(AppendPublishTicketStatus::Pending(state.public_stream()))
     }
 
-    fn append_publish_ticket_needs_payload_persist(
-        &self,
-        ticket: &AppendPublishTicket,
-    ) -> Result<bool> {
-        let record = lock(&self.append_publish_tickets)?
-            .get(&ticket.ticket_id)
-            .cloned()
-            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
-        if record.ticket != *ticket {
-            return Err(StorageError::conflict("stale append publish ticket"));
-        }
-        if record.completed.is_some() {
-            return Ok(false);
-        }
-        let inner = lock(&self.inner)?;
-        let state = inner
-            .append_streams
-            .get(&ticket.stream_id)
-            .ok_or_else(|| StorageError::conflict("stale append publish ticket"))?;
-        if state.keyspace_id != ticket.keyspace_id
-            || state.file_id != ticket.file_id
-            || state.stream_id != ticket.stream_id
-            || state.writer_epoch != ticket.writer_epoch
-            || state.status != AppendStreamStatus::Active
-            || ticket.publish_through <= state.published_through
-            || ticket.publish_through > state.accepted_tail
-            || ticket.publish_through > state.contiguous_record_tail_from(state.published_through)?
-        {
-            return Err(StorageError::conflict("stale append publish ticket"));
-        }
-        Ok(state.durable_through < ticket.publish_through)
-    }
-
     fn pending_append_publish_tickets(&self) -> Result<Vec<AppendPublishTicket>> {
         Ok(lock(&self.append_publish_tickets)?
             .values()

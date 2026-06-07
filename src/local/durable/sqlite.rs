@@ -4,13 +4,16 @@ pub(super) struct DurableSqliteStore {
     conn: Arc<Mutex<Connection>>,
     node_catalogs: Arc<NodeCatalogs>,
     policy: DurableDataLogPolicy,
-    data_log_allocation_lock: Arc<Mutex<()>>,
+    data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
+    append_log_service: Arc<StorageNodeAppendLogService>,
     #[cfg(test)]
     persist_delay: Arc<Mutex<Option<Duration>>>,
     #[cfg(test)]
     fail_next_persist: Arc<AtomicBool>,
     #[cfg(test)]
     fail_next_prestage: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_append_payload_sync: Arc<AtomicBool>,
 }
 
 /// Process-local timing for one physical durable persist.
@@ -94,6 +97,11 @@ pub struct AppendPublishWaitProfile {
     pub cvar_waits: u64,
     pub persist_batches_started: u64,
     pub max_batch_ticket_count: u64,
+    pub payload_already_durable_bytes: u64,
+    pub payload_synced_bytes: u64,
+    pub payload_sync_nanos: u64,
+    pub visible_metadata_commit_nanos: u64,
+    pub catalog_manifest_publish_nanos: u64,
     pub registered: bool,
     pub completed_without_register: bool,
     pub success: bool,
@@ -300,6 +308,11 @@ pub(super) struct DurablePersistOutcome {
 enum DurableBundlePayload {
     NewSegments(Vec<DurableSegmentPayload>),
     Preingested(PendingDataLogAppend),
+    PreingestedSynced {
+        appended: PendingDataLogAppend,
+        sync_profile: DataLogAppendProfile,
+        sync_nanos: u64,
+    },
     PrestagedBlockDelta {
         pending_append: PendingDataLogAppend,
         segments: Vec<DurableSegmentPayload>,
@@ -377,6 +390,345 @@ fn data_log_file_to_sync(file: File, bytes: u64) -> DataLogFileToSync {
 fn data_log_file_to_sync_with_metadata(file: File) -> Result<DataLogFileToSync> {
     let bytes = file.metadata().map_err(fs_error)?.len();
     Ok(DataLogFileToSync { file, bytes })
+}
+
+#[derive(Debug, Default)]
+struct StorageNodeDataLogAllocationLocks {
+    lanes: Mutex<BTreeMap<StorageNodeId, Arc<Mutex<()>>>>,
+}
+
+impl StorageNodeDataLogAllocationLocks {
+    fn lanes_for_nodes<I>(&self, storage_nodes: I) -> Result<Vec<Arc<Mutex<()>>>>
+    where
+        I: IntoIterator<Item = StorageNodeId>,
+    {
+        let mut lanes = lock(&self.lanes)?;
+        let mut out = Vec::new();
+        for storage_node in storage_nodes.into_iter().collect::<BTreeSet<_>>() {
+            out.push(Arc::clone(
+                lanes
+                    .entry(storage_node)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            ));
+        }
+        Ok(out)
+    }
+
+    fn lane_for_node(&self, storage_node: StorageNodeId) -> Result<Arc<Mutex<()>>> {
+        let mut lanes = lock(&self.lanes)?;
+        Ok(Arc::clone(
+            lanes
+                .entry(storage_node)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct StorageNodeAppendLogService {
+    paths: DurableStorePaths,
+    node_catalogs: Arc<NodeCatalogs>,
+    policy: DurableDataLogPolicy,
+    allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
+    lanes: Mutex<BTreeMap<StorageNodeId, Arc<StorageNodeAppendLogLane>>>,
+    #[cfg(test)]
+    fail_next_payload_sync: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct StorageNodeAppendLogLane {
+    active: Mutex<BTreeMap<String, Arc<Mutex<ActiveAppendRunLog>>>>,
+}
+
+#[derive(Debug)]
+struct ActiveAppendRunLog {
+    log_id: u64,
+    total_bytes: u64,
+    file: File,
+    needs_dir_sync: bool,
+}
+
+impl StorageNodeAppendLogService {
+    fn lane_for_node(&self, storage_node: StorageNodeId) -> Result<Arc<StorageNodeAppendLogLane>> {
+        let mut lanes = lock(&self.lanes)?;
+        Ok(Arc::clone(
+            lanes
+                .entry(storage_node)
+                .or_insert_with(|| Arc::new(StorageNodeAppendLogLane {
+                    active: Mutex::new(BTreeMap::new()),
+                })),
+        ))
+    }
+
+    fn open_active_append_run_log(
+        &self,
+        storage_node: StorageNodeId,
+        active_state: &str,
+        pending_base: Option<&PendingDataLogAppend>,
+    ) -> Result<ActiveAppendRunLog> {
+        let mut active = match pending_base {
+            Some(pending) => {
+                pending.active_log_for_node(storage_node, &self.paths.data_dir, active_state)?
+            }
+            None => None,
+        };
+        let active = match active.take() {
+            Some(active) => active,
+            None => {
+                let node_conn = self.node_catalogs.lock(storage_node)?;
+                active_data_log_with_state(
+                    &node_conn,
+                    &self.paths.data_dir,
+                    storage_node,
+                    active_state,
+                )?
+            }
+        };
+        self.open_append_run_log_file(storage_node, active)
+    }
+
+    fn open_next_append_run_log(
+        &self,
+        storage_node: StorageNodeId,
+        previous_log_id: u64,
+    ) -> Result<ActiveAppendRunLog> {
+        let node_conn = self.node_catalogs.lock(storage_node)?;
+        let active = next_data_log(
+            &node_conn,
+            &self.paths.data_dir,
+            storage_node,
+            previous_log_id,
+        )?;
+        self.open_append_run_log_file(storage_node, active)
+    }
+
+    fn open_append_run_log_file(
+        &self,
+        storage_node: StorageNodeId,
+        active: DataLogRow,
+    ) -> Result<ActiveAppendRunLog> {
+        let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
+        fs::create_dir_all(&data_dir).map_err(fs_error)?;
+        let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
+        let needs_dir_sync = !path.exists();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(fs_error)?;
+        let file_len = file.metadata().map_err(fs_error)?.len();
+        Ok(ActiveAppendRunLog {
+            log_id: active.log_id,
+            total_bytes: active.total_bytes.max(file_len),
+            file,
+            needs_dir_sync,
+        })
+    }
+
+    fn write_payload_chunks_unsynced(
+        &self,
+        payload: DurableAppendRunChunkPayload,
+        pending_base: Option<&PendingDataLogAppend>,
+    ) -> Result<(AppendLogRun, PendingDataLogAppend, DataLogAppendProfile)> {
+        let payload_bytes = payload.chunks.iter().try_fold(0_u64, |total, chunk| {
+            total
+                .checked_add(usize_to_u64(chunk.len()))
+                .ok_or_else(|| StorageError::invalid_argument("payload length overflows u64"))
+        })?;
+        if payload_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "append run payload must not be empty",
+            ));
+        }
+
+        let record_len = payload_bytes;
+        let storage_node = payload.storage_node;
+        let active_state = STREAM_DATA_LOG_STATE_ACTIVE.to_string();
+        let lane = self.lane_for_node(storage_node)?;
+        let active_handle = lane.active_handle_for_state(
+            &active_state,
+            || {
+                let allocation_lane = self.allocation_locks.lane_for_node(storage_node)?;
+                let _allocation_guard = lock(allocation_lane.as_ref())?;
+                self.open_active_append_run_log(storage_node, &active_state, pending_base)
+            },
+        )?;
+
+        let mut active = lock(active_handle.as_ref())?;
+        let should_roll = {
+            active.total_bytes != 0
+                && active
+                    .total_bytes
+                    .checked_add(record_len)
+                    .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
+                    > self.policy.target_data_log_bytes
+        };
+
+        let mut append = PendingDataLogAppend::default();
+        if should_roll {
+            let previous_log_id = active.log_id;
+            append.sealed_logs.push(DurableDataLogRef {
+                storage_node,
+                log_id: previous_log_id,
+            });
+            let allocation_lane = self.allocation_locks.lane_for_node(storage_node)?;
+            let _allocation_guard = lock(allocation_lane.as_ref())?;
+            *active = self.open_next_append_run_log(storage_node, previous_log_id)?;
+        }
+
+        let record_offset = active.total_bytes;
+        let new_total = record_offset
+            .checked_add(record_len)
+            .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
+
+        let mut profile = DataLogAppendProfile::default();
+        let started = Instant::now();
+        let integrity =
+            segment_payload_integrity_chunks(payload.payload_integrity, &payload.chunks);
+        profile.encode_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
+        active
+            .file
+            .seek(SeekFrom::Start(record_offset))
+            .map_err(fs_error)?;
+        for chunk in &payload.chunks {
+            active.file.write_all(chunk).map_err(fs_error)?;
+        }
+        profile.write_nanos = duration_nanos_u64(started.elapsed());
+
+        active.total_bytes = new_total;
+        let log_id = active.log_id;
+        let needs_dir_sync = active.needs_dir_sync;
+        let log_ref = DurableDataLogRef {
+            storage_node,
+            log_id,
+        };
+        append.logs.insert(
+            log_ref,
+            PendingDataLogManifest {
+                storage_node,
+                log_id,
+                state: active_state,
+                total_bytes: new_total,
+                needs_dir_sync,
+            },
+        );
+
+        let run = AppendLogRun {
+            run_id: payload.run_id,
+            storage_node,
+            stream_id: payload.stream_id,
+            writer_epoch: payload.writer_epoch,
+            keyspace_id: payload.keyspace_id,
+            file_id: payload.file_id,
+            file_offset_start: payload.file_offset_start,
+            payload_len: payload_bytes,
+            log_id,
+            log_payload_offset: record_offset,
+            log_record_bytes: record_len,
+            integrity,
+        };
+        run.validate()?;
+        Ok((run, append, profile))
+    }
+
+    fn sync_pending_append(
+        &self,
+        appended: &PendingDataLogAppend,
+    ) -> Result<DataLogAppendProfile> {
+        let mut profile = DataLogAppendProfile::default();
+        if appended.logs.is_empty() && appended.sealed_logs.is_empty() {
+            return Ok(profile);
+        }
+        #[cfg(test)]
+        if self.fail_next_payload_sync.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::unavailable(
+                "injected append payload sync failure",
+            ));
+        }
+
+        let mut files = Vec::with_capacity(appended.logs.len() + appended.sealed_logs.len());
+        let mut storage_nodes_needing_dir_sync = BTreeSet::new();
+        for (log_ref, manifest) in &appended.logs {
+            if manifest.needs_dir_sync {
+                storage_nodes_needing_dir_sync.insert(log_ref.storage_node);
+            }
+            let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
+            files.push(data_log_file_to_sync(
+                File::open(&path).map_err(fs_error)?,
+                manifest.total_bytes,
+            ));
+        }
+        for log_ref in &appended.sealed_logs {
+            if appended.logs.contains_key(log_ref) {
+                continue;
+            }
+            let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
+            files.push(data_log_file_to_sync_with_metadata(
+                File::open(&path).map_err(fs_error)?,
+            )?);
+        }
+
+        let dirs_to_sync = storage_nodes_needing_dir_sync
+            .into_iter()
+            .map(|storage_node| node_data_log_dir(&self.paths.data_dir, storage_node))
+            .collect::<Vec<_>>();
+        let dir_sync_handle = if dirs_to_sync.is_empty() {
+            None
+        } else {
+            Some(thread::spawn(move || {
+                let started = Instant::now();
+                for dir in dirs_to_sync {
+                    sync_dir(&dir)?;
+                }
+                Ok::<_, StorageError>(duration_nanos_u64(started.elapsed()))
+            }))
+        };
+
+        let started = Instant::now();
+        let sync_result = sync_data_log_files_with_fanout(files, self.policy.file_sync_fanout);
+        let file_sync_nanos = duration_nanos_u64(started.elapsed());
+        let dir_sync_result = match dir_sync_handle {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| StorageError::unavailable("data-log dir sync worker panicked"))?,
+            None => Ok(0),
+        };
+
+        let sync_profile = sync_result?;
+        profile.file_sync_nanos = file_sync_nanos;
+        profile.file_sync_sum_nanos = sync_profile.sync_sum_nanos;
+        profile.file_sync_max_nanos = sync_profile.sync_max_nanos;
+        profile.files_synced = sync_profile.files_synced;
+        profile.sync_bytes = sync_profile.sync_bytes;
+        profile.dir_sync_nanos = dir_sync_result?;
+        Ok(profile)
+    }
+}
+
+impl StorageNodeAppendLogLane {
+    fn active_handle_for_state(
+        &self,
+        active_state: &str,
+        open: impl FnOnce() -> Result<ActiveAppendRunLog>,
+    ) -> Result<Arc<Mutex<ActiveAppendRunLog>>> {
+        {
+            let active = lock(&self.active)?;
+            if let Some(handle) = active.get(active_state) {
+                return Ok(Arc::clone(handle));
+            }
+        }
+        let opened = Arc::new(Mutex::new(open()?));
+        let mut active = lock(&self.active)?;
+        Ok(Arc::clone(
+            active
+                .entry(active_state.to_string())
+                .or_insert_with(|| opened),
+        ))
+    }
+
 }
 
 #[derive(Debug)]
@@ -715,15 +1067,8 @@ pub(super) const MAX_STREAM_PREFIX_PERSIST_GROUPS_PER_RUN: usize = 64;
 pub(super) const GENERIC_DATA_LOG_STATE_ACTIVE: &str = "active";
 pub(super) const STREAM_DATA_LOG_STATE_ACTIVE: &str = "stream-active";
 
-pub(super) fn stream_data_log_state(stream_id: AppendStreamId) -> String {
-    format!("{STREAM_DATA_LOG_STATE_ACTIVE}:{}", stream_id.raw())
-}
-
 pub(super) fn is_stream_data_log_state(state: &str) -> bool {
     state == STREAM_DATA_LOG_STATE_ACTIVE
-        || state
-            .strip_prefix(STREAM_DATA_LOG_STATE_ACTIVE)
-            .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 impl DurableSqliteStore {
@@ -740,22 +1085,38 @@ impl DurableSqliteStore {
         reject_root_storage_catalog_tables_if_present(&conn)?;
         reject_legacy_device_head_tables_if_present(&conn)?;
         reject_legacy_keyspace_head_tables_if_present(&conn)?;
-        let node_catalogs = NodeCatalogs::open(&paths, configured_storage_nodes)?;
+        let node_catalogs = Arc::new(NodeCatalogs::open(&paths, configured_storage_nodes)?);
+        let data_log_allocation_locks =
+            Arc::new(StorageNodeDataLogAllocationLocks::default());
+        #[cfg(test)]
+        let fail_next_append_payload_sync = Arc::new(AtomicBool::new(false));
+        let append_log_service = Arc::new(StorageNodeAppendLogService {
+            paths: paths.clone(),
+            node_catalogs: Arc::clone(&node_catalogs),
+            policy,
+            allocation_locks: Arc::clone(&data_log_allocation_locks),
+            lanes: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            fail_next_payload_sync: Arc::clone(&fail_next_append_payload_sync),
+        });
         if !metadata_existed {
             sync_parent_dir(&paths.metadata)?;
         }
         Ok(Self {
             paths,
             conn: Arc::new(Mutex::new(conn)),
-            node_catalogs: Arc::new(node_catalogs),
+            node_catalogs,
             policy,
-            data_log_allocation_lock: Arc::new(Mutex::new(())),
+            data_log_allocation_locks,
+            append_log_service,
             #[cfg(test)]
             persist_delay: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             fail_next_persist: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_prestage: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_append_payload_sync,
         })
     }
 
@@ -1628,6 +1989,23 @@ impl DurableSqliteStore {
         segment_ids: &BTreeSet<SegmentId>,
         appended: PendingDataLogAppend,
     ) -> Result<DurablePersistProfile> {
+        self.persist_append_stream_prefix_bundle(
+            cursor,
+            streams,
+            nodes,
+            segment_ids,
+            DurableBundlePayload::Preingested(appended),
+        )
+    }
+
+    fn persist_append_stream_prefix_bundle(
+        &self,
+        cursor: &DurableExportCursor,
+        streams: &[AppendStreamState],
+        nodes: &SelectedStorageNodeState,
+        segment_ids: &BTreeSet<SegmentId>,
+        payload: DurableBundlePayload,
+    ) -> Result<DurablePersistProfile> {
         let total_started = Instant::now();
         #[cfg(test)]
         {
@@ -1643,10 +2021,7 @@ impl DurableSqliteStore {
         }
 
         let started = Instant::now();
-        let prepared = self.prepare_durable_bundle_payload(
-            DurableBundlePayload::Preingested(appended),
-            segment_ids,
-        )?;
+        let prepared = self.prepare_durable_bundle_payload(payload, segment_ids)?;
         let catalog_profile = self.persist_durable_bundle_catalog(
             nodes,
             segment_ids,
@@ -1757,6 +2132,23 @@ impl DurableSqliteStore {
                     appended,
                     data_log_profile,
                     data_log_append_sync_nanos,
+                    new_segment_count: 0,
+                    new_segment_bytes: 0,
+                    pre_root_pending_segments,
+                    sync_storage_node_count,
+                })
+            }
+            DurableBundlePayload::PreingestedSynced {
+                appended,
+                sync_profile,
+                sync_nanos,
+            } => {
+                let sync_storage_node_count = appended.storage_node_count();
+                let pre_root_pending_segments = preingested_pre_root_segments.clone();
+                Ok(PreparedDurableBundlePayload {
+                    appended,
+                    data_log_profile: sync_profile,
+                    data_log_append_sync_nanos: sync_nanos,
                     new_segment_count: 0,
                     new_segment_bytes: 0,
                     pre_root_pending_segments,
@@ -1896,18 +2288,24 @@ impl DurableSqliteStore {
         )
     }
 
-    fn persist_preingested_append_publish_delta(
+    fn persist_synced_append_publish_delta(
         &self,
         delta: &NativeMetadataDelta,
         nodes: &SelectedStorageNodeState,
         changed_segments: &BTreeSet<SegmentId>,
         appended: PendingDataLogAppend,
+        sync_profile: DataLogAppendProfile,
+        sync_nanos: u64,
     ) -> Result<DurablePersistProfile> {
         self.persist_native_metadata_delta_bundle(
             delta,
             nodes,
             changed_segments,
-            DurableBundlePayload::Preingested(appended),
+            DurableBundlePayload::PreingestedSynced {
+                appended,
+                sync_profile,
+                sync_nanos,
+            },
         )
     }
 
@@ -2079,128 +2477,8 @@ impl DurableSqliteStore {
         payload: DurableAppendRunChunkPayload,
         pending_base: Option<&PendingDataLogAppend>,
     ) -> Result<(AppendLogRun, PendingDataLogAppend, DataLogAppendProfile)> {
-        let payload_bytes = payload.chunks.iter().try_fold(0_u64, |total, chunk| {
-            total
-                .checked_add(usize_to_u64(chunk.len()))
-                .ok_or_else(|| StorageError::invalid_argument("payload length overflows u64"))
-        })?;
-        if payload_bytes == 0 {
-            return Err(StorageError::invalid_argument(
-                "append run payload must not be empty",
-            ));
-        }
-        let record_len = payload_bytes;
-        let mut append = PendingDataLogAppend::default();
-        let mut profile = DataLogAppendProfile::default();
-        let storage_node = payload.storage_node;
-        let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
-        let active_state = stream_data_log_state(payload.stream_id);
-
-        let (mut file, log_id, record_offset, new_total, needs_dir_sync) = {
-            let _allocation_guard = lock(&self.data_log_allocation_lock)?;
-            let mut active = match pending_base {
-                Some(pending) => pending.active_log_for_node(
-                    storage_node,
-                    &self.paths.data_dir,
-                    &active_state,
-                )?,
-                None => None,
-            };
-            let mut active = match active.take() {
-                Some(active) => active,
-                None => {
-                    let node_conn = self.node_catalogs.lock(storage_node)?;
-                    active_data_log_with_state(
-                        &node_conn,
-                        &self.paths.data_dir,
-                        storage_node,
-                        &active_state,
-                    )?
-                }
-            };
-            if active.total_bytes != 0
-                && active
-                    .total_bytes
-                    .checked_add(record_len)
-                    .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
-                    > self.policy.target_data_log_bytes
-            {
-                append.sealed_logs.push(DurableDataLogRef {
-                    storage_node,
-                    log_id: active.log_id,
-                });
-                let node_conn = self.node_catalogs.lock(storage_node)?;
-                active = next_data_log(
-                    &node_conn,
-                    &self.paths.data_dir,
-                    storage_node,
-                    active.log_id,
-                )?;
-            }
-
-            fs::create_dir_all(&data_dir).map_err(fs_error)?;
-            let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
-            let needs_dir_sync = !path.exists();
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .map_err(fs_error)?;
-            let file_len = file.metadata().map_err(fs_error)?.len();
-            active.total_bytes = active.total_bytes.max(file_len);
-            let record_offset = active.total_bytes;
-            let new_total = record_offset
-                .checked_add(record_len)
-                .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
-            (file, active.log_id, record_offset, new_total, needs_dir_sync)
-        };
-
-        let started = Instant::now();
-        let integrity =
-            segment_payload_integrity_chunks(payload.payload_integrity, &payload.chunks);
-        profile.encode_nanos = duration_nanos_u64(started.elapsed());
-        let started = Instant::now();
-        file.seek(SeekFrom::Start(record_offset))
-            .map_err(fs_error)?;
-        for chunk in &payload.chunks {
-            file.write_all(chunk).map_err(fs_error)?;
-        }
-        profile.write_nanos = duration_nanos_u64(started.elapsed());
-
-        let payload_offset = record_offset;
-        let log_ref = DurableDataLogRef {
-            storage_node,
-            log_id,
-        };
-        append.logs.insert(
-            log_ref,
-            PendingDataLogManifest {
-                storage_node,
-                log_id,
-                state: active_state,
-                total_bytes: new_total,
-                needs_dir_sync,
-            },
-        );
-
-        let run = AppendLogRun {
-            run_id: payload.run_id,
-            storage_node,
-            stream_id: payload.stream_id,
-            writer_epoch: payload.writer_epoch,
-            keyspace_id: payload.keyspace_id,
-            file_id: payload.file_id,
-            file_offset_start: payload.file_offset_start,
-            payload_len: payload_bytes,
-            log_id,
-            log_payload_offset: payload_offset,
-            log_record_bytes: record_len,
-            integrity,
-        };
-        run.validate()?;
-        Ok((run, append, profile))
+        self.append_log_service
+            .write_payload_chunks_unsynced(payload, pending_base)
     }
 
     fn pending_append_run_manifests_for_log_refs(
@@ -2287,6 +2565,13 @@ impl DurableSqliteStore {
         if segments.is_empty() {
             return Ok((append, DataLogAppendProfile::default()));
         }
+        let allocation_lanes = self
+            .data_log_allocation_locks
+            .lanes_for_nodes(segments.iter().map(|segment| segment.storage_node))?;
+        let _allocation_guards = allocation_lanes
+            .iter()
+            .map(|lane| lock(lane.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut active_logs = BTreeMap::new();
         let mut open_log: Option<(DurableDataLogRef, File, u64, bool)> = None;
@@ -2294,7 +2579,6 @@ impl DurableSqliteStore {
         let mut synced_dirs = BTreeSet::new();
         let mut profile = DataLogAppendProfile::default();
         {
-            let _allocation_guard = lock(&self.data_log_allocation_lock)?;
             for segment in segments {
                 let segment_id = segment.segment_id;
                 let storage_node = segment.storage_node;
@@ -2513,66 +2797,19 @@ impl DurableSqliteStore {
         &self,
         appended: &PendingDataLogAppend,
     ) -> Result<DataLogAppendProfile> {
-        let mut profile = DataLogAppendProfile::default();
-        if appended.logs.is_empty() && appended.sealed_logs.is_empty() {
-            return Ok(profile);
-        }
+        self.append_log_service.sync_pending_append(appended)
+    }
 
-        let mut files = Vec::with_capacity(appended.logs.len() + appended.sealed_logs.len());
-        let mut storage_nodes_needing_dir_sync = BTreeSet::new();
-        for (log_ref, manifest) in &appended.logs {
-            if manifest.needs_dir_sync {
-                storage_nodes_needing_dir_sync.insert(log_ref.storage_node);
-            }
-            let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
-            files.push(data_log_file_to_sync(
-                File::open(&path).map_err(fs_error)?,
-                manifest.total_bytes,
-            ));
+    fn sync_pending_append_payload(
+        &self,
+        appended: &PendingDataLogAppend,
+    ) -> Result<(DataLogAppendProfile, u64)> {
+        if appended.is_empty() {
+            return Ok((DataLogAppendProfile::default(), 0));
         }
-        for log_ref in &appended.sealed_logs {
-            if appended.logs.contains_key(log_ref) {
-                continue;
-            }
-            let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
-            files.push(data_log_file_to_sync_with_metadata(
-                File::open(&path).map_err(fs_error)?,
-            )?);
-        }
-        let dirs_to_sync = storage_nodes_needing_dir_sync
-            .into_iter()
-            .map(|storage_node| node_data_log_dir(&self.paths.data_dir, storage_node))
-            .collect::<Vec<_>>();
-        let dir_sync_handle = if dirs_to_sync.is_empty() {
-            None
-        } else {
-            Some(thread::spawn(move || {
-                let started = Instant::now();
-                for dir in dirs_to_sync {
-                    sync_dir(&dir)?;
-                }
-                Ok::<_, StorageError>(duration_nanos_u64(started.elapsed()))
-            }))
-        };
-
         let started = Instant::now();
-        let sync_result = sync_data_log_files_with_fanout(files, self.policy.file_sync_fanout);
-        let file_sync_nanos = duration_nanos_u64(started.elapsed());
-        let dir_sync_result = match dir_sync_handle {
-            Some(handle) => handle
-                .join()
-                .map_err(|_| StorageError::unavailable("data-log dir sync worker panicked"))?,
-            None => Ok(0),
-        };
-
-        let sync_profile = sync_result?;
-        profile.file_sync_nanos = file_sync_nanos;
-        profile.file_sync_sum_nanos = sync_profile.sync_sum_nanos;
-        profile.file_sync_max_nanos = sync_profile.sync_max_nanos;
-        profile.files_synced = sync_profile.files_synced;
-        profile.sync_bytes = sync_profile.sync_bytes;
-        profile.dir_sync_nanos = dir_sync_result?;
-        Ok(profile)
+        let profile = self.append_log_service.sync_pending_append(appended)?;
+        Ok((profile, duration_nanos_u64(started.elapsed())))
     }
 
     fn read_segment_payload(&self, placement: &SegmentPlacementRow) -> Result<Vec<u8>> {

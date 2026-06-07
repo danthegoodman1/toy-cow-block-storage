@@ -40,6 +40,33 @@ impl StreamAppendLane {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AppendPublishBatchDiagnostics {
+    payload_already_durable_bytes: u64,
+    payload_synced_bytes: u64,
+    payload_sync_nanos: u64,
+    visible_metadata_commit_nanos: u64,
+    catalog_manifest_publish_nanos: u64,
+}
+
+impl AppendPublishBatchDiagnostics {
+    fn from_persist_profile(
+        profile: &DurablePersistProfile,
+        payload_already_durable_bytes: u64,
+        payload_synced_bytes: u64,
+    ) -> Self {
+        Self {
+            payload_already_durable_bytes,
+            payload_synced_bytes,
+            payload_sync_nanos: profile.data_log_append_sync_nanos,
+            visible_metadata_commit_nanos: profile
+                .root_sqlite_row_sync_nanos
+                .saturating_add(profile.root_sqlite_commit_nanos),
+            catalog_manifest_publish_nanos: profile.node_catalog_publish_nanos,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StreamAutoPersistWorkerState {
     shutdown: bool,
@@ -1618,8 +1645,8 @@ impl DurableCoordinator {
         &self,
         plans: &[AppendPublishPlan],
         total_started: Instant,
-        lock_wait_nanos: u64,
-    ) -> Result<CommitSeq> {
+        mut lock_wait_nanos: u64,
+    ) -> Result<(CommitSeq, AppendPublishBatchDiagnostics)> {
         let snapshot_started = Instant::now();
         let previous_segments = lock(&self.persisted_segments)?.clone();
         let delta = Self::merged_append_publish_plan_delta(plans)?;
@@ -1656,6 +1683,10 @@ impl DurableCoordinator {
             .iter()
             .map(|plan| plan.ticket.publish_through.saturating_sub(plan.payload_persist_start))
             .fold(0_u64, u64::saturating_add);
+        let already_durable_bytes = plans
+            .iter()
+            .map(|plan| plan.payload_persist_start.saturating_sub(plan.old_head.size))
+            .fold(0_u64, u64::saturating_add);
         let stream_prefix_storage_node_count = usize_to_u64(
             plans
                 .iter()
@@ -1671,12 +1702,28 @@ impl DurableCoordinator {
                 .collect::<BTreeSet<_>>()
                 .len(),
         );
-        let mut profile = self.durable.persist_preingested_append_publish_delta(
+        let pending_payload_sync = !pending_stream_append.is_empty();
+        let (sync_profile, sync_nanos) = self
+            .durable
+            .sync_pending_append_payload(&pending_stream_append)?;
+        let persist_guard = if pending_payload_sync {
+            let persist_lock_started = Instant::now();
+            let guard = lock(&self.persist_lock)?;
+            lock_wait_nanos =
+                lock_wait_nanos.saturating_add(duration_nanos_u64(persist_lock_started.elapsed()));
+            Some(guard)
+        } else {
+            None
+        };
+        let mut profile = self.durable.persist_synced_append_publish_delta(
             &delta,
             &nodes,
             &changed_segments,
             pending_stream_append,
+            sync_profile,
+            sync_nanos,
         )?;
+        drop(persist_guard);
         let durable_high_water = CommitSeq::from_raw(profile.durable_commit_high_water);
         let target_commit = plans
             .last()
@@ -1702,19 +1749,24 @@ impl DurableCoordinator {
         profile.new_segment_bytes = profile.new_segment_bytes.saturating_add(new_run_bytes);
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.attach_metadata_publish_profile(&mut profile)?;
+        let diagnostics = AppendPublishBatchDiagnostics::from_persist_profile(
+            &profile,
+            already_durable_bytes,
+            new_run_bytes,
+        );
         self.record_persist_profile(profile)?;
-        Ok(durable_high_water)
+        Ok((durable_high_water, diagnostics))
     }
 
     fn persist_append_publish_ticket_batch(
         &self,
         tickets: Vec<AppendPublishTicket>,
-    ) -> Result<()> {
+    ) -> Result<AppendPublishBatchDiagnostics> {
         if tickets.is_empty() {
-            return Ok(());
+            return Ok(AppendPublishBatchDiagnostics::default());
         }
         enum BatchStep {
-            Published(CommitSeq),
+            Published(CommitSeq, AppendPublishBatchDiagnostics),
             NeedsFullPersist,
         }
 
@@ -1727,16 +1779,6 @@ impl DurableCoordinator {
             drop(state);
 
             let total_started = Instant::now();
-            let needs_payload_persist = self.local.append_publish_tickets_need_payload_persist(&tickets)?;
-            let persist_lock_started = Instant::now();
-            let (persist_guard, lock_wait_nanos) = if needs_payload_persist {
-                (
-                    Some(lock(&self.persist_lock)?),
-                    duration_nanos_u64(persist_lock_started.elapsed()),
-                )
-            } else {
-                (None, 0)
-            };
             let result = (|| {
                 if self.append_publish_requires_full_persist_before_plan()? {
                     return Ok(BatchStep::NeedsFullPersist);
@@ -1778,17 +1820,14 @@ impl DurableCoordinator {
                     plans.push(plan);
                 }
                 if plans.is_empty() {
-                    return Ok(BatchStep::Published(CommitSeq::from_raw(
-                        cursor.next_commit_seq.saturating_sub(1),
-                    )));
+                    return Ok(BatchStep::Published(
+                        CommitSeq::from_raw(cursor.next_commit_seq.saturating_sub(1)),
+                        AppendPublishBatchDiagnostics::default(),
+                    ));
                 }
-                let durable_high_water =
-                    match self.persist_prepared_append_publish_plans(
-                        &plans,
-                        total_started,
-                        lock_wait_nanos,
-                    ) {
-                        Ok(durable_high_water) => durable_high_water,
+                let (durable_high_water, diagnostics) =
+                    match self.persist_prepared_append_publish_plans(&plans, total_started, 0) {
+                        Ok(outcome) => outcome,
                         Err(error) => {
                             for plan in &plans {
                                 self.local.cancel_append_publish_plan(plan)?;
@@ -1799,22 +1838,21 @@ impl DurableCoordinator {
                 for plan in plans {
                     self.local.apply_append_publish_plan(plan)?;
                 }
-                Ok(BatchStep::Published(durable_high_water))
+                Ok(BatchStep::Published(durable_high_water, diagnostics))
             })();
-            drop(persist_guard);
 
             let mut state = lock(&self.persist_coordinator.inner)?;
             state.in_flight = false;
             state.generation = state.generation.saturating_add(1);
             let generation = state.generation;
             match result {
-                Ok(BatchStep::Published(durable_high_water)) => {
+                Ok(BatchStep::Published(durable_high_water, diagnostics)) => {
                     state.durable_through = state.durable_through.max(durable_high_water);
                     let durable_through = state.durable_through;
                     state.requested_through = state.requested_through.max(durable_through);
                     state.last_error = None;
                     self.persist_coordinator.cvar.notify_all();
-                    return Ok(());
+                    return Ok(diagnostics);
                 }
                 Ok(BatchStep::NeedsFullPersist) => {
                     state.last_error = None;
@@ -2002,6 +2040,13 @@ impl DurableCoordinator {
     #[cfg(test)]
     fn fail_next_prestage_for_test(&self) {
         self.durable.fail_next_prestage.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_append_payload_sync_for_test(&self) {
+        self.durable
+            .fail_next_append_payload_sync
+            .store(true, Ordering::SeqCst);
     }
 
     pub fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
@@ -2452,6 +2497,22 @@ impl DurableCoordinator {
                 }
                 observed_generation = state.generation;
             }
+            if !registered {
+                let lock_started = Instant::now();
+                let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                profile.coordinator_lock_wait_nanos = profile
+                    .coordinator_lock_wait_nanos
+                    .saturating_add(duration_nanos_u64(lock_started.elapsed()));
+                while state.in_flight {
+                    let wait_started = Instant::now();
+                    profile.cvar_waits = profile.cvar_waits.saturating_add(1);
+                    state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                    profile.coordinator_wait_nanos = profile
+                        .coordinator_wait_nanos
+                        .saturating_add(duration_nanos_u64(wait_started.elapsed()));
+                }
+                observed_generation = state.generation;
+            }
             let status_started = Instant::now();
             let status = self.local.metadata.append_publish_ticket_status(ticket)?;
             profile.status_check_nanos = profile
@@ -2549,6 +2610,23 @@ impl DurableCoordinator {
             profile.persist_batch_nanos = profile
                 .persist_batch_nanos
                 .saturating_add(duration_nanos_u64(persist_started.elapsed()));
+            if let Ok(diagnostics) = result.as_ref() {
+                profile.payload_already_durable_bytes = profile
+                    .payload_already_durable_bytes
+                    .saturating_add(diagnostics.payload_already_durable_bytes);
+                profile.payload_synced_bytes = profile
+                    .payload_synced_bytes
+                    .saturating_add(diagnostics.payload_synced_bytes);
+                profile.payload_sync_nanos = profile
+                    .payload_sync_nanos
+                    .saturating_add(diagnostics.payload_sync_nanos);
+                profile.visible_metadata_commit_nanos = profile
+                    .visible_metadata_commit_nanos
+                    .saturating_add(diagnostics.visible_metadata_commit_nanos);
+                profile.catalog_manifest_publish_nanos = profile
+                    .catalog_manifest_publish_nanos
+                    .saturating_add(diagnostics.catalog_manifest_publish_nanos);
+            }
 
             let lock_started = Instant::now();
             let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
@@ -2559,7 +2637,7 @@ impl DurableCoordinator {
             state.generation = state.generation.saturating_add(1);
             let generation = state.generation;
             match result {
-                Ok(()) => {
+                Ok(_) => {
                     state.last_error = None;
                     self.append_publish_persist_coordinator.cvar.notify_all();
                     self.notify_stream_auto_persist_worker();

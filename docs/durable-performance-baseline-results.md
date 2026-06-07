@@ -713,6 +713,22 @@ Measurement directories:
   `target/loadbench/local-architecture-fanout/`
 - Rejected round-robin ordering experiment:
   `target/loadbench/local-architecture-roundrobin/`
+- Storage-node append-log lane experiment:
+  `target/loadbench/storage-node-lanes-baseline/` and
+  `target/loadbench/storage-node-lanes-after4/`
+- Storage-node append-log lane affected-row rerun:
+  `target/loadbench/storage-node-lanes-after5/`
+- Rejected storage-node lane follow-ups:
+  `target/loadbench/storage-node-lanes-coalesce/`,
+  `target/loadbench/storage-node-lanes-coalesce-bounded/`,
+  `target/loadbench/storage-node-lanes-delay3/`, and
+  `target/loadbench/storage-node-lanes-delay10/`
+- Final-drain/node-shared active-log proof:
+  `target/loadbench/final-drain-hypothesis-local/node-shared-append-log/20260606-234428-atend/`
+  and
+  `target/loadbench/final-drain-hypothesis-local/node-shared-append-log/20260607-000133-broad-rtt700/`
+- Rejected background lock split:
+  `target/loadbench/final-drain-hypothesis-local/node-shared-append-log/20260606-235627-lock-split-atend/`
 
 All rows used 4 simulated storage nodes, RTT `0`, `512 MiB` per worker, and
 `128 MiB` publish interval. The purpose was to separate local filesystem sync
@@ -767,16 +783,137 @@ Rejected experiments:
 - Storage-node round-robin sync ordering was mixed and mostly worse for
   barrier rows, so it was removed.
 
+Storage-node append-log service / node-shared active-log proof:
+
+The kept proof moves append-run payload writes behind an internal
+`StorageNodeAppendLogService` and uses one active append-run data log per
+storage node (`stream-active`) instead of one active log per stream. The public
+native API is unchanged. This reduces physical log fanout for final publish, but
+interleaved streams can now produce multiple visible run extents because their
+bytes are interleaved inside the shared node log.
+
+Focused at-end rows showed the intended effect in several primary cases:
+
+| Mode | RTT | Workload | c | old `published_mbps` | new `published_mbps` | old final drain p99 | new final drain p99 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| no-auto | 700 us | at-end 4m | 32 | 2668 | 3448 | 5544 ms | 2497 ms |
+| no-auto | 700 us | at-end 4m | 64 | 2825 | 3581 | 5714 ms | 4614 ms |
+| no-auto | 700 us | at-end 32m | 64 | 3381 | 3558 | 7093 ms | 4800 ms |
+| auto16 | 700 us | at-end 4m | 32 | 3317 | 4153 | 3234 ms | 1812 ms |
+| auto16 | 700 us | at-end 32m | 64 | 3396 | 3243 | 3656 ms | 3070 ms |
+
+The broader RTT `700 us` rerun was mixed and noisier, so this is not a complete
+tail fix:
+
+| Mode | Workload | c | baseline `published_mbps` | current `published_mbps` | baseline final drain p99 | current final drain p99 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| no-auto | interval 4m | 64 | 3354 | 3253 | 2371 ms | 1974 ms |
+| no-auto | interval 32m | 64 | 3245 | 3378 | 2016 ms | 1975 ms |
+| auto16 | at-end 4m | 32 | 3317 | 3578 | 3234 ms | 2468 ms |
+| auto16 | at-end 32m | 32 | 3881 | 2903 | 3211 ms | 2476 ms |
+| auto16 | at-end 32m | 64 | 3396 | 3283 | 3656 ms | 4532 ms |
+| auto16 | interval 4m | 64 | 3288 | 3583 | 2102 ms | 2046 ms |
+| auto16 | interval 32m | 64 | 2870 | 3385 | 3759 ms | 2510 ms |
+
+The node-shared active-log change is worth keeping as an architecture proof and
+as useful instrumentation, but it does not make final drain lock-free. A
+background auto-persist lock split was tested and removed: it improved some
+throughput rows, but final drain p99 regressed in too many primary rows. The
+reason is structural: private durable stream progress is still persisted as a
+full append-stream row, so background durability and visible publish metadata
+remain coupled.
+
+The next simplification should split private durable watermark/catalog progress
+from visible append-stream publish state. That would let per-storage-node
+payload durability advance through owner lanes without risking overwrite of
+published stream metadata.
+
+Rejected follow-ups:
+
+- Same-file publish-ticket coalescing was removed. Fixed-byte interval
+  workloads wait at each publish boundary, so they do not build multiple pending
+  tickets for one stream; the added completion complexity did not address the
+  measured regression.
+- Longer fixed publish batch windows were removed. A `10 ms` window reduced
+  batch count but worsened the 32 MiB interval tail and throughput. A `3 ms`
+  window was mixed and unstable in the broader c32/c64 matrix. The durable
+  profiles point to sync burst shape and workload alignment, not ticket
+  coalescing, as the remaining issue.
+
 Current conclusion:
 
 - The local host/container sync layer is a real tail-latency ceiling: even
   payload-only append-log controls are seconds-class.
 - The durable-provider architecture still has avoidable sensitivity to fanout,
   log sizing, and foreground/background scheduling.
-- The next useful architecture proof is not another global fanout tweak. It is a
-  storage-node append-log service with per-node sync/backpressure lanes, so
-  publish can observe bounded dirty payload per storage node without letting
-  background work sit in front of foreground publish.
+- Storage-node append lanes help the primary publish-at-end shape, but they are
+  not a complete publish-tail fix. The remaining work is to decouple private
+  durable watermarks from visible stream metadata so foreground publish no
+  longer waits behind unrelated private durability commits.
+
+## GCP Local NVMe Proof
+
+Raw artifacts:
+
+- `infra/gcp-local-nvme-bench/results/gcp-local-nvme-20260606-150805/`
+
+Benchmark shape:
+
+- Google Cloud project `projectvoice-442316`
+- Requested `c4-standard-96-lssd`, but all `us-central1` zones were stocked out.
+- Actual VM: `c3-standard-176-lssd` in `us-central1-a`, gVNIC, Tier 1 network
+  configured.
+- Local storage: 32 x 375 GB local SSD, RAID0 `/dev/md0`, XFS, mounted at
+  `/mnt/localssd`.
+- Current dirty workspace copied to the VM and built with `rustc 1.96.0`.
+- Loadbench root: `/mnt/localssd/loadbench-root`.
+- Matrix: native at-end, barrier-at-end, and interval publish workloads for
+  4 MiB and 32 MiB ops; concurrency `16,32,64`; storage nodes `4,16`; modeled
+  RTT `0,200,700,3600 us`.
+- `700 us` approximates the saved Rapid TCP probe c1 p99 (`0.663 ms`).
+- `3600 us` approximates the saved Rapid TCP probe c64 p99 (`3.616 ms`).
+
+Selected `storage_nodes=16` rows:
+
+| RTT | Workload | c | `published_mbps` | publish p50 | publish p99 | append p99 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 0 us | at-end 4m | 64 | 6612 | 4112 ms | 4586 ms | 15 ms |
+| 0 us | at-end 32m | 64 | 6100 | 3876 ms | 4610 ms | 183 ms |
+| 0 us | interval 4m | 64 | 6694 | 1032 ms | 1184 ms | 23 ms |
+| 0 us | interval 32m | 64 | 6304 | 1019 ms | 1238 ms | 189 ms |
+| 200 us | at-end 4m | 64 | 6544 | 4143 ms | 4546 ms | 16 ms |
+| 200 us | at-end 32m | 64 | 5919 | 3887 ms | 4545 ms | 213 ms |
+| 200 us | interval 4m | 64 | 6615 | 1058 ms | 1210 ms | 17 ms |
+| 200 us | interval 32m | 64 | 6043 | 1099 ms | 1350 ms | 196 ms |
+| 700 us | at-end 4m | 64 | 6409 | 4119 ms | 4501 ms | 26 ms |
+| 700 us | at-end 32m | 64 | 5838 | 4008 ms | 4632 ms | 204 ms |
+| 700 us | interval 4m | 64 | 6647 | 1031 ms | 1216 ms | 18 ms |
+| 700 us | interval 32m | 64 | 6129 | 1046 ms | 1274 ms | 200 ms |
+| 3600 us | at-end 4m | 64 | 6190 | 4066 ms | 4398 ms | 26 ms |
+| 3600 us | at-end 32m | 64 | 5953 | 4176 ms | 4631 ms | 197 ms |
+| 3600 us | interval 4m | 64 | 6359 | 1037 ms | 1201 ms | 15 ms |
+| 3600 us | interval 32m | 64 | 6171 | 981 ms | 1211 ms | 146 ms |
+
+fio comparison on the same RAID0 local SSD mount:
+
+| fio job | write MiB/s | fsync p50 | fsync p99 | fsync p99.9 |
+| --- | ---: | ---: | ---: | ---: |
+| 4 MiB write + fdatasync each write | 1327 | 1.71 ms | 2.02 ms | 2.93 ms |
+| 32 MiB write + fdatasync each write | 1997 | 5.34 ms | 5.54 ms | 6.26 ms |
+
+Read:
+
+- GCP local NVMe raises native durable throughput from local Docker’s roughly
+  `3 GiB/s` range into the `6.0-6.7 GiB/s` range for c64 rows. The Mac
+  Docker/local filesystem was a throughput ceiling.
+- Append p99 is low on GCP local NVMe: tens of milliseconds for 4 MiB c64 and
+  roughly `150-213 ms` for 32 MiB c64 in the headline rows.
+- Full publish-at-end p99 remains around `4.4-4.6 s`; interval publish p99 is
+  around `1.2-1.35 s`.
+- Therefore the remaining publish-at-end tail is architectural, not raw local
+  NVMe fsync latency. The system appears to wait for a multi-second global
+  publish wave at c64 even though fio fsync p99 on the same mount is
+  single-digit milliseconds.
 
 ## External North-Star Targets
 

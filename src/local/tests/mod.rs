@@ -3402,7 +3402,6 @@ fn durable_append_publish_metadata_failure_keeps_head_invisible_and_ticket_retry
     store
         .append_stream(&stream, &payload, WriteDurability::Acknowledged)
         .unwrap();
-    store.persist_append_stream_prefix(&stream, 4096).unwrap();
     let ticket = store.submit_append_publish(&stream, 4096).unwrap();
 
     store.fail_next_persist_for_test();
@@ -3445,6 +3444,78 @@ fn durable_append_publish_metadata_failure_keeps_head_invisible_and_ticket_retry
         .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
         .unwrap();
     assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_publish_payload_sync_failure_keeps_head_invisible_and_ticket_retryable() {
+    let root = durable_temp_dir("stream-publish-payload-sync-failure-retry");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 83);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    let ticket = store.submit_append_publish(&stream, 4096).unwrap();
+
+    store.fail_next_append_payload_sync_for_test();
+    let failed = store.wait_append_publish(&ticket);
+    assert!(matches!(failed, Err(StorageError::Unavailable { .. })));
+    assert_eq!(
+        store
+            .metadata()
+            .get_file_head(keyspace_id, file_id)
+            .unwrap()
+            .size,
+        0
+    );
+    assert!(
+        store
+            .local
+            .metadata
+            .state_inner()
+            .unwrap()
+            .append_publish_in_flight
+            .is_empty(),
+        "failed payload sync should clear the transient in-flight marker"
+    );
+
+    let commit = store.wait_append_publish(&ticket).unwrap();
+    assert_eq!(commit.range, ByteRange::new(0, 4096));
+    let mut bytes = vec![0; payload.len()];
+    store
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, payload);
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut reopened_bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, 4096),
+            &mut reopened_bytes,
+        )
+        .unwrap();
+    assert_eq!(reopened_bytes, payload);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3666,8 +3737,8 @@ fn durable_append_stream_prefix_persist_collapses_many_appends_into_one_run_exte
 }
 
 #[test]
-fn durable_append_stream_lanes_keep_interleaved_files_coalescible() {
-    let root = durable_temp_dir("stream-lanes-keep-files-coalescible");
+fn durable_append_stream_node_shared_logs_keep_interleaved_files_visible() {
+    let root = durable_temp_dir("stream-node-shared-logs-keep-files-visible");
     let cfg = LocalStoreConfig {
         file_root_blocks: 16 * 1024,
         metadata_leaf_blocks: 16 * 1024,
@@ -3721,11 +3792,23 @@ fn durable_append_stream_lanes_keep_interleaved_files_coalescible() {
 
     let extents_a = file_run_extents(&store.metadata(), keyspace_id, file_a);
     let extents_b = file_run_extents(&store.metadata(), keyspace_id, file_b);
-    assert_eq!(extents_a.len(), 1);
-    assert_eq!(extents_b.len(), 1);
-    assert_eq!(extents_a[0].payload_len, 8 * 1024 * 1024);
-    assert_eq!(extents_b[0].payload_len, 8 * 1024 * 1024);
-    assert_ne!(extents_a[0].run.log_id, extents_b[0].run.log_id);
+    assert_eq!(extents_a.len(), 8);
+    assert_eq!(extents_b.len(), 8);
+    assert_eq!(
+        extents_a
+            .iter()
+            .map(|extent| extent.payload_len)
+            .sum::<u64>(),
+        8 * 1024 * 1024
+    );
+    assert_eq!(
+        extents_b
+            .iter()
+            .map(|extent| extent.payload_len)
+            .sum::<u64>(),
+        8 * 1024 * 1024
+    );
+    assert_eq!(extents_a[0].run.log_id, extents_b[0].run.log_id);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5888,6 +5971,69 @@ fn durable_append_run_payload_writes_without_segment_placement() {
         .unwrap();
     assert_eq!(read, bytes);
     assert!(store.local.segment_ids().unwrap().is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_run_payloads_share_node_owned_active_log_across_streams() {
+    let root = durable_temp_dir("append-run-node-owned-active-log");
+    let cfg = config();
+    let store = DurableCoordinator::open_with_data_log_policy(
+        &root,
+        cfg,
+        DurableDataLogPolicy {
+            target_data_log_bytes: 1024 * 1024,
+            file_sync_fanout: 4,
+            min_reclaimable_ratio_ppm: 1,
+            min_reclaimable_bytes: 1,
+            max_compaction_copy_bytes: u64::MAX,
+        },
+    )
+    .unwrap();
+
+    let first = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(77),
+        storage_node: cfg.storage_node,
+        stream_id: AppendStreamId::from_raw(88),
+        writer_epoch: WriterEpoch::from_raw(3),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(5),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![Arc::from(repeated_blocks(1, 11))],
+    };
+    let second = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(78),
+        storage_node: cfg.storage_node,
+        stream_id: AppendStreamId::from_raw(89),
+        writer_epoch: WriterEpoch::from_raw(4),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(6),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![Arc::from(repeated_blocks(1, 12))],
+    };
+
+    let (first_run, first_pending, _) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(first, None)
+        .unwrap();
+    let (second_run, second_pending, _) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(second, None)
+        .unwrap();
+
+    assert_eq!(first_run.storage_node, second_run.storage_node);
+    assert_eq!(first_run.log_id, second_run.log_id);
+    assert_eq!(first_run.log_payload_offset, 0);
+    assert_eq!(second_run.log_payload_offset, first_run.payload_len);
+    assert_eq!(first_pending.logs.len(), 1);
+    assert_eq!(second_pending.logs.len(), 1);
+    assert_eq!(
+        first_pending.logs.keys().next(),
+        second_pending.logs.keys().next()
+    );
 
     let _ = fs::remove_dir_all(root);
 }

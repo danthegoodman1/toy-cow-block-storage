@@ -404,6 +404,26 @@ mod tests {
     }
 
     #[test]
+    fn bench_report_records_final_drain_without_counting_operations() {
+        let mut worker = WorkerReport::new(8);
+        let mut rng = Lcg::new(1);
+
+        worker.record_stream_append(10, 100, OpProgress::default(), true, &mut rng);
+        worker.record_stream_final_drain(200, &mut rng);
+        worker.record_stream_barrier_wait(50, &mut rng);
+        worker.record_stream_phases(1_000_000_000, 200_000_000);
+
+        let report = BenchReport::from_workers(Duration::from_secs(2), vec![worker]);
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.successes, 1);
+        assert_eq!(report.bytes, 100);
+        assert_eq!(report.stream_final_drain_p99_nanos, 200);
+        assert_eq!(report.stream_barrier_wait_p99_nanos, 50);
+        assert_eq!(report.stream_append_phase_nanos, 1_000_000_000);
+        assert_eq!(report.stream_boundary_phase_nanos, 200_000_000);
+    }
+
+    #[test]
     fn csv_append_writes_header_for_new_file() {
         let path = env::temp_dir().join(format!(
             "toy-cow-block-storage-loadbench-csv-new-{}.csv",

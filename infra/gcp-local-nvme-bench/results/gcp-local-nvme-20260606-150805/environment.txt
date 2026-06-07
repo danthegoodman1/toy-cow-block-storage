@@ -1,0 +1,90 @@
+project=projectvoice-442316
+vm=toy-cow-nvme-150805
+zone=us-central1-a
+machine_type=c3-standard-176-lssd
+requested_machine_type=c4-standard-96-lssd
+requested_machine_stockout=us-central1-a_b_c_f
+local_ssd=32x375GB_RAID0_XFS
+mount=/mnt/localssd
+rapid_tcp_probe_p99_us_c1=663
+rapid_tcp_probe_p99_us_c16=832
+rapid_tcp_probe_p99_us_c64=3616
+Linux toy-cow-nvme-150805 6.1.0-49-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.174-1 (2026-05-26) x86_64 GNU/Linux
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/md0         12T   85G   12T   1% /mnt/localssd
+Personalities : [raid0] 
+md0 : active raid0 nvme32n1[31] nvme31n1[30] nvme30n1[29] nvme29n1[28] nvme28n1[27] nvme27n1[26] nvme26n1[25] nvme25n1[24] nvme24n1[23] nvme23n1[22] nvme22n1[21] nvme21n1[20] nvme20n1[19] nvme19n1[18] nvme18n1[17] nvme17n1[16] nvme16n1[15] nvme15n1[14] nvme14n1[13] nvme13n1[12] nvme12n1[11] nvme11n1[10] nvme10n1[9] nvme9n1[8] nvme8n1[7] nvme7n1[6] nvme6n1[5] nvme5n1[4] nvme4n1[3] nvme3n1[2] nvme2n1[1] nvme1n1[0]
+      12578684928 blocks super 1.2 512k chunks
+      
+unused devices: <none>
+NAME         MODEL          SIZE TYPE  MOUNTPOINT
+nvme0n1      nvme_card-pd   200G disk  
+├─nvme0n1p1               199.9G part  /
+├─nvme0n1p14                  3M part  
+└─nvme0n1p15                124M part  /boot/efi
+nvme1n1      nvme_card0     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme2n1      nvme_card1     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme3n1      nvme_card2     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme4n1      nvme_card3     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme5n1      nvme_card4     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme7n1      nvme_card6     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme6n1      nvme_card5     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme8n1      nvme_card7     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme9n1      nvme_card8     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme10n1     nvme_card9     375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme13n1     nvme_card12    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme11n1     nvme_card10    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme14n1     nvme_card13    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme12n1     nvme_card11    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme16n1     nvme_card15    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme15n1     nvme_card14    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme28n1     nvme_card27    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme18n1     nvme_card17    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme26n1     nvme_card25    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme24n1     nvme_card23    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme19n1     nvme_card18    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme32n1     nvme_card31    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme27n1     nvme_card26    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme30n1     nvme_card29    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme17n1     nvme_card16    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme29n1     nvme_card28    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme22n1     nvme_card21    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme21n1     nvme_card20    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme25n1     nvme_card24    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme20n1     nvme_card19    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme23n1     nvme_card22    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd
+nvme31n1     nvme_card30    375G disk  
+└─md0                      11.7T raid0 /mnt/localssd

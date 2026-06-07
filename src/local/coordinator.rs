@@ -1896,21 +1896,6 @@ impl LocalCoordinator {
         Ok(commit)
     }
 
-    fn append_publish_tickets_need_payload_persist(
-        &self,
-        tickets: &[AppendPublishTicket],
-    ) -> Result<bool> {
-        for ticket in tickets {
-            if self
-                .metadata
-                .append_publish_ticket_needs_payload_persist(ticket)?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     #[cfg(test)]
     fn prepare_append_publish_plan(
         &self,

@@ -140,7 +140,7 @@ fn append_append_publish_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,ticket_id,stream_id,publish_through,total_nanos,status_check_nanos,coordinator_lock_wait_nanos,coordinator_wait_nanos,persist_batch_nanos,wait_loops,cvar_waits,persist_batches_started,max_batch_ticket_count,registered,completed_without_register,success";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,ticket_id,stream_id,publish_through,total_nanos,status_check_nanos,coordinator_lock_wait_nanos,coordinator_wait_nanos,persist_batch_nanos,wait_loops,cvar_waits,persist_batches_started,max_batch_ticket_count,payload_already_durable_bytes,payload_synced_bytes,payload_sync_nanos,visible_metadata_commit_nanos,catalog_manifest_publish_nanos,registered,completed_without_register,success";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -164,6 +164,11 @@ fn append_append_publish_profile_csv(
             profile.cvar_waits.to_string(),
             profile.persist_batches_started.to_string(),
             profile.max_batch_ticket_count.to_string(),
+            profile.payload_already_durable_bytes.to_string(),
+            profile.payload_synced_bytes.to_string(),
+            profile.payload_sync_nanos.to_string(),
+            profile.visible_metadata_commit_nanos.to_string(),
+            profile.catalog_manifest_publish_nanos.to_string(),
             profile.registered.to_string(),
             profile.completed_without_register.to_string(),
             profile.success.to_string(),
