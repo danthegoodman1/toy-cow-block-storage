@@ -4,7 +4,7 @@
 // durable metadata journal sync without imposing the full window on lone
 // publishes.
 const APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY: Duration = Duration::from_millis(1);
-const APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY: Duration = Duration::from_millis(5);
+const APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY: Duration = Duration::from_millis(20);
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 

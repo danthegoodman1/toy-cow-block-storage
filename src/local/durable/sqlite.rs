@@ -68,6 +68,7 @@ pub struct DurablePersistProfile {
     pub node_catalog_segment_rows: u64,
     pub root_sqlite_row_sync_nanos: u64,
     pub root_sqlite_commit_nanos: u64,
+    pub visible_metadata_write_bytes: u64,
     pub new_segment_count: u64,
     pub new_segment_bytes: u64,
     pub touched_node_count: u64,
@@ -1438,8 +1439,9 @@ fn decode_native_publish_journal_header(
 fn append_native_publish_journal_commit(
     path: &Path,
     commit: &NativeMetadataDeltaCommit,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let frame = native_publish_journal_frame(commit)?;
+    let frame_bytes = usize_to_u64(frame.len());
     let existed = path.exists();
     let started = Instant::now();
     let mut file = OpenOptions::new()
@@ -1455,7 +1457,7 @@ fn append_native_publish_journal_commit(
         sync_parent_dir(path)?;
     }
     let sync_nanos = duration_nanos_u64(sync_started.elapsed());
-    Ok((write_nanos, sync_nanos))
+    Ok((write_nanos, sync_nanos, frame_bytes))
 }
 
 fn load_native_publish_journal_commits_since(
@@ -2047,7 +2049,7 @@ impl DurableSqliteStore {
     fn append_native_publish_journal_commit(
         &self,
         commit: &NativeMetadataDeltaCommit,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64, u64)> {
         let _journal_guard = lock(&self.native_publish_journal_lock)?;
         append_native_publish_journal_commit(&self.paths.native_publish_journal, commit)
     }
@@ -2981,7 +2983,7 @@ impl DurableSqliteStore {
         let commit_started = Instant::now();
         let delta_commit = NativeMetadataDeltaCommit::from_delta(delta)?;
         let commit_prepare_nanos = duration_nanos_u64(commit_started.elapsed());
-        let (root_sqlite_row_sync_nanos, root_sqlite_commit_nanos) =
+        let (root_sqlite_row_sync_nanos, root_sqlite_commit_nanos, visible_metadata_write_bytes) =
             self.append_native_publish_journal_commit(&delta_commit)?;
         let root_sqlite_row_sync_nanos =
             root_sqlite_row_sync_nanos.saturating_add(commit_prepare_nanos);
@@ -3012,6 +3014,7 @@ impl DurableSqliteStore {
             node_catalog_segment_rows: catalog_profile.segment_rows,
             root_sqlite_row_sync_nanos,
             root_sqlite_commit_nanos,
+            visible_metadata_write_bytes,
             new_segment_count: prepared.new_segment_count,
             new_segment_bytes: prepared.new_segment_bytes,
             touched_node_count: catalog_profile.touched_node_count(),

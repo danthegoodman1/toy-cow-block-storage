@@ -4150,7 +4150,36 @@ fn durable_append_stream_node_shared_logs_keep_interleaved_files_visible() {
             .sum::<u64>(),
         8 * 1024 * 1024
     );
-    assert_eq!(extents_a[0].run.log_id, extents_b[0].run.log_id);
+    assert!(
+        extents_a
+            .iter()
+            .all(|extent| extent.run.log_id == extents_a[0].run.log_id)
+    );
+    assert!(
+        extents_b
+            .iter()
+            .all(|extent| extent.run.log_id == extents_b[0].run.log_id)
+    );
+    let mut bytes_a = vec![0; 8 * 1024 * 1024];
+    let mut bytes_b = vec![0; 8 * 1024 * 1024];
+    store
+        .read_file(
+            keyspace_id,
+            file_a,
+            ByteRange::new(0, bytes_a.len() as u64),
+            &mut bytes_a,
+        )
+        .unwrap();
+    store
+        .read_file(
+            keyspace_id,
+            file_b,
+            ByteRange::new(0, bytes_b.len() as u64),
+            &mut bytes_b,
+        )
+        .unwrap();
+    assert_eq!(bytes_a, one_mib_a.repeat(8));
+    assert_eq!(bytes_b, one_mib_b.repeat(8));
 
     let _ = fs::remove_dir_all(root);
 }

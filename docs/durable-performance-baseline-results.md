@@ -915,6 +915,59 @@ Read:
   publish wave at c64 even though fio fsync p99 on the same mount is
   single-digit milliseconds.
 
+## Local Docker c64 Publish Follow-Up
+
+After the native append-publish hot-path work, the 4-node local Docker c64
+`native-stream-publish-interval-32m` row was used for quick architecture
+screening with `--stream-total-mib 512`, `--stream-publish-mib 128`,
+`--stream-auto-persist-mib 32`, and `--rtt-us 200`.
+
+Selected rows:
+
+| Variant | `published_mbps` | publish p99 | append p99 | Read |
+| --- | ---: | ---: | ---: | --- |
+| auto32, 5 ms publish coalesce max | 3393.82 | 628.7 ms | 842.1 ms | Baseline for this follow-up run. |
+| auto32, 20 ms publish coalesce max | 3555.04 | 461.0 ms | 823.2 ms | Best simple tuning point observed. |
+| auto32, 20 ms rerun | 3603.44 | 510.8 ms | 684.2 ms | Same code path, showing local tail variance. |
+| auto16, 20 ms coalesce max | 3612.58 | 648.8 ms | 1035.1 ms | More append-side sync did not improve publish p99. |
+| auto32, 20 ms, file-sync fanout 64 | 3527.96 | 631.8 ms | 810.7 ms | More sync fanout worsened publish tail. |
+| auto32, 20 ms, 16 storage nodes | 1605.99 | 1392.5 ms | 2604.9 ms | More logical storage nodes multiplied sync pressure. |
+| auto32, root SQLite publish materialization | 3135.43 | 1062.3 ms | 923.3 ms | Moving append-publish deltas back through root SQLite was worse. |
+
+Rejected mechanisms:
+
+- Stream append-log striping across active logs regressed throughput on this
+  filesystem because it multiplied sync targets. One shared active stream log
+  per storage node coalesces fdatasync better locally.
+- Preallocating the native publish journal moved inode growth out of append but
+  made `sync_data` on the journal worse in this Docker-backed filesystem; the
+  profiled c64 row had publish p99 around `1.06 s`.
+- Root SQLite publish materialization was also worse than the compact native
+  journal, so the current direction should not be to put append-publish deltas
+  back into root SQLite rows.
+- Smaller auto-persist thresholds move work into append p99 without reliably
+  lowering publish p99.
+
+Profiles for the best simple tuning point still show `payload_sync_nanos = 0`
+at p99. The remaining c64 publish tail is dominated by visible metadata journal
+sync and waiters queued behind that single journal. The local `diskprobe`
+control on `/tmp` also shows high concurrent fsync tails: c16 32 MiB raw groups
+reported sync p99 around `157 ms`, and framed-copy c16 32 MiB groups reported
+sync p99 around `325 ms`. That sync substrate is materially worse than the
+Rapid Storage p99 target, but the single global visible-publish journal remains
+the main storage-layer scaling limit.
+
+A follow-up durable-profile field, `visible_metadata_write_bytes`, showed that
+the c64 compact native journal frames are not large enough to explain the tail:
+average frame size was about `178 KiB`, p90 about `469 KiB`, and max about
+`478 KiB` for the profiled row. Small frames still hit large sync outliers
+(`23 KiB` frame with `166 ms` sync, `14 KiB` frame with `137 ms` sync), so
+record compaction alone is unlikely to move local c64 p99 into Rapid range.
+The same interval/32 MiB/auto32 shape on the current code path reached about
+`3.62 GB/s` with publish p99 `15.5 ms` at c16, and about `3.68 GB/s` with
+publish p99 `233 ms` at c32. Local c16 is already Rapid-range for p99; c32/c64
+remain limited by high-concurrency sync waves.
+
 ## External North-Star Targets
 
 The June 6, 2026 Rapid Storage c3-88/Tier1 run is the current external
