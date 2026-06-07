@@ -1103,6 +1103,61 @@ Read:
   is now a data-device and per-lane persist scheduling problem, not evidence
   that SQLite row work is the native append-publish limiter.
 
+## Append-Visible Cross-Lane Group Commit Recovery
+
+The lane-only result proved file-scoped replay correctness but was the wrong
+performance shape. The follow-up kept the lane-safe durable format and restored
+cross-lane group commit by using the shared base append-visible journal for
+multi-lane batches, while singleton lane publishes can still use derived lane
+journals. The run used the same `c4-standard-288-lssd`, 48 local SSDs,
+`raid-split-journal`, 4 storage nodes, 32 MiB appends, 128 MiB publish
+boundaries, 512 MiB per worker, concurrency `32,64`, and modeled RTTs `0us`,
+`200us`, `700us`, and `3600us`.
+
+Raw artifacts:
+
+- `infra/gcp-local-nvme-bench/results/c4288-group-commit-06071625/`
+- `infra/gcp-local-nvme-bench/results/c4288-group-commit-06071625-results.tgz`
+
+Headline rows:
+
+| RTT | Workload | c | `published_mbps` | publish p99 | final drain p99 | append p99 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `0us` | at-end 32 MiB | 32 | 9063.55 | 12.3 ms | 12.3 ms | 216.3 ms |
+| `0us` | at-end 32 MiB | 64 | 9298.94 | 18.7 ms | 18.7 ms | 389.4 ms |
+| `200us` | at-end 32 MiB | 32 | 12740.83 | 11.4 ms | 11.4 ms | 148.7 ms |
+| `200us` | at-end 32 MiB | 64 | 12600.05 | 12.9 ms | 12.9 ms | 330.3 ms |
+| `700us` | at-end 32 MiB | 32 | 13212.67 | 12.4 ms | 12.4 ms | 121.7 ms |
+| `700us` | at-end 32 MiB | 64 | 14439.48 | 14.0 ms | 14.0 ms | 273.5 ms |
+| `3600us` | at-end 32 MiB | 32 | 13232.87 | 15.1 ms | 15.1 ms | 137.9 ms |
+| `3600us` | at-end 32 MiB | 64 | 13969.29 | 36.6 ms | 36.6 ms | 281.4 ms |
+| `0us` | interval 32 MiB | 32 | 9388.70 | 23.8 ms | 10.3 ms | 208.4 ms |
+| `0us` | interval 32 MiB | 64 | 9454.29 | 18.6 ms | 18.6 ms | 424.5 ms |
+| `200us` | interval 32 MiB | 32 | 12378.87 | 17.7 ms | 6.1 ms | 149.7 ms |
+| `200us` | interval 32 MiB | 64 | 12400.88 | 12.7 ms | 10.2 ms | 322.2 ms |
+| `700us` | interval 32 MiB | 32 | 14319.66 | 14.0 ms | 17.3 ms | 87.9 ms |
+| `700us` | interval 32 MiB | 64 | 13708.74 | 12.7 ms | 12.7 ms | 270.7 ms |
+| `3600us` | interval 32 MiB | 32 | 14714.59 | 10.3 ms | 10.7 ms | 81.1 ms |
+| `3600us` | interval 32 MiB | 64 | 13882.55 | 15.4 ms | 15.5 ms | 289.0 ms |
+
+Read:
+
+- Cross-lane group commit restored the lost batching. Driver batches reported
+  `max_batch_ticket_count` p99 from `3` to `16` depending on shape, and
+  `batch_shared_journal=true` appeared in every row.
+- Publish p99 recovered from the lane-only `328 ms` median / `689 ms` max to
+  `14.0 ms` median / `36.6 ms` max.
+- Throughput recovered from the lane-only `10.99 GB/s` median / `14.79 GB/s`
+  max to `12.98 GB/s` median / `14.71 GB/s` max.
+- The new wait profile split shows planning, apply, and metadata gate wait are
+  not the remaining tail: planning p99 is generally below `3.2 ms`, apply p99
+  below `0.12 ms`, and metadata-gate wait is effectively zero. The remaining
+  publish p99 is mostly group-commit in-flight wait plus append-visible journal
+  sync.
+- This is the current best native durable append shape: 10 GB/s-class at `0us`,
+  12.4-14.7 GB/s on nonzero modeled RTT rows, and publish p99 in the low
+  tens of milliseconds.
+
 ## External North-Star Targets
 
 The June 6, 2026 Rapid Storage c3-88/Tier1 run is the current external

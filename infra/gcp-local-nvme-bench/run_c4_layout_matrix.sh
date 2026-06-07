@@ -39,9 +39,9 @@ sort_candidate_zones() {
   awk -v preferred_regions="${PREFERRED_REGIONS}" '
     BEGIN {
       preferred_count = split(preferred_regions, preferred, /[, ]+/)
-      for (index = 1; index <= preferred_count; index++) {
-        if (preferred[index] != "") {
-          region_rank[preferred[index]] = index
+      for (preferred_index = 1; preferred_index <= preferred_count; preferred_index++) {
+        if (preferred[preferred_index] != "") {
+          region_rank[preferred[preferred_index]] = preferred_index
         }
       }
       fallback_rank = 10000

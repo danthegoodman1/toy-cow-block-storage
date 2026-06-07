@@ -7,7 +7,6 @@ pub(super) struct DurableSqliteStore {
     data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     append_log_service: Arc<StorageNodeAppendLogService>,
     native_publish_journal_lock: Arc<Mutex<()>>,
-    #[cfg(test)]
     append_visible_publish_journal_lock: Arc<Mutex<()>>,
     append_visible_publish_journal_lane_locks: Arc<Vec<Mutex<()>>>,
     #[cfg(test)]
@@ -110,6 +109,10 @@ pub struct AppendPublishWaitProfile {
     pub in_flight_wait_nanos: u64,
     pub coalesce_wait_nanos: u64,
     pub persist_batch_nanos: u64,
+    pub persist_batch_metadata_gate_wait_nanos: u64,
+    pub persist_batch_plan_nanos: u64,
+    pub persist_batch_durable_nanos: u64,
+    pub persist_batch_apply_nanos: u64,
     pub wait_loops: u64,
     pub cvar_waits: u64,
     pub in_flight_waits: u64,
@@ -125,6 +128,8 @@ pub struct AppendPublishWaitProfile {
     pub batch_planned_ticket_count: u64,
     pub batch_completed_ticket_count: u64,
     pub batch_same_file_skip_count: u64,
+    pub batch_journal_lane_count: u64,
+    pub batch_shared_journal: bool,
     pub post_batch_request_count: u64,
     pub post_batch_pending_ticket_count: u64,
     pub append_publish_batch_id: u64,
@@ -145,6 +150,12 @@ pub struct AppendPublishWaitProfile {
     pub registered: bool,
     pub completed_without_register: bool,
     pub success: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AppendVisibleJournalTarget {
+    Shared,
+    Lane(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1919,7 +1930,6 @@ impl DurableSqliteStore {
             data_log_allocation_locks,
             append_log_service,
             native_publish_journal_lock: Arc::new(Mutex::new(())),
-            #[cfg(test)]
             append_visible_publish_journal_lock: Arc::new(Mutex::new(())),
             append_visible_publish_journal_lane_locks: Arc::new(
                 (0..KEYSPACE_CATALOG_SHARD_COUNT)
@@ -2272,7 +2282,6 @@ impl DurableSqliteStore {
         self.append_append_visible_publish_journal_records(std::slice::from_ref(record))
     }
 
-    #[cfg(test)]
     pub(super) fn append_append_visible_publish_journal_records(
         &self,
         records: &[AppendVisiblePublish],
@@ -3238,7 +3247,7 @@ impl DurableSqliteStore {
 
     fn persist_synced_append_visible_publish_records(
         &self,
-        journal_lane_index: usize,
+        journal_target: AppendVisibleJournalTarget,
         records: &[AppendVisiblePublish],
         nodes: &SelectedStorageNodeState,
         appended: PendingDataLogAppend,
@@ -3290,8 +3299,16 @@ impl DurableSqliteStore {
             .map(|record| record.commit_seq)
             .max()
             .unwrap_or_else(|| CommitSeq::from_raw(0));
-        let append_visible_journal =
-            self.append_append_visible_publish_journal_records_for_lane(journal_lane_index, records)?;
+        let append_visible_journal = match journal_target {
+            AppendVisibleJournalTarget::Shared => {
+                self.append_append_visible_publish_journal_records(records)?
+            }
+            AppendVisibleJournalTarget::Lane(journal_lane_index) => self
+                .append_append_visible_publish_journal_records_for_lane(
+                    journal_lane_index,
+                    records,
+                )?,
+        };
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),

@@ -1386,9 +1386,10 @@ is not a meaningful read bottleneck at 200 us RTT.
 ## Phase 23B: File-Scoped Native Append Publish Records
 
 Status: in progress; record, codec, deterministic replay, durable-open
-materialization, the synchronous append-publish hot path, and catalog-shard
-append-visible lane journals now use file-scoped append-visible records instead
-of the global native metadata delta journal.
+materialization, the synchronous append-publish hot path, catalog-shard
+append-visible lane journals, and shared cross-lane group-commit frames now use
+file-scoped append-visible records instead of the global native metadata delta
+journal.
 
 Remove the remaining global visible-publish serialization from native append
 streams. Phase 23A made append payloads run-backed, but append publish
@@ -1427,8 +1428,10 @@ Deliverables:
   replay as a monotonic fencing high-water so later durable private-stream
   fences are not regressed.
 - [x] Convert the synchronous append-publish wait path to persist payload runs,
-  sync one append-visible lane-journal batch containing file-scoped publish
-  records, and return without syncing the global native metadata delta journal.
+  sync append-visible batches containing file-scoped publish records, and return
+  without syncing the global native metadata delta journal. Singleton lane
+  publishes may use lane journals; cross-lane group commits use the shared base
+  append-visible journal.
 - [ ] Add a checkpoint/materialization path that folds file-scoped append
   records into ordinary run-backed file roots for reads, PITR anchors, snapshots,
   restores, and GC traversal.

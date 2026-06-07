@@ -23,8 +23,7 @@ pub struct DurableCoordinator {
     metadata_persist_gate: Arc<RwLock<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
-    append_publish_persist_lanes:
-        Arc<Mutex<BTreeMap<AppendPublishLaneKey, Arc<AppendPublishPersistCoordinator>>>>,
+    append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
@@ -74,6 +73,12 @@ struct AppendPublishBatchDiagnostics {
     planned_ticket_count: u64,
     completed_ticket_count: u64,
     same_file_skip_count: u64,
+    metadata_gate_wait_nanos: u64,
+    plan_nanos: u64,
+    durable_persist_nanos: u64,
+    apply_nanos: u64,
+    journal_lane_count: u64,
+    shared_journal: bool,
 }
 
 impl AppendPublishBatchDiagnostics {
@@ -105,6 +110,12 @@ impl AppendPublishBatchDiagnostics {
             planned_ticket_count: 0,
             completed_ticket_count: 0,
             same_file_skip_count: 0,
+            metadata_gate_wait_nanos: 0,
+            plan_nanos: 0,
+            durable_persist_nanos: profile.total_nanos,
+            apply_nanos: 0,
+            journal_lane_count: 0,
+            shared_journal: false,
         }
     }
 }
@@ -274,7 +285,7 @@ impl DurableCoordinator {
             metadata_persist_gate: Arc::new(RwLock::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
-            append_publish_persist_lanes: Arc::new(Mutex::new(BTreeMap::new())),
+            append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
@@ -398,25 +409,12 @@ impl DurableCoordinator {
         })
     }
 
-    fn append_publish_lane(
-        &self,
-        key: AppendPublishLaneKey,
-    ) -> Result<Arc<AppendPublishPersistCoordinator>> {
-        let mut lanes = lock(&self.append_publish_persist_lanes)?;
-        Ok(Arc::clone(
-            lanes
-                .entry(key)
-                .or_insert_with(|| Arc::new(AppendPublishPersistCoordinator::new())),
-        ))
-    }
-
     fn append_publish_lane_for_ticket(
         &self,
         ticket: &AppendPublishTicket,
     ) -> Result<(AppendPublishLaneKey, Arc<AppendPublishPersistCoordinator>)> {
         let key = Self::append_publish_lane_key(ticket)?;
-        let lane = self.append_publish_lane(key)?;
-        Ok((key, lane))
+        Ok((key, Arc::clone(&self.append_publish_persist_coordinator)))
     }
 
     fn maybe_auto_persist_append_stream(
@@ -1553,11 +1551,27 @@ impl DurableCoordinator {
     fn persist_prepared_append_publish_plans(
         &self,
         batch_id: u64,
-        journal_lane_index: usize,
         plans: &[AppendPublishPlan],
         total_started: Instant,
         mut lock_wait_nanos: u64,
     ) -> Result<(CommitSeq, AppendPublishBatchDiagnostics)> {
+        let journal_lanes = plans
+            .iter()
+            .map(|plan| Self::append_publish_lane_key(&plan.ticket).map(|key| key.shard_index))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let journal_lane_count = usize_to_u64(journal_lanes.len());
+        let shared_journal = journal_lanes.len() != 1;
+        let journal_target = if shared_journal {
+            AppendVisibleJournalTarget::Shared
+        } else {
+            AppendVisibleJournalTarget::Lane(
+                journal_lanes
+                    .iter()
+                    .next()
+                    .copied()
+                    .ok_or_else(|| StorageError::invalid_argument("append publish batch is empty"))?,
+            )
+        };
         let snapshot_started = Instant::now();
         let (pending_stream_append, mut stream_prefix_pending_lock_wait_nanos) =
             self.pending_append_for_append_publish_plans(plans)?;
@@ -1619,7 +1633,7 @@ impl DurableCoordinator {
             .map(|plan| plan.visible_publish.clone())
             .collect::<Vec<_>>();
         let mut profile = self.durable.persist_synced_append_visible_publish_records(
-            journal_lane_index,
+            journal_target,
             &records,
             &nodes,
             pending_stream_append,
@@ -1657,13 +1671,17 @@ impl DurableCoordinator {
             already_durable_bytes,
             new_run_bytes,
         );
+        let diagnostics = AppendPublishBatchDiagnostics {
+            journal_lane_count,
+            shared_journal,
+            ..diagnostics
+        };
         self.record_persist_profile(profile)?;
         Ok((durable_high_water, diagnostics))
     }
 
     fn persist_append_publish_ticket_batch(
         &self,
-        lane_key: AppendPublishLaneKey,
         batch_id: u64,
         tickets: Vec<AppendPublishTicket>,
     ) -> Result<AppendPublishBatchDiagnostics> {
@@ -1677,11 +1695,17 @@ impl DurableCoordinator {
 
         loop {
             let total_started = Instant::now();
+            let mut metadata_gate_wait_nanos = 0_u64;
+            let mut plan_nanos = 0_u64;
+            let mut apply_nanos = 0_u64;
             let result = (|| -> Result<BatchStep> {
+                let gate_started = Instant::now();
                 let _metadata_gate = read_lock(&self.metadata_persist_gate)?;
+                metadata_gate_wait_nanos = duration_nanos_u64(gate_started.elapsed());
                 if self.append_publish_requires_full_persist_before_plan()? {
                     Ok(BatchStep::NeedsFullPersist)
                 } else {
+                    let plan_started = Instant::now();
                     let mut cursor =
                         self.durable.effective_export_cursor()?.ok_or_else(|| {
                             StorageError::conflict(
@@ -1733,10 +1757,13 @@ impl DurableCoordinator {
                             .max(cursor.next_commit_seq);
                         plans.push(plan);
                     }
+                    plan_nanos = duration_nanos_u64(plan_started.elapsed());
                     if plans.is_empty() {
                         let diagnostics = AppendPublishBatchDiagnostics {
                             completed_ticket_count,
                             same_file_skip_count,
+                            metadata_gate_wait_nanos,
+                            plan_nanos,
                             ..AppendPublishBatchDiagnostics::default()
                         };
                         Ok(BatchStep::Published(
@@ -1748,7 +1775,6 @@ impl DurableCoordinator {
                         let (durable_high_water, diagnostics) =
                             match self.persist_prepared_append_publish_plans(
                                 batch_id,
-                                lane_key.shard_index,
                                 &plans,
                                 total_started,
                                 0,
@@ -1761,13 +1787,18 @@ impl DurableCoordinator {
                                     return Err(error);
                                 }
                             };
+                        let apply_started = Instant::now();
                         for plan in plans {
                             self.local.apply_append_publish_plan(plan)?;
                         }
+                        apply_nanos = duration_nanos_u64(apply_started.elapsed());
                         let diagnostics = AppendPublishBatchDiagnostics {
                             planned_ticket_count,
                             completed_ticket_count,
                             same_file_skip_count,
+                            metadata_gate_wait_nanos,
+                            plan_nanos,
+                            apply_nanos,
                             ..diagnostics
                         };
                         Ok(BatchStep::Published(durable_high_water, diagnostics))
@@ -1806,7 +1837,6 @@ impl DurableCoordinator {
 
     fn append_publish_ticket_batch(
         &self,
-        lane_key: AppendPublishLaneKey,
         waiter_tickets: Vec<AppendPublishTicket>,
     ) -> Result<AppendPublishTicketBatch> {
         let waiter_request_count = waiter_tickets.len();
@@ -1817,9 +1847,6 @@ impl DurableCoordinator {
         let pending_tickets = self.local.metadata.pending_append_publish_tickets()?;
         let mut metadata_pending_ticket_count = 0;
         for ticket in pending_tickets {
-            if Self::append_publish_lane_key(&ticket)? != lane_key {
-                continue;
-            }
             metadata_pending_ticket_count += 1;
             tickets.entry(ticket.ticket_id).or_insert(ticket);
         }
@@ -1832,15 +1859,9 @@ impl DurableCoordinator {
 
     fn append_publish_batch_demand(
         &self,
-        lane_key: AppendPublishLaneKey,
         state: &AppendPublishPersistCoordinatorState,
     ) -> Result<usize> {
-        let mut pending_count = 0;
-        for ticket in self.local.metadata.pending_append_publish_tickets()? {
-            if Self::append_publish_lane_key(&ticket)? == lane_key {
-                pending_count += 1;
-            }
-        }
+        let pending_count = self.local.metadata.pending_append_publish_tickets()?.len();
         Ok(state
             .requests
             .len()
@@ -1849,13 +1870,12 @@ impl DurableCoordinator {
 
     fn coalesce_append_publish_waiters(
         &self,
-        lane_key: AppendPublishLaneKey,
         lane: &AppendPublishPersistCoordinator,
         mut state: MutexGuard<'_, AppendPublishPersistCoordinatorState>,
         profile: &mut AppendPublishWaitProfile,
     ) -> Result<AppendPublishTicketBatch> {
         let started = Instant::now();
-        let mut demand = self.append_publish_batch_demand(lane_key, &state)?;
+        let mut demand = self.append_publish_batch_demand(&state)?;
         profile.batch_coalesce_start_demand = usize_to_u64(demand);
         let mut saw_peer = demand > 1;
         let mut hit_target = demand >= APPEND_PUBLISH_BATCH_TARGET_TICKETS;
@@ -1888,7 +1908,7 @@ impl DurableCoordinator {
                 profile.coordinator_wait_nanos.saturating_add(wait_nanos);
             profile.coalesce_wait_nanos = profile.coalesce_wait_nanos.saturating_add(wait_nanos);
 
-            let next_demand = self.append_publish_batch_demand(lane_key, &state)?;
+            let next_demand = self.append_publish_batch_demand(&state)?;
             if next_demand > demand {
                 demand = next_demand;
                 hit_target = demand >= APPEND_PUBLISH_BATCH_TARGET_TICKETS;
@@ -1904,7 +1924,7 @@ impl DurableCoordinator {
         profile.batch_coalesce_hit_target = hit_target;
         let waiter_tickets = state.requests.values().cloned().collect::<Vec<_>>();
         drop(state);
-        self.append_publish_ticket_batch(lane_key, waiter_tickets)
+        self.append_publish_ticket_batch(waiter_tickets)
     }
 
     /// Return the maintenance policy configured for this store.
@@ -2517,7 +2537,7 @@ impl DurableCoordinator {
         let mut registered = false;
         let mut observed_generation = 0_u64;
         let mut last_in_flight_batch_waited = 0_u64;
-        let (lane_key, lane) = self.append_publish_lane_for_ticket(ticket)?;
+        let (_lane_key, lane) = self.append_publish_lane_for_ticket(ticket)?;
         loop {
             profile.wait_loops = profile.wait_loops.saturating_add(1);
             if registered {
@@ -2662,7 +2682,6 @@ impl DurableCoordinator {
             profile.persist_batches_started = profile.persist_batches_started.saturating_add(1);
 
             let batch = match self.coalesce_append_publish_waiters(
-                lane_key,
                 &lane,
                 state,
                 &mut profile,
@@ -2695,12 +2714,23 @@ impl DurableCoordinator {
                 .max(usize_to_u64(batch.metadata_pending_ticket_count));
 
             let persist_started = Instant::now();
-            let result =
-                self.persist_append_publish_ticket_batch(lane_key, batch_id, batch.tickets);
+            let result = self.persist_append_publish_ticket_batch(batch_id, batch.tickets);
             profile.persist_batch_nanos = profile
                 .persist_batch_nanos
                 .saturating_add(duration_nanos_u64(persist_started.elapsed()));
             if let Ok(diagnostics) = result.as_ref() {
+                profile.persist_batch_metadata_gate_wait_nanos = profile
+                    .persist_batch_metadata_gate_wait_nanos
+                    .saturating_add(diagnostics.metadata_gate_wait_nanos);
+                profile.persist_batch_plan_nanos = profile
+                    .persist_batch_plan_nanos
+                    .saturating_add(diagnostics.plan_nanos);
+                profile.persist_batch_durable_nanos = profile
+                    .persist_batch_durable_nanos
+                    .saturating_add(diagnostics.durable_persist_nanos);
+                profile.persist_batch_apply_nanos = profile
+                    .persist_batch_apply_nanos
+                    .saturating_add(diagnostics.apply_nanos);
                 profile.payload_already_durable_bytes = profile
                     .payload_already_durable_bytes
                     .saturating_add(diagnostics.payload_already_durable_bytes);
@@ -2755,6 +2785,11 @@ impl DurableCoordinator {
                 profile.batch_same_file_skip_count = profile
                     .batch_same_file_skip_count
                     .saturating_add(diagnostics.same_file_skip_count);
+                profile.batch_journal_lane_count = profile
+                    .batch_journal_lane_count
+                    .max(diagnostics.journal_lane_count);
+                profile.batch_shared_journal =
+                    profile.batch_shared_journal || diagnostics.shared_journal;
             }
             let post_batch_pending_ticket_count = self
                 .local

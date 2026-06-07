@@ -9721,6 +9721,119 @@ fn durable_append_publish_wait_batches_submitted_pending_tickets() {
 }
 
 #[test]
+fn durable_append_publish_wait_batches_cross_lane_pending_tickets() {
+    let root = durable_temp_dir("native-ticket-batches-cross-lane-pending");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let first_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("first".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let second_file = create_file_in_different_append_publish_lane_for_test(
+        &store,
+        keyspace_id,
+        first_file,
+        "second",
+    );
+    let first_stream = store.open_append_stream(keyspace_id, first_file).unwrap();
+    let second_stream = store.open_append_stream(keyspace_id, second_file).unwrap();
+    let first_payload = repeated_blocks(1, 93);
+    let second_payload = repeated_blocks(1, 94);
+    store
+        .append_stream(&first_stream, &first_payload, WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .append_stream(
+            &second_stream,
+            &second_payload,
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    let first_ticket = store.submit_append_publish(&first_stream, 4096).unwrap();
+    let second_ticket = store.submit_append_publish(&second_stream, 4096).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+    store.enable_append_publish_wait_profiling(16).unwrap();
+
+    let first_commit = store.wait_append_publish(&first_ticket).unwrap();
+    assert_eq!(first_commit.range, ByteRange::new(0, 4096));
+    let second_commit = store.wait_append_publish(&second_ticket).unwrap();
+    assert_eq!(second_commit.range, ByteRange::new(0, 4096));
+
+    let persist_profiles = store.drain_persist_profiles(16).unwrap();
+    assert_eq!(
+        persist_profiles.len(),
+        1,
+        "one waiter should drive one shared physical publish for cross-lane tickets"
+    );
+    assert_eq!(persist_profiles[0].stream_prefix_plan_count, 2);
+    assert_eq!(
+        load_append_visible_publish_journal_records(&root.join("append-visible-publish.journal"))
+            .unwrap()
+            .len(),
+        2,
+        "cross-lane group commit should use the shared append-visible batch journal"
+    );
+    assert_eq!(
+        append_visible_publish_journal_count(&root, keyspace_id, first_file),
+        0
+    );
+    assert_eq!(
+        append_visible_publish_journal_count(&root, keyspace_id, second_file),
+        0
+    );
+
+    let wait_profiles = store.drain_append_publish_wait_profiles(16).unwrap();
+    assert_eq!(wait_profiles.len(), 2);
+    let driver = wait_profiles
+        .iter()
+        .find(|profile| profile.persist_batches_started == 1)
+        .expect("one waiter should drive the cross-lane physical batch");
+    assert!(driver.max_batch_ticket_count >= 2);
+    assert!(driver.batch_metadata_pending_ticket_count >= 2);
+    assert!(driver.batch_planned_ticket_count >= 2);
+    assert!(driver.batch_journal_lane_count >= 2);
+    assert!(driver.batch_shared_journal);
+    assert!(driver.persist_batch_plan_nanos > 0);
+    assert!(driver.persist_batch_durable_nanos > 0);
+    assert!(driver.persist_batch_apply_nanos > 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut first = vec![0; first_payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            first_file,
+            ByteRange::new(0, first_payload.len() as u64),
+            &mut first,
+        )
+        .unwrap();
+    assert_eq!(first, first_payload);
+    let mut second = vec![0; second_payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            second_file,
+            ByteRange::new(0, second_payload.len() as u64),
+            &mut second,
+        )
+        .unwrap();
+    assert_eq!(second, second_payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_append_publish_wait_starts_immediately_at_target_batch_demand() {
     let root = durable_temp_dir("native-ticket-target-batch-start");
     let store = DurableCoordinator::open(&root, config()).unwrap();
@@ -15496,6 +15609,32 @@ fn create_file_in_same_append_publish_lane_for_test(
             )
             .unwrap();
         if file_id != anchor && append_publish_lane_index_for_test(file_id) == target_lane {
+            return file_id;
+        }
+    }
+}
+
+fn create_file_in_different_append_publish_lane_for_test(
+    store: &DurableCoordinator,
+    keyspace_id: KeyspaceId,
+    anchor: FileId,
+    name: &str,
+) -> FileId {
+    let anchor_lane = append_publish_lane_index_for_test(anchor);
+    let mut attempt = 0_u64;
+    loop {
+        attempt += 1;
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some(format!("{name}-{anchor_lane}-{attempt}")),
+                    },
+                },
+            )
+            .unwrap();
+        if append_publish_lane_index_for_test(file_id) != anchor_lane {
             return file_id;
         }
     }
