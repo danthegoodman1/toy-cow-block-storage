@@ -9,6 +9,8 @@ MACHINE_TYPE="${MACHINE_TYPE:-c4-standard-32-lssd}"
 MIN_LOCAL_SSDS="${MIN_LOCAL_SSDS:-5}"
 STORAGE_NODES="${STORAGE_NODES:-4}"
 CONCURRENCY="${CONCURRENCY:-16,32}"
+LAYOUTS="${LAYOUTS:-raid-shared,raid-split-journal,node-private-journal}"
+NODE_RAID_GROUPS="${NODE_RAID_GROUPS:-}"
 RUN_ID="${RUN_ID:-gcp-c4-layout-$(date +%Y%m%d-%H%M%S)}"
 VM_NAME="${VM_NAME:-toy-cow-nvme-bench-${RUN_ID}}"
 NETWORK="${NETWORK:-toy-cow-nvme-${RUN_ID}}"
@@ -195,7 +197,7 @@ gcloud compute scp "${REMOTE_SCRIPT}" "${VM_NAME}:/tmp/remote_c4_layout_matrix.s
 set +e
 gcloud compute ssh "${VM_NAME}" \
   --project "${PROJECT}" --zone "${ZONE}" \
-  --command "sudo MIN_LOCAL_SSDS='${MIN_LOCAL_SSDS}' STORAGE_NODES='${STORAGE_NODES}' CONCURRENCY='${CONCURRENCY}' bash /tmp/remote_c4_layout_matrix.sh '${RUN_ID}' /tmp/source.tgz"
+  --command "sudo MIN_LOCAL_SSDS='${MIN_LOCAL_SSDS}' STORAGE_NODES='${STORAGE_NODES}' CONCURRENCY='${CONCURRENCY}' LAYOUTS='${LAYOUTS}' NODE_RAID_GROUPS='${NODE_RAID_GROUPS}' bash /tmp/remote_c4_layout_matrix.sh '${RUN_ID}' /tmp/source.tgz"
 run_status=$?
 set -e
 

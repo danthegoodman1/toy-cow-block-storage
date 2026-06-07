@@ -374,12 +374,56 @@ operations; those rows are useful service-operation context but are not raw
 network RTT.
 
 Treat the c3-88/Tier1 Rapid rows as an external north-star for native durable
-append publish until local measurements prove a lower hardware ceiling. For
-publish-at-end, the target shape is multi-GiB/s visible durable throughput with
-sub-500 ms p99, and the stretch target is the c64 32 MiB Rapid row: about
-`9.35 GiB/s` with about `122 ms` publish p99. Do not conclude that the native
-path is hardware-limited just because it matches local fio throughput while
-publish p99 remains seconds-class.
+append publish, but the latest GCP local-NVMe results show the native hot path
+can now reach the same throughput class with much lower publish latency. The
+June 7, 2026 C4 run used `c4-standard-192-lssd` in `us-east1-b`, 32 local SSDs,
+512 MiB per worker, 32 MiB appends, 128 MiB publish boundaries, concurrency
+`32,64`, and modeled RTTs `0us`, `200us`, `700us`, and `3600us`.
+
+| Layout | Best `published_mbps` | Median `published_mbps` | Publish p99 median | Publish p99 max | Append p99 median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Shared 32-disk RAID0 for data and journal | 11.02 GB/s | 10.86 GB/s | 82.9 ms | 595.3 ms | 302.5 ms |
+| 31-disk RAID0 data plus 1 dedicated journal SSD | 10.65 GB/s | 10.45 GB/s | 12.4 ms | 55.8 ms | 334.2 ms |
+| 31 one-disk storage nodes plus 1 dedicated journal SSD | 7.40 GB/s | 5.92 GB/s | 8.4 ms | 19.7 ms | 253.6 ms |
+| 4 private storage-node RAID0 groups `8/8/8/7` plus 1 journal SSD | 6.65 GB/s | 6.36 GB/s | 16.8 ms | 54.3 ms | 507.6 ms |
+
+The best deployment layout from these runs is the split-journal shape: shared
+RAID0 across 31 data SSDs, plus one isolated append-visible journal SSD. It
+keeps the 10 GB/s-class data path while preventing journal syncs from queuing
+behind saturated data writes. The old shared-RAID layout reaches slightly
+higher peak throughput, but publish p99 is dominated by append-visible journal
+`sync_data` waiting behind the data stream.
+
+The `8/8/8/7` private RAID experiment did not recover the wide-RAID bandwidth.
+Its four private RAID groups were near 100 percent utilization during hot rows,
+but aggregate active write telemetry only reached about `6.3 GB/s` median and
+`7.0 GB/s` max. The dedicated journal disk stayed mostly idle, so the private
+RAID result is not a journal bottleneck.
+
+The split-journal c32 versus c64 rows show that c64 mostly adds queue depth once
+the data path is saturated:
+
+| RTT | Workload | c32 throughput / publish p99 | c64 throughput / publish p99 |
+| ---: | --- | ---: | ---: |
+| `200us` | at-end 32 MiB | 10.50 GB/s / 5.9 ms | 10.65 GB/s / 14.4 ms |
+| `200us` | interval 32 MiB | 10.37 GB/s / 4.9 ms | 10.64 GB/s / 11.3 ms |
+| `700us` | at-end 32 MiB | 10.45 GB/s / 11.1 ms | 10.61 GB/s / 24.4 ms |
+| `700us` | interval 32 MiB | 10.27 GB/s / 5.9 ms | 10.49 GB/s / 13.5 ms |
+| `3600us` | at-end 32 MiB | 10.18 GB/s / 9.6 ms | 10.45 GB/s / 17.4 ms |
+| `3600us` | interval 32 MiB | 9.71 GB/s / 14.5 ms | 10.54 GB/s / 19.9 ms |
+
+At c64, the append-publish profile generally shows the extra p99 in
+coordinator/in-flight wait rather than in the actual journal write. For example,
+the `200us` interval c64 row had publish total p99 `11.7 ms`, coordinator wait
+p99 `11.7 ms`, visible commit p99 `1.65 ms`, and journal sync p99 `1.63 ms`.
+The next native append work should therefore target publish batching, handoff,
+or a latency governor around c32-equivalent publish pressure before more disk
+layout changes.
+
+Raw C4 artifacts are local and ignored under
+`infra/gcp-local-nvme-bench/results/`, specifically
+`gcp-c4-192-layout-20260607-125041` and `c48887-06071318`. The temporary GCP
+instances, networks, subnets, and firewall rules were deleted after the runs.
 
 `cargo bench --bench regression` is the Criterion mechanism suite.
 `loadbench` is the integration runner for public block/native API behavior,

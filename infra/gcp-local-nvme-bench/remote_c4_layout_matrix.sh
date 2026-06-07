@@ -9,6 +9,8 @@ SRC_DIR="/opt/src"
 LOADBENCH="${SRC_DIR}/target/release/loadbench"
 STORAGE_NODES="${STORAGE_NODES:-4}"
 MIN_LOCAL_SSDS="${MIN_LOCAL_SSDS:-32}"
+LAYOUTS="${LAYOUTS:-raid-shared,raid-split-journal,node-private-journal}"
+NODE_RAID_GROUPS="${NODE_RAID_GROUPS:-}"
 RTTS=(0 200 700 3600)
 CONCURRENCY="${CONCURRENCY:-16,32}"
 WORKLOADS="native-stream-publish-at-end-32m,native-stream-publish-interval-32m"
@@ -73,6 +75,8 @@ fi
   echo "zone=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')"
   echo "storage_nodes=${STORAGE_NODES}"
   echo "min_local_ssds=${MIN_LOCAL_SSDS}"
+  echo "layouts=${LAYOUTS}"
+  echo "node_raid_groups=${NODE_RAID_GROUPS}"
   echo "rtts=${RTTS[*]}"
   echo "concurrency=${CONCURRENCY}"
   echo "workloads=${WORKLOADS}"
@@ -115,10 +119,11 @@ teardown_storage() {
       umount "${mountpoint}"
     fi
   done
-  if [[ -e /dev/md0 ]]; then
-    mdadm --stop /dev/md0 >/dev/null 2>&1
-    mdadm --remove /dev/md0 >/dev/null 2>&1
-  fi
+  for md_device in /dev/md*; do
+    [[ -e "${md_device}" ]] || continue
+    mdadm --stop "${md_device}" >/dev/null 2>&1 || true
+    mdadm --remove "${md_device}" >/dev/null 2>&1 || true
+  done
   set -e
 }
 
@@ -158,6 +163,48 @@ setup_node_private_journal() {
   mount_xfs "${DISKS[0]}" /mnt/journal
   for index in $(seq 1 "${STORAGE_NODES}"); do
     mount_xfs "${DISKS[$index]}" "/mnt/node-${index}"
+  done
+}
+
+setup_node_private_raid_journal() {
+  if [[ -z "${NODE_RAID_GROUPS}" ]]; then
+    printf 'node-private-raid-journal requires NODE_RAID_GROUPS, for example 8,8,8,7\n' >&2
+    exit 1
+  fi
+
+  IFS=',' read -r -a groups <<<"${NODE_RAID_GROUPS}"
+  if (( ${#groups[@]} != STORAGE_NODES )); then
+    printf 'NODE_RAID_GROUPS must have one group per storage node: storage_nodes=%s groups=%s\n' \
+      "${STORAGE_NODES}" "${NODE_RAID_GROUPS}" >&2
+    exit 1
+  fi
+
+  local required_data_disks=0
+  for group_size in "${groups[@]}"; do
+    if ! [[ "${group_size}" =~ ^[0-9]+$ ]] || (( group_size < 1 )); then
+      printf 'invalid NODE_RAID_GROUPS entry: %s\n' "${group_size}" >&2
+      exit 1
+    fi
+    required_data_disks=$((required_data_disks + group_size))
+  done
+  if (( required_data_disks > ${#DISKS[@]} - 1 )); then
+    printf 'node-private RAID groups need one journal disk plus %s data disks, found %s disks\n' \
+      "${required_data_disks}" "${#DISKS[@]}" >&2
+    exit 1
+  fi
+
+  wipe_disks
+  mount_xfs "${DISKS[0]}" /mnt/journal
+
+  local disk_offset=1
+  local node_index=1
+  for group_size in "${groups[@]}"; do
+    local group_disks=("${DISKS[@]:${disk_offset}:${group_size}}")
+    mdadm --create "/dev/md${node_index}" --level=0 --raid-devices="${group_size}" \
+      --chunk=1024K "${group_disks[@]}" --run --force
+    mount_xfs "/dev/md${node_index}" "/mnt/node-${node_index}"
+    disk_offset=$((disk_offset + group_size))
+    node_index=$((node_index + 1))
   done
 }
 
@@ -395,15 +442,33 @@ with (root / "durable-profile-summary.csv").open("w", newline="") as f:
 PY
 }
 
-setup_raid_shared
-run_layout "raid-shared" "/mnt/raid/loadbench" "" ""
-
-setup_raid_split_journal
-run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" ""
-
-setup_node_private_journal
-NODE_DIRS="$(csv_join_node_dirs)"
-run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}"
+IFS=',' read -r -a requested_layouts <<<"${LAYOUTS}"
+for layout in "${requested_layouts[@]}"; do
+  case "${layout}" in
+    raid-shared)
+      setup_raid_shared
+      run_layout "raid-shared" "/mnt/raid/loadbench" "" ""
+      ;;
+    raid-split-journal)
+      setup_raid_split_journal
+      run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" ""
+      ;;
+    node-private-journal)
+      setup_node_private_journal
+      NODE_DIRS="$(csv_join_node_dirs)"
+      run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}"
+      ;;
+    node-private-raid-journal)
+      setup_node_private_raid_journal
+      NODE_DIRS="$(csv_join_node_dirs)"
+      run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}"
+      ;;
+    *)
+      printf 'unknown layout: %s\n' "${layout}" >&2
+      exit 1
+      ;;
+  esac
+done
 
 teardown_storage
 summarize
