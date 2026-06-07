@@ -3,8 +3,9 @@ set -euo pipefail
 
 PROJECT="${PROJECT:-projectvoice-442316}"
 ZONE="${ZONE:-auto}"
-REGION="${REGION:-us-central1}"
+REGION="${REGION:-all}"
 ZONE_SCOPE="${ZONE_SCOPE:-us}"
+PREFERRED_REGIONS="${PREFERRED_REGIONS:-us-east1,us-central1,us-east4,us-west1,us-west2,us-west3,us-west4,us-south1}"
 MACHINE_TYPE="${MACHINE_TYPE:-c4-standard-32-lssd}"
 MIN_LOCAL_SSDS="${MIN_LOCAL_SSDS:-5}"
 STORAGE_NODES="${STORAGE_NODES:-4}"
@@ -32,6 +33,30 @@ last_attempt_zone=""
 
 zone_region() {
   sed -E 's/-[a-z]$//' <<<"$1"
+}
+
+sort_candidate_zones() {
+  awk -v preferred_regions="${PREFERRED_REGIONS}" '
+    BEGIN {
+      preferred_count = split(preferred_regions, preferred, /[, ]+/)
+      for (index = 1; index <= preferred_count; index++) {
+        if (preferred[index] != "") {
+          region_rank[preferred[index]] = index
+        }
+      }
+      fallback_rank = 10000
+    }
+    NF {
+      zone = $0
+      region = zone
+      sub(/-[a-z]$/, "", region)
+      rank = fallback_rank
+      if (region in region_rank) {
+        rank = region_rank[region]
+      }
+      printf "%05d %s\n", rank, zone
+    }
+  ' | sort -k1,1n -k2,2 | awk '{ print $2 }'
 }
 
 cleanup() {
@@ -73,7 +98,7 @@ candidate_zones() {
     gcloud compute machine-types list \
       --project "${PROJECT}" \
       --filter="name=${MACHINE_TYPE}" \
-      --format="value(zone)" | filter_zone_scope | sort -u
+      --format="value(zone)" | filter_zone_scope | sort -u | sort_candidate_zones
   else
     gcloud compute machine-types list \
       --project "${PROJECT}" \

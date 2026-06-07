@@ -6287,10 +6287,13 @@ fn durable_append_visible_publish_journal_can_live_outside_store_root() {
     .unwrap();
     let run_extents = file_run_extents(&store.metadata(), keyspace_id, file_id);
     assert_eq!(run_extents.len(), 1);
-    assert!(journal.exists());
+    let lane_journal =
+        append_visible_publish_journal_path_for_test(&journal_root, keyspace_id, file_id);
+    assert!(lane_journal.exists());
+    assert!(!journal.exists());
     assert!(!root.join("append-visible-publish.journal").exists());
     assert_eq!(
-        load_append_visible_publish_journal_records(&journal)
+        load_append_visible_publish_journal_records(&lane_journal)
             .unwrap()
             .len(),
         1
@@ -6374,6 +6377,104 @@ fn durable_append_visible_publish_replays_unpersisted_writer_epoch_skip() {
             .get(&(keyspace_id, file_id)),
         Some(&WriterEpoch::from_raw(2))
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_visible_publish_replays_independent_catalog_lane_journals() {
+    let root = durable_temp_dir("append-visible-publish-independent-lanes");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let first_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("first".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let second_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("second".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    assert_ne!(
+        append_publish_lane_index_for_test(first_file),
+        append_publish_lane_index_for_test(second_file)
+    );
+
+    let first_payload = repeated_blocks(1, 61);
+    let second_payload = repeated_blocks(1, 62);
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        first_file,
+        &first_payload,
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        second_file,
+        &second_payload,
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+    let first_journal =
+        append_visible_publish_journal_path_for_test(&root, keyspace_id, first_file);
+    let second_journal =
+        append_visible_publish_journal_path_for_test(&root, keyspace_id, second_file);
+    assert_ne!(first_journal, second_journal);
+    assert_eq!(
+        load_append_visible_publish_journal_records(&first_journal)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        load_append_visible_publish_journal_records(&second_journal)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut first = vec![0; first_payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            first_file,
+            ByteRange::new(0, first_payload.len() as u64),
+            &mut first,
+        )
+        .unwrap();
+    assert_eq!(first, first_payload);
+    let mut second = vec![0; second_payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            second_file,
+            ByteRange::new(0, second_payload.len() as u64),
+            &mut second,
+        )
+        .unwrap();
+    assert_eq!(second, second_payload);
+    reopened
+        .metadata()
+        .validate_keyspace_catalog_for_test(keyspace_id)
+        .unwrap();
     let _ = fs::remove_dir_all(root);
 }
 
@@ -9514,6 +9615,12 @@ fn durable_same_file_publish_tickets_serialize_without_inflight_conflict() {
     assert!(
         profiles
             .iter()
+            .any(|profile| profile.batch_same_file_skip_count >= 1),
+        "same-file tickets must be observed but skipped from the first physical batch"
+    );
+    assert!(
+        profiles
+            .iter()
             .any(|profile| profile.cvar_waits > 0 && profile.coordinator_wait_nanos > 0)
     );
     drop(store);
@@ -9540,16 +9647,8 @@ fn durable_append_publish_wait_batches_submitted_pending_tickets() {
             },
         )
         .unwrap();
-    let second_file = store
-        .create_file(
-            keyspace_id,
-            CreateFileRequest {
-                spec: FileSpec {
-                    name: Some("second".to_string()),
-                },
-            },
-        )
-        .unwrap();
+    let second_file =
+        create_file_in_same_append_publish_lane_for_test(&store, keyspace_id, first_file, "second");
     let first_stream = store.open_append_stream(keyspace_id, first_file).unwrap();
     let second_stream = store.open_append_stream(keyspace_id, second_file).unwrap();
     let first_payload = repeated_blocks(1, 91);
@@ -9608,9 +9707,78 @@ fn durable_append_publish_wait_batches_submitted_pending_tickets() {
     assert!(
         wait_profiles
             .iter()
+            .any(|profile| profile.batch_metadata_pending_ticket_count >= 2
+                && profile.batch_planned_ticket_count >= 2),
+        "batch profile should expose pending demand and admitted tickets"
+    );
+    assert!(
+        wait_profiles
+            .iter()
             .any(|profile| profile.completed_without_register)
     );
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_publish_wait_starts_immediately_at_target_batch_demand() {
+    let root = durable_temp_dir("native-ticket-target-batch-start");
+    let store = DurableCoordinator::open(&root, config()).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let mut tickets = Vec::new();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let mut publish_through = 0_u64;
+    for index in 0..17 {
+        let payload = vec![100 + index as u8; 128];
+        store
+            .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+            .unwrap();
+        publish_through += payload.len() as u64;
+        tickets.push(
+            store
+                .submit_append_publish(&stream, publish_through)
+                .unwrap(),
+        );
+    }
+    store.enable_append_publish_wait_profiling(32).unwrap();
+
+    let mut expected_offset = 0_u64;
+    for ticket in &tickets {
+        let commit = store.wait_append_publish(ticket).unwrap();
+        assert_eq!(commit.range, ByteRange::new(expected_offset, 128));
+        expected_offset += 128;
+    }
+
+    let profiles = store.drain_append_publish_wait_profiles(32).unwrap();
+    let driver = profiles
+        .iter()
+        .find(|profile| profile.persist_batches_started == 1)
+        .expect("one waiter should drive the target-sized physical batch");
+    assert!(driver.batch_coalesce_hit_target);
+    assert_eq!(
+        driver.coalesce_waits, 0,
+        "already-target-sized demand should not spend an extra coalesce wait"
+    );
+    assert!(driver.batch_metadata_pending_ticket_count >= 16);
+    assert!(driver.max_batch_ticket_count >= 16);
+    assert!(
+        driver.batch_same_file_skip_count >= 16,
+        "same-file tickets should count toward demand but only one can plan per physical batch"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -15299,12 +15467,50 @@ fn native_publish_journal_commit_count(root: &Path, next_commit_seq: u64) -> usi
         .len()
 }
 
+fn append_publish_lane_index_for_test(file_id: FileId) -> usize {
+    InMemoryMetadataPlane::keyspace_catalog_shard_index_for_len(
+        file_id,
+        KEYSPACE_CATALOG_SHARD_COUNT,
+    )
+    .unwrap()
+}
+
+fn create_file_in_same_append_publish_lane_for_test(
+    store: &DurableCoordinator,
+    keyspace_id: KeyspaceId,
+    anchor: FileId,
+    name: &str,
+) -> FileId {
+    let target_lane = append_publish_lane_index_for_test(anchor);
+    let mut attempt = 0_u64;
+    loop {
+        attempt += 1;
+        let file_id = store
+            .create_file(
+                keyspace_id,
+                CreateFileRequest {
+                    spec: FileSpec {
+                        name: Some(format!("{name}-{target_lane}-{attempt}")),
+                    },
+                },
+            )
+            .unwrap();
+        if file_id != anchor && append_publish_lane_index_for_test(file_id) == target_lane {
+            return file_id;
+        }
+    }
+}
+
 fn append_visible_publish_journal_path_for_test(
     root: &Path,
     _keyspace_id: KeyspaceId,
-    _file_id: FileId,
+    file_id: FileId,
 ) -> PathBuf {
-    root.join("append-visible-publish.journal")
+    append_visible_publish_journal_path_for_lane(
+        &root.join("append-visible-publish.journal"),
+        append_publish_lane_index_for_test(file_id),
+    )
+    .unwrap()
 }
 
 fn append_visible_publish_journal_count(

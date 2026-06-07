@@ -1044,6 +1044,65 @@ Read:
   append-publish path. SQLite may still matter for other metadata-heavy paths,
   but it is not the limiter evidenced by these native append publish rows.
 
+## Append-Visible Lane Journal Large-C4 Follow-Up
+
+The next GCP follow-up replaced the single append-visible publish coordinator
+and batch journal with keyspace-catalog-shard publish lanes. Each lane syncs a
+derived append-visible journal file, while full durable metadata persist takes
+an exclusive metadata-persist gate so checkpoint-style writes cannot cross an
+in-flight lane publish. The run used `c4-standard-288-lssd` in `us-east1-b`,
+48 local SSDs, `raid-split-journal`, 4 storage nodes, 32 MiB appends, 128 MiB
+publish boundaries, 512 MiB per worker, concurrency `32,64`, and modeled RTTs
+`0us`, `200us`, `700us`, and `3600us`.
+
+Raw artifacts:
+
+- `infra/gcp-local-nvme-bench/results/c4288-sharded-publish-06071540/`
+- `infra/gcp-local-nvme-bench/results/c4288-sharded-publish-06071540-results.tgz`
+
+Headline rows:
+
+| RTT | Workload | c | `published_mbps` | publish p99 | final drain p99 | append p99 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `0us` | at-end 32 MiB | 32 | 7394.02 | 501.1 ms | 501.1 ms | 169.0 ms |
+| `0us` | at-end 32 MiB | 64 | 8808.81 | 256.7 ms | 256.7 ms | 410.6 ms |
+| `200us` | at-end 32 MiB | 32 | 10634.11 | 367.4 ms | 367.5 ms | 136.1 ms |
+| `200us` | at-end 32 MiB | 64 | 10944.32 | 498.3 ms | 498.3 ms | 284.2 ms |
+| `700us` | at-end 32 MiB | 32 | 9803.58 | 455.2 ms | 455.2 ms | 150.9 ms |
+| `700us` | at-end 32 MiB | 64 | 12032.69 | 559.5 ms | 559.5 ms | 278.6 ms |
+| `3600us` | at-end 32 MiB | 32 | 10394.94 | 440.6 ms | 440.6 ms | 138.2 ms |
+| `3600us` | at-end 32 MiB | 64 | 11027.57 | 688.9 ms | 688.9 ms | 296.2 ms |
+| `0us` | interval 32 MiB | 32 | 9322.27 | 154.4 ms | 13.6 ms | 195.0 ms |
+| `0us` | interval 32 MiB | 64 | 9302.22 | 524.3 ms | 40.2 ms | 394.0 ms |
+| `200us` | interval 32 MiB | 32 | 12517.58 | 152.6 ms | 6.8 ms | 128.8 ms |
+| `200us` | interval 32 MiB | 64 | 12541.23 | 289.5 ms | 19.9 ms | 298.5 ms |
+| `700us` | interval 32 MiB | 32 | 14515.53 | 162.9 ms | 50.2 ms | 132.4 ms |
+| `700us` | interval 32 MiB | 64 | 13610.74 | 27.4 ms | 13.1 ms | 272.7 ms |
+| `3600us` | interval 32 MiB | 32 | 14789.69 | 9.5 ms | 7.1 ms | 79.7 ms |
+| `3600us` | interval 32 MiB | 64 | 14109.41 | 38.3 ms | 16.1 ms | 311.6 ms |
+
+Read:
+
+- The old single-lane queue was removed: `in_flight_wait_nanos` p99 and max
+  were `0` for every row, and append-visible journal lock wait was effectively
+  zero.
+- The best steady-state interval rows reached `14.5-14.8 GB/s`
+  `published_mbps`. This preserves the previous 15 GB/s-class target on the
+  larger node while no longer depending on one global visible-publish lane.
+- At-end still has a large final drain tail because all workers publish at the
+  terminal boundary. Those rows are now dominated by per-lane
+  `persist_batch_nanos` and device queueing, not by coordinator
+  `in_flight_wait_nanos`.
+- The lane split trades away cross-file group commit in these rows:
+  `max_batch_ticket_count` p99 was `1` throughout. That is acceptable for
+  proving the queueing fix, but it means the next latency work should target
+  adaptive group commit or persist batching that does not recreate a single
+  global visibility lane.
+- The storage device is still a throughput limiter in hot rows: the data RAID
+  device was saturated while the dedicated journal device was mostly idle. This
+  is now a data-device and per-lane persist scheduling problem, not evidence
+  that SQLite row work is the native append-publish limiter.
+
 ## External North-Star Targets
 
 The June 6, 2026 Rapid Storage c3-88/Tier1 run is the current external

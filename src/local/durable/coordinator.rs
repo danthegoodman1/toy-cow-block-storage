@@ -5,6 +5,7 @@
 // publishes.
 const APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY: Duration = Duration::from_millis(1);
 const APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY: Duration = Duration::from_millis(20);
+const APPEND_PUBLISH_BATCH_TARGET_TICKETS: usize = 16;
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -19,15 +20,23 @@ pub struct DurableCoordinator {
     block_delta_prestage: Arc<BlockDeltaPrestageTracker>,
     stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<StreamAppendLane>>>>,
     persist_lock: Arc<Mutex<()>>,
+    metadata_persist_gate: Arc<RwLock<()>>,
     persist_coordinator: Arc<PersistCoordinator>,
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
-    append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
+    append_publish_persist_lanes:
+        Arc<Mutex<BTreeMap<AppendPublishLaneKey, Arc<AppendPublishPersistCoordinator>>>>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AppendPublishLaneKey {
+    keyspace_id: KeyspaceId,
+    shard_index: usize,
 }
 
 #[derive(Debug)]
@@ -62,6 +71,9 @@ struct AppendPublishBatchDiagnostics {
     append_visible_journal_record_count: u64,
     append_visible_journal_frame_bytes: u64,
     append_visible_journal_created: u64,
+    planned_ticket_count: u64,
+    completed_ticket_count: u64,
+    same_file_skip_count: u64,
 }
 
 impl AppendPublishBatchDiagnostics {
@@ -90,8 +102,18 @@ impl AppendPublishBatchDiagnostics {
             append_visible_journal_record_count: profile.append_visible_journal_record_count,
             append_visible_journal_frame_bytes: profile.append_visible_journal_frame_bytes,
             append_visible_journal_created: profile.append_visible_journal_created,
+            planned_ticket_count: 0,
+            completed_ticket_count: 0,
+            same_file_skip_count: 0,
         }
     }
+}
+
+#[derive(Debug)]
+struct AppendPublishTicketBatch {
+    tickets: Vec<AppendPublishTicket>,
+    waiter_request_count: usize,
+    metadata_pending_ticket_count: usize,
 }
 
 impl DurableCoordinator {
@@ -249,9 +271,10 @@ impl DurableCoordinator {
             block_delta_prestage: Arc::new(BlockDeltaPrestageTracker::new()),
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_lock: Arc::new(Mutex::new(())),
+            metadata_persist_gate: Arc::new(RwLock::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
-            append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
+            append_publish_persist_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
@@ -363,6 +386,37 @@ impl DurableCoordinator {
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         profile.success = success;
         let _ = self.record_append_publish_wait_profile(profile);
+    }
+
+    fn append_publish_lane_key(ticket: &AppendPublishTicket) -> Result<AppendPublishLaneKey> {
+        Ok(AppendPublishLaneKey {
+            keyspace_id: ticket.keyspace_id,
+            shard_index: InMemoryMetadataPlane::keyspace_catalog_shard_index_for_len(
+                ticket.file_id,
+                KEYSPACE_CATALOG_SHARD_COUNT,
+            )?,
+        })
+    }
+
+    fn append_publish_lane(
+        &self,
+        key: AppendPublishLaneKey,
+    ) -> Result<Arc<AppendPublishPersistCoordinator>> {
+        let mut lanes = lock(&self.append_publish_persist_lanes)?;
+        Ok(Arc::clone(
+            lanes
+                .entry(key)
+                .or_insert_with(|| Arc::new(AppendPublishPersistCoordinator::new())),
+        ))
+    }
+
+    fn append_publish_lane_for_ticket(
+        &self,
+        ticket: &AppendPublishTicket,
+    ) -> Result<(AppendPublishLaneKey, Arc<AppendPublishPersistCoordinator>)> {
+        let key = Self::append_publish_lane_key(ticket)?;
+        let lane = self.append_publish_lane(key)?;
+        Ok((key, lane))
     }
 
     fn maybe_auto_persist_append_stream(
@@ -726,6 +780,7 @@ impl DurableCoordinator {
         total_started: Instant,
         mut deltas: Vec<BlockDeltaCommit>,
     ) -> Result<CommitSeq> {
+        let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
         let mut block_delta_prestage_wait_nanos = self.wait_for_block_delta_prestage(&deltas)?;
         let durable_before = deltas
             .first()
@@ -906,6 +961,7 @@ impl DurableCoordinator {
         changed_catalog_segments: Option<&BTreeSet<SegmentId>>,
         target_commit: Option<CommitSeq>,
     ) -> Result<CommitSeq> {
+        let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
         let block_delta_prestage_wait_nanos = self.wait_for_all_block_delta_prestage()?;
         let lock_started = Instant::now();
         let _persist_guard = lock(&self.persist_lock)?;
@@ -1322,6 +1378,7 @@ impl DurableCoordinator {
         changed_segments: &BTreeSet<SegmentId>,
         total_started: Instant,
     ) -> Result<CommitSeq> {
+        let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
         let target_commit = lock(&self.persist_coordinator.inner)?
             .requested_through
             .max(minimum_target);
@@ -1496,6 +1553,7 @@ impl DurableCoordinator {
     fn persist_prepared_append_publish_plans(
         &self,
         batch_id: u64,
+        journal_lane_index: usize,
         plans: &[AppendPublishPlan],
         total_started: Instant,
         mut lock_wait_nanos: u64,
@@ -1561,6 +1619,7 @@ impl DurableCoordinator {
             .map(|plan| plan.visible_publish.clone())
             .collect::<Vec<_>>();
         let mut profile = self.durable.persist_synced_append_visible_publish_records(
+            journal_lane_index,
             &records,
             &nodes,
             pending_stream_append,
@@ -1604,6 +1663,7 @@ impl DurableCoordinator {
 
     fn persist_append_publish_ticket_batch(
         &self,
+        lane_key: AppendPublishLaneKey,
         batch_id: u64,
         tickets: Vec<AppendPublishTicket>,
     ) -> Result<AppendPublishBatchDiagnostics> {
@@ -1616,93 +1676,108 @@ impl DurableCoordinator {
         }
 
         loop {
-            let mut state = lock(&self.persist_coordinator.inner)?;
-            while state.in_flight {
-                state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
-            }
-            state.in_flight = true;
-            drop(state);
-
             let total_started = Instant::now();
-            let result = (|| {
+            let result = (|| -> Result<BatchStep> {
+                let _metadata_gate = read_lock(&self.metadata_persist_gate)?;
                 if self.append_publish_requires_full_persist_before_plan()? {
-                    return Ok(BatchStep::NeedsFullPersist);
-                }
-                let mut cursor = self.durable.effective_export_cursor()?.ok_or_else(|| {
-                    StorageError::conflict("prepared append publish requires durable cursor")
-                })?;
-                let mut draft_keyspace_heads = BTreeMap::new();
-                let mut planned_files = BTreeSet::new();
-                let mut plans = Vec::new();
-                for ticket in &tickets {
-                    let file_key = (ticket.keyspace_id, ticket.file_id);
-                    if planned_files.contains(&file_key) {
-                        continue;
-                    }
-                    if matches!(
-                        self.local.metadata.append_publish_ticket_status(ticket)?,
-                        AppendPublishTicketStatus::Completed(_)
-                    ) {
-                        continue;
-                    }
-                    planned_files.insert(file_key);
-                    let plan = match self.local.prepare_append_publish_plan_with_drafts(
-                        ticket,
-                        WriteDurability::Flushed,
-                        &cursor,
-                        &mut draft_keyspace_heads,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(StorageError::Conflict { reason })
-                            if reason
-                                == "prepared append publish requires prior metadata durable" =>
-                        {
-                            return Ok(BatchStep::NeedsFullPersist);
+                    Ok(BatchStep::NeedsFullPersist)
+                } else {
+                    let mut cursor =
+                        self.durable.effective_export_cursor()?.ok_or_else(|| {
+                            StorageError::conflict(
+                                "prepared append publish requires durable cursor",
+                            )
+                        })?;
+                    let mut draft_keyspace_heads = BTreeMap::new();
+                    let mut planned_files = BTreeSet::new();
+                    let mut plans = Vec::new();
+                    let mut completed_ticket_count = 0_u64;
+                    let mut same_file_skip_count = 0_u64;
+                    for ticket in &tickets {
+                        let file_key = (ticket.keyspace_id, ticket.file_id);
+                        if planned_files.contains(&file_key) {
+                            same_file_skip_count = same_file_skip_count.saturating_add(1);
+                            continue;
                         }
-                        Err(error) => return Err(error),
-                    };
-                    cursor.next_commit_seq = plan
-                        .commit
-                        .commit_seq
-                        .raw()
-                        .checked_add(1)
-                        .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?
-                        .max(cursor.next_commit_seq);
-                    plans.push(plan);
-                }
-                if plans.is_empty() {
-                    return Ok(BatchStep::Published(
-                        CommitSeq::from_raw(cursor.next_commit_seq.saturating_sub(1)),
-                        AppendPublishBatchDiagnostics::default(),
-                    ));
-                }
-                let (durable_high_water, diagnostics) =
-                    match self.persist_prepared_append_publish_plans(
-                        batch_id,
-                        &plans,
-                        total_started,
-                        0,
-                    ) {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            for plan in &plans {
-                                self.local.cancel_append_publish_plan(plan)?;
+                        if matches!(
+                            self.local.metadata.append_publish_ticket_status(ticket)?,
+                            AppendPublishTicketStatus::Completed(_)
+                        ) {
+                            completed_ticket_count = completed_ticket_count.saturating_add(1);
+                            continue;
+                        }
+                        planned_files.insert(file_key);
+                        let plan = match self.local.prepare_append_publish_plan_with_drafts(
+                            ticket,
+                            WriteDurability::Flushed,
+                            &cursor,
+                            &mut draft_keyspace_heads,
+                        ) {
+                            Ok(plan) => plan,
+                            Err(StorageError::Conflict { reason })
+                                if reason
+                                    == "prepared append publish requires prior metadata durable" =>
+                            {
+                                return Ok(BatchStep::NeedsFullPersist);
                             }
-                            return Err(error);
+                            Err(error) => return Err(error),
+                        };
+                        cursor.next_commit_seq = plan
+                            .commit
+                            .commit_seq
+                            .raw()
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                StorageError::conflict("durable cursor commit overflow")
+                            })?
+                            .max(cursor.next_commit_seq);
+                        plans.push(plan);
+                    }
+                    if plans.is_empty() {
+                        let diagnostics = AppendPublishBatchDiagnostics {
+                            completed_ticket_count,
+                            same_file_skip_count,
+                            ..AppendPublishBatchDiagnostics::default()
+                        };
+                        Ok(BatchStep::Published(
+                            CommitSeq::from_raw(cursor.next_commit_seq.saturating_sub(1)),
+                            diagnostics,
+                        ))
+                    } else {
+                        let planned_ticket_count = usize_to_u64(plans.len());
+                        let (durable_high_water, diagnostics) =
+                            match self.persist_prepared_append_publish_plans(
+                                batch_id,
+                                lane_key.shard_index,
+                                &plans,
+                                total_started,
+                                0,
+                            ) {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    for plan in &plans {
+                                        self.local.cancel_append_publish_plan(plan)?;
+                                    }
+                                    return Err(error);
+                                }
+                            };
+                        for plan in plans {
+                            self.local.apply_append_publish_plan(plan)?;
                         }
-                    };
-                for plan in plans {
-                    self.local.apply_append_publish_plan(plan)?;
+                        let diagnostics = AppendPublishBatchDiagnostics {
+                            planned_ticket_count,
+                            completed_ticket_count,
+                            same_file_skip_count,
+                            ..diagnostics
+                        };
+                        Ok(BatchStep::Published(durable_high_water, diagnostics))
+                    }
                 }
-                Ok(BatchStep::Published(durable_high_water, diagnostics))
             })();
 
-            let mut state = lock(&self.persist_coordinator.inner)?;
-            state.in_flight = false;
-            state.generation = state.generation.saturating_add(1);
-            let generation = state.generation;
             match result {
                 Ok(BatchStep::Published(durable_high_water, diagnostics)) => {
+                    let mut state = lock(&self.persist_coordinator.inner)?;
                     state.durable_through = state.durable_through.max(durable_high_water);
                     let durable_through = state.durable_through;
                     state.requested_through = state.requested_through.max(durable_through);
@@ -1711,12 +1786,16 @@ impl DurableCoordinator {
                     return Ok(diagnostics);
                 }
                 Ok(BatchStep::NeedsFullPersist) => {
+                    let mut state = lock(&self.persist_coordinator.inner)?;
                     state.last_error = None;
                     self.persist_coordinator.cvar.notify_all();
                     drop(state);
                     self.persist_now()?;
                 }
                 Err(error) => {
+                    let mut state = lock(&self.persist_coordinator.inner)?;
+                    state.generation = state.generation.saturating_add(1);
+                    let generation = state.generation;
                     state.last_error = Some((generation, error.clone()));
                     self.persist_coordinator.cvar.notify_all();
                     return Err(error);
@@ -1727,37 +1806,63 @@ impl DurableCoordinator {
 
     fn append_publish_ticket_batch(
         &self,
+        lane_key: AppendPublishLaneKey,
         waiter_tickets: Vec<AppendPublishTicket>,
-    ) -> Result<Vec<AppendPublishTicket>> {
+    ) -> Result<AppendPublishTicketBatch> {
+        let waiter_request_count = waiter_tickets.len();
         let mut tickets = BTreeMap::new();
         for ticket in waiter_tickets {
             tickets.insert(ticket.ticket_id, ticket);
         }
-        for ticket in self.local.metadata.pending_append_publish_tickets()? {
+        let pending_tickets = self.local.metadata.pending_append_publish_tickets()?;
+        let mut metadata_pending_ticket_count = 0;
+        for ticket in pending_tickets {
+            if Self::append_publish_lane_key(&ticket)? != lane_key {
+                continue;
+            }
+            metadata_pending_ticket_count += 1;
             tickets.entry(ticket.ticket_id).or_insert(ticket);
         }
-        Ok(tickets.into_values().collect())
+        Ok(AppendPublishTicketBatch {
+            tickets: tickets.into_values().collect(),
+            waiter_request_count,
+            metadata_pending_ticket_count,
+        })
     }
 
     fn append_publish_batch_demand(
         &self,
+        lane_key: AppendPublishLaneKey,
         state: &AppendPublishPersistCoordinatorState,
     ) -> Result<usize> {
+        let mut pending_count = 0;
+        for ticket in self.local.metadata.pending_append_publish_tickets()? {
+            if Self::append_publish_lane_key(&ticket)? == lane_key {
+                pending_count += 1;
+            }
+        }
         Ok(state
             .requests
             .len()
-            .max(self.local.metadata.pending_append_publish_tickets()?.len()))
+            .max(pending_count))
     }
 
     fn coalesce_append_publish_waiters(
         &self,
+        lane_key: AppendPublishLaneKey,
+        lane: &AppendPublishPersistCoordinator,
         mut state: MutexGuard<'_, AppendPublishPersistCoordinatorState>,
         profile: &mut AppendPublishWaitProfile,
-    ) -> Result<Vec<AppendPublishTicket>> {
+    ) -> Result<AppendPublishTicketBatch> {
         let started = Instant::now();
-        let mut demand = self.append_publish_batch_demand(&state)?;
+        let mut demand = self.append_publish_batch_demand(lane_key, &state)?;
+        profile.batch_coalesce_start_demand = usize_to_u64(demand);
         let mut saw_peer = demand > 1;
+        let mut hit_target = demand >= APPEND_PUBLISH_BATCH_TARGET_TICKETS;
         loop {
+            if hit_target {
+                break;
+            }
             let elapsed = started.elapsed();
             if saw_peer && elapsed >= APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY {
                 break;
@@ -1775,20 +1880,18 @@ impl DurableCoordinator {
             let wait_started = Instant::now();
             profile.cvar_waits = profile.cvar_waits.saturating_add(1);
             profile.coalesce_waits = profile.coalesce_waits.saturating_add(1);
-            let (next_state, timed_out) = wait_timeout_on_cvar(
-                &self.append_publish_persist_coordinator.cvar,
-                state,
-                delay,
-            )?;
+            let (next_state, timed_out) =
+                wait_timeout_on_cvar(&lane.cvar, state, delay)?;
             state = next_state;
             let wait_nanos = duration_nanos_u64(wait_started.elapsed());
             profile.coordinator_wait_nanos =
                 profile.coordinator_wait_nanos.saturating_add(wait_nanos);
             profile.coalesce_wait_nanos = profile.coalesce_wait_nanos.saturating_add(wait_nanos);
 
-            let next_demand = self.append_publish_batch_demand(&state)?;
+            let next_demand = self.append_publish_batch_demand(lane_key, &state)?;
             if next_demand > demand {
                 demand = next_demand;
+                hit_target = demand >= APPEND_PUBLISH_BATCH_TARGET_TICKETS;
                 saw_peer = saw_peer || demand > 1;
                 continue;
             }
@@ -1797,9 +1900,11 @@ impl DurableCoordinator {
             }
         }
 
+        profile.batch_coalesce_end_demand = usize_to_u64(demand);
+        profile.batch_coalesce_hit_target = hit_target;
         let waiter_tickets = state.requests.values().cloned().collect::<Vec<_>>();
         drop(state);
-        self.append_publish_ticket_batch(waiter_tickets)
+        self.append_publish_ticket_batch(lane_key, waiter_tickets)
     }
 
     /// Return the maintenance policy configured for this store.
@@ -2393,7 +2498,8 @@ impl DurableCoordinator {
         publish_through: u64,
     ) -> Result<AppendPublishTicket> {
         let ticket = self.local.submit_append_publish(stream, publish_through)?;
-        self.append_publish_persist_coordinator.cvar.notify_all();
+        let (_, lane) = self.append_publish_lane_for_ticket(&ticket)?;
+        lane.cvar.notify_all();
         Ok(ticket)
     }
 
@@ -2410,21 +2516,29 @@ impl DurableCoordinator {
         };
         let mut registered = false;
         let mut observed_generation = 0_u64;
+        let mut last_in_flight_batch_waited = 0_u64;
+        let (lane_key, lane) = self.append_publish_lane_for_ticket(ticket)?;
         loop {
             profile.wait_loops = profile.wait_loops.saturating_add(1);
             if registered {
                 let lock_started = Instant::now();
-                let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                let mut state = lock(&lane.inner)?;
                 profile.coordinator_lock_wait_nanos = profile
                     .coordinator_lock_wait_nanos
                     .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                 while state.in_flight {
+                    let batch_id = state.current_batch_id;
+                    if batch_id != 0 && batch_id != last_in_flight_batch_waited {
+                        last_in_flight_batch_waited = batch_id;
+                        profile.in_flight_batches_waited =
+                            profile.in_flight_batches_waited.saturating_add(1);
+                    }
                     let wait_started = Instant::now();
                     profile.cvar_waits = profile.cvar_waits.saturating_add(1);
                     profile.in_flight_waits = profile.in_flight_waits.saturating_add(1);
                     profile.append_publish_batch_id =
                         profile.append_publish_batch_id.max(state.current_batch_id);
-                    state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                    state = wait_on_cvar(&lane.cvar, state)?;
                     let wait_nanos = duration_nanos_u64(wait_started.elapsed());
                     profile.coordinator_wait_nanos =
                         profile.coordinator_wait_nanos.saturating_add(wait_nanos);
@@ -2442,17 +2556,23 @@ impl DurableCoordinator {
             }
             if !registered {
                 let lock_started = Instant::now();
-                let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                let mut state = lock(&lane.inner)?;
                 profile.coordinator_lock_wait_nanos = profile
                     .coordinator_lock_wait_nanos
                     .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                 while state.in_flight {
+                    let batch_id = state.current_batch_id;
+                    if batch_id != 0 && batch_id != last_in_flight_batch_waited {
+                        last_in_flight_batch_waited = batch_id;
+                        profile.in_flight_batches_waited =
+                            profile.in_flight_batches_waited.saturating_add(1);
+                    }
                     let wait_started = Instant::now();
                     profile.cvar_waits = profile.cvar_waits.saturating_add(1);
                     profile.in_flight_waits = profile.in_flight_waits.saturating_add(1);
                     profile.append_publish_batch_id =
                         profile.append_publish_batch_id.max(state.current_batch_id);
-                    state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                    state = wait_on_cvar(&lane.cvar, state)?;
                     let wait_nanos = duration_nanos_u64(wait_started.elapsed());
                     profile.coordinator_wait_nanos =
                         profile.coordinator_wait_nanos.saturating_add(wait_nanos);
@@ -2470,7 +2590,7 @@ impl DurableCoordinator {
                 AppendPublishTicketStatus::Completed(commit) => {
                     if registered {
                         let lock_started = Instant::now();
-                        let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                        let mut state = lock(&lane.inner)?;
                         profile.coordinator_lock_wait_nanos = profile
                             .coordinator_lock_wait_nanos
                             .saturating_add(duration_nanos_u64(lock_started.elapsed()));
@@ -2487,19 +2607,19 @@ impl DurableCoordinator {
 
             if !registered {
                 let lock_started = Instant::now();
-                let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                let mut state = lock(&lane.inner)?;
                 profile.coordinator_lock_wait_nanos = profile
                     .coordinator_lock_wait_nanos
                     .saturating_add(duration_nanos_u64(lock_started.elapsed()));
                 state.requests.insert(ticket.ticket_id, ticket.clone());
-                self.append_publish_persist_coordinator.cvar.notify_all();
+                lane.cvar.notify_all();
                 observed_generation = state.generation;
                 registered = true;
                 profile.registered = true;
             }
 
             let lock_started = Instant::now();
-            let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+            let mut state = lock(&lane.inner)?;
             profile.coordinator_lock_wait_nanos = profile
                 .coordinator_lock_wait_nanos
                 .saturating_add(duration_nanos_u64(lock_started.elapsed()));
@@ -2513,12 +2633,18 @@ impl DurableCoordinator {
             if state.in_flight {
                 let generation = state.generation;
                 while state.in_flight && state.generation == generation {
+                    let batch_id = state.current_batch_id;
+                    if batch_id != 0 && batch_id != last_in_flight_batch_waited {
+                        last_in_flight_batch_waited = batch_id;
+                        profile.in_flight_batches_waited =
+                            profile.in_flight_batches_waited.saturating_add(1);
+                    }
                     let wait_started = Instant::now();
                     profile.cvar_waits = profile.cvar_waits.saturating_add(1);
                     profile.in_flight_waits = profile.in_flight_waits.saturating_add(1);
                     profile.append_publish_batch_id =
                         profile.append_publish_batch_id.max(state.current_batch_id);
-                    state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
+                    state = wait_on_cvar(&lane.cvar, state)?;
                     let wait_nanos = duration_nanos_u64(wait_started.elapsed());
                     profile.coordinator_wait_nanos =
                         profile.coordinator_wait_nanos.saturating_add(wait_nanos);
@@ -2535,11 +2661,16 @@ impl DurableCoordinator {
             profile.append_publish_batch_id = batch_id;
             profile.persist_batches_started = profile.persist_batches_started.saturating_add(1);
 
-            let tickets = match self.coalesce_append_publish_waiters(state, &mut profile) {
-                Ok(tickets) => tickets,
+            let batch = match self.coalesce_append_publish_waiters(
+                lane_key,
+                &lane,
+                state,
+                &mut profile,
+            ) {
+                Ok(batch) => batch,
                 Err(error) => {
                     let lock_started = Instant::now();
-                    let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+                    let mut state = lock(&lane.inner)?;
                     profile.coordinator_lock_wait_nanos = profile
                         .coordinator_lock_wait_nanos
                         .saturating_add(duration_nanos_u64(lock_started.elapsed()));
@@ -2548,17 +2679,24 @@ impl DurableCoordinator {
                     let generation = state.generation;
                     state.last_error = Some((generation, error.clone()));
                     state.requests.remove(&ticket.ticket_id);
-                    self.append_publish_persist_coordinator.cvar.notify_all();
+                    lane.cvar.notify_all();
                     self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }
             };
             profile.max_batch_ticket_count = profile
                 .max_batch_ticket_count
-                .max(usize_to_u64(tickets.len()));
+                .max(usize_to_u64(batch.tickets.len()));
+            profile.batch_waiter_request_count = profile
+                .batch_waiter_request_count
+                .max(usize_to_u64(batch.waiter_request_count));
+            profile.batch_metadata_pending_ticket_count = profile
+                .batch_metadata_pending_ticket_count
+                .max(usize_to_u64(batch.metadata_pending_ticket_count));
 
             let persist_started = Instant::now();
-            let result = self.persist_append_publish_ticket_batch(batch_id, tickets);
+            let result =
+                self.persist_append_publish_ticket_batch(lane_key, batch_id, batch.tickets);
             profile.persist_batch_nanos = profile
                 .persist_batch_nanos
                 .saturating_add(duration_nanos_u64(persist_started.elapsed()));
@@ -2608,27 +2746,45 @@ impl DurableCoordinator {
                 profile.append_visible_journal_created = profile
                     .append_visible_journal_created
                     .saturating_add(diagnostics.append_visible_journal_created);
+                profile.batch_planned_ticket_count = profile
+                    .batch_planned_ticket_count
+                    .saturating_add(diagnostics.planned_ticket_count);
+                profile.batch_completed_ticket_count = profile
+                    .batch_completed_ticket_count
+                    .saturating_add(diagnostics.completed_ticket_count);
+                profile.batch_same_file_skip_count = profile
+                    .batch_same_file_skip_count
+                    .saturating_add(diagnostics.same_file_skip_count);
             }
+            let post_batch_pending_ticket_count = self
+                .local
+                .metadata
+                .pending_append_publish_tickets()
+                .ok()
+                .map(|tickets| usize_to_u64(tickets.len()))
+                .unwrap_or_default();
 
             let lock_started = Instant::now();
-            let mut state = lock(&self.append_publish_persist_coordinator.inner)?;
+            let mut state = lock(&lane.inner)?;
             profile.coordinator_lock_wait_nanos = profile
                 .coordinator_lock_wait_nanos
                 .saturating_add(duration_nanos_u64(lock_started.elapsed()));
             state.in_flight = false;
             state.generation = state.generation.saturating_add(1);
             let generation = state.generation;
+            profile.post_batch_request_count = usize_to_u64(state.requests.len());
+            profile.post_batch_pending_ticket_count = post_batch_pending_ticket_count;
             match result {
                 Ok(_) => {
                     state.last_error = None;
-                    self.append_publish_persist_coordinator.cvar.notify_all();
+                    lane.cvar.notify_all();
                     observed_generation = generation;
                     continue;
                 }
                 Err(error) => {
                     state.last_error = Some((generation, error.clone()));
                     state.requests.remove(&ticket.ticket_id);
-                    self.append_publish_persist_coordinator.cvar.notify_all();
+                    lane.cvar.notify_all();
                     self.finish_append_publish_wait_profile(profile, total_started, false);
                     return Err(error);
                 }

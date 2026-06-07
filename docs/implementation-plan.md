@@ -1386,9 +1386,9 @@ is not a meaningful read bottleneck at 200 us RTT.
 ## Phase 23B: File-Scoped Native Append Publish Records
 
 Status: in progress; record, codec, deterministic replay, durable-open
-materialization, and the synchronous append-publish hot path now use
-file-scoped append-visible records instead of the global native metadata delta
-journal.
+materialization, the synchronous append-publish hot path, and catalog-shard
+append-visible lane journals now use file-scoped append-visible records instead
+of the global native metadata delta journal.
 
 Remove the remaining global visible-publish serialization from native append
 streams. Phase 23A made append payloads run-backed, but append publish
@@ -1427,8 +1427,8 @@ Deliverables:
   replay as a monotonic fencing high-water so later durable private-stream
   fences are not regressed.
 - [x] Convert the synchronous append-publish wait path to persist payload runs,
-  sync one append-visible journal batch containing file-scoped publish records,
-  and return without syncing the global native metadata delta journal.
+  sync one append-visible lane-journal batch containing file-scoped publish
+  records, and return without syncing the global native metadata delta journal.
 - [ ] Add a checkpoint/materialization path that folds file-scoped append
   records into ordinary run-backed file roots for reads, PITR anchors, snapshots,
   restores, and GC traversal.
@@ -1447,14 +1447,14 @@ Exit gate:
   bytes after reopen.
 - [ ] Crash after the file-scoped publish record sync exposes the whole prefix
   after reopen, even when materialization/checkpointing did not run.
-- [ ] Independent files can publish and replay without waiting for a contiguous
+- [x] Independent files can publish and replay without waiting for a contiguous
   global native append-publish commit sequence.
 - [ ] Stale stream, fenced stream, same-file ordinary write, fork, restore,
   delete, PITR, and GC tests cover outstanding append publish records.
 - [ ] c16 keeps Rapid-range publish p99, and c32/c64 materially reduce publish
   p99 versus the Phase 23A 20 ms coalescing checkpoint without losing more than
   10 percent `published_mbps`.
-- [ ] Durable profile rows show append publish no longer spends p99 in the
+- [x] Durable profile rows show append publish no longer spends p99 in the
   global visible metadata journal sync path.
 - [ ] Full Rust gate passes inside the dev container.
 

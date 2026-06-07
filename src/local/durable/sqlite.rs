@@ -7,7 +7,9 @@ pub(super) struct DurableSqliteStore {
     data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     append_log_service: Arc<StorageNodeAppendLogService>,
     native_publish_journal_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
     append_visible_publish_journal_lock: Arc<Mutex<()>>,
+    append_visible_publish_journal_lane_locks: Arc<Vec<Mutex<()>>>,
     #[cfg(test)]
     persist_delay: Arc<Mutex<Option<Duration>>>,
     #[cfg(test)]
@@ -111,9 +113,20 @@ pub struct AppendPublishWaitProfile {
     pub wait_loops: u64,
     pub cvar_waits: u64,
     pub in_flight_waits: u64,
+    pub in_flight_batches_waited: u64,
     pub coalesce_waits: u64,
     pub persist_batches_started: u64,
     pub max_batch_ticket_count: u64,
+    pub batch_waiter_request_count: u64,
+    pub batch_metadata_pending_ticket_count: u64,
+    pub batch_coalesce_start_demand: u64,
+    pub batch_coalesce_end_demand: u64,
+    pub batch_coalesce_hit_target: bool,
+    pub batch_planned_ticket_count: u64,
+    pub batch_completed_ticket_count: u64,
+    pub batch_same_file_skip_count: u64,
+    pub post_batch_request_count: u64,
+    pub post_batch_pending_ticket_count: u64,
     pub append_publish_batch_id: u64,
     pub payload_already_durable_bytes: u64,
     pub payload_synced_bytes: u64,
@@ -1631,6 +1644,26 @@ pub(super) fn load_append_visible_publish_journal_records(
     Ok(batches.into_iter().flatten().collect())
 }
 
+pub(super) fn append_visible_publish_journal_path_for_lane(
+    base: &Path,
+    lane_index: usize,
+) -> Result<PathBuf> {
+    if lane_index >= KEYSPACE_CATALOG_SHARD_COUNT {
+        return Err(StorageError::invalid_argument(
+            "append visible publish journal lane index out of range",
+        ));
+    }
+    let stem = base
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("append-visible-publish");
+    let file_name = match base.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => format!("{stem}.lane-{lane_index:04}.{extension}"),
+        None => format!("{stem}.lane-{lane_index:04}"),
+    };
+    Ok(base.with_file_name(file_name))
+}
+
 fn prune_native_publish_journal_through(path: &Path, commit_seq: CommitSeq) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -1886,7 +1919,13 @@ impl DurableSqliteStore {
             data_log_allocation_locks,
             append_log_service,
             native_publish_journal_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
             append_visible_publish_journal_lock: Arc::new(Mutex::new(())),
+            append_visible_publish_journal_lane_locks: Arc::new(
+                (0..KEYSPACE_CATALOG_SHARD_COUNT)
+                    .map(|_| Mutex::new(()))
+                    .collect(),
+            ),
             #[cfg(test)]
             persist_delay: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2233,6 +2272,7 @@ impl DurableSqliteStore {
         self.append_append_visible_publish_journal_records(std::slice::from_ref(record))
     }
 
+    #[cfg(test)]
     pub(super) fn append_append_visible_publish_journal_records(
         &self,
         records: &[AppendVisiblePublish],
@@ -2248,13 +2288,47 @@ impl DurableSqliteStore {
         Ok(profile)
     }
 
+    pub(super) fn append_append_visible_publish_journal_records_for_lane(
+        &self,
+        lane_index: usize,
+        records: &[AppendVisiblePublish],
+    ) -> Result<AppendVisibleJournalProfile> {
+        let lane_lock = self
+            .append_visible_publish_journal_lane_locks
+            .get(lane_index)
+            .ok_or_else(|| {
+                StorageError::invalid_argument(
+                    "append visible publish journal lane index out of range",
+                )
+            })?;
+        let path = append_visible_publish_journal_path_for_lane(
+            &self.paths.append_visible_publish_journal,
+            lane_index,
+        )?;
+        let lock_started = Instant::now();
+        let _journal_guard = lock(lane_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let mut profile = append_append_visible_publish_journal_records(&path, records)?;
+        profile.lock_wait_nanos = lock_wait_nanos;
+        Ok(profile)
+    }
+
     #[cfg(test)]
     pub(super) fn append_visible_publish_journal_records(&self) -> Result<Vec<AppendVisiblePublish>> {
-        load_append_visible_publish_journal_records(&self.paths.append_visible_publish_journal)
+        self.all_append_visible_publish_journal_records()
     }
 
     fn all_append_visible_publish_journal_records(&self) -> Result<Vec<AppendVisiblePublish>> {
-        load_append_visible_publish_journal_records(&self.paths.append_visible_publish_journal)
+        let mut records =
+            load_append_visible_publish_journal_records(&self.paths.append_visible_publish_journal)?;
+        for lane_index in 0..KEYSPACE_CATALOG_SHARD_COUNT {
+            let path = append_visible_publish_journal_path_for_lane(
+                &self.paths.append_visible_publish_journal,
+                lane_index,
+            )?;
+            records.extend(load_append_visible_publish_journal_records(&path)?);
+        }
+        Ok(records)
     }
 
     fn persist_catalog_reference_repairs(
@@ -3164,6 +3238,7 @@ impl DurableSqliteStore {
 
     fn persist_synced_append_visible_publish_records(
         &self,
+        journal_lane_index: usize,
         records: &[AppendVisiblePublish],
         nodes: &SelectedStorageNodeState,
         appended: PendingDataLogAppend,
@@ -3215,7 +3290,8 @@ impl DurableSqliteStore {
             .map(|record| record.commit_seq)
             .max()
             .unwrap_or_else(|| CommitSeq::from_raw(0));
-        let append_visible_journal = self.append_append_visible_publish_journal_records(records)?;
+        let append_visible_journal =
+            self.append_append_visible_publish_journal_records_for_lane(journal_lane_index, records)?;
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),

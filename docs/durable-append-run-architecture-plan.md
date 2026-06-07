@@ -341,16 +341,18 @@ metadata nodes, commit groups, keyspace commits, and file commits, then synced
 one native publish journal frame. Reopen required the retained native publish
 journal records to replay as a contiguous global commit sequence above the
 materialized cursor. The replacement keeps the records file-scoped for replay
-but writes them as one append-visible batch frame per publish batch, avoiding
-per-file sync fanout while preserving incomplete-tail replay semantics.
+and writes append-visible batch frames to a lane journal selected by keyspace
+catalog shard. Replay still loads the legacy base append-visible journal for
+compatibility, then every lane journal, but file-scoped record validation no
+longer requires unrelated files to form one contiguous visible prefix.
 
-That replay rule is the main correctness reason a simple per-file journal
-cannot be added as a small optimization. If file A commits sequence 101 and file
-B commits sequence 102 in different journals, replay cannot safely expose 102
-when 101 is missing, and the current cursor would not know which IDs, file
-versions, metadata nodes, or keyspace shard roots are safe to reuse. Keeping the
-global cursor while spreading journal files would only move the sync target; it
-would not remove the global durable prefix requirement.
+The lane split is safe because the synchronous publish path updates only the
+touched file and keyspace catalog shard. Full metadata persist and checkpoint
+paths take the exclusive side of the metadata-persist gate, while append-visible
+lane publishes take the shared side. That prevents a full durable cursor from
+checkpointing across concurrent lane publishes without putting unrelated
+append-visible publishes back behind one coordinator lane. Coalescing remains
+lane-local; batches from different catalog shards may sync independently.
 
 The next architecture should make native append publish records the source of
 truth for append-created file suffixes and treat CoW file roots as materialized
@@ -387,7 +389,8 @@ that file's publish records:
   overlaps;
 - every referenced run payload and catalog record must already be durable;
 - records for different files may replay independently because they no longer
-  share one visibility cursor.
+  share one visibility cursor; production lane journals group those records by
+  keyspace catalog shard.
 
 The keyspace catalog still needs a discoverable file entry, but append-only
 suffix publication should not require rewriting and syncing the keyspace shard
@@ -415,8 +418,9 @@ Rejected directions for this limitation:
 
 - Do not move append publishes back through root SQLite rows; measured c64 p99
   was worse than the compact native journal.
-- Do not only shard the existing `NativeMetadataDelta` journal; the global
-  cursor and contiguous replay requirement would remain.
+- Do not shard the existing `NativeMetadataDelta` journal; the global cursor
+  and contiguous replay requirement would remain. The implemented lane split is
+  for file-scoped append-visible records, not the old global delta format.
 - Do not use longer fixed coalescing windows as the architecture answer; short
   tuning helped one local point but did not remove the serialization boundary.
 - Do not make accepted private bytes recoverable through the public API just to

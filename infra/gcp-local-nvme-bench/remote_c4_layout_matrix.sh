@@ -168,8 +168,19 @@ setup_node_private_journal() {
 
 setup_node_private_raid_journal() {
   if [[ -z "${NODE_RAID_GROUPS}" ]]; then
-    printf 'node-private-raid-journal requires NODE_RAID_GROUPS, for example 8,8,8,7\n' >&2
-    exit 1
+    local data_disk_count=$(( ${#DISKS[@]} - 1 ))
+    local base_group_size=$(( data_disk_count / STORAGE_NODES ))
+    local remainder=$(( data_disk_count % STORAGE_NODES ))
+    local generated_groups=()
+    for index in $(seq 1 "${STORAGE_NODES}"); do
+      local group_size="${base_group_size}"
+      if (( index <= remainder )); then
+        group_size=$(( group_size + 1 ))
+      fi
+      generated_groups+=("${group_size}")
+    done
+    NODE_RAID_GROUPS="$(IFS=,; printf '%s' "${generated_groups[*]}")"
+    log "auto NODE_RAID_GROUPS=${NODE_RAID_GROUPS}"
   fi
 
   IFS=',' read -r -a groups <<<"${NODE_RAID_GROUPS}"
@@ -322,6 +333,15 @@ def to_float(row, key):
 def to_ms(row, key):
     return to_float(row, key) / 1_000_000.0
 
+def to_bool(row, key):
+    return str(row.get(key, "")).lower() == "true"
+
+def pvalue(rows, key, q):
+    return percentile([to_float(row, key) for row in rows], q)
+
+def max_int(rows, key):
+    return max((int(to_float(row, key)) for row in rows), default=0)
+
 write_combined("matrix.csv", "combined-matrix.csv")
 write_combined("durable-profile.csv", "combined-durable-profile.csv")
 write_combined("append-publish-profile.csv", "combined-append-publish-profile.csv")
@@ -366,13 +386,30 @@ append_fields = [
     "append_visible_journal_sync_nanos",
     "append_visible_journal_dir_sync_nanos",
 ]
+append_count_fields = [
+    "in_flight_batches_waited",
+    "wait_loops",
+    "max_batch_ticket_count",
+    "batch_planned_ticket_count",
+    "batch_completed_ticket_count",
+    "batch_same_file_skip_count",
+    "post_batch_pending_ticket_count",
+]
 with (root / "append-publish-profile-summary.csv").open("w", newline="") as f:
     fields = ["mode","rtt_us","workload","concurrency","samples"]
     for name in append_fields:
         fields.extend([f"{name}_p50_ms", f"{name}_p99_ms", f"{name}_max_ms"])
+    for name in append_count_fields:
+        fields.extend([f"{name}_p50", f"{name}_p99", f"{name}_max"])
     fields.extend([
-        "persist_batches_started_sum","in_flight_waits_sum","coalesce_waits_sum",
-        "max_batch_ticket_count_max","append_visible_journal_record_count_sum",
+        "persist_batches_started_sum","in_flight_waits_sum",
+        "in_flight_batches_waited_sum","coalesce_waits_sum",
+        "batch_coalesce_hit_target_count","max_batch_ticket_count_max",
+        "batch_waiter_request_count_max","batch_metadata_pending_ticket_count_max",
+        "batch_coalesce_start_demand_max","batch_coalesce_end_demand_max",
+        "batch_planned_ticket_count_sum","batch_completed_ticket_count_sum",
+        "batch_same_file_skip_count_sum","post_batch_request_count_max",
+        "post_batch_pending_ticket_count_max","append_visible_journal_record_count_sum",
         "append_visible_journal_frame_bytes_sum",
     ])
     writer = csv.DictWriter(f, fieldnames=fields)
@@ -386,8 +423,19 @@ with (root / "append-publish-profile-summary.csv").open("w", newline="") as f:
             "samples": len(rows),
             "persist_batches_started_sum": sum(int(to_float(r, "persist_batches_started")) for r in rows),
             "in_flight_waits_sum": sum(int(to_float(r, "in_flight_waits")) for r in rows),
+            "in_flight_batches_waited_sum": sum(int(to_float(r, "in_flight_batches_waited")) for r in rows),
             "coalesce_waits_sum": sum(int(to_float(r, "coalesce_waits")) for r in rows),
+            "batch_coalesce_hit_target_count": sum(1 for r in rows if to_bool(r, "batch_coalesce_hit_target")),
             "max_batch_ticket_count_max": max((int(to_float(r, "max_batch_ticket_count")) for r in rows), default=0),
+            "batch_waiter_request_count_max": max((int(to_float(r, "batch_waiter_request_count")) for r in rows), default=0),
+            "batch_metadata_pending_ticket_count_max": max((int(to_float(r, "batch_metadata_pending_ticket_count")) for r in rows), default=0),
+            "batch_coalesce_start_demand_max": max((int(to_float(r, "batch_coalesce_start_demand")) for r in rows), default=0),
+            "batch_coalesce_end_demand_max": max((int(to_float(r, "batch_coalesce_end_demand")) for r in rows), default=0),
+            "batch_planned_ticket_count_sum": sum(int(to_float(r, "batch_planned_ticket_count")) for r in rows),
+            "batch_completed_ticket_count_sum": sum(int(to_float(r, "batch_completed_ticket_count")) for r in rows),
+            "batch_same_file_skip_count_sum": sum(int(to_float(r, "batch_same_file_skip_count")) for r in rows),
+            "post_batch_request_count_max": max((int(to_float(r, "post_batch_request_count")) for r in rows), default=0),
+            "post_batch_pending_ticket_count_max": max((int(to_float(r, "post_batch_pending_ticket_count")) for r in rows), default=0),
             "append_visible_journal_record_count_sum": sum(int(to_float(r, "append_visible_journal_record_count")) for r in rows),
             "append_visible_journal_frame_bytes_sum": sum(int(to_float(r, "append_visible_journal_frame_bytes")) for r in rows),
         }
@@ -396,7 +444,57 @@ with (root / "append-publish-profile-summary.csv").open("w", newline="") as f:
             out[f"{name}_p50_ms"] = percentile(values, 0.50)
             out[f"{name}_p99_ms"] = percentile(values, 0.99)
             out[f"{name}_max_ms"] = max(values, default=0.0)
+        for name in append_count_fields:
+            values = [to_float(r, name) for r in rows]
+            out[f"{name}_p50"] = percentile(values, 0.50)
+            out[f"{name}_p99"] = percentile(values, 0.99)
+            out[f"{name}_max"] = max(values, default=0.0)
         writer.writerow(out)
+
+driver_batch_rows = [
+    row for row in append_rows if int(to_float(row, "persist_batches_started")) > 0
+]
+with (root / "append-publish-driver-batches.csv").open("w", newline="") as f:
+    fields = [
+        "mode","rtt_us","workload","concurrency","sequence","append_publish_batch_id",
+        "total_ms","coordinator_wait_ms","in_flight_wait_ms","coalesce_wait_ms",
+        "persist_batch_ms","visible_metadata_commit_ms","append_visible_journal_sync_ms",
+        "max_batch_ticket_count","batch_waiter_request_count",
+        "batch_metadata_pending_ticket_count","batch_coalesce_start_demand",
+        "batch_coalesce_end_demand","batch_coalesce_hit_target",
+        "batch_planned_ticket_count","batch_completed_ticket_count",
+        "batch_same_file_skip_count","post_batch_request_count",
+        "post_batch_pending_ticket_count",
+    ]
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
+    for row in driver_batch_rows:
+        writer.writerow({
+            "mode": row["mode"],
+            "rtt_us": row["rtt_us"],
+            "workload": row["workload"],
+            "concurrency": row["concurrency"],
+            "sequence": row["sequence"],
+            "append_publish_batch_id": row["append_publish_batch_id"],
+            "total_ms": to_ms(row, "total_nanos"),
+            "coordinator_wait_ms": to_ms(row, "coordinator_wait_nanos"),
+            "in_flight_wait_ms": to_ms(row, "in_flight_wait_nanos"),
+            "coalesce_wait_ms": to_ms(row, "coalesce_wait_nanos"),
+            "persist_batch_ms": to_ms(row, "persist_batch_nanos"),
+            "visible_metadata_commit_ms": to_ms(row, "visible_metadata_commit_nanos"),
+            "append_visible_journal_sync_ms": to_ms(row, "append_visible_journal_sync_nanos"),
+            "max_batch_ticket_count": int(to_float(row, "max_batch_ticket_count")),
+            "batch_waiter_request_count": int(to_float(row, "batch_waiter_request_count")),
+            "batch_metadata_pending_ticket_count": int(to_float(row, "batch_metadata_pending_ticket_count")),
+            "batch_coalesce_start_demand": int(to_float(row, "batch_coalesce_start_demand")),
+            "batch_coalesce_end_demand": int(to_float(row, "batch_coalesce_end_demand")),
+            "batch_coalesce_hit_target": row.get("batch_coalesce_hit_target", "false"),
+            "batch_planned_ticket_count": int(to_float(row, "batch_planned_ticket_count")),
+            "batch_completed_ticket_count": int(to_float(row, "batch_completed_ticket_count")),
+            "batch_same_file_skip_count": int(to_float(row, "batch_same_file_skip_count")),
+            "post_batch_request_count": int(to_float(row, "post_batch_request_count")),
+            "post_batch_pending_ticket_count": int(to_float(row, "post_batch_pending_ticket_count")),
+        })
 
 durable_rows = list(rows_for("durable-profile.csv"))
 groups = {}
@@ -439,6 +537,286 @@ with (root / "durable-profile-summary.csv").open("w", newline="") as f:
             out[f"{name}_p99_ms"] = percentile(values, 0.99)
             out[f"{name}_max_ms"] = max(values, default=0.0)
         writer.writerow(out)
+
+def parse_mount_sources(mode):
+    layout = root / mode / "layout.txt"
+    journal = None
+    data = []
+    if not layout.exists():
+        return journal, data
+    for line in layout.read_text(errors="ignore").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        target = parts[0].lstrip("├─└─│")
+        source = parts[1]
+        if target == "/mnt/journal":
+            journal = source
+        elif target in ("/mnt/data", "/mnt/raid") or target.startswith("/mnt/node-"):
+            data.append(source)
+    return journal, data
+
+def device_name(source):
+    if not source:
+        return ""
+    return source.rsplit("/", 1)[-1]
+
+iostat_fields = [
+    "device","r/s","rMB/s","rrqm/s","%rrqm","r_await","rareq-sz",
+    "w/s","wMB/s","wrqm/s","%wrqm","w_await","wareq-sz",
+    "d/s","dMB/s","drqm/s","%drqm","d_await","dareq-sz",
+    "f/s","f_await","aqu-sz","%util",
+]
+
+def iostat_rows(mode):
+    path = root.parent / "monitor" / mode / "iostat.log"
+    out = []
+    if not path.exists():
+        return out
+    for line in path.read_text(errors="ignore").splitlines():
+        if not line or line.startswith(("Linux", "Device")):
+            continue
+        parts = line.split()
+        if len(parts) != len(iostat_fields):
+            continue
+        if not (parts[0].startswith("md") or parts[0].startswith("nvme")):
+            continue
+        try:
+            out.append({
+                field: (parts[index] if field == "device" else float(parts[index]))
+                for index, field in enumerate(iostat_fields)
+            })
+        except ValueError:
+            continue
+    return out
+
+def summarize_devices(rows, devices):
+    summaries = []
+    for device in devices:
+        selected = [row for row in rows if row["device"] == device]
+        active = [row for row in selected if row["wMB/s"] > 1.0]
+        if not active:
+            active = selected
+        if not active:
+            continue
+        summaries.append({
+            "device": device,
+            "samples": len(active),
+            "wMBps_p50": pvalue(active, "wMB/s", 0.50),
+            "wMBps_p90": pvalue(active, "wMB/s", 0.90),
+            "wMBps_max": max((row["wMB/s"] for row in active), default=0.0),
+            "w_await_p50_ms": pvalue(active, "w_await", 0.50),
+            "w_await_p90_ms": pvalue(active, "w_await", 0.90),
+            "w_await_max_ms": max((row["w_await"] for row in active), default=0.0),
+            "util_p50": pvalue(active, "%util", 0.50),
+            "util_p90": pvalue(active, "%util", 0.90),
+            "util_max": max((row["%util"] for row in active), default=0.0),
+        })
+    return summaries
+
+modes = sorted({row["mode"] for row in matrix} | {row["mode"] for row in append_rows})
+device_summaries = {}
+for mode in modes:
+    journal_source, data_sources = parse_mount_sources(mode)
+    rows_iostat = iostat_rows(mode)
+    data_devices = [device_name(source) for source in data_sources]
+    journal_device = device_name(journal_source)
+    if not data_devices and mode.startswith("raid-"):
+        data_devices = ["md0"]
+    data_summary = summarize_devices(rows_iostat, list(dict.fromkeys(data_devices)))
+    journal_summary = summarize_devices(rows_iostat, [journal_device] if journal_device else [])
+    device_summaries[mode] = {
+        "journal_device": journal_device,
+        "data_devices": ",".join(data_devices),
+        "data_device_count": len(data_devices),
+        "data_wMBps_p90_sum": sum(item["wMBps_p90"] for item in data_summary),
+        "data_w_await_p90_max_ms": max((item["w_await_p90_ms"] for item in data_summary), default=0.0),
+        "data_util_p90_max": max((item["util_p90"] for item in data_summary), default=0.0),
+        "journal_wMBps_p90": max((item["wMBps_p90"] for item in journal_summary), default=0.0),
+        "journal_w_await_p90_ms": max((item["w_await_p90_ms"] for item in journal_summary), default=0.0),
+        "journal_util_p90": max((item["util_p90"] for item in journal_summary), default=0.0),
+    }
+
+headline_by_key = {
+    (row["mode"], row["rtt_us"], row["workload"], row["concurrency"]): row
+    for row in csv.DictReader((root / "headline-summary.csv").open())
+}
+append_summary_by_key = {
+    (row["mode"], row["rtt_us"], row["workload"], row["concurrency"]): row
+    for row in csv.DictReader((root / "append-publish-profile-summary.csv").open())
+}
+durable_summary_by_key = {
+    (row["mode"], row["rtt_us"], row["workload"], row["concurrency"]): row
+    for row in csv.DictReader((root / "durable-profile-summary.csv").open())
+}
+
+def ratio(numerator, denominator):
+    return numerator / denominator if denominator > 0 else 0.0
+
+def classify_publish_tail(row, append):
+    publish_p99 = to_float(row, "stream_publish_p99_ms")
+    total = to_float(append, "total_nanos_p99_ms")
+    sync = to_float(append, "append_visible_journal_sync_nanos_p99_ms")
+    inflight = to_float(append, "in_flight_wait_nanos_p99_ms")
+    coalesce = to_float(append, "coalesce_wait_nanos_p99_ms")
+    persist = to_float(append, "persist_batch_nanos_p99_ms")
+    same_file_skips = int(to_float(append, "batch_same_file_skip_count_sum"))
+    batches_waited_p99 = to_float(append, "in_flight_batches_waited_p99")
+    sync_ratio = ratio(sync, total)
+    inflight_ratio = ratio(inflight, total)
+    coalesce_ratio = ratio(coalesce, total)
+    persist_ratio = ratio(persist, total)
+
+    if publish_p99 < 10.0 and total < 10.0:
+        return (
+            "publish_tail_within_target",
+            "publish tail is already single digit; optimize throughput or device queueing first",
+        )
+    if same_file_skips > max(16, int(to_float(append, "samples")) // 8):
+        return (
+            "same_file_serialization",
+            "same-file publish ordering is dominating; parallelism cannot safely improve this workload without changing semantics",
+        )
+    if sync_ratio >= 0.65 and sync >= 8.0:
+        return (
+            "journal_sync_bound",
+            "reduce or shard append-visible journal syncs; batching policy alone will not remove the tail",
+        )
+    if inflight_ratio >= 0.50 and batches_waited_p99 >= 2.0:
+        return (
+            "publish_lane_serialization",
+            "remove the single append-visible publish lane with sharded publish lanes or use a layout that avoids cross-node publish contention",
+        )
+    if coalesce_ratio >= 0.25:
+        return (
+            "coalesce_policy_bound",
+            "tune adaptive coalescing or the target batch threshold",
+        )
+    if persist_ratio >= 0.60:
+        return (
+            "durable_persist_bound",
+            "split persist work into independent durable lanes or reduce per-batch durable work",
+        )
+    return (
+        "sync_floor_or_mixed",
+        "no single dominant software wait remains; compare against device baseline before changing coordinator policy",
+    )
+
+def classify_throughput(row, devices):
+    data_util = devices["data_util_p90_max"]
+    data_await = devices["data_w_await_p90_max_ms"]
+    journal_util = devices["journal_util_p90"]
+    journal_await = devices["journal_w_await_p90_ms"]
+    published_mbps = to_float(row, "published_mbps")
+    append_p99 = to_float(row, "stream_append_p99_ms")
+    publish_p99 = to_float(row, "stream_publish_p99_ms")
+
+    if data_util >= 90.0 and data_await >= 20.0:
+        return (
+            "data_device_bound",
+            "increase data-device parallelism; for node-private layouts use per-node RAID groups instead of one SSD per node",
+        )
+    if journal_util >= 80.0 and journal_await >= 8.0:
+        return (
+            "journal_device_bound",
+            "move the visible journal off the contended device or shard the visible journal",
+        )
+    if append_p99 > publish_p99 * 10 and published_mbps < 3000:
+        return (
+            "data_device_bound",
+            "append throughput is limiting published throughput; increase per-node data device bandwidth",
+        )
+    return (
+        "not_device_limited",
+        "throughput is not clearly device-limited by the collected iostat counters",
+    )
+
+def combined_classification(row, append, publish_tail, throughput):
+    publish_p99 = to_float(row, "stream_publish_p99_ms")
+    append_p99 = to_float(row, "stream_append_p99_ms")
+    if publish_tail[0] in ("journal_sync_bound", "publish_lane_serialization", "coalesce_policy_bound") and publish_p99 >= 10.0:
+        return publish_tail
+    if throughput[0] == "data_device_bound" and append_p99 >= publish_p99 * 4:
+        return throughput
+    if publish_tail[0] not in ("publish_tail_within_target", "sync_floor_or_mixed"):
+        return publish_tail
+    return throughput
+
+with (root / "bottleneck-summary.csv").open("w", newline="") as f:
+    fields = [
+        "mode","rtt_us","workload","concurrency","published_mbps",
+        "stream_append_p99_ms","stream_publish_p99_ms",
+        "bottleneck","publish_tail_bottleneck","throughput_bottleneck",
+        "recommended_next_action",
+        "total_p99_ms","journal_sync_p99_ms","journal_sync_ratio",
+        "in_flight_wait_p99_ms","in_flight_wait_ratio",
+        "in_flight_batches_waited_p99","coalesce_wait_p99_ms",
+        "coalesce_wait_ratio","persist_batch_p99_ms","persist_batch_ratio",
+        "max_batch_ticket_count_max","post_batch_pending_ticket_count_max",
+        "same_file_skip_count_sum","data_devices","data_device_count",
+        "data_wMBps_p90_sum","data_w_await_p90_max_ms","data_util_p90_max",
+        "journal_device","journal_wMBps_p90","journal_w_await_p90_ms",
+        "journal_util_p90",
+    ]
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
+    for key, row in sorted(headline_by_key.items()):
+        append = append_summary_by_key.get(key, {})
+        durable = durable_summary_by_key.get(key, {})
+        devices = device_summaries.get(key[0], {
+            "journal_device": "",
+            "data_devices": "",
+            "data_device_count": 0,
+            "data_wMBps_p90_sum": 0.0,
+            "data_w_await_p90_max_ms": 0.0,
+            "data_util_p90_max": 0.0,
+            "journal_wMBps_p90": 0.0,
+            "journal_w_await_p90_ms": 0.0,
+            "journal_util_p90": 0.0,
+        })
+        publish_tail = classify_publish_tail(row, append)
+        throughput = classify_throughput(row, devices)
+        bottleneck, action = combined_classification(row, append, publish_tail, throughput)
+        total = to_float(append, "total_nanos_p99_ms")
+        sync = to_float(append, "append_visible_journal_sync_nanos_p99_ms")
+        inflight = to_float(append, "in_flight_wait_nanos_p99_ms")
+        coalesce = to_float(append, "coalesce_wait_nanos_p99_ms")
+        persist = to_float(append, "persist_batch_nanos_p99_ms")
+        writer.writerow({
+            "mode": key[0],
+            "rtt_us": key[1],
+            "workload": key[2],
+            "concurrency": key[3],
+            "published_mbps": row["published_mbps"],
+            "stream_append_p99_ms": row["stream_append_p99_ms"],
+            "stream_publish_p99_ms": row["stream_publish_p99_ms"],
+            "bottleneck": bottleneck,
+            "publish_tail_bottleneck": publish_tail[0],
+            "throughput_bottleneck": throughput[0],
+            "recommended_next_action": action,
+            "total_p99_ms": total,
+            "journal_sync_p99_ms": sync,
+            "journal_sync_ratio": ratio(sync, total),
+            "in_flight_wait_p99_ms": inflight,
+            "in_flight_wait_ratio": ratio(inflight, total),
+            "in_flight_batches_waited_p99": to_float(append, "in_flight_batches_waited_p99"),
+            "coalesce_wait_p99_ms": coalesce,
+            "coalesce_wait_ratio": ratio(coalesce, total),
+            "persist_batch_p99_ms": persist,
+            "persist_batch_ratio": ratio(persist, total),
+            "max_batch_ticket_count_max": append.get("max_batch_ticket_count_max", 0),
+            "post_batch_pending_ticket_count_max": append.get("post_batch_pending_ticket_count_max", 0),
+            "same_file_skip_count_sum": append.get("batch_same_file_skip_count_sum", 0),
+            "data_devices": devices["data_devices"],
+            "data_device_count": devices["data_device_count"],
+            "data_wMBps_p90_sum": devices["data_wMBps_p90_sum"],
+            "data_w_await_p90_max_ms": devices["data_w_await_p90_max_ms"],
+            "data_util_p90_max": devices["data_util_p90_max"],
+            "journal_device": devices["journal_device"],
+            "journal_wMBps_p90": devices["journal_wMBps_p90"],
+            "journal_w_await_p90_ms": devices["journal_w_await_p90_ms"],
+            "journal_util_p90": devices["journal_util_p90"],
+        })
 PY
 }
 

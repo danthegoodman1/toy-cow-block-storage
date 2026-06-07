@@ -4,6 +4,18 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
 }
 
+pub(super) fn read_lock<T>(rwlock: &RwLock<T>) -> Result<RwLockReadGuard<'_, T>> {
+    rwlock
+        .read()
+        .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
+}
+
+pub(super) fn write_lock<T>(rwlock: &RwLock<T>) -> Result<RwLockWriteGuard<'_, T>> {
+    rwlock
+        .write()
+        .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
+}
+
 pub(super) fn wait_on_cvar<'a, T>(cvar: &Condvar, guard: MutexGuard<'a, T>) -> Result<MutexGuard<'a, T>> {
     cvar.wait(guard)
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))

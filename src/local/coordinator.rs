@@ -1911,6 +1911,39 @@ impl LocalCoordinator {
         )
     }
 
+    fn append_publish_commit_gap_is_in_flight(
+        metadata: &MetadataInner,
+        durable_next_commit_seq: u64,
+        local_next_commit_seq: u64,
+    ) -> Result<bool> {
+        if durable_next_commit_seq > local_next_commit_seq {
+            return Ok(false);
+        }
+        if durable_next_commit_seq == local_next_commit_seq {
+            return Ok(true);
+        }
+        let mut expected = durable_next_commit_seq;
+        let mut in_flight = metadata
+            .append_publish_in_flight
+            .values()
+            .map(|publish| publish.commit_seq.raw())
+            .filter(|seq| *seq >= durable_next_commit_seq && *seq < local_next_commit_seq)
+            .collect::<Vec<_>>();
+        in_flight.sort_unstable();
+        for seq in in_flight {
+            if seq < expected {
+                continue;
+            }
+            if seq != expected {
+                return Ok(false);
+            }
+            expected = expected
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("append publish commit sequence overflows"))?;
+        }
+        Ok(expected == local_next_commit_seq)
+    }
+
     fn prepare_append_publish_plan_with_drafts(
         &self,
         ticket: &AppendPublishTicket,
@@ -1976,7 +2009,11 @@ impl LocalCoordinator {
         let publish_started = Instant::now();
         let mut metadata = lock(&self.metadata.inner)?;
         let publish_lock_wait_nanos = duration_nanos_u64(publish_started.elapsed());
-        if previous.next_commit_seq != metadata.next_commit_seq {
+        if !Self::append_publish_commit_gap_is_in_flight(
+            &metadata,
+            previous.next_commit_seq,
+            metadata.next_commit_seq,
+        )? {
             self.metadata.record_publish_profile(MetadataPublishProfile {
                 lock_wait_nanos: publish_lock_wait_nanos,
                 logical_conflict_count: 1,
@@ -2129,6 +2166,7 @@ impl LocalCoordinator {
         let in_flight = AppendPublishInFlight {
             ticket_id: ticket.ticket_id,
             stream_id: ticket.stream_id,
+            commit_seq,
             writer_epoch: ticket.writer_epoch,
             keyspace_id: ticket.keyspace_id,
             file_id: ticket.file_id,
@@ -2183,7 +2221,6 @@ impl LocalCoordinator {
             stream,
             old_head,
             new_head,
-            new_keyspace_head,
             new_keyspace_shard,
             commit_group,
             keyspace_commit,
@@ -2304,9 +2341,25 @@ impl LocalCoordinator {
         }
         stream.records = retained;
 
+        let shard_index = usize::try_from(plan.keyspace_commit.shard_index)
+            .map_err(|_| StorageError::corrupt("append publish shard index overflows usize"))?;
+        if current_keyspace.shard_roots.get(shard_index).copied()
+            != Some(plan.keyspace_commit.old_shard)
+        {
+            return Err(StorageError::corrupt(
+                "prepared append publish catalog shard changed before apply",
+            ));
+        }
+        let mut new_keyspace_head = current_keyspace.clone();
+        new_keyspace_head.generation =
+            InMemoryMetadataPlane::next_keyspace_generation(new_keyspace_head.generation)?;
+        new_keyspace_head.latest_commit =
+            new_keyspace_head.latest_commit.max(plan.commit.commit_seq);
+        new_keyspace_head.shard_roots[shard_index] = plan.new_keyspace_shard.shard_id;
+        new_keyspace_head.file_count = plan.keyspace_commit.new_file_count;
         metadata
             .keyspace_heads
-            .insert(plan.ticket.keyspace_id, plan.new_keyspace_head.clone());
+            .insert(plan.ticket.keyspace_id, new_keyspace_head);
         metadata
             .keyspace_catalog_shards
             .insert(plan.new_keyspace_shard.shard_id, plan.new_keyspace_shard.clone());
@@ -2363,7 +2416,7 @@ impl LocalCoordinator {
         record: &AppendVisiblePublish,
     ) -> Result<()> {
         record.validate()?;
-        let (old_head, old_keyspace_head, old_entry, file_writer_epoch) = {
+        let (old_head, old_entry, file_writer_epoch) = {
             let metadata = lock(&self.metadata.inner)?;
             let keyspace_head = metadata
                 .keyspace_heads
@@ -2395,7 +2448,6 @@ impl LocalCoordinator {
             )?;
             (
                 entry.head.clone(),
-                keyspace_head,
                 entry,
                 file_writer_epoch,
             )
@@ -2429,7 +2481,7 @@ impl LocalCoordinator {
         if Self::append_visible_publish_already_materialized(&current_entry.head, record) {
             return Ok(());
         }
-        if current_entry.head != old_head || current_keyspace != old_keyspace_head {
+        if current_entry.head != old_head {
             return Err(StorageError::conflict(
                 "append visible publish file head changed before materialization",
             ));

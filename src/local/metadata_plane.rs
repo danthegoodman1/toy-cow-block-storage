@@ -383,6 +383,7 @@ pub(super) struct AppendStreamState {
 pub(super) struct AppendPublishInFlight {
     ticket_id: AppendPublishTicketId,
     stream_id: AppendStreamId,
+    commit_seq: CommitSeq,
     writer_epoch: WriterEpoch,
     keyspace_id: KeyspaceId,
     file_id: FileId,
@@ -397,7 +398,6 @@ pub(super) struct AppendPublishPlan {
     stream: AppendStream,
     old_head: FileHead,
     new_head: FileHead,
-    new_keyspace_head: KeyspaceHead,
     new_keyspace_shard: KeyspaceCatalogShard,
     commit_group: CommitGroup,
     keyspace_commit: KeyspaceCommit,

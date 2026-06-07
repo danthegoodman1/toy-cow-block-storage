@@ -374,11 +374,11 @@ operations; those rows are useful service-operation context but are not raw
 network RTT.
 
 Treat the c3-88/Tier1 Rapid rows as an external north-star for native durable
-append publish, but the latest GCP local-NVMe results show the native hot path
-can now reach the same throughput class with much lower publish latency. The
-June 7, 2026 C4 run used `c4-standard-192-lssd` in `us-east1-b`, 32 local SSDs,
-512 MiB per worker, 32 MiB appends, 128 MiB publish boundaries, concurrency
-`32,64`, and modeled RTTs `0us`, `200us`, `700us`, and `3600us`.
+append publish, but the June 7, 2026 GCP local-NVMe results show the native hot
+path can now reach the same throughput class. The first C4 run used
+`c4-standard-192-lssd` in `us-east1-b`, 32 local SSDs, 512 MiB per worker,
+32 MiB appends, 128 MiB publish boundaries, concurrency `32,64`, and modeled
+RTTs `0us`, `200us`, `700us`, and `3600us`.
 
 | Layout | Best `published_mbps` | Median `published_mbps` | Publish p99 median | Publish p99 max | Append p99 median |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -416,14 +416,36 @@ At c64, the append-publish profile generally shows the extra p99 in
 coordinator/in-flight wait rather than in the actual journal write. For example,
 the `200us` interval c64 row had publish total p99 `11.7 ms`, coordinator wait
 p99 `11.7 ms`, visible commit p99 `1.65 ms`, and journal sync p99 `1.63 ms`.
-The next native append work should therefore target publish batching, handoff,
-or a latency governor around c32-equivalent publish pressure before more disk
-layout changes.
+That finding motivated sharding the append-visible publish coordinator and
+journal by keyspace catalog shard.
+
+The follow-up run used `c4-standard-288-lssd`, 48 local SSDs, the same
+32 MiB/128 MiB workload shape, and the `raid-split-journal` layout. This code
+change removed the old global queue: `in_flight_wait_nanos` p99 and max were
+`0` for every row, and append-visible journal lock wait was effectively zero.
+The best steady-state interval rows preserved the 15 GB/s-class target, while
+at-end final-drain latency remained the unsolved tail.
+
+| RTT | Workload | c32 throughput / publish p99 | c64 throughput / publish p99 |
+| ---: | --- | ---: | ---: |
+| `200us` | interval 32 MiB | 12.52 GB/s / 152.6 ms | 12.54 GB/s / 289.5 ms |
+| `700us` | interval 32 MiB | 14.52 GB/s / 162.9 ms | 13.61 GB/s / 27.4 ms |
+| `3600us` | interval 32 MiB | 14.79 GB/s / 9.5 ms | 14.11 GB/s / 38.3 ms |
+| `200us` | at-end 32 MiB | 10.63 GB/s / 367.4 ms | 10.94 GB/s / 498.3 ms |
+| `700us` | at-end 32 MiB | 9.80 GB/s / 455.2 ms | 12.03 GB/s / 559.5 ms |
+| `3600us` | at-end 32 MiB | 10.39 GB/s / 440.6 ms | 11.03 GB/s / 688.9 ms |
+
+After the lane split, the next native append work should target per-lane
+persist batching or adaptive group commit that avoids recreating one global
+visibility lane. Hot rows also show the data RAID device saturated, so further
+throughput gains need to account for data-device queueing rather than treating
+SQLite row work as the append-publish limiter.
 
 Raw C4 artifacts are local and ignored under
 `infra/gcp-local-nvme-bench/results/`, specifically
-`gcp-c4-192-layout-20260607-125041` and `c48887-06071318`. The temporary GCP
-instances, networks, subnets, and firewall rules were deleted after the runs.
+`gcp-c4-192-layout-20260607-125041`, `c48887-06071318`, and
+`c4288-sharded-publish-06071540`. The temporary GCP instances, networks,
+subnets, and firewall rules were deleted after the runs.
 
 `cargo bench --bench regression` is the Criterion mechanism suite.
 `loadbench` is the integration runner for public block/native API behavior,
