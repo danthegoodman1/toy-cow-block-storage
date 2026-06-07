@@ -23,7 +23,7 @@ if [[ "$#" == "0" ]]; then
     --total-mib=512 \
     --publish-mib=128 \
     --mode=at-end,interval,close-at-end \
-    --csv=rapid-results-c3-88-tier1.csv
+    --csv=rapid-results-c4-32-tier1.csv
 fi
 
 terraform -chdir="${script_dir}" init -backend=false

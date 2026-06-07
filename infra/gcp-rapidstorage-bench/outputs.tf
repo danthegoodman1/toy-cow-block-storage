@@ -19,5 +19,5 @@ output "ssh_command" {
 }
 
 output "copy_and_run_command" {
-  value = "./run_remote.sh --workers=16,32,64 --op-mib=4,32 --total-mib=512 --publish-mib=128 --mode=at-end,interval,close-at-end --csv=rapid-results-c3-88-tier1.csv"
+  value = "./run_remote.sh --workers=16,32,64 --op-mib=4,32 --total-mib=512 --publish-mib=128 --mode=at-end,interval,close-at-end --csv=rapid-results-c4-32-tier1.csv"
 }

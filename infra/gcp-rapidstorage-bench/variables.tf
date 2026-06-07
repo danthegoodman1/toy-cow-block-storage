@@ -29,9 +29,9 @@ variable "vm_name" {
 }
 
 variable "machine_type" {
-  description = "Benchmark VM machine type. Use a larger C3/C4 shape for high-concurrency runs."
+  description = "Benchmark VM machine type. Use a larger C4 shape for high-concurrency runs."
   type        = string
-  default     = "c3-standard-88"
+  default     = "c4-standard-32"
 }
 
 variable "total_egress_bandwidth_tier" {

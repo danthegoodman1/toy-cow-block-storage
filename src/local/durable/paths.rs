@@ -8,18 +8,40 @@ pub(super) struct DurableStorePaths {
 
 impl DurableStorePaths {
     fn new(root: impl AsRef<Path>, _storage_node: StorageNodeId) -> Result<Self> {
+        Self::new_with_append_visible_publish_journal(root, None)
+    }
+
+    fn new_with_append_visible_publish_journal(
+        root: impl AsRef<Path>,
+        append_visible_publish_journal: Option<PathBuf>,
+    ) -> Result<Self> {
         let root = root.as_ref();
         let data_dir = root.join("data");
         let tmp_dir = root.join("tmp");
-        fs::create_dir_all(&data_dir).map_err(fs_error)?;
-        fs::create_dir_all(&tmp_dir).map_err(fs_error)?;
+        ensure_dir_exists(&data_dir)?;
+        ensure_dir_exists(&tmp_dir)?;
         Ok(Self {
             metadata: root.join("metadata.sqlite"),
             data_dir,
             native_publish_journal: root.join("native-publish.journal"),
-            append_visible_publish_journal: root.join("append-visible-publish.journal"),
+            append_visible_publish_journal: append_visible_publish_journal
+                .unwrap_or_else(|| root.join("append-visible-publish.journal")),
         })
     }
+}
+
+fn ensure_dir_exists(path: &Path) -> Result<bool> {
+    if path.exists() {
+        if path.is_dir() {
+            return Ok(true);
+        }
+        return Err(StorageError::invalid_argument(format!(
+            "path exists but is not a directory: {}",
+            path.display()
+        )));
+    }
+    fs::create_dir_all(path).map_err(fs_error)?;
+    Ok(false)
 }
 
 pub(super) fn node_catalog_table(_storage_node: StorageNodeId, table: &'static str) -> Result<&'static str> {
@@ -114,7 +136,7 @@ pub(super) fn open_node_catalog(paths: &DurableStorePaths, storage_node: Storage
     let catalog_path = node_catalog_path(&paths.data_dir, storage_node);
     let data_dir_existed = data_dir.exists();
     let existed = catalog_path.exists();
-    fs::create_dir_all(&data_dir).map_err(fs_error)?;
+    ensure_dir_exists(&data_dir)?;
     if !data_dir_existed {
         sync_dir(&paths.data_dir)?;
     }

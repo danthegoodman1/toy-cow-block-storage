@@ -716,6 +716,13 @@ store/
   tmp/
 ```
 
+Deployments may place the append-visible publish journal on a separate
+provider-private path to isolate the visible append publish sync from large
+data-log writes. That path is a layout input, not logical store metadata: a
+store opened with a split append-visible journal must be reopened with the same
+journal path so unmaterialized visible append publishes can replay before
+serving reads.
+
 The root metadata database and storage-node catalogs have separate durability
 boundaries. The root `metadata.sqlite` stores logical metadata-plane rows:
 counters/config, live and deleted heads, immutable metadata object payloads

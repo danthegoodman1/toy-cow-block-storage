@@ -6,7 +6,11 @@ enum BenchStore {
 }
 
 impl BenchStore {
-    fn open(args: &Args, root: &Path) -> Result<Self> {
+    fn open(
+        args: &Args,
+        root: &Path,
+        append_visible_journal: Option<PathBuf>,
+    ) -> Result<Self> {
         match args.provider {
             ProviderKind::Local => {
                 let store = Arc::new(LocalCoordinator::with_storage_nodes(
@@ -50,7 +54,7 @@ impl BenchStore {
             }
             ProviderKind::Durable => {
                 let store = Arc::new(
-                    DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+                    DurableCoordinator::open_with_storage_nodes_data_log_policy_and_append_visible_publish_journal(
                         root,
                         args.config(),
                         args.storage_node_ids(),
@@ -59,6 +63,7 @@ impl BenchStore {
                             file_sync_fanout: args.data_log_file_sync_fanout,
                             ..DurableDataLogPolicy::default()
                         },
+                        append_visible_journal,
                     )?,
                 );
                 if args.durable_profile_csv.is_some() {

@@ -70,6 +70,16 @@ pub struct DurablePersistProfile {
     pub root_sqlite_row_sync_nanos: u64,
     pub root_sqlite_commit_nanos: u64,
     pub visible_metadata_write_bytes: u64,
+    pub append_visible_publish_batch_id: u64,
+    pub append_visible_journal_lock_wait_nanos: u64,
+    pub append_visible_journal_encode_nanos: u64,
+    pub append_visible_journal_open_nanos: u64,
+    pub append_visible_journal_write_nanos: u64,
+    pub append_visible_journal_sync_nanos: u64,
+    pub append_visible_journal_dir_sync_nanos: u64,
+    pub append_visible_journal_record_count: u64,
+    pub append_visible_journal_frame_bytes: u64,
+    pub append_visible_journal_created: u64,
     pub new_segment_count: u64,
     pub new_segment_bytes: u64,
     pub touched_node_count: u64,
@@ -95,16 +105,30 @@ pub struct AppendPublishWaitProfile {
     pub status_check_nanos: u64,
     pub coordinator_lock_wait_nanos: u64,
     pub coordinator_wait_nanos: u64,
+    pub in_flight_wait_nanos: u64,
+    pub coalesce_wait_nanos: u64,
     pub persist_batch_nanos: u64,
     pub wait_loops: u64,
     pub cvar_waits: u64,
+    pub in_flight_waits: u64,
+    pub coalesce_waits: u64,
     pub persist_batches_started: u64,
     pub max_batch_ticket_count: u64,
+    pub append_publish_batch_id: u64,
     pub payload_already_durable_bytes: u64,
     pub payload_synced_bytes: u64,
     pub payload_sync_nanos: u64,
     pub visible_metadata_commit_nanos: u64,
     pub catalog_manifest_publish_nanos: u64,
+    pub append_visible_journal_lock_wait_nanos: u64,
+    pub append_visible_journal_encode_nanos: u64,
+    pub append_visible_journal_open_nanos: u64,
+    pub append_visible_journal_write_nanos: u64,
+    pub append_visible_journal_sync_nanos: u64,
+    pub append_visible_journal_dir_sync_nanos: u64,
+    pub append_visible_journal_record_count: u64,
+    pub append_visible_journal_frame_bytes: u64,
+    pub append_visible_journal_created: u64,
     pub registered: bool,
     pub completed_without_register: bool,
     pub success: bool,
@@ -753,7 +777,7 @@ impl StorageNodeAppendLogService {
         active: DataLogRow,
     ) -> Result<ActiveAppendRunLog> {
         let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
-        fs::create_dir_all(&data_dir).map_err(fs_error)?;
+        ensure_dir_exists(&data_dir)?;
         let path = data_log_path(&self.paths.data_dir, storage_node, active.log_id);
         let needs_dir_sync = !path.exists();
         let file = OpenOptions::new()
@@ -1097,6 +1121,8 @@ pub(super) struct AppendPublishPersistCoordinator {
 pub(super) struct AppendPublishPersistCoordinatorState {
     in_flight: bool,
     generation: u64,
+    current_batch_id: u64,
+    next_batch_id: u64,
     requests: BTreeMap<AppendPublishTicketId, AppendPublishTicket>,
     last_error: Option<(u64, StorageError)>,
 }
@@ -1169,6 +1195,8 @@ impl AppendPublishPersistCoordinator {
             inner: Mutex::new(AppendPublishPersistCoordinatorState {
                 in_flight: false,
                 generation: 0,
+                current_batch_id: 0,
+                next_batch_id: 1,
                 requests: BTreeMap::new(),
                 last_error: None,
             }),
@@ -1394,6 +1422,19 @@ const MAX_DURABLE_JOURNAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"TCPJNL01";
 const APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"AVPJNL01";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct AppendVisibleJournalProfile {
+    lock_wait_nanos: u64,
+    encode_nanos: u64,
+    open_nanos: u64,
+    write_nanos: u64,
+    sync_nanos: u64,
+    dir_sync_nanos: u64,
+    record_count: u64,
+    frame_bytes: u64,
+    created: u64,
+}
+
 fn durable_journal_frame<T: DurableCodec>(
     record: &T,
     magic: &[u8; 8],
@@ -1479,33 +1520,53 @@ fn append_durable_journal_record<T: DurableCodec>(
     record: &T,
     magic: &[u8; 8],
     too_large_reason: &'static str,
-) -> Result<(u64, u64, u64)> {
+) -> Result<AppendVisibleJournalProfile> {
+    let encode_started = Instant::now();
     let frame = durable_journal_frame(record, magic, too_large_reason)?;
-    let frame_bytes = usize_to_u64(frame.len());
+    let encode_nanos = duration_nanos_u64(encode_started.elapsed());
+    let mut dir_sync_nanos = 0_u64;
     let parent = path
         .parent()
         .ok_or_else(|| StorageError::invalid_argument("journal path has no parent directory"))?;
     let parent_existed = parent.exists();
     if !parent_existed {
         fs::create_dir_all(parent).map_err(fs_error)?;
+        let dir_sync_started = Instant::now();
         sync_parent_dir(parent)?;
+        dir_sync_nanos =
+            dir_sync_nanos.saturating_add(duration_nanos_u64(dir_sync_started.elapsed()));
     }
     let existed = path.exists();
-    let started = Instant::now();
+    let open_started = Instant::now();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(fs_error)?;
+    let open_nanos = duration_nanos_u64(open_started.elapsed());
+    let started = Instant::now();
     file.write_all(&frame).map_err(fs_error)?;
     let write_nanos = duration_nanos_u64(started.elapsed());
     let sync_started = Instant::now();
     file.sync_data().map_err(fs_error)?;
-    if !existed {
-        sync_parent_dir(path)?;
-    }
     let sync_nanos = duration_nanos_u64(sync_started.elapsed());
-    Ok((write_nanos, sync_nanos, frame_bytes))
+    if !existed {
+        let dir_sync_started = Instant::now();
+        sync_parent_dir(path)?;
+        dir_sync_nanos =
+            dir_sync_nanos.saturating_add(duration_nanos_u64(dir_sync_started.elapsed()));
+    }
+    Ok(AppendVisibleJournalProfile {
+        encode_nanos,
+        open_nanos,
+        write_nanos,
+        sync_nanos,
+        dir_sync_nanos,
+        record_count: 1,
+        frame_bytes: usize_to_u64(frame.len()),
+        created: if existed { 0 } else { 1 },
+        ..AppendVisibleJournalProfile::default()
+    })
 }
 
 fn native_publish_journal_frame(commit: &NativeMetadataDeltaCommit) -> Result<Vec<u8>> {
@@ -1536,7 +1597,7 @@ fn load_native_publish_journal_commits_since(
 pub(super) fn append_append_visible_publish_journal_records(
     path: &Path,
     records: &[AppendVisiblePublish],
-) -> Result<(u64, u64, u64)> {
+) -> Result<AppendVisibleJournalProfile> {
     if records.is_empty() {
         return Err(StorageError::invalid_argument(
             "append visible publish journal batch must include records",
@@ -1546,12 +1607,14 @@ pub(super) fn append_append_visible_publish_journal_records(
         record.validate()?;
     }
     let records = records.to_vec();
-    append_durable_journal_record(
+    let mut profile = append_durable_journal_record(
         path,
         &records,
         &APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC,
         "append visible publish journal record exceeds durable payload limit",
-    )
+    )?;
+    profile.record_count = usize_to_u64(records.len());
+    Ok(profile)
 }
 
 pub(super) fn load_append_visible_publish_journal_records(
@@ -2166,19 +2229,23 @@ impl DurableSqliteStore {
     pub(super) fn append_append_visible_publish_journal_record(
         &self,
         record: &AppendVisiblePublish,
-    ) -> Result<(u64, u64, u64)> {
+    ) -> Result<AppendVisibleJournalProfile> {
         self.append_append_visible_publish_journal_records(std::slice::from_ref(record))
     }
 
     pub(super) fn append_append_visible_publish_journal_records(
         &self,
         records: &[AppendVisiblePublish],
-    ) -> Result<(u64, u64, u64)> {
+    ) -> Result<AppendVisibleJournalProfile> {
+        let lock_started = Instant::now();
         let _journal_guard = lock(&self.append_visible_publish_journal_lock)?;
-        append_append_visible_publish_journal_records(
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let mut profile = append_append_visible_publish_journal_records(
             &self.paths.append_visible_publish_journal,
             records,
-        )
+        )?;
+        profile.lock_wait_nanos = lock_wait_nanos;
+        Ok(profile)
     }
 
     #[cfg(test)]
@@ -3148,8 +3215,7 @@ impl DurableSqliteStore {
             .map(|record| record.commit_seq)
             .max()
             .unwrap_or_else(|| CommitSeq::from_raw(0));
-        let (root_sqlite_row_sync_nanos, root_sqlite_commit_nanos, visible_metadata_write_bytes) =
-            self.append_append_visible_publish_journal_records(records)?;
+        let append_visible_journal = self.append_append_visible_publish_journal_records(records)?;
 
         Ok(DurablePersistProfile {
             total_nanos: duration_nanos_u64(total_started.elapsed()),
@@ -3175,9 +3241,18 @@ impl DurableSqliteStore {
             node_catalog_sealed_rows: catalog_profile.sealed_rows,
             node_catalog_placement_rows: catalog_profile.placement_rows,
             node_catalog_segment_rows: catalog_profile.segment_rows,
-            root_sqlite_row_sync_nanos,
-            root_sqlite_commit_nanos,
-            visible_metadata_write_bytes,
+            root_sqlite_row_sync_nanos: append_visible_journal.write_nanos,
+            root_sqlite_commit_nanos: append_visible_journal.sync_nanos,
+            visible_metadata_write_bytes: append_visible_journal.frame_bytes,
+            append_visible_journal_lock_wait_nanos: append_visible_journal.lock_wait_nanos,
+            append_visible_journal_encode_nanos: append_visible_journal.encode_nanos,
+            append_visible_journal_open_nanos: append_visible_journal.open_nanos,
+            append_visible_journal_write_nanos: append_visible_journal.write_nanos,
+            append_visible_journal_sync_nanos: append_visible_journal.sync_nanos,
+            append_visible_journal_dir_sync_nanos: append_visible_journal.dir_sync_nanos,
+            append_visible_journal_record_count: append_visible_journal.record_count,
+            append_visible_journal_frame_bytes: append_visible_journal.frame_bytes,
+            append_visible_journal_created: append_visible_journal.created,
             new_segment_count: prepared.new_segment_count,
             new_segment_bytes: prepared.new_segment_bytes,
             touched_node_count: catalog_profile.touched_node_count(),
@@ -3526,7 +3601,7 @@ impl DurableSqliteStore {
                         files_to_sync.push(data_log_file_to_sync(file, bytes));
                     }
                     let data_dir_existed = data_dir.exists();
-                    fs::create_dir_all(&data_dir).map_err(fs_error)?;
+                    ensure_dir_exists(&data_dir)?;
                     if sync_mode == DataLogSyncMode::Sync && !data_dir_existed {
                         let started = Instant::now();
                         sync_dir(&self.paths.data_dir)?;

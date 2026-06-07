@@ -6258,6 +6258,66 @@ fn durable_append_visible_publish_record_materializes_on_reopen() {
 }
 
 #[test]
+fn durable_append_visible_publish_journal_can_live_outside_store_root() {
+    let root = durable_temp_dir("append-visible-publish-split-root");
+    let journal_root = durable_temp_dir("append-visible-publish-split-journal");
+    let journal = journal_root.join("append-visible-publish.journal");
+    let cfg = config();
+    let store =
+        DurableCoordinator::open_with_append_visible_publish_journal(&root, cfg, &journal).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec { name: None },
+            },
+        )
+        .unwrap();
+    let payload = repeated_blocks(1, 73);
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        file_id,
+        &payload,
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+    let run_extents = file_run_extents(&store.metadata(), keyspace_id, file_id);
+    assert_eq!(run_extents.len(), 1);
+    assert!(journal.exists());
+    assert!(!root.join("append-visible-publish.journal").exists());
+    assert_eq!(
+        load_append_visible_publish_journal_records(&journal)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(store);
+
+    let reopened =
+        DurableCoordinator::open_with_append_visible_publish_journal(&root, cfg, &journal).unwrap();
+    assert_eq!(
+        file_run_extents(&reopened.metadata(), keyspace_id, file_id),
+        run_extents
+    );
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(journal_root);
+}
+
+#[test]
 fn durable_append_visible_publish_replays_unpersisted_writer_epoch_skip() {
     let root = durable_temp_dir("append-visible-publish-writer-epoch-skip");
     let cfg = config();

@@ -52,6 +52,16 @@ struct AppendPublishBatchDiagnostics {
     payload_sync_nanos: u64,
     visible_metadata_commit_nanos: u64,
     catalog_manifest_publish_nanos: u64,
+    append_publish_batch_id: u64,
+    append_visible_journal_lock_wait_nanos: u64,
+    append_visible_journal_encode_nanos: u64,
+    append_visible_journal_open_nanos: u64,
+    append_visible_journal_write_nanos: u64,
+    append_visible_journal_sync_nanos: u64,
+    append_visible_journal_dir_sync_nanos: u64,
+    append_visible_journal_record_count: u64,
+    append_visible_journal_frame_bytes: u64,
+    append_visible_journal_created: u64,
 }
 
 impl AppendPublishBatchDiagnostics {
@@ -68,6 +78,18 @@ impl AppendPublishBatchDiagnostics {
                 .root_sqlite_row_sync_nanos
                 .saturating_add(profile.root_sqlite_commit_nanos),
             catalog_manifest_publish_nanos: profile.node_catalog_publish_nanos,
+            append_publish_batch_id: profile.append_visible_publish_batch_id,
+            append_visible_journal_lock_wait_nanos: profile
+                .append_visible_journal_lock_wait_nanos,
+            append_visible_journal_encode_nanos: profile.append_visible_journal_encode_nanos,
+            append_visible_journal_open_nanos: profile.append_visible_journal_open_nanos,
+            append_visible_journal_write_nanos: profile.append_visible_journal_write_nanos,
+            append_visible_journal_sync_nanos: profile.append_visible_journal_sync_nanos,
+            append_visible_journal_dir_sync_nanos: profile
+                .append_visible_journal_dir_sync_nanos,
+            append_visible_journal_record_count: profile.append_visible_journal_record_count,
+            append_visible_journal_frame_bytes: profile.append_visible_journal_frame_bytes,
+            append_visible_journal_created: profile.append_visible_journal_created,
         }
     }
 }
@@ -104,6 +126,47 @@ impl DurableCoordinator {
         )
     }
 
+    /// Open a durable store with an explicit append-visible publish journal.
+    ///
+    /// This is a provider-private deployment layout option. It does not change
+    /// the logical durable format, but a store using a split journal must be
+    /// reopened with the same journal path so unmaterialized visible append
+    /// publishes can replay.
+    pub fn open_with_append_visible_publish_journal(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        append_visible_publish_journal: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::open_with_storage_nodes_data_log_policy_and_append_visible_publish_journal(
+            root,
+            config,
+            vec![config.storage_node],
+            DurableDataLogPolicy::default(),
+            Some(append_visible_publish_journal.as_ref().to_path_buf()),
+        )
+    }
+
+    /// Open a durable store with explicit storage-node placement and an
+    /// optional split append-visible publish journal path.
+    ///
+    /// The split journal path is intentionally outside `LocalStoreConfig`
+    /// because it is deployment layout, not durable logical store state.
+    pub fn open_with_storage_nodes_data_log_policy_and_append_visible_publish_journal(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        policy: DurableDataLogPolicy,
+        append_visible_publish_journal: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+            root,
+            config,
+            storage_nodes,
+            MaintenancePolicy::manual(policy),
+            append_visible_publish_journal,
+        )
+    }
+
     /// Open a one-node durable store with an explicit maintenance policy.
     ///
     /// Manual mode starts no background worker. Opportunistic and always-on
@@ -133,10 +196,32 @@ impl DurableCoordinator {
         storage_nodes: Vec<StorageNodeId>,
         maintenance_policy: MaintenancePolicy,
     ) -> Result<Self> {
+        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+            root,
+            config,
+            storage_nodes,
+            maintenance_policy,
+            None,
+        )
+    }
+
+    fn open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        maintenance_policy: MaintenancePolicy,
+        append_visible_publish_journal: Option<PathBuf>,
+    ) -> Result<Self> {
         config.validate()?;
         maintenance_policy.validate()?;
         let storage_nodes = normalize_storage_nodes(config.storage_node, storage_nodes);
-        let paths = DurableStorePaths::new(root, config.storage_node)?;
+        let paths = match append_visible_publish_journal {
+            Some(path) => DurableStorePaths::new_with_append_visible_publish_journal(
+                root,
+                Some(path),
+            )?,
+            None => DurableStorePaths::new(root, config.storage_node)?,
+        };
         let durable = DurableSqliteStore::open(
             paths,
             maintenance_policy.data_log_policy,
@@ -1410,6 +1495,7 @@ impl DurableCoordinator {
 
     fn persist_prepared_append_publish_plans(
         &self,
+        batch_id: u64,
         plans: &[AppendPublishPlan],
         total_started: Instant,
         mut lock_wait_nanos: u64,
@@ -1504,6 +1590,7 @@ impl DurableCoordinator {
         profile.stream_prefix_pending_lock_wait_nanos = stream_prefix_pending_lock_wait_nanos;
         profile.new_segment_count = profile.new_segment_count.saturating_add(new_run_count);
         profile.new_segment_bytes = profile.new_segment_bytes.saturating_add(new_run_bytes);
+        profile.append_visible_publish_batch_id = batch_id;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.attach_metadata_publish_profile(&mut profile)?;
         let diagnostics = AppendPublishBatchDiagnostics::from_persist_profile(
@@ -1517,6 +1604,7 @@ impl DurableCoordinator {
 
     fn persist_append_publish_ticket_batch(
         &self,
+        batch_id: u64,
         tickets: Vec<AppendPublishTicket>,
     ) -> Result<AppendPublishBatchDiagnostics> {
         if tickets.is_empty() {
@@ -1589,7 +1677,12 @@ impl DurableCoordinator {
                     ));
                 }
                 let (durable_high_water, diagnostics) =
-                    match self.persist_prepared_append_publish_plans(&plans, total_started, 0) {
+                    match self.persist_prepared_append_publish_plans(
+                        batch_id,
+                        &plans,
+                        total_started,
+                        0,
+                    ) {
                         Ok(outcome) => outcome,
                         Err(error) => {
                             for plan in &plans {
@@ -1681,15 +1774,17 @@ impl DurableCoordinator {
 
             let wait_started = Instant::now();
             profile.cvar_waits = profile.cvar_waits.saturating_add(1);
+            profile.coalesce_waits = profile.coalesce_waits.saturating_add(1);
             let (next_state, timed_out) = wait_timeout_on_cvar(
                 &self.append_publish_persist_coordinator.cvar,
                 state,
                 delay,
             )?;
             state = next_state;
-            profile.coordinator_wait_nanos = profile
-                .coordinator_wait_nanos
-                .saturating_add(duration_nanos_u64(wait_started.elapsed()));
+            let wait_nanos = duration_nanos_u64(wait_started.elapsed());
+            profile.coordinator_wait_nanos =
+                profile.coordinator_wait_nanos.saturating_add(wait_nanos);
+            profile.coalesce_wait_nanos = profile.coalesce_wait_nanos.saturating_add(wait_nanos);
 
             let next_demand = self.append_publish_batch_demand(&state)?;
             if next_demand > demand {
@@ -2222,7 +2317,6 @@ impl DurableCoordinator {
         }
         Some(
             threshold
-                .saturating_div(4)
                 .max(usize_to_u64(APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES))
                 .min(APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES),
         )
@@ -2327,10 +2421,15 @@ impl DurableCoordinator {
                 while state.in_flight {
                     let wait_started = Instant::now();
                     profile.cvar_waits = profile.cvar_waits.saturating_add(1);
+                    profile.in_flight_waits = profile.in_flight_waits.saturating_add(1);
+                    profile.append_publish_batch_id =
+                        profile.append_publish_batch_id.max(state.current_batch_id);
                     state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
-                    profile.coordinator_wait_nanos = profile
-                        .coordinator_wait_nanos
-                        .saturating_add(duration_nanos_u64(wait_started.elapsed()));
+                    let wait_nanos = duration_nanos_u64(wait_started.elapsed());
+                    profile.coordinator_wait_nanos =
+                        profile.coordinator_wait_nanos.saturating_add(wait_nanos);
+                    profile.in_flight_wait_nanos =
+                        profile.in_flight_wait_nanos.saturating_add(wait_nanos);
                 }
                 if let Some((error_generation, error)) = state.last_error.clone()
                     && error_generation > observed_generation
@@ -2350,10 +2449,15 @@ impl DurableCoordinator {
                 while state.in_flight {
                     let wait_started = Instant::now();
                     profile.cvar_waits = profile.cvar_waits.saturating_add(1);
+                    profile.in_flight_waits = profile.in_flight_waits.saturating_add(1);
+                    profile.append_publish_batch_id =
+                        profile.append_publish_batch_id.max(state.current_batch_id);
                     state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
-                    profile.coordinator_wait_nanos = profile
-                        .coordinator_wait_nanos
-                        .saturating_add(duration_nanos_u64(wait_started.elapsed()));
+                    let wait_nanos = duration_nanos_u64(wait_started.elapsed());
+                    profile.coordinator_wait_nanos =
+                        profile.coordinator_wait_nanos.saturating_add(wait_nanos);
+                    profile.in_flight_wait_nanos =
+                        profile.in_flight_wait_nanos.saturating_add(wait_nanos);
                 }
                 observed_generation = state.generation;
             }
@@ -2411,15 +2515,24 @@ impl DurableCoordinator {
                 while state.in_flight && state.generation == generation {
                     let wait_started = Instant::now();
                     profile.cvar_waits = profile.cvar_waits.saturating_add(1);
+                    profile.in_flight_waits = profile.in_flight_waits.saturating_add(1);
+                    profile.append_publish_batch_id =
+                        profile.append_publish_batch_id.max(state.current_batch_id);
                     state = wait_on_cvar(&self.append_publish_persist_coordinator.cvar, state)?;
-                    profile.coordinator_wait_nanos = profile
-                        .coordinator_wait_nanos
-                        .saturating_add(duration_nanos_u64(wait_started.elapsed()));
+                    let wait_nanos = duration_nanos_u64(wait_started.elapsed());
+                    profile.coordinator_wait_nanos =
+                        profile.coordinator_wait_nanos.saturating_add(wait_nanos);
+                    profile.in_flight_wait_nanos =
+                        profile.in_flight_wait_nanos.saturating_add(wait_nanos);
                 }
                 observed_generation = state.generation;
                 continue;
             }
             state.in_flight = true;
+            let batch_id = state.next_batch_id;
+            state.next_batch_id = state.next_batch_id.saturating_add(1);
+            state.current_batch_id = batch_id;
+            profile.append_publish_batch_id = batch_id;
             profile.persist_batches_started = profile.persist_batches_started.saturating_add(1);
 
             let tickets = match self.coalesce_append_publish_waiters(state, &mut profile) {
@@ -2445,7 +2558,7 @@ impl DurableCoordinator {
                 .max(usize_to_u64(tickets.len()));
 
             let persist_started = Instant::now();
-            let result = self.persist_append_publish_ticket_batch(tickets);
+            let result = self.persist_append_publish_ticket_batch(batch_id, tickets);
             profile.persist_batch_nanos = profile
                 .persist_batch_nanos
                 .saturating_add(duration_nanos_u64(persist_started.elapsed()));
@@ -2465,6 +2578,36 @@ impl DurableCoordinator {
                 profile.catalog_manifest_publish_nanos = profile
                     .catalog_manifest_publish_nanos
                     .saturating_add(diagnostics.catalog_manifest_publish_nanos);
+                profile.append_publish_batch_id = profile
+                    .append_publish_batch_id
+                    .max(diagnostics.append_publish_batch_id);
+                profile.append_visible_journal_lock_wait_nanos = profile
+                    .append_visible_journal_lock_wait_nanos
+                    .saturating_add(diagnostics.append_visible_journal_lock_wait_nanos);
+                profile.append_visible_journal_encode_nanos = profile
+                    .append_visible_journal_encode_nanos
+                    .saturating_add(diagnostics.append_visible_journal_encode_nanos);
+                profile.append_visible_journal_open_nanos = profile
+                    .append_visible_journal_open_nanos
+                    .saturating_add(diagnostics.append_visible_journal_open_nanos);
+                profile.append_visible_journal_write_nanos = profile
+                    .append_visible_journal_write_nanos
+                    .saturating_add(diagnostics.append_visible_journal_write_nanos);
+                profile.append_visible_journal_sync_nanos = profile
+                    .append_visible_journal_sync_nanos
+                    .saturating_add(diagnostics.append_visible_journal_sync_nanos);
+                profile.append_visible_journal_dir_sync_nanos = profile
+                    .append_visible_journal_dir_sync_nanos
+                    .saturating_add(diagnostics.append_visible_journal_dir_sync_nanos);
+                profile.append_visible_journal_record_count = profile
+                    .append_visible_journal_record_count
+                    .saturating_add(diagnostics.append_visible_journal_record_count);
+                profile.append_visible_journal_frame_bytes = profile
+                    .append_visible_journal_frame_bytes
+                    .saturating_add(diagnostics.append_visible_journal_frame_bytes);
+                profile.append_visible_journal_created = profile
+                    .append_visible_journal_created
+                    .saturating_add(diagnostics.append_visible_journal_created);
             }
 
             let lock_started = Instant::now();

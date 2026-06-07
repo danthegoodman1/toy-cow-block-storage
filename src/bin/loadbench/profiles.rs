@@ -56,7 +56,7 @@ fn append_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,stream_prefix_request_count,stream_prefix_plan_count,stream_prefix_record_count,stream_prefix_payload_bytes,stream_prefix_storage_node_count,stream_prefix_pending_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,visible_metadata_write_bytes,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,stream_prefix_request_count,stream_prefix_plan_count,stream_prefix_record_count,stream_prefix_payload_bytes,stream_prefix_storage_node_count,stream_prefix_pending_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,visible_metadata_write_bytes,append_visible_publish_batch_id,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -113,6 +113,16 @@ fn append_profile_csv(
             profile.root_sqlite_row_sync_nanos.to_string(),
             profile.root_sqlite_commit_nanos.to_string(),
             profile.visible_metadata_write_bytes.to_string(),
+            profile.append_visible_publish_batch_id.to_string(),
+            profile.append_visible_journal_lock_wait_nanos.to_string(),
+            profile.append_visible_journal_encode_nanos.to_string(),
+            profile.append_visible_journal_open_nanos.to_string(),
+            profile.append_visible_journal_write_nanos.to_string(),
+            profile.append_visible_journal_sync_nanos.to_string(),
+            profile.append_visible_journal_dir_sync_nanos.to_string(),
+            profile.append_visible_journal_record_count.to_string(),
+            profile.append_visible_journal_frame_bytes.to_string(),
+            profile.append_visible_journal_created.to_string(),
             profile.new_segment_count.to_string(),
             profile.new_segment_bytes.to_string(),
             profile.touched_node_count.to_string(),
@@ -141,7 +151,7 @@ fn append_append_publish_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,ticket_id,stream_id,publish_through,total_nanos,status_check_nanos,coordinator_lock_wait_nanos,coordinator_wait_nanos,persist_batch_nanos,wait_loops,cvar_waits,persist_batches_started,max_batch_ticket_count,payload_already_durable_bytes,payload_synced_bytes,payload_sync_nanos,visible_metadata_commit_nanos,catalog_manifest_publish_nanos,registered,completed_without_register,success";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,ticket_id,stream_id,publish_through,total_nanos,status_check_nanos,coordinator_lock_wait_nanos,coordinator_wait_nanos,in_flight_wait_nanos,coalesce_wait_nanos,persist_batch_nanos,wait_loops,cvar_waits,in_flight_waits,coalesce_waits,persist_batches_started,max_batch_ticket_count,append_publish_batch_id,payload_already_durable_bytes,payload_synced_bytes,payload_sync_nanos,visible_metadata_commit_nanos,catalog_manifest_publish_nanos,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,registered,completed_without_register,success";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -160,16 +170,30 @@ fn append_append_publish_profile_csv(
             profile.status_check_nanos.to_string(),
             profile.coordinator_lock_wait_nanos.to_string(),
             profile.coordinator_wait_nanos.to_string(),
+            profile.in_flight_wait_nanos.to_string(),
+            profile.coalesce_wait_nanos.to_string(),
             profile.persist_batch_nanos.to_string(),
             profile.wait_loops.to_string(),
             profile.cvar_waits.to_string(),
+            profile.in_flight_waits.to_string(),
+            profile.coalesce_waits.to_string(),
             profile.persist_batches_started.to_string(),
             profile.max_batch_ticket_count.to_string(),
+            profile.append_publish_batch_id.to_string(),
             profile.payload_already_durable_bytes.to_string(),
             profile.payload_synced_bytes.to_string(),
             profile.payload_sync_nanos.to_string(),
             profile.visible_metadata_commit_nanos.to_string(),
             profile.catalog_manifest_publish_nanos.to_string(),
+            profile.append_visible_journal_lock_wait_nanos.to_string(),
+            profile.append_visible_journal_encode_nanos.to_string(),
+            profile.append_visible_journal_open_nanos.to_string(),
+            profile.append_visible_journal_write_nanos.to_string(),
+            profile.append_visible_journal_sync_nanos.to_string(),
+            profile.append_visible_journal_dir_sync_nanos.to_string(),
+            profile.append_visible_journal_record_count.to_string(),
+            profile.append_visible_journal_frame_bytes.to_string(),
+            profile.append_visible_journal_created.to_string(),
             profile.registered.to_string(),
             profile.completed_without_register.to_string(),
             profile.success.to_string(),

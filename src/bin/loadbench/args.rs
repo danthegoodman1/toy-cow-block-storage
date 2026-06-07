@@ -10,6 +10,8 @@ struct Args {
     serial_rtts: u32,
     delay_mode: DelayMode,
     root: PathBuf,
+    append_visible_journal_dir: Option<PathBuf>,
+    storage_node_data_dirs: Vec<PathBuf>,
     files: usize,
     shards: usize,
     storage_nodes: usize,
@@ -53,6 +55,8 @@ impl Args {
             serial_rtts: 1,
             delay_mode: DelayMode::Spin,
             root: env::temp_dir().join("toy-cow-block-storage-loadbench"),
+            append_visible_journal_dir: None,
+            storage_node_data_dirs: Vec::new(),
             files: 1024,
             shards: 64,
             storage_nodes: 1,
@@ -115,6 +119,16 @@ impl Args {
                 "--serial-rtts" => args.serial_rtts = parse_next(&mut raw, "--serial-rtts")?,
                 "--delay-mode" => args.delay_mode = parse_next(&mut raw, "--delay-mode")?,
                 "--root" => args.root = PathBuf::from(parse_next::<String>(&mut raw, "--root")?),
+                "--append-visible-journal-dir" => {
+                    args.append_visible_journal_dir = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--append-visible-journal-dir",
+                    )?));
+                }
+                "--storage-node-data-dirs" => {
+                    let value: String = parse_next(&mut raw, "--storage-node-data-dirs")?;
+                    args.storage_node_data_dirs = parse_path_list(&value);
+                }
                 "--files" => args.files = parse_next(&mut raw, "--files")?,
                 "--shards" => args.shards = parse_next(&mut raw, "--shards")?,
                 "--storage-nodes" => args.storage_nodes = parse_next(&mut raw, "--storage-nodes")?,
@@ -272,6 +286,13 @@ impl Args {
                 "storage-nodes must be greater than zero",
             ));
         }
+        if !args.storage_node_data_dirs.is_empty()
+            && args.storage_node_data_dirs.len() < args.storage_nodes
+        {
+            return Err(StorageError::invalid_argument(
+                "storage-node-data-dirs must provide at least storage-nodes paths",
+            ));
+        }
         if args.data_log_file_sync_fanout == 0 {
             return Err(StorageError::invalid_argument(
                 "data-log-file-sync-fanout must be greater than zero",
@@ -427,7 +448,9 @@ options:\n\
   --payload-integrity verified|unchecked   write payload integrity, default: verified\n\
   --read-verification default|require-verified|skip\n\
                                            read verification policy, default: default\n\
-  --root PATH                              durable scratch root"
+  --root PATH                              durable scratch root\n\
+  --append-visible-journal-dir PATH        directory for per-case append-visible publish journals\n\
+  --storage-node-data-dirs LIST            comma-separated per-node data directories"
     );
 }
 
@@ -451,6 +474,14 @@ fn parse_usize_list(value: &str, flag: &str) -> Result<Vec<usize>> {
                 StorageError::invalid_argument(format!("invalid {flag} entry {part}: {error}"))
             })
         })
+        .collect()
+}
+
+fn parse_path_list(value: &str) -> Vec<PathBuf> {
+    value
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
         .collect()
 }
 

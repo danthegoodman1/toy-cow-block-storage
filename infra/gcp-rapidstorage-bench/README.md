@@ -8,7 +8,7 @@ Defaults:
 - Project: `projectvoice-442316`
 - Region: `us-central1`
 - Zone: `us-central1-a`
-- VM: `c3-standard-88`
+- VM: `c4-standard-32`
 - Networking: gVNIC with per-VM Tier 1 egress bandwidth
 
 Rapid bucket creation currently uses `gcloud storage buckets create` from a
@@ -29,7 +29,7 @@ were created.
 To run a custom matrix while keeping the same apply/run/destroy behavior:
 
 ```sh
-./run_once.sh --workers=16,32,64 --op-mib=4,32 --total-mib=512 --publish-mib=128 --mode=at-end,interval,close-at-end --csv=rapid-results-c3-88-tier1.csv
+./run_once.sh --workers=16,32,64 --op-mib=4,32 --total-mib=512 --publish-mib=128 --mode=at-end,interval,close-at-end --csv=rapid-results-c4-32-tier1.csv
 ```
 
 The remote run script copies `tools/gcp-rapidstorage-bench` to the VM, runs it

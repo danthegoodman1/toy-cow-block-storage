@@ -1,17 +1,26 @@
 fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<BenchReport> {
-    let root = args.root.join(format!(
+    let case_id = format!(
         "{}-{}-c{}-{}",
         std::process::id(),
         workload.name(),
         concurrency,
         NEXT_ROOT_ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    );
+    let root = args.root.join(&case_id);
+    let append_visible_journal = args
+        .append_visible_journal_dir
+        .as_ref()
+        .map(|dir| dir.join(format!("{case_id}-append-visible-publish.journal")));
     if matches!(args.provider, ProviderKind::Durable) {
         let _ = fs::remove_dir_all(&root);
+        if let Some(path) = &append_visible_journal {
+            let _ = fs::remove_file(path);
+        }
         fs::create_dir_all(&root).map_err(fs_error)?;
     }
+    let storage_node_data_targets = prepare_storage_node_data_dirs(args, &root, &case_id)?;
 
-    let store = BenchStore::open(args, &root)?;
+    let store = BenchStore::open(args, &root, append_visible_journal.clone())?;
     let context = setup_context(args, workload, concurrency, store, &root)?;
     let profile_store = context.store.clone();
     let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
@@ -54,10 +63,43 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
 
     if matches!(args.provider, ProviderKind::Durable) {
         let _ = fs::remove_dir_all(&root);
+        for target in &storage_node_data_targets {
+            let _ = fs::remove_dir_all(target);
+        }
+        if let Some(path) = &append_visible_journal {
+            let _ = fs::remove_file(path);
+        }
     }
 
     Ok(report)
 }
+
+fn prepare_storage_node_data_dirs(
+    args: &Args,
+    root: &Path,
+    case_id: &str,
+) -> Result<Vec<PathBuf>> {
+    if !matches!(args.provider, ProviderKind::Durable) || args.storage_node_data_dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let data_dir = root.join("data");
+    fs::create_dir_all(&data_dir).map_err(fs_error)?;
+    let mut targets = Vec::with_capacity(args.storage_nodes);
+    for (index, storage_node) in args.storage_node_ids().into_iter().enumerate() {
+        let target = args.storage_node_data_dirs[index]
+            .join(case_id)
+            .join(format!("node-{}", storage_node.raw()));
+        fs::create_dir_all(&target).map_err(fs_error)?;
+        let target = fs::canonicalize(&target).map_err(fs_error)?;
+        let link = data_dir.join(format!("node-{}", storage_node.raw()));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).map_err(fs_error)?;
+        targets.push(target);
+    }
+    Ok(targets)
+}
+
 fn setup_context(
     args: &Args,
     workload: Workload,
