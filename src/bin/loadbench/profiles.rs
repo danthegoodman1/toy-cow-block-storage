@@ -233,7 +233,7 @@ fn append_append_ingest_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,stream_id,storage_node,active_log_lane,active_log_lanes,payload_bytes,total_nanos,admission_wait_nanos,stream_lock_wait_nanos,pending_lock_wait_nanos,active_log_lock_wait_nanos,metadata_prepare_nanos,metadata_record_nanos,payload_encode_nanos,payload_write_nanos,auto_persist_nanos,auto_persist_target_nanos,auto_persist_pending_nanos,auto_persist_sync_nanos,auto_persist_sync_file_nanos,auto_persist_sync_file_max_nanos,auto_persist_sync_dir_nanos,auto_persist_mark_nanos,auto_persist_request_nanos,auto_persist_target_bytes,auto_persist_pending_log_refs,auto_persist_pending_storage_nodes,auto_persist_sync_bytes,auto_persist_files_synced,auto_persist_sync_success,auto_persist_request_submitted,background_sync_requested_bytes,max_in_flight_bytes,success";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,stream_id,storage_node,active_log_lane,active_log_lanes,payload_bytes,total_nanos,admission_wait_nanos,stream_lock_wait_nanos,pending_lock_wait_nanos,active_log_lock_wait_nanos,metadata_prepare_nanos,metadata_record_nanos,payload_encode_nanos,payload_write_nanos,auto_persist_nanos,auto_persist_target_nanos,auto_persist_pending_nanos,auto_persist_sync_nanos,auto_persist_sync_file_nanos,auto_persist_sync_file_max_nanos,auto_persist_sync_dir_nanos,auto_persist_mark_nanos,auto_persist_request_nanos,auto_persist_target_bytes,auto_persist_pending_log_refs,auto_persist_pending_storage_nodes,auto_persist_sync_bytes,auto_persist_files_synced,auto_persist_sync_success,auto_persist_request_submitted,background_sync_requested_bytes,background_sync_request_count,background_sync_step_bytes,max_in_flight_bytes,success";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -276,6 +276,8 @@ fn append_append_ingest_profile_csv(
             profile.auto_persist_sync_success.to_string(),
             profile.auto_persist_request_submitted.to_string(),
             profile.background_sync_requested_bytes.to_string(),
+            profile.background_sync_request_count.to_string(),
+            profile.background_sync_step_bytes.to_string(),
             profile.max_in_flight_bytes.to_string(),
             profile.success.to_string(),
         ];

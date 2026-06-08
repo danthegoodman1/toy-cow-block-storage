@@ -514,6 +514,43 @@ trade it for more operation overhead and publish-lane wait. The next storage
 runtime target is therefore not a smaller public append default; it is reducing
 active-log queueing for large appends without multiplying publish work.
 
+A June 8, 2026 PT storage-node-count sweep tested that target by keeping the
+same 32 MiB append / 128 MiB publish shape and c32 `raid-split-journal` layout,
+but varying logical storage nodes across `4`, `8`, `16`, and `32`. The GCP
+driver now accepts `STORAGE_NODE_COUNTS` so these modes run on one C4 node under
+the same machine/disk conditions. In the steady repeat:
+
+| Nodes | RTT | Throughput | Append p99 | Publish p99 | Dominant append profile |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| `4` | `0us` | 14.80 GiB/s | 106.9 ms | 5.8 ms | lock 55.6 ms, sync 72.7 ms |
+| `4` | `200us` | 9.14 GiB/s | 191.7 ms | 13.1 ms | lock 57.2 ms, sync 158.8 ms |
+| `4` | `700us` | 9.04 GiB/s | 190.2 ms | 13.6 ms | lock 56.1 ms, sync 159.1 ms |
+| `4` | `3600us` | 9.05 GiB/s | 202.1 ms | 19.5 ms | lock 47.8 ms, sync 154.0 ms |
+| `8` | `0us` | 11.28 GiB/s | 154.5 ms | 15.7 ms | lock 25.8 ms, sync 129.6 ms |
+| `8` | `200us` | 15.23 GiB/s | 109.5 ms | 3.3 ms | lock 32.4 ms, sync 80.1 ms |
+| `8` | `700us` | 15.44 GiB/s | 114.3 ms | 6.4 ms | lock 33.7 ms, sync 87.9 ms |
+| `8` | `3600us` | 15.24 GiB/s | 103.4 ms | 9.4 ms | lock 36.4 ms, sync 75.5 ms |
+| `16` | `0us` | 15.40 GiB/s | 118.2 ms | 3.3 ms | lock 12.3 ms, sync 102.9 ms |
+| `16` | `200us` | 15.28 GiB/s | 122.1 ms | 3.9 ms | lock 9.1 ms, sync 108.8 ms |
+| `16` | `700us` | 15.26 GiB/s | 121.9 ms | 5.7 ms | lock 9.7 ms, sync 102.4 ms |
+| `16` | `3600us` | 14.82 GiB/s | 129.0 ms | 7.7 ms | lock 9.7 ms, sync 107.9 ms |
+| `32` | `0us` | 15.32 GiB/s | 120.5 ms | 4.4 ms | lock 0.0 ms, sync 109.9 ms |
+| `32` | `200us` | 15.41 GiB/s | 124.8 ms | 5.1 ms | lock 0.0 ms, sync 113.2 ms |
+| `32` | `700us` | 15.31 GiB/s | 114.8 ms | 5.6 ms | lock 0.0 ms, sync 105.9 ms |
+| `32` | `3600us` | 14.60 GiB/s | 118.5 ms | 8.0 ms | lock 0.0 ms, sync 106.9 ms |
+
+This proved the active-log queueing hypothesis only halfway. Increasing logical
+storage nodes reduces or eliminates `active_log_lock_wait`, and `8` nodes fixed
+the nonzero-RTT throughput collapse in this run. It did not materially lower
+append p99, because the tail moved into synchronous auto-persist
+`fdatasync`/directory-sync work. The new append-ingest profile columns
+`background_sync_request_count` and `background_sync_step_bytes` make the next
+pass distinguish "background sync did not get scheduled" from "background sync
+was scheduled but could not win the race before auto-persist." Local 8 MiB and
+16 MiB early-sync cadences were tested and rejected before GCP: both increased
+local write/sync contention and worsened append p99 versus the original
+threshold-based cadence.
+
 Raw C4 artifacts are local and ignored under
 `infra/gcp-local-nvme-bench/results/`, specifically
 `gcp-c4-192-layout-20260607-125041`, `c48887-06071318`, and
@@ -522,8 +559,8 @@ Raw C4 artifacts are local and ignored under
 `c4288-warm-200first-spin-06071742`, plus
 `c4288-prealloc-target32-06071829`,
 `c4288-prealloc-target32-rand-06071837`,
-`c4288-coalesce4-rand-06071852`, `c4288-quantum-0608`, and
-`c4288-quantum16-0608`. The
+`c4288-coalesce4-rand-06071852`, `c4288-quantum-0608`,
+`c4288-quantum16-0608`, and `c4288-storage-nodes-0608`. The
 temporary GCP instances, networks, subnets, and firewall rules were deleted
 after the runs.
 

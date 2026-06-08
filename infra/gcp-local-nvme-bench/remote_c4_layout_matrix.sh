@@ -8,6 +8,7 @@ RESULT_ROOT="/opt/results/${RUN_ID}"
 SRC_DIR="/opt/src"
 LOADBENCH="${SRC_DIR}/target/release/loadbench"
 STORAGE_NODES="${STORAGE_NODES:-4}"
+STORAGE_NODE_COUNTS="${STORAGE_NODE_COUNTS:-${STORAGE_NODES}}"
 MIN_LOCAL_SSDS="${MIN_LOCAL_SSDS:-32}"
 LAYOUTS="${LAYOUTS:-raid-shared,raid-split-journal,node-private-journal}"
 NODE_RAID_GROUPS="${NODE_RAID_GROUPS:-}"
@@ -32,6 +33,22 @@ if (( ${#RTT_VALUES[@]} == 0 )); then
   printf 'RTTS must include at least one modeled RTT value\n' >&2
   exit 1
 fi
+IFS=',' read -r -a STORAGE_NODE_COUNT_VALUES <<<"${STORAGE_NODE_COUNTS}"
+if (( ${#STORAGE_NODE_COUNT_VALUES[@]} == 0 )); then
+  printf 'STORAGE_NODE_COUNTS must include at least one value\n' >&2
+  exit 1
+fi
+MAX_STORAGE_NODES=0
+for storage_node_count in "${STORAGE_NODE_COUNT_VALUES[@]}"; do
+  if ! [[ "${storage_node_count}" =~ ^[0-9]+$ ]] || (( storage_node_count < 1 )); then
+    printf 'STORAGE_NODE_COUNTS entries must be positive integers, got %s\n' \
+      "${storage_node_count}" >&2
+    exit 1
+  fi
+  if (( storage_node_count > MAX_STORAGE_NODES )); then
+    MAX_STORAGE_NODES="${storage_node_count}"
+  fi
+done
 if ! [[ "${REPEATS}" =~ ^[0-9]+$ ]] || (( REPEATS < 1 )); then
   printf 'REPEATS must be a positive integer, got %s\n' "${REPEATS}" >&2
   exit 1
@@ -85,9 +102,9 @@ if (( ${#DISKS[@]} < MIN_LOCAL_SSDS )); then
   lsblk -o NAME,TYPE,TRAN,SIZE,MODEL,MOUNTPOINT | tee "${RESULT_ROOT}/environment-lsblk-failure.txt"
   exit 1
 fi
-if (( ${#DISKS[@]} <= STORAGE_NODES )); then
+if (( ${#DISKS[@]} <= MAX_STORAGE_NODES )); then
   printf 'node-private layout needs one journal disk plus %s storage-node disks, found %s\n' \
-    "${STORAGE_NODES}" "${#DISKS[@]}" >&2
+    "${MAX_STORAGE_NODES}" "${#DISKS[@]}" >&2
   exit 1
 fi
 
@@ -96,6 +113,7 @@ fi
   echo "machine_type=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/machine-type | awk -F/ '{print $NF}')"
   echo "zone=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')"
   echo "storage_nodes=${STORAGE_NODES}"
+  echo "storage_node_counts=${STORAGE_NODE_COUNT_VALUES[*]}"
   echo "min_local_ssds=${MIN_LOCAL_SSDS}"
   echo "layouts=${LAYOUTS}"
   echo "node_raid_groups=${NODE_RAID_GROUPS}"
@@ -285,11 +303,12 @@ run_layout() {
   esac
   append_ingest_label="${append_ingest_label}-lanes${append_ingest_active_log_lanes}"
   append_ingest_args+=(--append-ingest-active-log-lanes "${append_ingest_active_log_lanes}")
-  mode="${mode}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m"
+  mode="${mode}-nodes${STORAGE_NODES}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m"
   local out="${RESULT_ROOT}/loadbench/${mode}"
   mkdir -p "${out}"
   {
     echo "mode=${mode}"
+    echo "storage_nodes=${STORAGE_NODES}"
     echo "append_ingest_max_in_flight_mib=${append_ingest_cap_mib}"
     echo "append_ingest_active_log_lanes=${append_ingest_active_log_lanes}"
     echo "stream_auto_persist_mib=${stream_auto_persist_mib}"
@@ -593,6 +612,8 @@ with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
     fields.extend([
         "payload_bytes_sum",
         "background_sync_requested_bytes_sum",
+        "background_sync_request_count_sum",
+        "background_sync_step_bytes_max",
         "max_in_flight_bytes_max",
         "active_log_lanes_max",
         "auto_persist_target_bytes_max",
@@ -616,6 +637,8 @@ with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
             "samples": len(rows),
             "payload_bytes_sum": sum(int(to_float(r, "payload_bytes")) for r in rows),
             "background_sync_requested_bytes_sum": sum(int(to_float(r, "background_sync_requested_bytes")) for r in rows),
+            "background_sync_request_count_sum": sum(int(to_float(r, "background_sync_request_count")) for r in rows),
+            "background_sync_step_bytes_max": max((int(to_float(r, "background_sync_step_bytes")) for r in rows), default=0),
             "max_in_flight_bytes_max": max((int(to_float(r, "max_in_flight_bytes")) for r in rows), default=0),
             "active_log_lanes_max": max((int(to_float(r, "active_log_lanes")) for r in rows), default=0),
             "auto_persist_target_bytes_max": max((int(to_float(r, "auto_persist_target_bytes")) for r in rows), default=0),
@@ -965,6 +988,9 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
         "append_ingest_auto_persist_pending_storage_nodes_max",
         "append_ingest_auto_persist_sync_success_count",
         "append_ingest_auto_persist_request_submitted_count",
+        "append_ingest_background_sync_requested_bytes_sum",
+        "append_ingest_background_sync_request_count_sum",
+        "append_ingest_background_sync_step_bytes",
         "append_ingest_max_in_flight_bytes",
         "append_ingest_active_log_lanes",
     ]
@@ -1046,6 +1072,9 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
             "append_ingest_auto_persist_pending_storage_nodes_max": ingest.get("auto_persist_pending_storage_nodes_max", 0),
             "append_ingest_auto_persist_sync_success_count": ingest.get("auto_persist_sync_success_count", 0),
             "append_ingest_auto_persist_request_submitted_count": ingest.get("auto_persist_request_submitted_count", 0),
+            "append_ingest_background_sync_requested_bytes_sum": ingest.get("background_sync_requested_bytes_sum", 0),
+            "append_ingest_background_sync_request_count_sum": ingest.get("background_sync_request_count_sum", 0),
+            "append_ingest_background_sync_step_bytes": ingest.get("background_sync_step_bytes_max", 0),
             "append_ingest_max_in_flight_bytes": ingest.get("max_in_flight_bytes_max", 0),
             "append_ingest_active_log_lanes": ingest.get("active_log_lanes_max", 0),
         })
@@ -1065,55 +1094,60 @@ IFS=',' read -r -a requested_stream_auto_persist_mibs <<<"${STREAM_AUTO_PERSIST_
 if (( ${#requested_stream_auto_persist_mibs[@]} == 0 )); then
   requested_stream_auto_persist_mibs=("32")
 fi
+base_node_raid_groups="${NODE_RAID_GROUPS}"
 for layout in "${requested_layouts[@]}"; do
-  case "${layout}" in
-    raid-shared)
-      setup_raid_shared
-      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-            run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+  for storage_node_count in "${STORAGE_NODE_COUNT_VALUES[@]}"; do
+    STORAGE_NODES="${storage_node_count}"
+    NODE_RAID_GROUPS="${base_node_raid_groups}"
+    case "${layout}" in
+      raid-shared)
+        setup_raid_shared
+        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+              run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+            done
           done
         done
-      done
-      ;;
-    raid-split-journal)
-      setup_raid_split_journal
-      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-            run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+        ;;
+      raid-split-journal)
+        setup_raid_split_journal
+        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+              run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+            done
           done
         done
-      done
-      ;;
-    node-private-journal)
-      setup_node_private_journal
-      NODE_DIRS="$(csv_join_node_dirs)"
-      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-            run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+        ;;
+      node-private-journal)
+        setup_node_private_journal
+        NODE_DIRS="$(csv_join_node_dirs)"
+        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+              run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+            done
           done
         done
-      done
-      ;;
-    node-private-raid-journal)
-      setup_node_private_raid_journal
-      NODE_DIRS="$(csv_join_node_dirs)"
-      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-            run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+        ;;
+      node-private-raid-journal)
+        setup_node_private_raid_journal
+        NODE_DIRS="$(csv_join_node_dirs)"
+        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+              run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+            done
           done
         done
-      done
-      ;;
-    *)
-      printf 'unknown layout: %s\n' "${layout}" >&2
-      exit 1
-      ;;
-  esac
+        ;;
+      *)
+        printf 'unknown layout: %s\n' "${layout}" >&2
+        exit 1
+        ;;
+    esac
+  done
 done
 
 teardown_storage

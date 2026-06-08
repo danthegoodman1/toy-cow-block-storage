@@ -191,6 +191,8 @@ pub struct AppendIngestProfile {
     pub auto_persist_sync_success: bool,
     pub auto_persist_request_submitted: bool,
     pub background_sync_requested_bytes: u64,
+    pub background_sync_request_count: u64,
+    pub background_sync_step_bytes: u64,
     pub max_in_flight_bytes: u64,
     pub success: bool,
 }
@@ -474,6 +476,8 @@ pub(super) struct DataLogAppendProfile {
     sync_bytes: u64,
     records_written: u64,
     write_bytes: u64,
+    background_sync_request_count: u64,
+    background_sync_step_bytes: u64,
 }
 
 impl DataLogAppendProfile {
@@ -495,6 +499,12 @@ impl DataLogAppendProfile {
         self.sync_bytes = self.sync_bytes.saturating_add(other.sync_bytes);
         self.records_written = self.records_written.saturating_add(other.records_written);
         self.write_bytes = self.write_bytes.saturating_add(other.write_bytes);
+        self.background_sync_request_count = self
+            .background_sync_request_count
+            .saturating_add(other.background_sync_request_count);
+        self.background_sync_step_bytes = self
+            .background_sync_step_bytes
+            .max(other.background_sync_step_bytes);
     }
 }
 
@@ -1019,6 +1029,7 @@ impl StorageNodeAppendLogService {
             .seek(SeekFrom::Start(record_offset))
             .map_err(fs_error)?;
         let background_sync_step = payload.background_sync_step_bytes;
+        profile.background_sync_step_bytes = background_sync_step.unwrap_or_default();
         let mut next_background_sync_at = background_sync_step
             .map(|step| record_offset.saturating_add(step).min(new_total));
         let mut written_through = record_offset;
@@ -1033,6 +1044,8 @@ impl StorageNodeAppendLogService {
                     bytes: written_through,
                     sync_dir: needs_dir_sync,
                 });
+                profile.background_sync_request_count =
+                    profile.background_sync_request_count.saturating_add(1);
                 if let Some(step) = background_sync_step {
                     next_background_sync_at = if written_through < new_total {
                         let mut next = next_background_sync_at.unwrap_or(new_total);

@@ -2820,6 +2820,8 @@ impl DurableCoordinator {
                 self.append_stream_background_sync_step_bytes(data.len());
             if background_sync_step_bytes.is_some() {
                 profile.background_sync_requested_bytes = payload_bytes;
+                profile.background_sync_step_bytes =
+                    background_sync_step_bytes.unwrap_or_default();
             }
             let payload = DurableAppendRunChunkPayload {
                 run_id: prepared.run_id,
@@ -2848,6 +2850,8 @@ impl DurableCoordinator {
             profile.active_log_lock_wait_nanos = data_profile.active_log_lock_wait_nanos;
             profile.active_log_lane = data_profile.active_log_lane;
             profile.active_log_lanes = data_profile.active_log_lanes;
+            profile.background_sync_request_count = data_profile.background_sync_request_count;
+            profile.background_sync_step_bytes = data_profile.background_sync_step_bytes;
             let appended_log_refs = append.log_refs();
             let pending_lock_started = ingest_profile_enabled.then(Instant::now);
             lock(&lane.pending)?.merge(append);

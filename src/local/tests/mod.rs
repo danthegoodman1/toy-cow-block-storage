@@ -3431,10 +3431,12 @@ fn durable_append_payload_chunks_start_background_sync_progress() {
         chunks: vec![first.as_slice(), second.as_slice()],
         background_sync_step_bytes: Some(4096),
     };
-    let (_run, pending, _) = store
+    let (_run, pending, profile) = store
         .durable
         .write_append_run_payload_chunks_unsynced(append_payload, None)
         .unwrap();
+    assert_eq!(profile.background_sync_step_bytes, 4096);
+    assert_eq!(profile.background_sync_request_count, 2);
     let (log_ref, manifest) = pending.logs.iter().next().unwrap();
     assert!(
         store
@@ -10397,6 +10399,8 @@ fn durable_append_ingest_profile_records_payload_write() {
     assert_eq!(profile.payload_bytes, 4096);
     assert_eq!(profile.max_in_flight_bytes, 4096);
     assert!(profile.payload_write_nanos > 0);
+    assert_eq!(profile.background_sync_request_count, 0);
+    assert_eq!(profile.background_sync_step_bytes, 0);
     assert!(profile.metadata_prepare_nanos > 0);
     assert!(profile.metadata_record_nanos > 0);
     assert!(profile.total_nanos >= profile.payload_write_nanos);
