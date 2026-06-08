@@ -183,13 +183,17 @@ pub struct AppendIngestProfile {
     pub auto_persist_sync_dir_nanos: u64,
     pub auto_persist_mark_nanos: u64,
     pub auto_persist_request_nanos: u64,
+    pub auto_persist_wait_nanos: u64,
     pub auto_persist_target_bytes: u64,
+    pub auto_persist_wait_target_bytes: u64,
     pub auto_persist_pending_log_refs: u64,
     pub auto_persist_pending_storage_nodes: u64,
     pub auto_persist_sync_bytes: u64,
     pub auto_persist_files_synced: u64,
     pub auto_persist_sync_success: bool,
     pub auto_persist_request_submitted: bool,
+    pub auto_persist_observed_synced_bytes: u64,
+    pub auto_persist_marked_bytes: u64,
     pub background_sync_requested_bytes: u64,
     pub background_sync_request_count: u64,
     pub background_sync_step_bytes: u64,
@@ -588,17 +592,23 @@ struct AppendLogPayloadSyncWorkerState {
 #[derive(Debug)]
 struct AppendLogPayloadSyncWorker {
     state: Arc<(Mutex<AppendLogPayloadSyncWorkerState>, Condvar)>,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl AppendLogPayloadSyncWorker {
     fn start(
         paths: DurableStorePaths,
         policy: DurableDataLogPolicy,
+        worker_count: usize,
         synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
         dir_synced_logs: Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
         synced_log_cvar: Arc<Condvar>,
     ) -> Result<Self> {
+        if worker_count == 0 {
+            return Err(StorageError::invalid_argument(
+                "append-log payload sync worker count must be greater than zero",
+            ));
+        }
         let state = Arc::new((
             Mutex::new(AppendLogPayloadSyncWorkerState {
                 shutdown: false,
@@ -606,27 +616,36 @@ impl AppendLogPayloadSyncWorker {
             }),
             Condvar::new(),
         ));
-        let worker_state = Arc::clone(&state);
-        let handle = thread::Builder::new()
-            .name("toy-cow-append-log-payload-sync".to_string())
-            .spawn(move || {
-                append_log_payload_sync_worker_loop(
-                    paths,
-                    policy,
-                    synced_logs,
-                    dir_synced_logs,
-                    synced_log_cvar,
-                    worker_state,
-                )
-            })
-            .map_err(|error| {
-                StorageError::unavailable(format!(
-                    "failed to start append-log payload sync worker: {error}"
-                ))
-            })?;
+        let mut handles = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let paths = paths.clone();
+            let worker_state = Arc::clone(&state);
+            let synced_logs = Arc::clone(&synced_logs);
+            let dir_synced_logs = Arc::clone(&dir_synced_logs);
+            let synced_log_cvar = Arc::clone(&synced_log_cvar);
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("toy-cow-append-log-payload-sync-{index}"))
+                    .spawn(move || {
+                        append_log_payload_sync_worker_loop(
+                            paths,
+                            policy,
+                            synced_logs,
+                            dir_synced_logs,
+                            synced_log_cvar,
+                            worker_state,
+                        )
+                    })
+                    .map_err(|error| {
+                        StorageError::unavailable(format!(
+                            "failed to start append-log payload sync worker: {error}"
+                        ))
+                    })?,
+            );
+        }
         Ok(Self {
             state,
-            handle: Mutex::new(Some(handle)),
+            handles: Mutex::new(handles),
         })
     }
 
@@ -666,12 +685,12 @@ impl AppendLogPayloadSyncWorker {
         let (lock_state, cvar) = &*self.state;
         if let Ok(mut state) = lock_state.lock() {
             state.shutdown = true;
-            cvar.notify_one();
+            cvar.notify_all();
         }
-        if let Ok(mut handle) = self.handle.lock()
-            && let Some(handle) = handle.take()
-        {
-            let _ = handle.join();
+        if let Ok(mut handles) = self.handles.lock() {
+            for handle in handles.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -1131,6 +1150,59 @@ impl StorageNodeAppendLogService {
             self.payload_sync_worker.request_many(requests);
         }
         Ok(())
+    }
+
+    fn synced_append_stream_record_high_water_from_snapshot(
+        synced: &BTreeMap<DurableDataLogRef, u64>,
+        durable_before: u64,
+        records: &[AppendStreamRunRecord],
+    ) -> Result<u64> {
+        let mut high_water = durable_before;
+        for record in records {
+            if record.offset > high_water {
+                break;
+            }
+            if record.end_exclusive()? <= high_water {
+                continue;
+            }
+            if record.offset < high_water {
+                return Err(StorageError::conflict(
+                    "append stream sync high-water split an append run",
+                ));
+            }
+            let synced_bytes = synced.get(&record.log_ref()).copied().unwrap_or_default();
+            if synced_bytes < record.run.log_payload_end()? {
+                if synced_bytes > record.run.log_payload_offset {
+                    let synced_payload_bytes = synced_bytes - record.run.log_payload_offset;
+                    high_water = high_water.max(
+                        record
+                            .offset
+                            .checked_add(synced_payload_bytes.min(record.len))
+                            .ok_or_else(|| {
+                                StorageError::invalid_argument(
+                                    "append stream synced high-water overflows",
+                                )
+                            })?,
+                    );
+                }
+                break;
+            }
+            high_water = record.end_exclusive()?;
+        }
+        Ok(high_water)
+    }
+
+    fn synced_append_stream_record_high_water(
+        &self,
+        durable_before: u64,
+        records: &[AppendStreamRunRecord],
+    ) -> Result<u64> {
+        let synced = lock(&self.synced_logs)?;
+        Self::synced_append_stream_record_high_water_from_snapshot(
+            &synced,
+            durable_before,
+            records,
+        )
     }
 
     fn sync_pending_append(&self, appended: &PendingDataLogAppend) -> Result<DataLogAppendProfile> {
@@ -2082,6 +2154,7 @@ impl DurableSqliteStore {
         let payload_sync_worker = AppendLogPayloadSyncWorker::start(
             paths.clone(),
             policy,
+            append_ingest_data_log_policy.background_sync_workers,
             Arc::clone(&synced_append_logs),
             Arc::clone(&dir_synced_append_logs),
             Arc::clone(&synced_append_log_cvar),
@@ -3802,6 +3875,15 @@ impl DurableSqliteStore {
             pending.logs.insert(*log_ref, self.data_log_manifest_for_ref(*log_ref)?);
         }
         Ok(pending)
+    }
+
+    fn synced_append_stream_record_high_water(
+        &self,
+        durable_before: u64,
+        records: &[AppendStreamRunRecord],
+    ) -> Result<u64> {
+        self.append_log_service
+            .synced_append_stream_record_high_water(durable_before, records)
     }
 
     fn data_log_manifest_for_ref(

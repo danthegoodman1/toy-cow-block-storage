@@ -39,11 +39,11 @@ pub use id::{
     StorageNodeKeyId, TenantId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
-    AppendIngestAdmissionPolicy, AppendIngestDataLogPolicy, AppendIngestPolicy,
-    AppendIngestProfile, AppendPublishBatchPolicy, AppendPublishWaitProfile,
-    ChaosRemoteWireTransport, ChaosStorageNodeTransport, ChaosTransportMetrics,
-    DurableCompactionReport, DurableCoordinator, DurableDataLogPolicy, DurableDataLogRef,
-    DurablePersistProfile, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane,
+    AppendAutoPersistMode, AppendAutoPersistPolicy, AppendIngestAdmissionPolicy,
+    AppendIngestDataLogPolicy, AppendIngestPolicy, AppendIngestProfile, AppendPublishBatchPolicy,
+    AppendPublishWaitProfile, ChaosRemoteWireTransport, ChaosStorageNodeTransport,
+    ChaosTransportMetrics, DurableCompactionReport, DurableCoordinator, DurableDataLogPolicy,
+    DurableDataLogRef, DurablePersistProfile, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane,
     InMemorySegmentStore, InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient,
     LocalBlockDevice, LocalBlockServer, LocalCoordinator, LocalNativeClient, LocalNativeFile,
     LocalNativeServer, LocalStoreConfig, MaintenanceCommand, MaintenanceDataLogObservation,

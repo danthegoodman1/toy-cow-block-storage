@@ -26,7 +26,10 @@ APPEND_PUBLISH_IDLE_COALESCE_US="${APPEND_PUBLISH_IDLE_COALESCE_US:-250}"
 APPEND_PUBLISH_MAX_COALESCE_US="${APPEND_PUBLISH_MAX_COALESCE_US:-5000}"
 APPEND_INGEST_MAX_IN_FLIGHT_MIBS="${APPEND_INGEST_MAX_IN_FLIGHT_MIBS:-none}"
 APPEND_INGEST_ACTIVE_LOG_LANES="${APPEND_INGEST_ACTIVE_LOG_LANES:-1}"
+APPEND_INGEST_BACKGROUND_SYNC_WORKERS="${APPEND_INGEST_BACKGROUND_SYNC_WORKERS:-1}"
+APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB="${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB:-}"
 STREAM_AUTO_PERSIST_MIBS="${STREAM_AUTO_PERSIST_MIBS:-32}"
+STREAM_AUTO_PERSIST_MODES="${STREAM_AUTO_PERSIST_MODES:-inline-sync}"
 
 IFS=',' read -r -a RTT_VALUES <<<"${RTTS}"
 if (( ${#RTT_VALUES[@]} == 0 )); then
@@ -131,7 +134,10 @@ fi
   echo "append_publish_max_coalesce_us=${APPEND_PUBLISH_MAX_COALESCE_US}"
   echo "append_ingest_max_in_flight_mibs=${APPEND_INGEST_MAX_IN_FLIGHT_MIBS}"
   echo "append_ingest_active_log_lanes=${APPEND_INGEST_ACTIVE_LOG_LANES}"
+  echo "append_ingest_background_sync_workers=${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}"
+  echo "append_ingest_background_sync_step_mib=${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}"
   echo "stream_auto_persist_mibs=${STREAM_AUTO_PERSIST_MIBS}"
+  echo "stream_auto_persist_modes=${STREAM_AUTO_PERSIST_MODES}"
   echo "disk_count=${#DISKS[@]}"
   printf 'disks=%s\n' "${DISKS[*]}"
   echo
@@ -290,6 +296,7 @@ run_layout() {
   local append_ingest_cap_mib="${5:-none}"
   local append_ingest_active_log_lanes="${6:-1}"
   local stream_auto_persist_mib="${7:-32}"
+  local stream_auto_persist_mode="${8:-inline-sync}"
   local append_ingest_label
   local append_ingest_args=()
   case "${append_ingest_cap_mib}" in
@@ -303,7 +310,13 @@ run_layout() {
   esac
   append_ingest_label="${append_ingest_label}-lanes${append_ingest_active_log_lanes}"
   append_ingest_args+=(--append-ingest-active-log-lanes "${append_ingest_active_log_lanes}")
-  mode="${mode}-nodes${STORAGE_NODES}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m"
+  append_ingest_label="${append_ingest_label}-bg${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}"
+  append_ingest_args+=(--append-ingest-background-sync-workers "${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}")
+  if [[ -n "${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}" ]]; then
+    append_ingest_label="${append_ingest_label}-step${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}m"
+    append_ingest_args+=(--append-ingest-background-sync-step-mib "${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}")
+  fi
+  mode="${mode}-nodes${STORAGE_NODES}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m-${stream_auto_persist_mode}"
   local out="${RESULT_ROOT}/loadbench/${mode}"
   mkdir -p "${out}"
   {
@@ -311,7 +324,10 @@ run_layout() {
     echo "storage_nodes=${STORAGE_NODES}"
     echo "append_ingest_max_in_flight_mib=${append_ingest_cap_mib}"
     echo "append_ingest_active_log_lanes=${append_ingest_active_log_lanes}"
+    echo "append_ingest_background_sync_workers=${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}"
+    echo "append_ingest_background_sync_step_mib=${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}"
     echo "stream_auto_persist_mib=${stream_auto_persist_mib}"
+    echo "stream_auto_persist_mode=${stream_auto_persist_mode}"
     echo "root=${root}"
     echo "journal_dir=${journal_dir}"
     echo "node_dirs=${node_dirs}"
@@ -340,6 +356,7 @@ run_layout() {
       --stream-total-mib 512
       --stream-publish-mib 128
       --stream-auto-persist-mib "${stream_auto_persist_mib}"
+      --stream-auto-persist-mode "${stream_auto_persist_mode}"
       --target-data-log-mib 64
       --data-log-file-sync-fanout 16
       --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
@@ -383,6 +400,7 @@ run_layout() {
         --stream-total-mib 512
         --stream-publish-mib 128
         --stream-auto-persist-mib "${stream_auto_persist_mib}"
+        --stream-auto-persist-mode "${stream_auto_persist_mode}"
         --target-data-log-mib 64
         --data-log-file-sync-fanout 16
         --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
@@ -604,6 +622,7 @@ append_ingest_fields = [
     "auto_persist_sync_dir_nanos",
     "auto_persist_mark_nanos",
     "auto_persist_request_nanos",
+    "auto_persist_wait_nanos",
 ]
 with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
     fields = ["mode","rtt_us","repeat","workload","concurrency","samples"]
@@ -617,12 +636,15 @@ with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
         "max_in_flight_bytes_max",
         "active_log_lanes_max",
         "auto_persist_target_bytes_max",
+        "auto_persist_wait_target_bytes_max",
         "auto_persist_pending_log_refs_max",
         "auto_persist_pending_storage_nodes_max",
         "auto_persist_sync_bytes_sum",
         "auto_persist_files_synced_sum",
         "auto_persist_sync_success_count",
         "auto_persist_request_submitted_count",
+        "auto_persist_observed_synced_bytes_max",
+        "auto_persist_marked_bytes_max",
         "success_count",
     ])
     writer = csv.DictWriter(f, fieldnames=fields)
@@ -642,12 +664,15 @@ with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
             "max_in_flight_bytes_max": max((int(to_float(r, "max_in_flight_bytes")) for r in rows), default=0),
             "active_log_lanes_max": max((int(to_float(r, "active_log_lanes")) for r in rows), default=0),
             "auto_persist_target_bytes_max": max((int(to_float(r, "auto_persist_target_bytes")) for r in rows), default=0),
+            "auto_persist_wait_target_bytes_max": max((int(to_float(r, "auto_persist_wait_target_bytes")) for r in rows), default=0),
             "auto_persist_pending_log_refs_max": max((int(to_float(r, "auto_persist_pending_log_refs")) for r in rows), default=0),
             "auto_persist_pending_storage_nodes_max": max((int(to_float(r, "auto_persist_pending_storage_nodes")) for r in rows), default=0),
             "auto_persist_sync_bytes_sum": sum(int(to_float(r, "auto_persist_sync_bytes")) for r in rows),
             "auto_persist_files_synced_sum": sum(int(to_float(r, "auto_persist_files_synced")) for r in rows),
             "auto_persist_sync_success_count": sum(1 for r in rows if to_bool(r, "auto_persist_sync_success")),
             "auto_persist_request_submitted_count": sum(1 for r in rows if to_bool(r, "auto_persist_request_submitted")),
+            "auto_persist_observed_synced_bytes_max": max((int(to_float(r, "auto_persist_observed_synced_bytes")) for r in rows), default=0),
+            "auto_persist_marked_bytes_max": max((int(to_float(r, "auto_persist_marked_bytes")) for r in rows), default=0),
             "success_count": sum(1 for r in rows if to_bool(r, "success")),
         }
         for name in append_ingest_fields:
@@ -981,13 +1006,17 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
         "append_ingest_auto_persist_sync_dir_p99_ms",
         "append_ingest_auto_persist_mark_p99_ms",
         "append_ingest_auto_persist_request_p99_ms",
+        "append_ingest_auto_persist_wait_p99_ms",
         "append_ingest_auto_persist_sync_bytes_sum",
         "append_ingest_auto_persist_files_synced_sum",
         "append_ingest_auto_persist_target_bytes_max",
+        "append_ingest_auto_persist_wait_target_bytes_max",
         "append_ingest_auto_persist_pending_log_refs_max",
         "append_ingest_auto_persist_pending_storage_nodes_max",
         "append_ingest_auto_persist_sync_success_count",
         "append_ingest_auto_persist_request_submitted_count",
+        "append_ingest_auto_persist_observed_synced_bytes",
+        "append_ingest_auto_persist_marked_bytes",
         "append_ingest_background_sync_requested_bytes_sum",
         "append_ingest_background_sync_request_count_sum",
         "append_ingest_background_sync_step_bytes",
@@ -1065,13 +1094,17 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
             "append_ingest_auto_persist_sync_dir_p99_ms": ingest.get("auto_persist_sync_dir_nanos_p99_ms", 0),
             "append_ingest_auto_persist_mark_p99_ms": ingest.get("auto_persist_mark_nanos_p99_ms", 0),
             "append_ingest_auto_persist_request_p99_ms": ingest.get("auto_persist_request_nanos_p99_ms", 0),
+            "append_ingest_auto_persist_wait_p99_ms": ingest.get("auto_persist_wait_nanos_p99_ms", 0),
             "append_ingest_auto_persist_sync_bytes_sum": ingest.get("auto_persist_sync_bytes_sum", 0),
             "append_ingest_auto_persist_files_synced_sum": ingest.get("auto_persist_files_synced_sum", 0),
             "append_ingest_auto_persist_target_bytes_max": ingest.get("auto_persist_target_bytes_max", 0),
+            "append_ingest_auto_persist_wait_target_bytes_max": ingest.get("auto_persist_wait_target_bytes_max", 0),
             "append_ingest_auto_persist_pending_log_refs_max": ingest.get("auto_persist_pending_log_refs_max", 0),
             "append_ingest_auto_persist_pending_storage_nodes_max": ingest.get("auto_persist_pending_storage_nodes_max", 0),
             "append_ingest_auto_persist_sync_success_count": ingest.get("auto_persist_sync_success_count", 0),
             "append_ingest_auto_persist_request_submitted_count": ingest.get("auto_persist_request_submitted_count", 0),
+            "append_ingest_auto_persist_observed_synced_bytes": ingest.get("auto_persist_observed_synced_bytes_max", 0),
+            "append_ingest_auto_persist_marked_bytes": ingest.get("auto_persist_marked_bytes_max", 0),
             "append_ingest_background_sync_requested_bytes_sum": ingest.get("background_sync_requested_bytes_sum", 0),
             "append_ingest_background_sync_request_count_sum": ingest.get("background_sync_request_count_sum", 0),
             "append_ingest_background_sync_step_bytes": ingest.get("background_sync_step_bytes_max", 0),
@@ -1094,6 +1127,10 @@ IFS=',' read -r -a requested_stream_auto_persist_mibs <<<"${STREAM_AUTO_PERSIST_
 if (( ${#requested_stream_auto_persist_mibs[@]} == 0 )); then
   requested_stream_auto_persist_mibs=("32")
 fi
+IFS=',' read -r -a requested_stream_auto_persist_modes <<<"${STREAM_AUTO_PERSIST_MODES}"
+if (( ${#requested_stream_auto_persist_modes[@]} == 0 )); then
+  requested_stream_auto_persist_modes=("inline-sync")
+fi
 base_node_raid_groups="${NODE_RAID_GROUPS}"
 for layout in "${requested_layouts[@]}"; do
   for storage_node_count in "${STORAGE_NODE_COUNT_VALUES[@]}"; do
@@ -1105,7 +1142,9 @@ for layout in "${requested_layouts[@]}"; do
         for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
           for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
             for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
+                run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
+              done
             done
           done
         done
@@ -1115,7 +1154,9 @@ for layout in "${requested_layouts[@]}"; do
         for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
           for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
             for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
+                run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
+              done
             done
           done
         done
@@ -1126,7 +1167,9 @@ for layout in "${requested_layouts[@]}"; do
         for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
           for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
             for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
+                run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
+              done
             done
           done
         done
@@ -1137,7 +1180,9 @@ for layout in "${requested_layouts[@]}"; do
         for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
           for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
             for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
+                run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
+              done
             done
           done
         done

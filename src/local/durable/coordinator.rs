@@ -21,6 +21,7 @@ pub struct DurableCoordinator {
     append_publish_batch_policy: AppendPublishBatchPolicy,
     append_ingest_admission_policy: AppendIngestAdmissionPolicy,
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
+    append_auto_persist_policy: AppendAutoPersistPolicy,
     append_ingest_admission: Arc<AppendIngestAdmissionGate>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
@@ -447,6 +448,7 @@ impl DurableCoordinator {
             append_publish_batch_policy,
             append_ingest_admission_policy: append_ingest_policy.admission,
             append_ingest_data_log_policy: append_ingest_policy.data_log,
+            append_auto_persist_policy: append_ingest_policy.auto_persist,
             append_ingest_admission: Arc::new(AppendIngestAdmissionGate::default()),
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
@@ -658,6 +660,23 @@ impl DurableCoordinator {
         if let Some(profile) = profile.as_mut() {
             profile.auto_persist_target_bytes = target;
         }
+        match self.append_auto_persist_policy.mode {
+            AppendAutoPersistMode::InlineSync => {
+                self.maybe_auto_persist_append_stream_inline(stream, target, profile)
+            }
+            AppendAutoPersistMode::AsyncPayloadSync => {
+                self.maybe_auto_persist_append_stream_async(stream, target, profile)
+            }
+        }
+    }
+
+    fn maybe_auto_persist_append_stream_inline(
+        &self,
+        stream: &AppendStream,
+        target: u64,
+        profile: Option<&mut AppendIngestProfile>,
+    ) -> Result<()> {
+        let mut profile = profile;
         let sync_result = match profile.as_mut() {
             Some(profile) => {
                 self.sync_append_stream_payload_prefix_profiled(stream, target, Some(&mut **profile))
@@ -665,14 +684,7 @@ impl DurableCoordinator {
             None => self.sync_append_stream_payload_prefix_profiled(stream, target, None),
         };
         if sync_result.is_ok() {
-            let mark_started = profile.is_some().then(Instant::now);
-            let _ = self
-                .local
-                .metadata
-                .mark_append_stream_durable_through(stream, target);
-            if let (Some(profile), Some(started)) = (profile.as_mut(), mark_started.as_ref()) {
-                profile.auto_persist_mark_nanos = duration_nanos_u64(started.elapsed());
-            }
+            self.mark_append_stream_durable_through_profiled(stream, target, profile)?;
         } else {
             let _ = match profile.as_mut() {
                 Some(profile) => self.request_append_stream_payload_sync_profiled(
@@ -684,6 +696,91 @@ impl DurableCoordinator {
             };
         }
         Ok(())
+    }
+
+    fn maybe_auto_persist_append_stream_async(
+        &self,
+        stream: &AppendStream,
+        target: u64,
+        profile: Option<&mut AppendIngestProfile>,
+    ) -> Result<()> {
+        let mut profile = profile;
+        let pending_started = profile.is_some().then(Instant::now);
+        let (durable_before, records) = self
+            .local
+            .metadata
+            .append_stream_private_records_from_durable_through(stream, target)?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let remaining_log_refs = records
+            .iter()
+            .map(AppendStreamRunRecord::log_ref)
+            .collect::<BTreeSet<_>>();
+        let pending = self.pending_append_for_stream_log_refs(stream.stream_id, &remaining_log_refs)?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), pending_started.as_ref()) {
+            profile.auto_persist_pending_nanos = duration_nanos_u64(started.elapsed());
+            profile.auto_persist_pending_log_refs = pending.log_ref_count();
+            profile.auto_persist_pending_storage_nodes = pending.storage_node_count();
+        }
+
+        let observed = self
+            .durable
+            .synced_append_stream_record_high_water(durable_before, &records)?;
+        if let Some(profile) = profile.as_mut() {
+            profile.auto_persist_observed_synced_bytes = observed;
+        }
+        if observed > durable_before {
+            self.mark_append_stream_durable_through_profiled(stream, observed, profile.as_deref_mut())?;
+        }
+        if observed >= target {
+            if let Some(profile) = profile.as_mut() {
+                profile.auto_persist_sync_success = true;
+            }
+            return Ok(());
+        }
+
+        let request_started = profile.is_some().then(Instant::now);
+        let result = self.durable.request_pending_append_payload_sync(&pending);
+        if let (Some(profile), Some(started)) = (profile.as_mut(), request_started.as_ref()) {
+            profile.auto_persist_request_nanos = duration_nanos_u64(started.elapsed());
+            profile.auto_persist_request_submitted = result.is_ok() && !pending.is_empty();
+        }
+        result
+    }
+
+    fn mark_append_stream_durable_through_profiled(
+        &self,
+        stream: &AppendStream,
+        durable_through: u64,
+        profile: Option<&mut AppendIngestProfile>,
+    ) -> Result<u64> {
+        let mut profile = profile;
+        let mark_started = profile.is_some().then(Instant::now);
+        let marked = self
+            .local
+            .metadata
+            .mark_append_stream_durable_through(stream, durable_through)?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), mark_started.as_ref()) {
+            profile.auto_persist_mark_nanos = duration_nanos_u64(started.elapsed());
+            profile.auto_persist_marked_bytes = marked;
+        }
+        Ok(marked)
+    }
+
+    fn pending_append_for_stream_log_refs(
+        &self,
+        stream_id: AppendStreamId,
+        log_refs: &BTreeSet<DurableDataLogRef>,
+    ) -> Result<PendingDataLogAppend> {
+        let Some(lane) = self.existing_stream_append_lane(stream_id)? else {
+            return self
+                .durable
+                .pending_append_run_manifests_for_log_refs(log_refs, None);
+        };
+        let pending_stream = lock(&lane.pending)?;
+        self.durable
+            .pending_append_run_manifests_for_log_refs(log_refs, Some(&pending_stream))
     }
 
     fn pending_append_for_stream_payload_prefix(
@@ -702,14 +799,7 @@ impl DurableCoordinator {
             .iter()
             .map(AppendStreamRunRecord::log_ref)
             .collect::<BTreeSet<_>>();
-        let Some(lane) = self.existing_stream_append_lane(stream.stream_id)? else {
-            return self
-                .durable
-                .pending_append_run_manifests_for_log_refs(&log_refs, None);
-        };
-        let pending_stream = lock(&lane.pending)?;
-        self.durable
-            .pending_append_run_manifests_for_log_refs(&log_refs, Some(&pending_stream))
+        self.pending_append_for_stream_log_refs(stream.stream_id, &log_refs)
     }
 
     fn sync_append_stream_payload_prefix_profiled(
@@ -2724,10 +2814,13 @@ impl DurableCoordinator {
         if data_len <= APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES {
             return None;
         }
+        let default_step = threshold
+            .max(usize_to_u64(APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES))
+            .min(APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES);
         Some(
-            threshold
-                .max(usize_to_u64(APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES))
-                .min(APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES),
+            self.append_ingest_data_log_policy
+                .background_sync_step_bytes
+                .unwrap_or(default_step),
         )
     }
 

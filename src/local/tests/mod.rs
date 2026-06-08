@@ -3320,6 +3320,177 @@ fn durable_stream_auto_persist_syncs_payload_at_threshold_before_publish() {
 }
 
 #[test]
+fn durable_stream_auto_persist_async_queues_payload_sync_without_inline_wait() {
+    let root = durable_temp_dir("stream-auto-persist-async-queues-sync");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                auto_persist: AppendAutoPersistPolicy {
+                    mode: AppendAutoPersistMode::AsyncPayloadSync,
+                },
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 94);
+    store.enable_append_ingest_profiling(8).unwrap();
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    let ingest_profiles = store.drain_append_ingest_profiles(8).unwrap();
+    assert_eq!(ingest_profiles.len(), 1);
+    let ingest = ingest_profiles[0];
+    assert_eq!(ingest.auto_persist_target_bytes, 4096);
+    assert_eq!(ingest.auto_persist_pending_log_refs, 1);
+    assert!(!ingest.auto_persist_sync_success);
+    assert!(ingest.auto_persist_request_submitted);
+    assert_eq!(ingest.auto_persist_sync_bytes, 0);
+    assert_eq!(ingest.auto_persist_files_synced, 0);
+    assert_eq!(ingest.auto_persist_marked_bytes, 0);
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .append_stream_durable_high_water_if_reached(&stream, 4096)
+            .unwrap(),
+        None,
+        "async dirty-tail mode must not mark a prefix before sync completion is observed"
+    );
+
+    store.publish_append_stream(&stream, 4096).unwrap();
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_stream_auto_persist_async_marks_observed_background_sync() {
+    let root = durable_temp_dir("stream-auto-persist-async-marks-observed-sync");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                auto_persist: AppendAutoPersistPolicy {
+                    mode: AppendAutoPersistMode::AsyncPayloadSync,
+                },
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    store
+        .append_stream(
+            &stream,
+            &repeated_blocks(1, 95),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    let (_, records) = store
+        .local
+        .metadata
+        .append_stream_private_records_from_durable_through(&stream, 4096)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(
+        store
+            .durable
+            .wait_for_synced_append_log_for_test(
+                records[0].log_ref(),
+                records[0].run.log_payload_end().unwrap(),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        "async dirty-tail request should sync the first private prefix"
+    );
+
+    store.enable_append_ingest_profiling(8).unwrap();
+    store
+        .append_stream(
+            &stream,
+            &repeated_blocks(1, 96),
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    let profiles = store.drain_append_ingest_profiles(8).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = profiles[0];
+    assert_eq!(profile.auto_persist_target_bytes, 8192);
+    assert_eq!(profile.auto_persist_observed_synced_bytes, 4096);
+    assert_eq!(profile.auto_persist_marked_bytes, 4096);
+    assert!(profile.auto_persist_request_submitted);
+    assert_eq!(profile.auto_persist_sync_bytes, 0);
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .append_stream_durable_high_water_if_reached(&stream, 4096)
+            .unwrap(),
+        Some(4096)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_stream_auto_persist_syncs_append_log_directory_once() {
     let root = durable_temp_dir("stream-auto-persist-dir-sync-once");
     let cfg = LocalStoreConfig {
@@ -7118,6 +7289,7 @@ fn durable_append_run_payloads_can_shard_node_active_logs_by_stream() {
     let cfg = config();
     let ingest_data_log_policy = AppendIngestDataLogPolicy {
         active_log_lanes: 2,
+        ..AppendIngestDataLogPolicy::default()
     };
     let store =
         DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
@@ -7297,6 +7469,7 @@ fn durable_multilane_append_run_survives_publish_compaction_and_reopen() {
     };
     let ingest_data_log_policy = AppendIngestDataLogPolicy {
         active_log_lanes: 2,
+        ..AppendIngestDataLogPolicy::default()
     };
     let store =
         DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
@@ -10318,6 +10491,25 @@ fn durable_append_ingest_admission_policy_rejects_invalid_values() {
         )
         .is_err()
     );
+    let invalid = AppendIngestDataLogPolicy {
+        background_sync_step_bytes: Some(0),
+        ..AppendIngestDataLogPolicy::default()
+    };
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: invalid,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .is_err()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -10327,6 +10519,26 @@ fn durable_append_ingest_data_log_policy_rejects_invalid_values() {
     let cfg = config();
     let invalid = AppendIngestDataLogPolicy {
         active_log_lanes: 0,
+        ..AppendIngestDataLogPolicy::default()
+    };
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: invalid,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .is_err()
+    );
+    let invalid = AppendIngestDataLogPolicy {
+        background_sync_workers: 0,
+        ..AppendIngestDataLogPolicy::default()
     };
     assert!(
         DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(

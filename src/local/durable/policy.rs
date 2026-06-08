@@ -133,12 +133,19 @@ impl AppendIngestAdmissionPolicy {
 pub struct AppendIngestDataLogPolicy {
     /// Active append-run data-log lanes per storage node.
     pub active_log_lanes: usize,
+    /// Background workers that service provider-private append payload sync
+    /// requests.
+    pub background_sync_workers: usize,
+    /// Optional byte cadence for background append payload sync requests.
+    pub background_sync_step_bytes: Option<u64>,
 }
 
 impl Default for AppendIngestDataLogPolicy {
     fn default() -> Self {
         Self {
             active_log_lanes: 1,
+            background_sync_workers: 1,
+            background_sync_step_bytes: None,
         }
     }
 }
@@ -149,6 +156,16 @@ impl AppendIngestDataLogPolicy {
         if self.active_log_lanes == 0 {
             return Err(StorageError::invalid_argument(
                 "append ingest active_log_lanes must be greater than zero",
+            ));
+        }
+        if self.background_sync_workers == 0 {
+            return Err(StorageError::invalid_argument(
+                "append ingest background_sync_workers must be greater than zero",
+            ));
+        }
+        if self.background_sync_step_bytes == Some(0) {
+            return Err(StorageError::invalid_argument(
+                "append ingest background_sync_step_bytes must be greater than zero when configured",
             ));
         }
         Ok(())
@@ -163,13 +180,69 @@ impl AppendIngestDataLogPolicy {
 pub struct AppendIngestPolicy {
     pub admission: AppendIngestAdmissionPolicy,
     pub data_log: AppendIngestDataLogPolicy,
+    pub auto_persist: AppendAutoPersistPolicy,
 }
 
 impl AppendIngestPolicy {
     /// Validate all append ingest provider-private knobs.
     pub fn validate(self) -> Result<()> {
         self.admission.validate()?;
-        self.data_log.validate()
+        self.data_log.validate()?;
+        self.auto_persist.validate()
+    }
+}
+
+/// Provider-private append dirty-tail persistence mode.
+///
+/// This changes only local scheduling for private append payload sync. Publish
+/// still waits for all referenced payload bytes before syncing the visible
+/// append-publish journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppendAutoPersistMode {
+    /// Sync the dirty private prefix on the append caller when the threshold is
+    /// reached.
+    #[default]
+    InlineSync,
+    /// Queue payload sync on the background append-log worker and mark only
+    /// prefixes that are already proven synced.
+    AsyncPayloadSync,
+}
+
+impl std::str::FromStr for AppendAutoPersistMode {
+    type Err = StorageError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "inline" | "inline-sync" => Ok(Self::InlineSync),
+            "async" | "async-payload-sync" => Ok(Self::AsyncPayloadSync),
+            _ => Err(StorageError::invalid_argument(format!(
+                "unknown append auto-persist mode: {value}"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for AppendAutoPersistMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InlineSync => f.write_str("inline-sync"),
+            Self::AsyncPayloadSync => f.write_str("async-payload-sync"),
+        }
+    }
+}
+
+/// Provider-private dirty-tail persistence policy for append ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendAutoPersistPolicy {
+    pub mode: AppendAutoPersistMode,
+}
+
+impl AppendAutoPersistPolicy {
+    /// Validate append auto-persist scheduling policy.
+    pub fn validate(self) -> Result<()> {
+        match self.mode {
+            AppendAutoPersistMode::InlineSync | AppendAutoPersistMode::AsyncPayloadSync => Ok(()),
+        }
     }
 }
 

@@ -226,6 +226,21 @@ impl Args {
                     args.append_ingest_policy.data_log.active_log_lanes =
                         parse_next(&mut raw, flag.as_str())?;
                 }
+                "--append-ingest-background-sync-workers" => {
+                    args.append_ingest_policy
+                        .data_log
+                        .background_sync_workers = parse_next(&mut raw, flag.as_str())?;
+                }
+                "--append-ingest-background-sync-step-mib" => {
+                    let mib: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.append_ingest_policy
+                        .data_log
+                        .background_sync_step_bytes = Some(mib_to_bytes(mib, flag.as_str())?);
+                }
+                "--stream-auto-persist-mode" => {
+                    args.append_ingest_policy.auto_persist.mode =
+                        parse_next::<AppendAutoPersistMode>(&mut raw, flag.as_str())?;
+                }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
                     args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
@@ -472,6 +487,9 @@ options:\n\
   --append-publish-max-coalesce-us N       durable append publish max coalesce wait, default: 5000\n\
   --append-ingest-max-in-flight-mib N      durable append ingest max in-flight MiB, default: disabled\n\
   --append-ingest-active-log-lanes N       active append-run data logs per storage node, default: 1\n\
+  --append-ingest-background-sync-workers N background append payload sync workers, default: 1\n\
+  --append-ingest-background-sync-step-mib N background append payload sync request cadence\n\
+  --stream-auto-persist-mode MODE          inline-sync or async-payload-sync, default: inline-sync\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --stream-auto-persist-mib N              durable stream payload dirty-tail sync threshold\n\

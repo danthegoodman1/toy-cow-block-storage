@@ -551,6 +551,17 @@ was scheduled but could not win the race before auto-persist." Local 8 MiB and
 local write/sync contention and worsened append p99 versus the original
 threshold-based cadence.
 
+A follow-up local A/B tried making dirty-tail auto-persist queue payload sync to
+the background append-log worker instead of synchronously calling `fdatasync` on
+the append thread. This is now an explicit benchmark knob
+(`--stream-auto-persist-mode async-payload-sync`) with supporting knobs for
+background sync worker count and request cadence. It did cut local append p99
+substantially (`~101 ms` inline to `~19-26 ms` async in the small c8 local
+shape), but publish p99 rose to `~257-279 ms` because the visible boundary then
+absorbed the unfinished payload sync. Earlier 8 MiB / 16 MiB async request
+cadences and four background sync workers did not fix the publish tail locally,
+so that hypothesis was not escalated to GCP as a performance improvement.
+
 Raw C4 artifacts are local and ignored under
 `infra/gcp-local-nvme-bench/results/`, specifically
 `gcp-c4-192-layout-20260607-125041`, `c48887-06071318`, and
