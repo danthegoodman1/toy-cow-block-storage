@@ -27,7 +27,9 @@ APPEND_PUBLISH_MAX_COALESCE_US="${APPEND_PUBLISH_MAX_COALESCE_US:-5000}"
 APPEND_INGEST_MAX_IN_FLIGHT_MIBS="${APPEND_INGEST_MAX_IN_FLIGHT_MIBS:-none}"
 APPEND_INGEST_ACTIVE_LOG_LANES="${APPEND_INGEST_ACTIVE_LOG_LANES:-1}"
 APPEND_INGEST_BACKGROUND_SYNC_WORKERS="${APPEND_INGEST_BACKGROUND_SYNC_WORKERS:-1}"
+APPEND_INGEST_BACKGROUND_SYNC_WORKER_COUNTS="${APPEND_INGEST_BACKGROUND_SYNC_WORKER_COUNTS:-${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}}"
 APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB="${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB:-}"
+APPEND_INGEST_BACKGROUND_SYNC_STEP_MIBS="${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIBS:-${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}}"
 STREAM_AUTO_PERSIST_MIBS="${STREAM_AUTO_PERSIST_MIBS:-32}"
 STREAM_AUTO_PERSIST_MODES="${STREAM_AUTO_PERSIST_MODES:-inline-sync}"
 
@@ -134,8 +136,8 @@ fi
   echo "append_publish_max_coalesce_us=${APPEND_PUBLISH_MAX_COALESCE_US}"
   echo "append_ingest_max_in_flight_mibs=${APPEND_INGEST_MAX_IN_FLIGHT_MIBS}"
   echo "append_ingest_active_log_lanes=${APPEND_INGEST_ACTIVE_LOG_LANES}"
-  echo "append_ingest_background_sync_workers=${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}"
-  echo "append_ingest_background_sync_step_mib=${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}"
+  echo "append_ingest_background_sync_worker_counts=${APPEND_INGEST_BACKGROUND_SYNC_WORKER_COUNTS}"
+  echo "append_ingest_background_sync_step_mibs=${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIBS}"
   echo "stream_auto_persist_mibs=${STREAM_AUTO_PERSIST_MIBS}"
   echo "stream_auto_persist_modes=${STREAM_AUTO_PERSIST_MODES}"
   echo "disk_count=${#DISKS[@]}"
@@ -295,8 +297,10 @@ run_layout() {
   local node_dirs="${4:-}"
   local append_ingest_cap_mib="${5:-none}"
   local append_ingest_active_log_lanes="${6:-1}"
-  local stream_auto_persist_mib="${7:-32}"
-  local stream_auto_persist_mode="${8:-inline-sync}"
+  local append_ingest_background_sync_workers="${7:-1}"
+  local append_ingest_background_sync_step_mib="${8:-}"
+  local stream_auto_persist_mib="${9:-32}"
+  local stream_auto_persist_mode="${10:-inline-sync}"
   local append_ingest_label
   local append_ingest_args=()
   case "${append_ingest_cap_mib}" in
@@ -310,12 +314,16 @@ run_layout() {
   esac
   append_ingest_label="${append_ingest_label}-lanes${append_ingest_active_log_lanes}"
   append_ingest_args+=(--append-ingest-active-log-lanes "${append_ingest_active_log_lanes}")
-  append_ingest_label="${append_ingest_label}-bg${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}"
-  append_ingest_args+=(--append-ingest-background-sync-workers "${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}")
-  if [[ -n "${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}" ]]; then
-    append_ingest_label="${append_ingest_label}-step${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}m"
-    append_ingest_args+=(--append-ingest-background-sync-step-mib "${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}")
-  fi
+  append_ingest_label="${append_ingest_label}-bg${append_ingest_background_sync_workers}"
+  append_ingest_args+=(--append-ingest-background-sync-workers "${append_ingest_background_sync_workers}")
+  case "${append_ingest_background_sync_step_mib}" in
+    ""|none|default|disabled|off|0)
+      ;;
+    *)
+      append_ingest_label="${append_ingest_label}-step${append_ingest_background_sync_step_mib}m"
+      append_ingest_args+=(--append-ingest-background-sync-step-mib "${append_ingest_background_sync_step_mib}")
+      ;;
+  esac
   mode="${mode}-nodes${STORAGE_NODES}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m-${stream_auto_persist_mode}"
   local out="${RESULT_ROOT}/loadbench/${mode}"
   mkdir -p "${out}"
@@ -324,8 +332,8 @@ run_layout() {
     echo "storage_nodes=${STORAGE_NODES}"
     echo "append_ingest_max_in_flight_mib=${append_ingest_cap_mib}"
     echo "append_ingest_active_log_lanes=${append_ingest_active_log_lanes}"
-    echo "append_ingest_background_sync_workers=${APPEND_INGEST_BACKGROUND_SYNC_WORKERS}"
-    echo "append_ingest_background_sync_step_mib=${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIB}"
+    echo "append_ingest_background_sync_workers=${append_ingest_background_sync_workers}"
+    echo "append_ingest_background_sync_step_mib=${append_ingest_background_sync_step_mib}"
     echo "stream_auto_persist_mib=${stream_auto_persist_mib}"
     echo "stream_auto_persist_mode=${stream_auto_persist_mode}"
     echo "root=${root}"
@@ -1123,6 +1131,14 @@ IFS=',' read -r -a requested_append_ingest_active_log_lanes <<<"${APPEND_INGEST_
 if (( ${#requested_append_ingest_active_log_lanes[@]} == 0 )); then
   requested_append_ingest_active_log_lanes=("1")
 fi
+IFS=',' read -r -a requested_append_ingest_background_sync_workers <<<"${APPEND_INGEST_BACKGROUND_SYNC_WORKER_COUNTS}"
+if (( ${#requested_append_ingest_background_sync_workers[@]} == 0 )); then
+  requested_append_ingest_background_sync_workers=("1")
+fi
+IFS=',' read -r -a requested_append_ingest_background_sync_steps <<<"${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIBS}"
+if (( ${#requested_append_ingest_background_sync_steps[@]} == 0 )); then
+  requested_append_ingest_background_sync_steps=("")
+fi
 IFS=',' read -r -a requested_stream_auto_persist_mibs <<<"${STREAM_AUTO_PERSIST_MIBS}"
 if (( ${#requested_stream_auto_persist_mibs[@]} == 0 )); then
   requested_stream_auto_persist_mibs=("32")
@@ -1131,6 +1147,37 @@ IFS=',' read -r -a requested_stream_auto_persist_modes <<<"${STREAM_AUTO_PERSIST
 if (( ${#requested_stream_auto_persist_modes[@]} == 0 )); then
   requested_stream_auto_persist_modes=("inline-sync")
 fi
+
+run_layout_policy_matrix() {
+  local mode="$1"
+  local root="$2"
+  local journal_dir="${3:-}"
+  local node_dirs="${4:-}"
+  for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+    for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+      for append_ingest_background_sync_workers in "${requested_append_ingest_background_sync_workers[@]}"; do
+        for append_ingest_background_sync_step in "${requested_append_ingest_background_sync_steps[@]}"; do
+          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+            for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
+              run_layout \
+                "${mode}" \
+                "${root}" \
+                "${journal_dir}" \
+                "${node_dirs}" \
+                "${append_ingest_cap}" \
+                "${append_ingest_active_log_lanes}" \
+                "${append_ingest_background_sync_workers}" \
+                "${append_ingest_background_sync_step}" \
+                "${stream_auto_persist_mib}" \
+                "${stream_auto_persist_mode}"
+            done
+          done
+        done
+      done
+    done
+  done
+}
+
 base_node_raid_groups="${NODE_RAID_GROUPS}"
 for layout in "${requested_layouts[@]}"; do
   for storage_node_count in "${STORAGE_NODE_COUNT_VALUES[@]}"; do
@@ -1139,53 +1186,21 @@ for layout in "${requested_layouts[@]}"; do
     case "${layout}" in
       raid-shared)
         setup_raid_shared
-        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
-                run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
-              done
-            done
-          done
-        done
+        run_layout_policy_matrix "raid-shared" "/mnt/raid/loadbench" "" ""
         ;;
       raid-split-journal)
         setup_raid_split_journal
-        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
-                run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
-              done
-            done
-          done
-        done
+        run_layout_policy_matrix "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" ""
         ;;
       node-private-journal)
         setup_node_private_journal
         NODE_DIRS="$(csv_join_node_dirs)"
-        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
-                run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
-              done
-            done
-          done
-        done
+        run_layout_policy_matrix "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}"
         ;;
       node-private-raid-journal)
         setup_node_private_raid_journal
         NODE_DIRS="$(csv_join_node_dirs)"
-        for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-          for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-            for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
-              for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
-                run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}" "${stream_auto_persist_mode}"
-              done
-            done
-          done
-        done
+        run_layout_policy_matrix "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}"
         ;;
       *)
         printf 'unknown layout: %s\n' "${layout}" >&2
