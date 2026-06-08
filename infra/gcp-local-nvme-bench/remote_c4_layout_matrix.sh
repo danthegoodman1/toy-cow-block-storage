@@ -25,6 +25,7 @@ APPEND_PUBLISH_IDLE_COALESCE_US="${APPEND_PUBLISH_IDLE_COALESCE_US:-250}"
 APPEND_PUBLISH_MAX_COALESCE_US="${APPEND_PUBLISH_MAX_COALESCE_US:-5000}"
 APPEND_INGEST_MAX_IN_FLIGHT_MIBS="${APPEND_INGEST_MAX_IN_FLIGHT_MIBS:-none}"
 APPEND_INGEST_ACTIVE_LOG_LANES="${APPEND_INGEST_ACTIVE_LOG_LANES:-1}"
+STREAM_AUTO_PERSIST_MIBS="${STREAM_AUTO_PERSIST_MIBS:-32}"
 
 IFS=',' read -r -a RTT_VALUES <<<"${RTTS}"
 if (( ${#RTT_VALUES[@]} == 0 )); then
@@ -112,6 +113,7 @@ fi
   echo "append_publish_max_coalesce_us=${APPEND_PUBLISH_MAX_COALESCE_US}"
   echo "append_ingest_max_in_flight_mibs=${APPEND_INGEST_MAX_IN_FLIGHT_MIBS}"
   echo "append_ingest_active_log_lanes=${APPEND_INGEST_ACTIVE_LOG_LANES}"
+  echo "stream_auto_persist_mibs=${STREAM_AUTO_PERSIST_MIBS}"
   echo "disk_count=${#DISKS[@]}"
   printf 'disks=%s\n' "${DISKS[*]}"
   echo
@@ -269,6 +271,7 @@ run_layout() {
   local node_dirs="${4:-}"
   local append_ingest_cap_mib="${5:-none}"
   local append_ingest_active_log_lanes="${6:-1}"
+  local stream_auto_persist_mib="${7:-32}"
   local append_ingest_label
   local append_ingest_args=()
   case "${append_ingest_cap_mib}" in
@@ -282,13 +285,14 @@ run_layout() {
   esac
   append_ingest_label="${append_ingest_label}-lanes${append_ingest_active_log_lanes}"
   append_ingest_args+=(--append-ingest-active-log-lanes "${append_ingest_active_log_lanes}")
-  mode="${mode}-${append_ingest_label}"
+  mode="${mode}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m"
   local out="${RESULT_ROOT}/loadbench/${mode}"
   mkdir -p "${out}"
   {
     echo "mode=${mode}"
     echo "append_ingest_max_in_flight_mib=${append_ingest_cap_mib}"
     echo "append_ingest_active_log_lanes=${append_ingest_active_log_lanes}"
+    echo "stream_auto_persist_mib=${stream_auto_persist_mib}"
     echo "root=${root}"
     echo "journal_dir=${journal_dir}"
     echo "node_dirs=${node_dirs}"
@@ -316,7 +320,7 @@ run_layout() {
       --files 128
       --stream-total-mib 512
       --stream-publish-mib 128
-      --stream-auto-persist-mib 32
+      --stream-auto-persist-mib "${stream_auto_persist_mib}"
       --target-data-log-mib 64
       --data-log-file-sync-fanout 16
       --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
@@ -359,7 +363,7 @@ run_layout() {
         --files 128
         --stream-total-mib 512
         --stream-publish-mib 128
-        --stream-auto-persist-mib 32
+        --stream-auto-persist-mib "${stream_auto_persist_mib}"
         --target-data-log-mib 64
         --data-log-file-sync-fanout 16
         --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
@@ -1057,13 +1061,19 @@ IFS=',' read -r -a requested_append_ingest_active_log_lanes <<<"${APPEND_INGEST_
 if (( ${#requested_append_ingest_active_log_lanes[@]} == 0 )); then
   requested_append_ingest_active_log_lanes=("1")
 fi
+IFS=',' read -r -a requested_stream_auto_persist_mibs <<<"${STREAM_AUTO_PERSIST_MIBS}"
+if (( ${#requested_stream_auto_persist_mibs[@]} == 0 )); then
+  requested_stream_auto_persist_mibs=("32")
+fi
 for layout in "${requested_layouts[@]}"; do
   case "${layout}" in
     raid-shared)
       setup_raid_shared
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
         for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+            run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+          done
         done
       done
       ;;
@@ -1071,7 +1081,9 @@ for layout in "${requested_layouts[@]}"; do
       setup_raid_split_journal
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
         for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+            run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+          done
         done
       done
       ;;
@@ -1080,7 +1092,9 @@ for layout in "${requested_layouts[@]}"; do
       NODE_DIRS="$(csv_join_node_dirs)"
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
         for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+            run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+          done
         done
       done
       ;;
@@ -1089,7 +1103,9 @@ for layout in "${requested_layouts[@]}"; do
       NODE_DIRS="$(csv_join_node_dirs)"
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
         for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
-          run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+          for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
+            run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}" "${stream_auto_persist_mib}"
+          done
         done
       done
       ;;
