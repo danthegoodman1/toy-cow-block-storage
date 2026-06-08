@@ -3269,9 +3269,21 @@ fn durable_stream_auto_persist_syncs_payload_at_threshold_before_publish() {
         .unwrap();
     let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
     let payload = repeated_blocks(1, 93);
+    store.enable_append_ingest_profiling(8).unwrap();
     store
         .append_stream(&stream, &payload, WriteDurability::Acknowledged)
         .unwrap();
+    let ingest_profiles = store.drain_append_ingest_profiles(8).unwrap();
+    assert_eq!(ingest_profiles.len(), 1);
+    let ingest = ingest_profiles[0];
+    assert_eq!(ingest.auto_persist_target_bytes, 4096);
+    assert_eq!(ingest.auto_persist_pending_log_refs, 1);
+    assert_eq!(ingest.auto_persist_pending_storage_nodes, 1);
+    assert!(ingest.auto_persist_sync_success);
+    assert!(!ingest.auto_persist_request_submitted);
+    assert_eq!(ingest.auto_persist_sync_bytes, 4096);
+    assert_eq!(ingest.auto_persist_files_synced, 1);
+    assert!(ingest.auto_persist_sync_nanos <= ingest.auto_persist_nanos);
     assert_eq!(
         store
             .local
@@ -3304,6 +3316,63 @@ fn durable_stream_auto_persist_syncs_payload_at_threshold_before_publish() {
         )
         .unwrap();
     assert_eq!(bytes, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_stream_auto_persist_syncs_append_log_directory_once() {
+    let root = durable_temp_dir("stream-auto-persist-dir-sync-once");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    store.enable_append_ingest_profiling(8).unwrap();
+    let first = repeated_blocks(1, 101);
+    let second = repeated_blocks(1, 102);
+
+    store
+        .append_stream(&stream, &first, WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .append_stream(&stream, &second, WriteDurability::Acknowledged)
+        .unwrap();
+    let profiles = store.drain_append_ingest_profiles(8).unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert_eq!(profiles[0].auto_persist_target_bytes, 4096);
+    assert!(profiles[0].auto_persist_sync_success);
+    assert_eq!(profiles[0].auto_persist_sync_bytes, 4096);
+    assert_eq!(profiles[1].auto_persist_target_bytes, 8192);
+    assert!(profiles[1].auto_persist_sync_success);
+    assert_eq!(profiles[1].auto_persist_sync_bytes, 8192);
+    assert_eq!(
+        profiles[1].auto_persist_sync_dir_nanos, 0,
+        "the same append log directory entry should not be fsynced on every threshold sync"
+    );
+
+    store.publish_append_stream(&stream, 8192).unwrap();
+    let expected = [first, second].concat();
+    let mut bytes = vec![0; expected.len()];
+    store
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 8192), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, expected);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3691,6 +3760,7 @@ fn durable_stream_auto_payload_sync_failure_does_not_poison_publish_retry() {
             )
             .unwrap();
     }
+    store.enable_append_ingest_profiling(8).unwrap();
     store.fail_next_append_payload_sync_for_test();
     store
         .append_stream(
@@ -3715,6 +3785,15 @@ fn durable_stream_auto_payload_sync_failure_does_not_poison_publish_retry() {
         None,
         "failed dirty-tail sync must not mark the private prefix durable"
     );
+    let profiles = store.drain_append_ingest_profiles(8).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = profiles[0];
+    assert_eq!(profile.auto_persist_target_bytes, 16 * 1024);
+    assert_eq!(profile.auto_persist_pending_log_refs, 1);
+    assert!(!profile.auto_persist_sync_success);
+    assert!(profile.auto_persist_request_submitted);
+    assert_eq!(profile.auto_persist_sync_bytes, 0);
+    assert_eq!(profile.auto_persist_files_synced, 0);
 
     store.publish_append_stream(&stream, 16 * 1024).unwrap();
     let expected = [

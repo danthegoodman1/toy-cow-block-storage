@@ -175,6 +175,21 @@ pub struct AppendIngestProfile {
     pub payload_encode_nanos: u64,
     pub payload_write_nanos: u64,
     pub auto_persist_nanos: u64,
+    pub auto_persist_target_nanos: u64,
+    pub auto_persist_pending_nanos: u64,
+    pub auto_persist_sync_nanos: u64,
+    pub auto_persist_sync_file_nanos: u64,
+    pub auto_persist_sync_file_max_nanos: u64,
+    pub auto_persist_sync_dir_nanos: u64,
+    pub auto_persist_mark_nanos: u64,
+    pub auto_persist_request_nanos: u64,
+    pub auto_persist_target_bytes: u64,
+    pub auto_persist_pending_log_refs: u64,
+    pub auto_persist_pending_storage_nodes: u64,
+    pub auto_persist_sync_bytes: u64,
+    pub auto_persist_files_synced: u64,
+    pub auto_persist_sync_success: bool,
+    pub auto_persist_request_submitted: bool,
     pub background_sync_requested_bytes: u64,
     pub max_in_flight_bytes: u64,
     pub success: bool,
@@ -571,6 +586,7 @@ impl AppendLogPayloadSyncWorker {
         paths: DurableStorePaths,
         policy: DurableDataLogPolicy,
         synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
+        dir_synced_logs: Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
         synced_log_cvar: Arc<Condvar>,
     ) -> Result<Self> {
         let state = Arc::new((
@@ -588,6 +604,7 @@ impl AppendLogPayloadSyncWorker {
                     paths,
                     policy,
                     synced_logs,
+                    dir_synced_logs,
                     synced_log_cvar,
                     worker_state,
                 )
@@ -659,6 +676,7 @@ fn append_log_payload_sync_worker_loop(
     paths: DurableStorePaths,
     policy: DurableDataLogPolicy,
     synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
+    dir_synced_logs: Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
     synced_log_cvar: Arc<Condvar>,
     state: Arc<(Mutex<AppendLogPayloadSyncWorkerState>, Condvar)>,
 ) {
@@ -686,6 +704,7 @@ fn append_log_payload_sync_worker_loop(
             &paths,
             policy,
             &synced_logs,
+            &dir_synced_logs,
             &synced_log_cvar,
             requests,
         );
@@ -696,6 +715,7 @@ fn sync_append_run_log_requests(
     paths: &DurableStorePaths,
     policy: DurableDataLogPolicy,
     synced_logs: &Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
+    dir_synced_logs: &Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
     synced_log_cvar: &Arc<Condvar>,
     requests: Vec<AppendLogPayloadSyncRequest>,
 ) -> Result<DataLogAppendProfile> {
@@ -705,20 +725,28 @@ fn sync_append_run_log_requests(
     }
 
     let synced_snapshot = lock(synced_logs)?.clone();
+    let dir_synced_snapshot = lock(dir_synced_logs)?.clone();
     let mut files = Vec::new();
     let mut synced_after = BTreeMap::new();
+    let mut dir_synced_after = BTreeSet::new();
     let mut storage_nodes_needing_dir_sync = BTreeSet::new();
     for request in requests {
-        if synced_snapshot
+        let bytes_already_synced = synced_snapshot
             .get(&request.log_ref)
             .copied()
             .unwrap_or_default()
-            >= request.bytes
-        {
+            >= request.bytes;
+        let dir_already_synced = dir_synced_snapshot.contains(&request.log_ref);
+        let needs_dir_sync = request.sync_dir && !dir_already_synced;
+        if bytes_already_synced && !needs_dir_sync {
             continue;
         }
-        if request.sync_dir {
+        if needs_dir_sync {
             storage_nodes_needing_dir_sync.insert(request.log_ref.storage_node);
+            dir_synced_after.insert(request.log_ref);
+        }
+        if bytes_already_synced {
+            continue;
         }
         let path = data_log_path(
             &paths.data_dir,
@@ -776,6 +804,9 @@ fn sync_append_run_log_requests(
         }
         synced_log_cvar.notify_all();
     }
+    if !dir_synced_after.is_empty() {
+        lock(dir_synced_logs)?.extend(dir_synced_after);
+    }
 
     profile.file_sync_nanos = file_sync_nanos;
     profile.file_sync_sum_nanos = sync_profile.sync_sum_nanos;
@@ -795,6 +826,7 @@ struct StorageNodeAppendLogService {
     allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     lanes: Mutex<BTreeMap<StorageNodeId, Arc<StorageNodeAppendLogLane>>>,
     synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
+    dir_synced_logs: Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
     synced_log_cvar: Arc<Condvar>,
     payload_sync_worker: AppendLogPayloadSyncWorker,
     #[cfg(test)]
@@ -1103,6 +1135,7 @@ impl StorageNodeAppendLogService {
             &self.paths,
             self.policy,
             &self.synced_logs,
+            &self.dir_synced_logs,
             &self.synced_log_cvar,
             self.pending_sync_requests(appended)?,
         )
@@ -2031,11 +2064,13 @@ impl DurableSqliteStore {
         #[cfg(test)]
         let fail_next_append_payload_sync = Arc::new(AtomicBool::new(false));
         let synced_append_logs = Arc::new(Mutex::new(BTreeMap::new()));
+        let dir_synced_append_logs = Arc::new(Mutex::new(BTreeSet::new()));
         let synced_append_log_cvar = Arc::new(Condvar::new());
         let payload_sync_worker = AppendLogPayloadSyncWorker::start(
             paths.clone(),
             policy,
             Arc::clone(&synced_append_logs),
+            Arc::clone(&dir_synced_append_logs),
             Arc::clone(&synced_append_log_cvar),
         )?;
         let append_log_service = Arc::new(StorageNodeAppendLogService {
@@ -2046,6 +2081,7 @@ impl DurableSqliteStore {
             allocation_locks: Arc::clone(&data_log_allocation_locks),
             lanes: Mutex::new(BTreeMap::new()),
             synced_logs: synced_append_logs,
+            dir_synced_logs: dir_synced_append_logs,
             synced_log_cvar: synced_append_log_cvar,
             payload_sync_worker,
             #[cfg(test)]

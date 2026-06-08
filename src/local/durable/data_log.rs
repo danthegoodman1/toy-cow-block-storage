@@ -38,6 +38,10 @@ impl PendingDataLogAppend {
         )
     }
 
+    fn log_ref_count(&self) -> u64 {
+        usize_to_u64(self.log_refs().len())
+    }
+
     fn manifest_storage_nodes_except(&self, excluded: &BTreeSet<StorageNodeId>) -> Self {
         let logs = self
             .logs

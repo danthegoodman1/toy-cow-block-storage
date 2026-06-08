@@ -641,21 +641,47 @@ impl DurableCoordinator {
         &self,
         stream: &AppendStream,
         threshold: u64,
+        profile: Option<&mut AppendIngestProfile>,
     ) -> Result<()> {
-        let Ok(Some(target)) = self
+        let mut profile = profile;
+        let target_started = profile.is_some().then(Instant::now);
+        let target_result = self
             .local
             .metadata
-            .append_stream_auto_persist_target(stream, threshold)
-        else {
+            .append_stream_auto_persist_target(stream, threshold);
+        if let (Some(profile), Some(started)) = (profile.as_mut(), target_started.as_ref()) {
+            profile.auto_persist_target_nanos = duration_nanos_u64(started.elapsed());
+        }
+        let Ok(Some(target)) = target_result else {
             return Ok(());
         };
-        if self.sync_append_stream_payload_prefix(stream, target).is_ok() {
+        if let Some(profile) = profile.as_mut() {
+            profile.auto_persist_target_bytes = target;
+        }
+        let sync_result = match profile.as_mut() {
+            Some(profile) => {
+                self.sync_append_stream_payload_prefix_profiled(stream, target, Some(&mut **profile))
+            }
+            None => self.sync_append_stream_payload_prefix_profiled(stream, target, None),
+        };
+        if sync_result.is_ok() {
+            let mark_started = profile.is_some().then(Instant::now);
             let _ = self
                 .local
                 .metadata
                 .mark_append_stream_durable_through(stream, target);
+            if let (Some(profile), Some(started)) = (profile.as_mut(), mark_started.as_ref()) {
+                profile.auto_persist_mark_nanos = duration_nanos_u64(started.elapsed());
+            }
         } else {
-            let _ = self.request_append_stream_payload_sync(stream, target);
+            let _ = match profile.as_mut() {
+                Some(profile) => self.request_append_stream_payload_sync_profiled(
+                    stream,
+                    target,
+                    Some(&mut **profile),
+                ),
+                None => self.request_append_stream_payload_sync_profiled(stream, target, None),
+            };
         }
         Ok(())
     }
@@ -686,23 +712,60 @@ impl DurableCoordinator {
             .pending_append_run_manifests_for_log_refs(&log_refs, Some(&pending_stream))
     }
 
-    fn request_append_stream_payload_sync(
+    fn sync_append_stream_payload_prefix_profiled(
         &self,
         stream: &AppendStream,
         target: u64,
+        profile: Option<&mut AppendIngestProfile>,
     ) -> Result<()> {
+        let mut profile = profile;
+        let pending_started = profile.is_some().then(Instant::now);
         let pending = self.pending_append_for_stream_payload_prefix(stream, target)?;
-        self.durable.request_pending_append_payload_sync(&pending)
+        if let (Some(profile), Some(started)) = (profile.as_mut(), pending_started.as_ref()) {
+            profile.auto_persist_pending_nanos = duration_nanos_u64(started.elapsed());
+            profile.auto_persist_pending_log_refs = pending.log_ref_count();
+            profile.auto_persist_pending_storage_nodes = pending.storage_node_count();
+        }
+        let sync_started = profile.is_some().then(Instant::now);
+        let (sync_profile, sync_nanos) = self.durable.sync_pending_append_payload(&pending)?;
+        if let Some(profile) = profile.as_mut() {
+            profile.auto_persist_sync_nanos = sync_nanos;
+            if sync_nanos == 0 && let Some(started) = sync_started.as_ref() {
+                profile.auto_persist_sync_nanos = duration_nanos_u64(started.elapsed());
+            }
+            profile.auto_persist_sync_file_nanos = sync_profile.file_sync_nanos;
+            profile.auto_persist_sync_file_max_nanos = sync_profile.file_sync_max_nanos;
+            profile.auto_persist_sync_dir_nanos = sync_profile.dir_sync_nanos;
+            profile.auto_persist_sync_bytes = sync_profile.sync_bytes;
+            profile.auto_persist_files_synced = sync_profile.files_synced;
+            profile.auto_persist_sync_success = true;
+        }
+        Ok(())
     }
 
-    fn sync_append_stream_payload_prefix(
+    fn request_append_stream_payload_sync_profiled(
         &self,
         stream: &AppendStream,
         target: u64,
+        profile: Option<&mut AppendIngestProfile>,
     ) -> Result<()> {
+        let mut profile = profile;
+        let pending_started = profile.is_some().then(Instant::now);
         let pending = self.pending_append_for_stream_payload_prefix(stream, target)?;
-        self.durable.sync_pending_append_payload(&pending)?;
-        Ok(())
+        if let (Some(profile), Some(started)) = (profile.as_mut(), pending_started.as_ref()) {
+            profile.auto_persist_pending_nanos = profile
+                .auto_persist_pending_nanos
+                .saturating_add(duration_nanos_u64(started.elapsed()));
+            profile.auto_persist_pending_log_refs = pending.log_ref_count();
+            profile.auto_persist_pending_storage_nodes = pending.storage_node_count();
+        }
+        let request_started = profile.is_some().then(Instant::now);
+        let result = self.durable.request_pending_append_payload_sync(&pending);
+        if let (Some(profile), Some(started)) = (profile.as_mut(), request_started.as_ref()) {
+            profile.auto_persist_request_nanos = duration_nanos_u64(started.elapsed());
+            profile.auto_persist_request_submitted = result.is_ok() && !pending.is_empty();
+        }
+        result
     }
 
     pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
@@ -2831,8 +2894,13 @@ impl DurableCoordinator {
             }
             result
         } else if let Some(threshold) = self.local.config().stream_auto_persist_bytes {
+            let auto_persist_profile = if ingest_profile_enabled {
+                Some(&mut profile)
+            } else {
+                None
+            };
             let result = self
-                .maybe_auto_persist_append_stream(stream, threshold)
+                .maybe_auto_persist_append_stream(stream, threshold, auto_persist_profile)
                 .map(|_| ticket);
             if let Some(started) = auto_persist_started.as_ref() {
                 profile.auto_persist_nanos = duration_nanos_u64(started.elapsed());
