@@ -108,6 +108,10 @@ mod tests {
             Workload::NativeStreamPublishInterval4m
         );
         assert_eq!(
+            Workload::from_str("native-stream-publish-interval-16m").unwrap(),
+            Workload::NativeStreamPublishInterval16m
+        );
+        assert_eq!(
             Workload::from_str("native-stream-publish-interval-32m").unwrap(),
             Workload::NativeStreamPublishInterval32m
         );

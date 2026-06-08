@@ -434,6 +434,7 @@ options:\n\
                                            native-stream-publish-pipelined-1m,\n\
                                            native-stream-publish-interval-1m,\n\
                                            native-stream-publish-interval-4m,\n\
+                                           native-stream-publish-interval-16m,\n\
                                            native-stream-publish-interval-32m,\n\
                                            native-stream-publish-at-end-1m,\n\
                                            native-stream-publish-at-end-4m,\n\

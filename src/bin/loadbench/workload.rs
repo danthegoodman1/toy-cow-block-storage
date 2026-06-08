@@ -223,6 +223,7 @@ enum Workload {
     NativeStreamPublishPipelined1m,
     NativeStreamPublishInterval1m,
     NativeStreamPublishInterval4m,
+    NativeStreamPublishInterval16m,
     NativeStreamPublishInterval32m,
     NativeStreamPublishAtEnd1m,
     NativeStreamPublishAtEnd4m,
@@ -437,6 +438,7 @@ impl Workload {
             Self::NativeStreamPublishPipelined1m => "native-stream-publish-pipelined-1m",
             Self::NativeStreamPublishInterval1m => "native-stream-publish-interval-1m",
             Self::NativeStreamPublishInterval4m => "native-stream-publish-interval-4m",
+            Self::NativeStreamPublishInterval16m => "native-stream-publish-interval-16m",
             Self::NativeStreamPublishInterval32m => "native-stream-publish-interval-32m",
             Self::NativeStreamPublishAtEnd1m => "native-stream-publish-at-end-1m",
             Self::NativeStreamPublishAtEnd4m => "native-stream-publish-at-end-4m",
@@ -500,6 +502,7 @@ impl Workload {
             | Self::NativeStreamPublishBarrierAtEnd4m
             | Self::AppendLogMicrobenchStreamPrivate4m
             | Self::AppendLogMicrobenchNodeShared4m => 4 * 1024 * 1024,
+            Self::NativeStreamPublishInterval16m => 16 * 1024 * 1024,
             Self::NativeWrite32m
             | Self::NativeAppend32m
             | Self::NativeStreamIngest32m
@@ -746,6 +749,7 @@ impl Workload {
                 | Self::NativeStreamPublishPipelined1m
                 | Self::NativeStreamPublishInterval1m
                 | Self::NativeStreamPublishInterval4m
+                | Self::NativeStreamPublishInterval16m
                 | Self::NativeStreamPublishInterval32m
                 | Self::NativeStreamPublishAtEnd1m
                 | Self::NativeStreamPublishAtEnd4m
@@ -785,6 +789,7 @@ impl Workload {
             self,
             Self::NativeStreamPublishInterval1m
                 | Self::NativeStreamPublishInterval4m
+                | Self::NativeStreamPublishInterval16m
                 | Self::NativeStreamPublishInterval32m
         )
     }
@@ -925,6 +930,7 @@ impl FromStr for Workload {
             "native-stream-publish-pipelined-1m" => Ok(Self::NativeStreamPublishPipelined1m),
             "native-stream-publish-interval-1m" => Ok(Self::NativeStreamPublishInterval1m),
             "native-stream-publish-interval-4m" => Ok(Self::NativeStreamPublishInterval4m),
+            "native-stream-publish-interval-16m" => Ok(Self::NativeStreamPublishInterval16m),
             "native-stream-publish-interval-32m" => Ok(Self::NativeStreamPublishInterval32m),
             "native-stream-publish-at-end-1m" => Ok(Self::NativeStreamPublishAtEnd1m),
             "native-stream-publish-at-end-4m" => Ok(Self::NativeStreamPublishAtEnd4m),

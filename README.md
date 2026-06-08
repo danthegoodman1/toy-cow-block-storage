@@ -485,6 +485,35 @@ The data RAID stayed the throughput limiter (`data_wMBps_p90_sum` about
 target is therefore the single global append-visible publish lane; SQLite row
 work and metadata encoding are not the current limiter.
 
+A June 8, 2026 PT quantum sweep added an explicit
+`native-stream-publish-interval-16m` workload and compared 32 MiB, 16 MiB, and
+4 MiB append calls while keeping the same 128 MiB publish boundary, c32,
+`raid-split-journal`, randomized `REPEATS=2`, and RTTs `0us`, `200us`, `700us`,
+and `3600us`. The 16 MiB shape is useful as a benchmark control but is not a
+new default: it reduced append p99 where the 32 MiB row queued badly, especially
+at `200us`, but it did not preserve throughput and publish p99 across all RTTs.
+The steady repeat was:
+
+| RTT | Workload | Throughput | Append p99 | Publish p99 |
+| ---: | --- | ---: | ---: | ---: |
+| `0us` | interval 32 MiB | 15.37 GiB/s | 72.4 ms | 3.6 ms |
+| `0us` | interval 16 MiB | 13.70 GiB/s | 156.6 ms | 6.5 ms |
+| `0us` | interval 4 MiB | 13.98 GiB/s | 44.1 ms | 4.5 ms |
+| `200us` | interval 32 MiB | 14.50 GiB/s | 114.4 ms | 3.7 ms |
+| `200us` | interval 16 MiB | 14.54 GiB/s | 42.2 ms | 4.1 ms |
+| `200us` | interval 4 MiB | 13.40 GiB/s | 24.0 ms | 8.4 ms |
+| `700us` | interval 32 MiB | 15.00 GiB/s | 76.0 ms | 5.0 ms |
+| `700us` | interval 16 MiB | 14.38 GiB/s | 57.9 ms | 6.6 ms |
+| `700us` | interval 4 MiB | 13.57 GiB/s | 26.6 ms | 9.0 ms |
+| `3600us` | interval 32 MiB | 14.89 GiB/s | 76.5 ms | 7.6 ms |
+| `3600us` | interval 16 MiB | 14.07 GiB/s | 48.8 ms | 11.2 ms |
+| `3600us` | interval 4 MiB | 12.40 GiB/s | 30.0 ms | 10.6 ms |
+
+The sweep confirms that smaller append calls reduce active-log queueing but
+trade it for more operation overhead and publish-lane wait. The next storage
+runtime target is therefore not a smaller public append default; it is reducing
+active-log queueing for large appends without multiplying publish work.
+
 Raw C4 artifacts are local and ignored under
 `infra/gcp-local-nvme-bench/results/`, specifically
 `gcp-c4-192-layout-20260607-125041`, `c48887-06071318`, and
@@ -492,8 +521,9 @@ Raw C4 artifacts are local and ignored under
 `c4288-drain-owner-0607`, `c4288-rtt-random-spin-06071725`, and
 `c4288-warm-200first-spin-06071742`, plus
 `c4288-prealloc-target32-06071829`,
-`c4288-prealloc-target32-rand-06071837`, and
-`c4288-coalesce4-rand-06071852`. The
+`c4288-prealloc-target32-rand-06071837`,
+`c4288-coalesce4-rand-06071852`, `c4288-quantum-0608`, and
+`c4288-quantum16-0608`. The
 temporary GCP instances, networks, subnets, and firewall rules were deleted
 after the runs.
 
