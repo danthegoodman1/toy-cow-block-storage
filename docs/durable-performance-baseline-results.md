@@ -1263,6 +1263,61 @@ ceiling (`data_wMBps_p90_sum` about `14.2 GB/s`, `data_util_p90` about
 `99.4%`), while publish-tail outliers are wait-behind-active-publish plus
 append-visible journal sync, not SQLite row work.
 
+## GCP C4 Journal Preallocation And Coalesce4
+
+A June 7, 2026 PT follow-up kept the same `c4-standard-288-lssd`,
+48-local-SSD, `raid-split-journal` shape and tested append-visible journal
+preallocation plus a shorter append-publish coalescing policy. The runtime
+changes were:
+
+- preallocate newly created durable journal files with `fallocate(...,
+  KEEP_SIZE, 64 MiB)` on Linux;
+- use a 4-ticket append-publish batch target;
+- reduce append-publish idle coalescing to `250us`;
+- cap append-publish coalescing at `5 ms`.
+
+Those measured values are now the default `AppendPublishBatchPolicy`. Loadbench
+can sweep them without code changes through `--append-publish-batch-target`,
+`--append-publish-idle-coalesce-us`, and `--append-publish-max-coalesce-us`.
+
+Raw artifacts:
+
+- `infra/gcp-local-nvme-bench/results/c4288-prealloc-target32-06071829/`
+- `infra/gcp-local-nvme-bench/results/c4288-prealloc-target32-06071829-results.tgz`
+- `infra/gcp-local-nvme-bench/results/c4288-prealloc-target32-rand-06071837/`
+- `infra/gcp-local-nvme-bench/results/c4288-prealloc-target32-rand-06071837-results.tgz`
+- `infra/gcp-local-nvme-bench/results/c4288-coalesce4-rand-06071852/`
+- `infra/gcp-local-nvme-bench/results/c4288-coalesce4-rand-06071852-results.tgz`
+
+The decisive run was interval-only with `REPEATS=2`, randomized RTT order,
+`DELAY_MODE=spin`, RTTs `0,200,700,3600`, and concurrency `32,64`. The first
+measured rows still show layout/root-state variance, so the table below uses
+repeat 2 for steady-state comparison.
+
+| RTT | c32 `published_mbps` / publish p99 / append p99 | c64 `published_mbps` / publish p99 / append p99 |
+| ---: | ---: | ---: |
+| `0us` | 15.35 GiB/s / 2.9 ms / 74.6 ms | 15.22 GiB/s / 6.5 ms / 147.3 ms |
+| `200us` | 15.38 GiB/s / 3.9 ms / 74.2 ms | 15.47 GiB/s / 4.0 ms / 141.2 ms |
+| `700us` | 15.27 GiB/s / 3.8 ms / 76.0 ms | 15.39 GiB/s / 4.9 ms / 144.3 ms |
+| `3600us` | 15.23 GiB/s / 7.7 ms / 80.2 ms | 14.66 GiB/s / 8.0 ms / 199.4 ms |
+
+Compared with the immediately preceding preallocation plus 32-ticket target
+run, the coalesce4 pass improved all warm repeat publish p99 rows except the
+`0us` c64 row, which stayed single-digit. The largest wins were:
+
+- `0us` c32 publish p99: `5.29 ms` to `2.86 ms`;
+- `200us` c64 publish p99: `5.46 ms` to `4.01 ms`;
+- `700us` c64 publish p99: `6.40 ms` to `4.94 ms`;
+- `3600us` c64 publish p99: `11.05 ms` to `7.95 ms`.
+
+The instrumentation now points away from SQLite row work. Warm-row journal sync
+p99 is mostly `0.85-2.63 ms`, while wait-behind-active-publish remains the
+largest c64 tail component. The data RAID is the throughput limiter:
+`data_wMBps_p90_sum` was about `15.1 GB/s` with `data_util_p90` about `98.6%`.
+The next latency work should attack the single global append-visible publish
+lane without allowing commit-sequence gaps to become visible after crash
+replay.
+
 ## External North-Star Targets
 
 The June 6, 2026 Rapid Storage c3-88/Tier1 run is the current external

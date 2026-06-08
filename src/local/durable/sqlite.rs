@@ -1443,6 +1443,7 @@ impl DurableCodec for NativeMetadataDeltaCommit {
 
 const DURABLE_JOURNAL_HEADER_BYTES: usize = 24;
 const MAX_DURABLE_JOURNAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const DURABLE_JOURNAL_PREALLOC_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"TCPJNL01";
 const APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"AVPJNL01";
 
@@ -1568,6 +1569,9 @@ fn append_durable_journal_record<T: DurableCodec>(
         .open(path)
         .map_err(fs_error)?;
     let open_nanos = duration_nanos_u64(open_started.elapsed());
+    if !existed {
+        preallocate_durable_journal_file(&file, DURABLE_JOURNAL_PREALLOC_BYTES)?;
+    }
     let started = Instant::now();
     file.write_all(&frame).map_err(fs_error)?;
     let write_nanos = duration_nanos_u64(started.elapsed());
@@ -1591,6 +1595,26 @@ fn append_durable_journal_record<T: DurableCodec>(
         created: if existed { 0 } else { 1 },
         ..AppendVisibleJournalProfile::default()
     })
+}
+
+fn preallocate_durable_journal_file(file: &File, bytes: u64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::KEEP_SIZE, 0, bytes) {
+            Ok(()) => Ok(()),
+            Err(
+                rustix::io::Errno::INVAL
+                | rustix::io::Errno::NOSYS
+                | rustix::io::Errno::OPNOTSUPP,
+            ) => Ok(()),
+            Err(error) => Err(fs_error(std::io::Error::from(error))),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, bytes);
+        Ok(())
+    }
 }
 
 fn native_publish_journal_frame(commit: &NativeMetadataDeltaCommit) -> Result<Vec<u8>> {

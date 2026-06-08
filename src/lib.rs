@@ -39,19 +39,19 @@ pub use id::{
     StorageNodeKeyId, TenantId, WriteIntentId, WriterEpoch,
 };
 pub use local::{
-    AppendPublishWaitProfile, ChaosRemoteWireTransport, ChaosStorageNodeTransport,
-    ChaosTransportMetrics, DurableCompactionReport, DurableCoordinator, DurableDataLogPolicy,
-    DurableDataLogRef, DurablePersistProfile, InMemoryLocalSegmentCatalog, InMemoryMetadataPlane,
-    InMemorySegmentStore, InProcessBlockTransport, InProcessNativeTransport, LocalBlockClient,
-    LocalBlockDevice, LocalBlockServer, LocalCoordinator, LocalNativeClient, LocalNativeFile,
-    LocalNativeServer, LocalStoreConfig, MaintenanceCommand, MaintenanceDataLogObservation,
-    MaintenanceDiagnostics, MaintenanceMode, MaintenanceNodeObservation, MaintenanceObservation,
-    MaintenancePolicy, MaintenanceScheduler, MaintenanceSkippedLog, MaintenanceTickPlan,
-    MaintenanceTickReport, MetadataCustodianReport, MetadataMarkReport, MetadataSweepReport,
-    MetadataTxnMode, MetadataTxnProfile, MetadataTxnProfilePhase, ReadProfile, RemoteBlockEndpoint,
-    RemoteBlockTransport, RemoteNativeEndpoint, RemoteNativeTransport, RemoteWireTransport,
-    SegmentLifecycleState, TxnBlockCoordinator, TxnBlockMetadataPlane, TxnBlockWriteProfile,
-    WriteAdmission,
+    AppendPublishBatchPolicy, AppendPublishWaitProfile, ChaosRemoteWireTransport,
+    ChaosStorageNodeTransport, ChaosTransportMetrics, DurableCompactionReport, DurableCoordinator,
+    DurableDataLogPolicy, DurableDataLogRef, DurablePersistProfile, InMemoryLocalSegmentCatalog,
+    InMemoryMetadataPlane, InMemorySegmentStore, InProcessBlockTransport, InProcessNativeTransport,
+    LocalBlockClient, LocalBlockDevice, LocalBlockServer, LocalCoordinator, LocalNativeClient,
+    LocalNativeFile, LocalNativeServer, LocalStoreConfig, MaintenanceCommand,
+    MaintenanceDataLogObservation, MaintenanceDiagnostics, MaintenanceMode,
+    MaintenanceNodeObservation, MaintenanceObservation, MaintenancePolicy, MaintenanceScheduler,
+    MaintenanceSkippedLog, MaintenanceTickPlan, MaintenanceTickReport, MetadataCustodianReport,
+    MetadataMarkReport, MetadataSweepReport, MetadataTxnMode, MetadataTxnProfile,
+    MetadataTxnProfilePhase, ReadProfile, RemoteBlockEndpoint, RemoteBlockTransport,
+    RemoteNativeEndpoint, RemoteNativeTransport, RemoteWireTransport, SegmentLifecycleState,
+    TxnBlockCoordinator, TxnBlockMetadataPlane, TxnBlockWriteProfile, WriteAdmission,
 };
 pub use object::SegmentPayloadIntegrity;
 pub use provider::{

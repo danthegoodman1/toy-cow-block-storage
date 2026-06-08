@@ -1,11 +1,5 @@
 /// Durable in-process coordinator using SQLite metadata and node-scoped rolled
 /// data logs.
-// Demand-driven group commit lets barrier-like append publishes share one
-// durable metadata journal sync without imposing the full window on lone
-// publishes.
-const APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY: Duration = Duration::from_millis(1);
-const APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY: Duration = Duration::from_millis(20);
-const APPEND_PUBLISH_BATCH_TARGET_TICKETS: usize = 16;
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -24,6 +18,7 @@ pub struct DurableCoordinator {
     persist_coordinator: Arc<PersistCoordinator>,
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
     append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
+    append_publish_batch_policy: AppendPublishBatchPolicy,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
@@ -197,6 +192,30 @@ impl DurableCoordinator {
             storage_nodes,
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
+            AppendPublishBatchPolicy::default(),
+        )
+    }
+
+    /// Open a durable store with explicit storage nodes, split journal layout,
+    /// and provider-private append publish batching policy.
+    ///
+    /// The batching policy changes only local durable publish scheduling; it
+    /// does not change the visible or restart-durable publish contract.
+    pub fn open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_publish_batch_policy(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        policy: DurableDataLogPolicy,
+        append_visible_publish_journal: Option<PathBuf>,
+        append_publish_batch_policy: AppendPublishBatchPolicy,
+    ) -> Result<Self> {
+        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+            root,
+            config,
+            storage_nodes,
+            MaintenancePolicy::manual(policy),
+            append_visible_publish_journal,
+            append_publish_batch_policy,
         )
     }
 
@@ -235,6 +254,26 @@ impl DurableCoordinator {
             storage_nodes,
             maintenance_policy,
             None,
+            AppendPublishBatchPolicy::default(),
+        )
+    }
+
+    /// Open a durable store with explicit storage-node placement and append
+    /// publish batching policy.
+    pub fn open_with_storage_nodes_maintenance_policy_and_append_publish_batch_policy(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        maintenance_policy: MaintenancePolicy,
+        append_publish_batch_policy: AppendPublishBatchPolicy,
+    ) -> Result<Self> {
+        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+            root,
+            config,
+            storage_nodes,
+            maintenance_policy,
+            None,
+            append_publish_batch_policy,
         )
     }
 
@@ -244,9 +283,11 @@ impl DurableCoordinator {
         storage_nodes: Vec<StorageNodeId>,
         maintenance_policy: MaintenancePolicy,
         append_visible_publish_journal: Option<PathBuf>,
+        append_publish_batch_policy: AppendPublishBatchPolicy,
     ) -> Result<Self> {
         config.validate()?;
         maintenance_policy.validate()?;
+        append_publish_batch_policy.validate()?;
         let storage_nodes = normalize_storage_nodes(config.storage_node, storage_nodes);
         let paths = match append_visible_publish_journal {
             Some(path) => DurableStorePaths::new_with_append_visible_publish_journal(
@@ -286,6 +327,7 @@ impl DurableCoordinator {
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
             append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
+            append_publish_batch_policy,
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
             read_profiler: Arc::new(Mutex::new(None)),
@@ -415,6 +457,11 @@ impl DurableCoordinator {
     ) -> Result<(AppendPublishLaneKey, Arc<AppendPublishPersistCoordinator>)> {
         let key = Self::append_publish_lane_key(ticket)?;
         Ok((key, Arc::clone(&self.append_publish_persist_coordinator)))
+    }
+
+    /// Return the provider-private append publish batching policy.
+    pub fn append_publish_batch_policy(&self) -> AppendPublishBatchPolicy {
+        self.append_publish_batch_policy
     }
 
     fn maybe_auto_persist_append_stream(
@@ -1878,20 +1925,21 @@ impl DurableCoordinator {
         let mut demand = self.append_publish_batch_demand(&state)?;
         profile.batch_coalesce_start_demand = usize_to_u64(demand);
         let mut saw_peer = demand > 1;
-        let mut hit_target = demand >= APPEND_PUBLISH_BATCH_TARGET_TICKETS;
+        let policy = self.append_publish_batch_policy;
+        let mut hit_target = demand >= policy.target_tickets;
         loop {
             if hit_target {
                 break;
             }
             let elapsed = started.elapsed();
-            if saw_peer && elapsed >= APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY {
+            if saw_peer && elapsed >= policy.max_coalesce_delay {
                 break;
             }
-            let remaining = APPEND_PUBLISH_BATCH_MAX_COALESCE_DELAY.saturating_sub(elapsed);
+            let remaining = policy.max_coalesce_delay.saturating_sub(elapsed);
             let delay = if saw_peer {
-                APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY.min(remaining)
+                policy.idle_coalesce_delay.min(remaining)
             } else {
-                APPEND_PUBLISH_BATCH_IDLE_COALESCE_DELAY
+                policy.idle_coalesce_delay
             };
             if delay.is_zero() {
                 break;
@@ -1911,7 +1959,7 @@ impl DurableCoordinator {
             let next_demand = self.append_publish_batch_demand(&state)?;
             if next_demand > demand {
                 demand = next_demand;
-                hit_target = demand >= APPEND_PUBLISH_BATCH_TARGET_TICKETS;
+                hit_target = demand >= policy.target_tickets;
                 saw_peer = saw_peer || demand > 1;
                 continue;
             }

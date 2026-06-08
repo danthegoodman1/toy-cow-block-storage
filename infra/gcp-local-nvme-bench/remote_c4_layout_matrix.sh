@@ -19,7 +19,10 @@ WARMUP_BEFORE_MEASURED="${WARMUP_BEFORE_MEASURED:-0}"
 WARMUP_RTT_US="${WARMUP_RTT_US:-0}"
 WARMUP_CONCURRENCY="${WARMUP_CONCURRENCY:-32}"
 CONCURRENCY="${CONCURRENCY:-16,32}"
-WORKLOADS="native-stream-publish-at-end-32m,native-stream-publish-interval-32m"
+WORKLOADS="${WORKLOADS:-native-stream-publish-at-end-32m,native-stream-publish-interval-32m}"
+APPEND_PUBLISH_BATCH_TARGET="${APPEND_PUBLISH_BATCH_TARGET:-4}"
+APPEND_PUBLISH_IDLE_COALESCE_US="${APPEND_PUBLISH_IDLE_COALESCE_US:-250}"
+APPEND_PUBLISH_MAX_COALESCE_US="${APPEND_PUBLISH_MAX_COALESCE_US:-5000}"
 
 IFS=',' read -r -a RTT_VALUES <<<"${RTTS}"
 if (( ${#RTT_VALUES[@]} == 0 )); then
@@ -102,6 +105,9 @@ fi
   echo "warmup_concurrency=${WARMUP_CONCURRENCY}"
   echo "concurrency=${CONCURRENCY}"
   echo "workloads=${WORKLOADS}"
+  echo "append_publish_batch_target=${APPEND_PUBLISH_BATCH_TARGET}"
+  echo "append_publish_idle_coalesce_us=${APPEND_PUBLISH_IDLE_COALESCE_US}"
+  echo "append_publish_max_coalesce_us=${APPEND_PUBLISH_MAX_COALESCE_US}"
   echo "disk_count=${#DISKS[@]}"
   printf 'disks=%s\n' "${DISKS[*]}"
   echo
@@ -291,6 +297,9 @@ run_layout() {
       --stream-auto-persist-mib 32
       --target-data-log-mib 64
       --data-log-file-sync-fanout 16
+      --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
+      --append-publish-idle-coalesce-us "${APPEND_PUBLISH_IDLE_COALESCE_US}"
+      --append-publish-max-coalesce-us "${APPEND_PUBLISH_MAX_COALESCE_US}"
       --root "${root}/warmup/root"
       --matrix-csv "${warmup_out}/matrix.csv"
       --durable-profile-csv "${warmup_out}/durable-profile.csv"
@@ -329,6 +338,9 @@ run_layout() {
         --stream-auto-persist-mib 32
         --target-data-log-mib 64
         --data-log-file-sync-fanout 16
+        --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
+        --append-publish-idle-coalesce-us "${APPEND_PUBLISH_IDLE_COALESCE_US}"
+        --append-publish-max-coalesce-us "${APPEND_PUBLISH_MAX_COALESCE_US}"
         --root "${root}/rtt-${rtt}-rep-${repeat}/root"
         --matrix-csv "${rtt_out}/matrix.csv"
         --durable-profile-csv "${rtt_out}/durable-profile.csv"

@@ -56,6 +56,47 @@ impl DurableDataLogPolicy {
     }
 }
 
+/// Provider-private batching policy for durable append-visible publishes.
+///
+/// This is a latency/throughput scheduling knob below the public native file
+/// API. It does not change what a successful publish makes durable or visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendPublishBatchPolicy {
+    /// Pending tickets needed to start a batch without an extra coalesce wait.
+    pub target_tickets: usize,
+    /// Short wait used to let nearby publish waiters join a batch.
+    pub idle_coalesce_delay: Duration,
+    /// Maximum time one batch owner may spend collecting peer tickets.
+    pub max_coalesce_delay: Duration,
+}
+
+impl Default for AppendPublishBatchPolicy {
+    fn default() -> Self {
+        Self {
+            target_tickets: 4,
+            idle_coalesce_delay: Duration::from_micros(250),
+            max_coalesce_delay: Duration::from_millis(5),
+        }
+    }
+}
+
+impl AppendPublishBatchPolicy {
+    /// Validate that append publish batching can make deterministic progress.
+    pub fn validate(self) -> Result<()> {
+        if self.target_tickets == 0 {
+            return Err(StorageError::invalid_argument(
+                "append publish batch target_tickets must be greater than zero",
+            ));
+        }
+        if self.idle_coalesce_delay > self.max_coalesce_delay {
+            return Err(StorageError::invalid_argument(
+                "append publish idle_coalesce_delay must be <= max_coalesce_delay",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Durable data-log identity within a storage node.
 ///
 /// The pair is provider-owned diagnostic state. Public block and native callers

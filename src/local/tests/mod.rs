@@ -9855,7 +9855,7 @@ fn durable_append_publish_wait_starts_immediately_at_target_batch_demand() {
         .unwrap();
     let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
     let mut publish_through = 0_u64;
-    for index in 0..17 {
+    for index in 0..5 {
         let payload = vec![100 + index as u8; 128];
         store
             .append_stream(&stream, &payload, WriteDurability::Acknowledged)
@@ -9867,7 +9867,7 @@ fn durable_append_publish_wait_starts_immediately_at_target_batch_demand() {
                 .unwrap(),
         );
     }
-    store.enable_append_publish_wait_profiling(32).unwrap();
+    store.enable_append_publish_wait_profiling(16).unwrap();
 
     let mut expected_offset = 0_u64;
     for ticket in &tickets {
@@ -9876,7 +9876,7 @@ fn durable_append_publish_wait_starts_immediately_at_target_batch_demand() {
         expected_offset += 128;
     }
 
-    let profiles = store.drain_append_publish_wait_profiles(32).unwrap();
+    let profiles = store.drain_append_publish_wait_profiles(16).unwrap();
     let driver = profiles
         .iter()
         .find(|profile| profile.persist_batches_started == 1)
@@ -9886,12 +9886,121 @@ fn durable_append_publish_wait_starts_immediately_at_target_batch_demand() {
         driver.coalesce_waits, 0,
         "already-target-sized demand should not spend an extra coalesce wait"
     );
-    assert!(driver.batch_metadata_pending_ticket_count >= 16);
-    assert!(driver.max_batch_ticket_count >= 16);
+    assert!(driver.batch_metadata_pending_ticket_count >= 4);
+    assert!(driver.max_batch_ticket_count >= 4);
     assert!(
-        driver.batch_same_file_skip_count >= 16,
+        driver.batch_same_file_skip_count >= 4,
         "same-file tickets should count toward demand but only one can plan per physical batch"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn append_publish_batch_policy_defaults_match_gcp_latency_run() {
+    let policy = AppendPublishBatchPolicy::default();
+    assert_eq!(policy.target_tickets, 4);
+    assert_eq!(policy.idle_coalesce_delay, Duration::from_micros(250));
+    assert_eq!(policy.max_coalesce_delay, Duration::from_millis(5));
+    policy.validate().unwrap();
+}
+
+#[test]
+fn durable_append_publish_batch_policy_rejects_invalid_values() {
+    let root = durable_temp_dir("append-publish-batch-policy-invalid");
+    let cfg = config();
+    let invalid_target = AppendPublishBatchPolicy {
+        target_tickets: 0,
+        ..AppendPublishBatchPolicy::default()
+    };
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_maintenance_policy_and_append_publish_batch_policy(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            MaintenancePolicy::default(),
+            invalid_target,
+        )
+        .is_err()
+    );
+
+    let invalid_delay = AppendPublishBatchPolicy {
+        idle_coalesce_delay: Duration::from_millis(2),
+        max_coalesce_delay: Duration::from_millis(1),
+        ..AppendPublishBatchPolicy::default()
+    };
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_maintenance_policy_and_append_publish_batch_policy(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            MaintenancePolicy::default(),
+            invalid_delay,
+        )
+        .is_err()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_publish_batch_policy_controls_target_demand() {
+    let root = durable_temp_dir("append-publish-batch-policy-target");
+    let cfg = config();
+    let policy = AppendPublishBatchPolicy {
+        target_tickets: 2,
+        idle_coalesce_delay: Duration::ZERO,
+        max_coalesce_delay: Duration::ZERO,
+    };
+    let store =
+        DurableCoordinator::open_with_storage_nodes_maintenance_policy_and_append_publish_batch_policy(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            MaintenancePolicy::default(),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(store.append_publish_batch_policy(), policy);
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let first_payload = repeated_blocks(1, 101);
+    let second_payload = repeated_blocks(1, 102);
+    store
+        .append_stream(&stream, &first_payload, WriteDurability::Acknowledged)
+        .unwrap();
+    let first = store.submit_append_publish(&stream, 4096).unwrap();
+    store
+        .append_stream(&stream, &second_payload, WriteDurability::Acknowledged)
+        .unwrap();
+    let second = store.submit_append_publish(&stream, 8192).unwrap();
+    store.enable_append_publish_wait_profiling(16).unwrap();
+
+    let first_commit = store.wait_append_publish(&first).unwrap();
+    assert_eq!(first_commit.range, ByteRange::new(0, 4096));
+    let second_commit = store.wait_append_publish(&second).unwrap();
+    assert_eq!(second_commit.range, ByteRange::new(4096, 4096));
+    let profiles = store.drain_append_publish_wait_profiles(16).unwrap();
+    let driver = profiles
+        .iter()
+        .find(|profile| profile.persist_batches_started == 1)
+        .expect("one waiter should drive the custom target-sized batch");
+    assert!(driver.batch_coalesce_hit_target);
+    assert_eq!(driver.coalesce_waits, 0);
+    assert!(driver.batch_metadata_pending_ticket_count >= 2);
+    assert!(driver.max_batch_ticket_count >= 2);
     let _ = fs::remove_dir_all(root);
 }
 

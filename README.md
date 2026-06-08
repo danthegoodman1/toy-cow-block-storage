@@ -462,12 +462,38 @@ sufficient to make the first measured root steady, so future GCP comparisons
 should use repeated randomized RTTs and treat the first measured pass after
 layout setup separately.
 
+A June 7, 2026 PT follow-up on the same `c4-standard-288-lssd`
+split-journal shape added append-visible journal file preallocation and reduced
+append-publish coalescing to a 4-ticket target with a `250us` idle wait and
+`5 ms` max wait. The repeated randomized interval-only run preserved saturated
+throughput while reducing steady-state publish p99. These measured values are
+now the default `AppendPublishBatchPolicy` and can be swept in `loadbench` with
+`--append-publish-batch-target`, `--append-publish-idle-coalesce-us`, and
+`--append-publish-max-coalesce-us`:
+
+| RTT | Workload | c32 throughput / publish p99 | c64 throughput / publish p99 |
+| ---: | --- | ---: | ---: |
+| `0us` | interval 32 MiB | 15.35 GiB/s / 2.9 ms | 15.22 GiB/s / 6.5 ms |
+| `200us` | interval 32 MiB | 15.38 GiB/s / 3.9 ms | 15.47 GiB/s / 4.0 ms |
+| `700us` | interval 32 MiB | 15.27 GiB/s / 3.8 ms | 15.39 GiB/s / 4.9 ms |
+| `3600us` | interval 32 MiB | 15.23 GiB/s / 7.7 ms | 14.66 GiB/s / 8.0 ms |
+
+The profile now shows journal sync p99 mostly in the `0.85-2.63 ms` range on
+warm rows, with the residual c64 tail dominated by wait-behind-active-publish.
+The data RAID stayed the throughput limiter (`data_wMBps_p90_sum` about
+`15.1 GB/s`, `data_util_p90` about `98.6%`). The next structural latency
+target is therefore the single global append-visible publish lane; SQLite row
+work and metadata encoding are not the current limiter.
+
 Raw C4 artifacts are local and ignored under
 `infra/gcp-local-nvme-bench/results/`, specifically
 `gcp-c4-192-layout-20260607-125041`, `c48887-06071318`, and
 `c4288-sharded-publish-06071540`, `c4288-group-commit-06071625`,
 `c4288-drain-owner-0607`, `c4288-rtt-random-spin-06071725`, and
-`c4288-warm-200first-spin-06071742`. The
+`c4288-warm-200first-spin-06071742`, plus
+`c4288-prealloc-target32-06071829`,
+`c4288-prealloc-target32-rand-06071837`, and
+`c4288-coalesce4-rand-06071852`. The
 temporary GCP instances, networks, subnets, and firewall rules were deleted
 after the runs.
 

@@ -27,6 +27,7 @@ struct Args {
     read_profile_csv: Option<PathBuf>,
     target_data_log_bytes: u64,
     data_log_file_sync_fanout: usize,
+    append_publish_batch_policy: AppendPublishBatchPolicy,
     stream_publish_bytes: Option<u64>,
     stream_total_bytes: u64,
     stream_auto_persist_bytes: Option<u64>,
@@ -72,6 +73,7 @@ impl Args {
             read_profile_csv: None,
             target_data_log_bytes: 64 * 1024 * 1024,
             data_log_file_sync_fanout: 4,
+            append_publish_batch_policy: AppendPublishBatchPolicy::default(),
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,
             stream_auto_persist_bytes: None,
@@ -191,6 +193,20 @@ impl Args {
                 "--data-log-file-sync-fanout" => {
                     args.data_log_file_sync_fanout = parse_next(&mut raw, flag.as_str())?;
                 }
+                "--append-publish-batch-target" => {
+                    args.append_publish_batch_policy.target_tickets =
+                        parse_next(&mut raw, flag.as_str())?;
+                }
+                "--append-publish-idle-coalesce-us" => {
+                    let micros: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.append_publish_batch_policy.idle_coalesce_delay =
+                        Duration::from_micros(micros);
+                }
+                "--append-publish-max-coalesce-us" => {
+                    let micros: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.append_publish_batch_policy.max_coalesce_delay =
+                        Duration::from_micros(micros);
+                }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
                     args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
@@ -298,6 +314,7 @@ impl Args {
                 "data-log-file-sync-fanout must be greater than zero",
             ));
         }
+        args.append_publish_batch_policy.validate()?;
         if args.device_blocks < args.shards as u64 {
             return Err(StorageError::invalid_argument(
                 "device-blocks must be at least shards",
@@ -428,6 +445,9 @@ options:\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
   --target-data-log-mib N                  durable data-log roll target, default: 64\n\
   --data-log-file-sync-fanout N            concurrent durable data-log file syncs, default: 4\n\
+  --append-publish-batch-target N          durable append publish batch target, default: 4\n\
+  --append-publish-idle-coalesce-us N      durable append publish idle coalesce wait, default: 250\n\
+  --append-publish-max-coalesce-us N       durable append publish max coalesce wait, default: 5000\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --stream-auto-persist-mib N              durable stream payload dirty-tail sync threshold\n\
