@@ -222,6 +222,13 @@ impl Args {
                     args.append_ingest_policy.admission.max_in_flight_bytes =
                         Some(mib_to_bytes(mib, flag.as_str())?);
                 }
+                "--append-ingest-max-in-flight-per-storage-node-mib" => {
+                    let mib: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.append_ingest_policy
+                        .admission
+                        .max_in_flight_bytes_per_storage_node =
+                        Some(mib_to_bytes(mib, flag.as_str())?);
+                }
                 "--append-ingest-active-log-lanes" => {
                     args.append_ingest_policy.data_log.active_log_lanes =
                         parse_next(&mut raw, flag.as_str())?;
@@ -485,7 +492,8 @@ options:\n\
   --append-publish-batch-target N          durable append publish batch target, default: 4\n\
   --append-publish-idle-coalesce-us N      durable append publish idle coalesce wait, default: 250\n\
   --append-publish-max-coalesce-us N       durable append publish max coalesce wait, default: 5000\n\
-  --append-ingest-max-in-flight-mib N      durable append ingest max in-flight MiB, default: disabled\n\
+  --append-ingest-max-in-flight-mib N      durable append ingest global max in-flight MiB, default: disabled\n\
+  --append-ingest-max-in-flight-per-storage-node-mib N durable append ingest per-storage-node max in-flight MiB\n\
   --append-ingest-active-log-lanes N       active append-run data logs per storage node, default: 1\n\
   --append-ingest-background-sync-workers N background append payload sync workers, default: 1\n\
   --append-ingest-background-sync-step-mib N background append payload sync request cadence\n\

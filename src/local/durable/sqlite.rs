@@ -198,6 +198,7 @@ pub struct AppendIngestProfile {
     pub background_sync_request_count: u64,
     pub background_sync_step_bytes: u64,
     pub max_in_flight_bytes: u64,
+    pub max_in_flight_bytes_per_storage_node: u64,
     pub success: bool,
 }
 

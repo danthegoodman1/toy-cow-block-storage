@@ -23,6 +23,8 @@ pub struct DurableCoordinator {
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     append_auto_persist_policy: AppendAutoPersistPolicy,
     append_ingest_admission: Arc<AppendIngestAdmissionGate>,
+    append_ingest_node_admission:
+        Arc<Mutex<BTreeMap<StorageNodeId, Arc<AppendIngestAdmissionGate>>>>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
     append_ingest_profiler: Arc<Mutex<Option<AppendIngestProfiler>>>,
@@ -105,15 +107,12 @@ impl Drop for AppendIngestPermit {
 }
 
 impl AppendIngestAdmissionGate {
-    fn acquire(
+    fn acquire_with_limit(
         self: &Arc<Self>,
         bytes: u64,
-        policy: AppendIngestAdmissionPolicy,
+        max_in_flight_bytes: u64,
         measure_wait: bool,
     ) -> Result<AppendIngestPermit> {
-        let Some(max_in_flight_bytes) = policy.max_in_flight_bytes else {
-            return Ok(AppendIngestPermit::disabled());
-        };
         let started = measure_wait.then(Instant::now);
         let mut state = lock(&self.inner)?;
         while state.in_flight_bytes != 0
@@ -131,6 +130,18 @@ impl AppendIngestAdmissionGate {
                 .unwrap_or_default(),
             max_in_flight_bytes,
         })
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        bytes: u64,
+        policy: AppendIngestAdmissionPolicy,
+        measure_wait: bool,
+    ) -> Result<AppendIngestPermit> {
+        let Some(max_in_flight_bytes) = policy.max_in_flight_bytes else {
+            return Ok(AppendIngestPermit::disabled());
+        };
+        self.acquire_with_limit(bytes, max_in_flight_bytes, measure_wait)
     }
 }
 
@@ -450,6 +461,7 @@ impl DurableCoordinator {
             append_ingest_data_log_policy: append_ingest_policy.data_log,
             append_auto_persist_policy: append_ingest_policy.auto_persist,
             append_ingest_admission: Arc::new(AppendIngestAdmissionGate::default()),
+            append_ingest_node_admission: Arc::new(Mutex::new(BTreeMap::new())),
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
             append_ingest_profiler: Arc::new(Mutex::new(None)),
@@ -2788,6 +2800,34 @@ impl DurableCoordinator {
         ))
     }
 
+    fn append_ingest_node_admission_gate(
+        &self,
+        storage_node: StorageNodeId,
+    ) -> Result<Arc<AppendIngestAdmissionGate>> {
+        let mut gates = lock(&self.append_ingest_node_admission)?;
+        Ok(Arc::clone(
+            gates
+                .entry(storage_node)
+                .or_insert_with(|| Arc::new(AppendIngestAdmissionGate::default())),
+        ))
+    }
+
+    fn acquire_append_ingest_node_permit(
+        &self,
+        storage_node: StorageNodeId,
+        bytes: u64,
+        measure_wait: bool,
+    ) -> Result<AppendIngestPermit> {
+        let Some(max_in_flight_bytes) = self
+            .append_ingest_admission_policy
+            .max_in_flight_bytes_per_storage_node
+        else {
+            return Ok(AppendIngestPermit::disabled());
+        };
+        self.append_ingest_node_admission_gate(storage_node)?
+            .acquire_with_limit(bytes, max_in_flight_bytes, measure_wait)
+    }
+
     fn existing_stream_append_lane(
         &self,
         stream_id: AppendStreamId,
@@ -2882,6 +2922,7 @@ impl DurableCoordinator {
             .saturating_add(permit.wait_nanos());
         profile.max_in_flight_bytes = permit.max_in_flight_bytes();
         let lane = self.stream_append_lane(stream.stream_id)?;
+        let mut node_permit = AppendIngestPermit::disabled();
         let result = (|| {
             let stream_lock_started = ingest_profile_enabled.then(Instant::now);
             let _append_guard = lock(&lane.append)?;
@@ -2908,6 +2949,16 @@ impl DurableCoordinator {
                 }
             };
             profile.storage_node = prepared.storage_node.raw();
+            let permit = self.acquire_append_ingest_node_permit(
+                prepared.storage_node,
+                payload_bytes,
+                ingest_profile_enabled,
+            )?;
+            profile.admission_wait_nanos = profile
+                .admission_wait_nanos
+                .saturating_add(permit.wait_nanos());
+            profile.max_in_flight_bytes_per_storage_node = permit.max_in_flight_bytes();
+            node_permit = permit;
             let chunks = self.append_stream_payload_chunks(data);
             let background_sync_step_bytes =
                 self.append_stream_background_sync_step_bytes(data.len());
@@ -2975,7 +3026,6 @@ impl DurableCoordinator {
         if result.is_ok() {
             self.after_successful_write(admission);
         }
-        drop(permit);
         let ticket = match result {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -3006,6 +3056,8 @@ impl DurableCoordinator {
         } else {
             Ok(ticket)
         };
+        drop(node_permit);
+        drop(permit);
         self.finish_append_ingest_profile(profile, total_started.as_ref(), publish_result.is_ok());
         publish_result
     }

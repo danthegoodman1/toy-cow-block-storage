@@ -104,11 +104,23 @@ impl AppendPublishBatchPolicy {
 /// does not change append ordering, visibility, or durability semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppendIngestAdmissionPolicy {
-    /// Maximum append payload bytes concurrently writing through the provider.
+    /// Maximum append payload bytes concurrently admitted through append ingest.
+    ///
+    /// A permit is held until provider-private append ingest work finishes,
+    /// including configured auto-persist payload sync. This keeps sync debt
+    /// from growing beyond the byte cap while preserving append visibility and
+    /// durability semantics.
     ///
     /// `None` disables the cap. A single append larger than the cap may proceed
     /// alone after earlier admitted appends drain, which prevents deadlock.
     pub max_in_flight_bytes: Option<u64>,
+    /// Maximum append payload bytes concurrently admitted for one storage node.
+    ///
+    /// This cap is acquired after stream placement chooses the target storage
+    /// node, then held through provider-private auto-persist work. It can bound
+    /// per-log sync debt without forcing unrelated storage nodes through one
+    /// global byte gate.
+    pub max_in_flight_bytes_per_storage_node: Option<u64>,
 }
 
 impl AppendIngestAdmissionPolicy {
@@ -117,6 +129,11 @@ impl AppendIngestAdmissionPolicy {
         if self.max_in_flight_bytes == Some(0) {
             return Err(StorageError::invalid_argument(
                 "append ingest max_in_flight_bytes must be greater than zero when configured",
+            ));
+        }
+        if self.max_in_flight_bytes_per_storage_node == Some(0) {
+            return Err(StorageError::invalid_argument(
+                "append ingest max_in_flight_bytes_per_storage_node must be greater than zero when configured",
             ));
         }
         Ok(())

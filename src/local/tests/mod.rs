@@ -10475,6 +10475,26 @@ fn durable_append_ingest_admission_policy_rejects_invalid_values() {
     let cfg = config();
     let invalid = AppendIngestAdmissionPolicy {
         max_in_flight_bytes: Some(0),
+        ..AppendIngestAdmissionPolicy::default()
+    };
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                admission: invalid,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .is_err()
+    );
+    let invalid = AppendIngestAdmissionPolicy {
+        max_in_flight_bytes_per_storage_node: Some(0),
+        ..AppendIngestAdmissionPolicy::default()
     };
     assert!(
         DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
@@ -10559,11 +10579,40 @@ fn durable_append_ingest_data_log_policy_rejects_invalid_values() {
 }
 
 #[test]
+fn append_ingest_admission_gate_tracks_bytes_until_permit_drop() {
+    let gate = Arc::new(AppendIngestAdmissionGate::default());
+    let policy = AppendIngestAdmissionPolicy {
+        max_in_flight_bytes: Some(100),
+        ..AppendIngestAdmissionPolicy::default()
+    };
+
+    let first = gate.acquire(60, policy, true).unwrap();
+    assert_eq!(first.max_in_flight_bytes(), 100);
+    assert_eq!(lock(&gate.inner).unwrap().in_flight_bytes, 60);
+
+    let second = gate.acquire(40, policy, true).unwrap();
+    assert_eq!(lock(&gate.inner).unwrap().in_flight_bytes, 100);
+
+    drop(first);
+    assert_eq!(lock(&gate.inner).unwrap().in_flight_bytes, 40);
+
+    drop(second);
+    assert_eq!(lock(&gate.inner).unwrap().in_flight_bytes, 0);
+
+    let oversized = gate.acquire(150, policy, true).unwrap();
+    assert_eq!(lock(&gate.inner).unwrap().in_flight_bytes, 150);
+
+    drop(oversized);
+    assert_eq!(lock(&gate.inner).unwrap().in_flight_bytes, 0);
+}
+
+#[test]
 fn durable_append_ingest_profile_records_payload_write() {
     let root = durable_temp_dir("append-ingest-profile");
     let cfg = config();
     let policy = AppendIngestAdmissionPolicy {
         max_in_flight_bytes: Some(4096),
+        max_in_flight_bytes_per_storage_node: Some(4096),
     };
     let store =
         DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
@@ -10610,6 +10659,7 @@ fn durable_append_ingest_profile_records_payload_write() {
     assert_eq!(profile.storage_node, cfg.storage_node.raw());
     assert_eq!(profile.payload_bytes, 4096);
     assert_eq!(profile.max_in_flight_bytes, 4096);
+    assert_eq!(profile.max_in_flight_bytes_per_storage_node, 4096);
     assert!(profile.payload_write_nanos > 0);
     assert_eq!(profile.background_sync_request_count, 0);
     assert_eq!(profile.background_sync_step_bytes, 0);

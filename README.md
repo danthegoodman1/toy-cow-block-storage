@@ -562,6 +562,36 @@ absorbed the unfinished payload sync. Earlier 8 MiB / 16 MiB async request
 cadences and four background sync workers did not fix the publish tail locally,
 so that hypothesis was not escalated to GCP as a performance improvement.
 
+A June 8, 2026 PT append-admission sweep added an explicit per-storage-node
+append-ingest cap, `--append-ingest-max-in-flight-per-storage-node-mib`, and
+records `max_in_flight_bytes_per_storage_node` in append-ingest profiles. The
+global cap was also tightened so configured permits are held through
+provider-private auto-persist sync. On the `c4-standard-288-lssd`
+`raid-split-journal` shape, the global cap was not a latency win: tight caps
+reduced file-sync p99 but moved the same or more time into admission wait. The
+per-storage-node cap is a useful benchmark control, but not a new default.
+
+The best balanced steady lane sweep was `nodecap128m + lanes4 + bg4 + step8m`:
+throughput stayed in the `15.7-16.1 GB/s` class, average append p99 was
+`111.0 ms`, max append p99 was `115.8 ms`, average publish p99 was `8.3 ms`,
+and max publish p99 was `10.7 ms`. More active lanes reduced some lock waits
+but did not consistently reduce append p99; the tail remained a mix of
+`active_log_lock_wait`, payload write, and auto-persist file sync:
+
+| Per-node cap | Active lanes | Avg throughput | Avg append p99 | Max append p99 | Avg publish p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| `128 MiB` | `2` | 15.98 GB/s | 114.6 ms | 119.3 ms | 7.2 ms |
+| `128 MiB` | `4` | 15.87 GB/s | 111.0 ms | 115.8 ms | 8.3 ms |
+| `128 MiB` | `8` | 15.67 GB/s | 112.0 ms | 121.1 ms | 6.2 ms |
+| `256 MiB` | `2` | 15.70 GB/s | 114.7 ms | 123.9 ms | 7.8 ms |
+| `256 MiB` | `4` | 15.85 GB/s | 115.4 ms | 124.2 ms | 5.2 ms |
+| `256 MiB` | `8` | 15.69 GB/s | 110.7 ms | 122.3 ms | 7.0 ms |
+
+This leaves append p99 close to the 32 MiB Rapid Storage interval/at-end rows,
+but not reliably below `100 ms` at the same throughput. Further p99 reductions
+probably need to reduce the auto-persist sync critical path or smooth device
+queueing; admission alone mostly trades file-sync tail for queueing tail.
+
 Raw C4 artifacts are local and ignored under
 `infra/gcp-local-nvme-bench/results/`, specifically
 `gcp-c4-192-layout-20260607-125041`, `c48887-06071318`, and
@@ -571,8 +601,10 @@ Raw C4 artifacts are local and ignored under
 `c4288-prealloc-target32-06071829`,
 `c4288-prealloc-target32-rand-06071837`,
 `c4288-coalesce4-rand-06071852`, `c4288-quantum-0608`,
-`c4288-quantum16-0608`, and `c4288-storage-nodes-0608`. The
-temporary GCP instances, networks, subnets, and firewall rules were deleted
+`c4288-quantum16-0608`, `c4288-storage-nodes-0608`,
+`c4288-admitcap-0608`, `c4288-nodecap-0608`, and
+`c4288-nodecap-lanes-0608`. The temporary GCP instances, networks, subnets,
+and firewall rules were deleted
 after the runs.
 
 `cargo bench --bench regression` is the Criterion mechanism suite.
