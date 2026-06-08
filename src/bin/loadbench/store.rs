@@ -65,7 +65,7 @@ impl BenchStore {
                         },
                         append_visible_journal,
                         args.append_publish_batch_policy,
-                        args.append_ingest_admission_policy,
+                        args.append_ingest_policy,
                     )?,
                 );
                 if args.durable_profile_csv.is_some() {

@@ -24,6 +24,7 @@ APPEND_PUBLISH_BATCH_TARGET="${APPEND_PUBLISH_BATCH_TARGET:-4}"
 APPEND_PUBLISH_IDLE_COALESCE_US="${APPEND_PUBLISH_IDLE_COALESCE_US:-250}"
 APPEND_PUBLISH_MAX_COALESCE_US="${APPEND_PUBLISH_MAX_COALESCE_US:-5000}"
 APPEND_INGEST_MAX_IN_FLIGHT_MIBS="${APPEND_INGEST_MAX_IN_FLIGHT_MIBS:-none}"
+APPEND_INGEST_ACTIVE_LOG_LANES="${APPEND_INGEST_ACTIVE_LOG_LANES:-1}"
 
 IFS=',' read -r -a RTT_VALUES <<<"${RTTS}"
 if (( ${#RTT_VALUES[@]} == 0 )); then
@@ -110,6 +111,7 @@ fi
   echo "append_publish_idle_coalesce_us=${APPEND_PUBLISH_IDLE_COALESCE_US}"
   echo "append_publish_max_coalesce_us=${APPEND_PUBLISH_MAX_COALESCE_US}"
   echo "append_ingest_max_in_flight_mibs=${APPEND_INGEST_MAX_IN_FLIGHT_MIBS}"
+  echo "append_ingest_active_log_lanes=${APPEND_INGEST_ACTIVE_LOG_LANES}"
   echo "disk_count=${#DISKS[@]}"
   printf 'disks=%s\n' "${DISKS[*]}"
   echo
@@ -266,6 +268,7 @@ run_layout() {
   local journal_dir="${3:-}"
   local node_dirs="${4:-}"
   local append_ingest_cap_mib="${5:-none}"
+  local append_ingest_active_log_lanes="${6:-1}"
   local append_ingest_label
   local append_ingest_args=()
   case "${append_ingest_cap_mib}" in
@@ -277,12 +280,15 @@ run_layout() {
       append_ingest_args+=(--append-ingest-max-in-flight-mib "${append_ingest_cap_mib}")
       ;;
   esac
+  append_ingest_label="${append_ingest_label}-lanes${append_ingest_active_log_lanes}"
+  append_ingest_args+=(--append-ingest-active-log-lanes "${append_ingest_active_log_lanes}")
   mode="${mode}-${append_ingest_label}"
   local out="${RESULT_ROOT}/loadbench/${mode}"
   mkdir -p "${out}"
   {
     echo "mode=${mode}"
     echo "append_ingest_max_in_flight_mib=${append_ingest_cap_mib}"
+    echo "append_ingest_active_log_lanes=${append_ingest_active_log_lanes}"
     echo "root=${root}"
     echo "journal_dir=${journal_dir}"
     echo "node_dirs=${node_dirs}"
@@ -576,6 +582,7 @@ with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
         "payload_bytes_sum",
         "background_sync_requested_bytes_sum",
         "max_in_flight_bytes_max",
+        "active_log_lanes_max",
         "success_count",
     ])
     writer = csv.DictWriter(f, fieldnames=fields)
@@ -591,6 +598,7 @@ with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
             "payload_bytes_sum": sum(int(to_float(r, "payload_bytes")) for r in rows),
             "background_sync_requested_bytes_sum": sum(int(to_float(r, "background_sync_requested_bytes")) for r in rows),
             "max_in_flight_bytes_max": max((int(to_float(r, "max_in_flight_bytes")) for r in rows), default=0),
+            "active_log_lanes_max": max((int(to_float(r, "active_log_lanes")) for r in rows), default=0),
             "success_count": sum(1 for r in rows if to_bool(r, "success")),
         }
         for name in append_ingest_fields:
@@ -919,6 +927,7 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
         "append_ingest_payload_write_p99_ms",
         "append_ingest_auto_persist_p99_ms",
         "append_ingest_max_in_flight_bytes",
+        "append_ingest_active_log_lanes",
     ]
     writer = csv.DictWriter(f, fieldnames=fields)
     writer.writeheader()
@@ -986,6 +995,7 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
             "append_ingest_payload_write_p99_ms": ingest.get("payload_write_nanos_p99_ms", 0),
             "append_ingest_auto_persist_p99_ms": ingest.get("auto_persist_nanos_p99_ms", 0),
             "append_ingest_max_in_flight_bytes": ingest.get("max_in_flight_bytes_max", 0),
+            "append_ingest_active_log_lanes": ingest.get("active_log_lanes_max", 0),
         })
 PY
 }
@@ -995,32 +1005,44 @@ IFS=',' read -r -a requested_append_ingest_caps <<<"${APPEND_INGEST_MAX_IN_FLIGH
 if (( ${#requested_append_ingest_caps[@]} == 0 )); then
   requested_append_ingest_caps=("none")
 fi
+IFS=',' read -r -a requested_append_ingest_active_log_lanes <<<"${APPEND_INGEST_ACTIVE_LOG_LANES}"
+if (( ${#requested_append_ingest_active_log_lanes[@]} == 0 )); then
+  requested_append_ingest_active_log_lanes=("1")
+fi
 for layout in "${requested_layouts[@]}"; do
   case "${layout}" in
     raid-shared)
       setup_raid_shared
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}"
+        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+          run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+        done
       done
       ;;
     raid-split-journal)
       setup_raid_split_journal
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}"
+        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+          run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+        done
       done
       ;;
     node-private-journal)
       setup_node_private_journal
       NODE_DIRS="$(csv_join_node_dirs)"
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}"
+        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+          run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+        done
       done
       ;;
     node-private-raid-journal)
       setup_node_private_raid_journal
       NODE_DIRS="$(csv_join_node_dirs)"
       for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
-        run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}"
+        for append_ingest_active_log_lanes in "${requested_append_ingest_active_log_lanes[@]}"; do
+          run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}" "${append_ingest_active_log_lanes}"
+        done
       done
       ;;
     *)

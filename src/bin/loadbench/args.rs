@@ -29,7 +29,7 @@ struct Args {
     target_data_log_bytes: u64,
     data_log_file_sync_fanout: usize,
     append_publish_batch_policy: AppendPublishBatchPolicy,
-    append_ingest_admission_policy: AppendIngestAdmissionPolicy,
+    append_ingest_policy: AppendIngestPolicy,
     stream_publish_bytes: Option<u64>,
     stream_total_bytes: u64,
     stream_auto_persist_bytes: Option<u64>,
@@ -77,7 +77,7 @@ impl Args {
             target_data_log_bytes: 64 * 1024 * 1024,
             data_log_file_sync_fanout: 4,
             append_publish_batch_policy: AppendPublishBatchPolicy::default(),
-            append_ingest_admission_policy: AppendIngestAdmissionPolicy::default(),
+            append_ingest_policy: AppendIngestPolicy::default(),
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,
             stream_auto_persist_bytes: None,
@@ -219,8 +219,12 @@ impl Args {
                 }
                 "--append-ingest-max-in-flight-mib" => {
                     let mib: u64 = parse_next(&mut raw, flag.as_str())?;
-                    args.append_ingest_admission_policy.max_in_flight_bytes =
+                    args.append_ingest_policy.admission.max_in_flight_bytes =
                         Some(mib_to_bytes(mib, flag.as_str())?);
+                }
+                "--append-ingest-active-log-lanes" => {
+                    args.append_ingest_policy.data_log.active_log_lanes =
+                        parse_next(&mut raw, flag.as_str())?;
                 }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
@@ -330,7 +334,7 @@ impl Args {
             ));
         }
         args.append_publish_batch_policy.validate()?;
-        args.append_ingest_admission_policy.validate()?;
+        args.append_ingest_policy.validate()?;
         if args.device_blocks < args.shards as u64 {
             return Err(StorageError::invalid_argument(
                 "device-blocks must be at least shards",
@@ -466,6 +470,7 @@ options:\n\
   --append-publish-idle-coalesce-us N      durable append publish idle coalesce wait, default: 250\n\
   --append-publish-max-coalesce-us N       durable append publish max coalesce wait, default: 5000\n\
   --append-ingest-max-in-flight-mib N      durable append ingest max in-flight MiB, default: disabled\n\
+  --append-ingest-active-log-lanes N       active append-run data logs per storage node, default: 1\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --stream-auto-persist-mib N              durable stream payload dirty-tail sync threshold\n\

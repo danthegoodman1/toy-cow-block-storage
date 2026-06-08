@@ -20,6 +20,7 @@ pub struct DurableCoordinator {
     append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
     append_publish_batch_policy: AppendPublishBatchPolicy,
     append_ingest_admission_policy: AppendIngestAdmissionPolicy,
+    append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     append_ingest_admission: Arc<AppendIngestAdmissionGate>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
@@ -277,7 +278,7 @@ impl DurableCoordinator {
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             AppendPublishBatchPolicy::default(),
-            AppendIngestAdmissionPolicy::default(),
+            AppendIngestPolicy::default(),
         )
     }
 
@@ -301,12 +302,12 @@ impl DurableCoordinator {
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             append_publish_batch_policy,
-            AppendIngestAdmissionPolicy::default(),
+            AppendIngestPolicy::default(),
         )
     }
 
     /// Open a durable store with explicit storage nodes, split journal layout,
-    /// append publish batching, and append ingest admission policies.
+    /// append publish batching, and append ingest policies.
     ///
     /// The policies change only local durable scheduling. They do not change the
     /// visible or restart-durable append publish contract.
@@ -317,7 +318,7 @@ impl DurableCoordinator {
         policy: DurableDataLogPolicy,
         append_visible_publish_journal: Option<PathBuf>,
         append_publish_batch_policy: AppendPublishBatchPolicy,
-        append_ingest_admission_policy: AppendIngestAdmissionPolicy,
+        append_ingest_policy: AppendIngestPolicy,
     ) -> Result<Self> {
         Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
             root,
@@ -326,7 +327,7 @@ impl DurableCoordinator {
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             append_publish_batch_policy,
-            append_ingest_admission_policy,
+            append_ingest_policy,
         )
     }
 
@@ -366,7 +367,7 @@ impl DurableCoordinator {
             maintenance_policy,
             None,
             AppendPublishBatchPolicy::default(),
-            AppendIngestAdmissionPolicy::default(),
+            AppendIngestPolicy::default(),
         )
     }
 
@@ -386,7 +387,7 @@ impl DurableCoordinator {
             maintenance_policy,
             None,
             append_publish_batch_policy,
-            AppendIngestAdmissionPolicy::default(),
+            AppendIngestPolicy::default(),
         )
     }
 
@@ -397,12 +398,12 @@ impl DurableCoordinator {
         maintenance_policy: MaintenancePolicy,
         append_visible_publish_journal: Option<PathBuf>,
         append_publish_batch_policy: AppendPublishBatchPolicy,
-        append_ingest_admission_policy: AppendIngestAdmissionPolicy,
+        append_ingest_policy: AppendIngestPolicy,
     ) -> Result<Self> {
         config.validate()?;
         maintenance_policy.validate()?;
         append_publish_batch_policy.validate()?;
-        append_ingest_admission_policy.validate()?;
+        append_ingest_policy.validate()?;
         let storage_nodes = normalize_storage_nodes(config.storage_node, storage_nodes);
         let paths = match append_visible_publish_journal {
             Some(path) => DurableStorePaths::new_with_append_visible_publish_journal(
@@ -414,6 +415,7 @@ impl DurableCoordinator {
         let durable = DurableSqliteStore::open(
             paths,
             maintenance_policy.data_log_policy,
+            append_ingest_policy.data_log,
             storage_nodes.clone(),
         )?;
 
@@ -443,7 +445,8 @@ impl DurableCoordinator {
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
             append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
             append_publish_batch_policy,
-            append_ingest_admission_policy,
+            append_ingest_admission_policy: append_ingest_policy.admission,
+            append_ingest_data_log_policy: append_ingest_policy.data_log,
             append_ingest_admission: Arc::new(AppendIngestAdmissionGate::default()),
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
@@ -628,6 +631,10 @@ impl DurableCoordinator {
     /// Return the provider-private append ingest admission policy.
     pub fn append_ingest_admission_policy(&self) -> AppendIngestAdmissionPolicy {
         self.append_ingest_admission_policy
+    }
+
+    pub fn append_ingest_data_log_policy(&self) -> AppendIngestDataLogPolicy {
+        self.append_ingest_data_log_policy
     }
 
     fn maybe_auto_persist_append_stream(
@@ -2776,6 +2783,8 @@ impl DurableCoordinator {
             profile.payload_encode_nanos = data_profile.encode_nanos;
             profile.payload_write_nanos = data_profile.write_nanos;
             profile.active_log_lock_wait_nanos = data_profile.active_log_lock_wait_nanos;
+            profile.active_log_lane = data_profile.active_log_lane;
+            profile.active_log_lanes = data_profile.active_log_lanes;
             let appended_log_refs = append.log_refs();
             let pending_lock_started = ingest_profile_enabled.then(Instant::now);
             lock(&lane.pending)?.merge(append);

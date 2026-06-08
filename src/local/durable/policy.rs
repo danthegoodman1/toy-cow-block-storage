@@ -123,6 +123,56 @@ impl AppendIngestAdmissionPolicy {
     }
 }
 
+/// Provider-private data-log layout policy for durable append ingest.
+///
+/// This controls how many active append-run data logs each storage node may
+/// write concurrently. It does not change append-stream ordering, visibility,
+/// or durability semantics; each accepted run still records its concrete log
+/// reference and file offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendIngestDataLogPolicy {
+    /// Active append-run data-log lanes per storage node.
+    pub active_log_lanes: usize,
+}
+
+impl Default for AppendIngestDataLogPolicy {
+    fn default() -> Self {
+        Self {
+            active_log_lanes: 1,
+        }
+    }
+}
+
+impl AppendIngestDataLogPolicy {
+    /// Validate that append ingest data-log lane selection can make progress.
+    pub fn validate(self) -> Result<()> {
+        if self.active_log_lanes == 0 {
+            return Err(StorageError::invalid_argument(
+                "append ingest active_log_lanes must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Provider-private policy bundle for durable append ingest.
+///
+/// This groups queue-depth admission and local data-log lane layout below the
+/// public append-stream API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendIngestPolicy {
+    pub admission: AppendIngestAdmissionPolicy,
+    pub data_log: AppendIngestDataLogPolicy,
+}
+
+impl AppendIngestPolicy {
+    /// Validate all append ingest provider-private knobs.
+    pub fn validate(self) -> Result<()> {
+        self.admission.validate()?;
+        self.data_log.validate()
+    }
+}
+
 /// Durable data-log identity within a storage node.
 ///
 /// The pair is provider-owned diagnostic state. Public block and native callers

@@ -7032,6 +7032,280 @@ fn durable_append_run_payloads_share_node_owned_active_log_across_streams() {
 }
 
 #[test]
+fn durable_append_run_payloads_can_shard_node_active_logs_by_stream() {
+    let root = durable_temp_dir("append-run-node-active-log-lanes");
+    let cfg = config();
+    let ingest_data_log_policy = AppendIngestDataLogPolicy {
+        active_log_lanes: 2,
+    };
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy {
+                target_data_log_bytes: 1024 * 1024,
+                file_sync_fanout: 4,
+                min_reclaimable_ratio_ppm: 1,
+                min_reclaimable_bytes: 1,
+                max_compaction_copy_bytes: u64::MAX,
+            },
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: ingest_data_log_policy,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.append_ingest_data_log_policy(),
+        ingest_data_log_policy
+    );
+
+    let first_bytes = repeated_blocks(1, 11);
+    let second_bytes = repeated_blocks(1, 12);
+    let first = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(77),
+        storage_node: cfg.storage_node,
+        stream_id: AppendStreamId::from_raw(88),
+        writer_epoch: WriterEpoch::from_raw(3),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(5),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![first_bytes.as_slice()],
+        background_sync_step_bytes: None,
+    };
+    let second = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(78),
+        storage_node: cfg.storage_node,
+        stream_id: AppendStreamId::from_raw(89),
+        writer_epoch: WriterEpoch::from_raw(4),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(6),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![second_bytes.as_slice()],
+        background_sync_step_bytes: None,
+    };
+
+    let (first_run, first_pending, first_profile) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(first, None)
+        .unwrap();
+    let (second_run, second_pending, second_profile) = store
+        .durable
+        .write_append_run_payload_chunks_unsynced(second, None)
+        .unwrap();
+
+    assert_eq!(first_run.storage_node, second_run.storage_node);
+    assert_ne!(first_run.log_id, second_run.log_id);
+    assert_eq!(first_run.log_payload_offset, 0);
+    assert_eq!(second_run.log_payload_offset, 0);
+    assert_eq!(first_profile.active_log_lanes, 2);
+    assert_eq!(second_profile.active_log_lanes, 2);
+    assert_ne!(
+        first_profile.active_log_lane,
+        second_profile.active_log_lane
+    );
+
+    let first_manifest = first_pending.logs.values().next().unwrap();
+    let second_manifest = second_pending.logs.values().next().unwrap();
+    assert_ne!(first_manifest.state, second_manifest.state);
+    assert!(is_stream_data_log_state(&first_manifest.state));
+    assert!(is_stream_data_log_state(&second_manifest.state));
+
+    let mut combined_pending = first_pending;
+    combined_pending.merge(second_pending);
+    let selected = BTreeSet::from([
+        DurableDataLogRef {
+            storage_node: first_run.storage_node,
+            log_id: first_run.log_id,
+        },
+        DurableDataLogRef {
+            storage_node: second_run.storage_node,
+            log_id: second_run.log_id,
+        },
+    ]);
+    assert!(
+        store
+            .durable
+            .pending_append_run_manifests_for_log_refs(&selected, None)
+            .is_err(),
+        "multi-lane manifest reconstruction must not guess row-absent lane state"
+    );
+    store
+        .durable
+        .persist_data_log_manifests_only(&combined_pending)
+        .unwrap();
+
+    let catalog_manifests = store
+        .durable
+        .pending_append_run_manifests_for_log_refs(&selected, None)
+        .unwrap();
+    let catalog_states = catalog_manifests
+        .logs
+        .values()
+        .map(|manifest| manifest.state.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(catalog_states.len(), 2);
+
+    drop(store);
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy::default(),
+        )
+        .is_err(),
+        "reopen with a different active-log lane count must be rejected"
+    );
+    let reopened =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: ingest_data_log_policy,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .unwrap();
+    let third_bytes = repeated_blocks(1, 13);
+    let third = DurableAppendRunChunkPayload {
+        run_id: AppendRunId::from_raw(79),
+        storage_node: cfg.storage_node,
+        stream_id: AppendStreamId::from_raw(88),
+        writer_epoch: WriterEpoch::from_raw(5),
+        keyspace_id: KeyspaceId::from_raw(4),
+        file_id: FileId::from_raw(7),
+        file_offset_start: 0,
+        payload_integrity: PayloadIntegrity::Verified,
+        chunks: vec![third_bytes.as_slice()],
+        background_sync_step_bytes: None,
+    };
+    let (third_run, _, third_profile) = reopened
+        .durable
+        .write_append_run_payload_chunks_unsynced(third, None)
+        .unwrap();
+    assert_eq!(third_run.log_id, first_run.log_id);
+    assert_eq!(third_run.log_payload_offset, first_run.payload_len);
+    assert_eq!(third_profile.active_log_lane, first_profile.active_log_lane);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_multilane_append_run_survives_publish_compaction_and_reopen() {
+    let root = durable_temp_dir("append-run-lanes-compact-reopen");
+    let cfg = config();
+    let data_log_policy = DurableDataLogPolicy {
+        target_data_log_bytes: 4096,
+        file_sync_fanout: 4,
+        min_reclaimable_ratio_ppm: 1,
+        min_reclaimable_bytes: 1,
+        max_compaction_copy_bytes: u64::MAX,
+    };
+    let ingest_data_log_policy = AppendIngestDataLogPolicy {
+        active_log_lanes: 2,
+    };
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            data_log_policy,
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: ingest_data_log_policy,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let first = repeated_blocks(1, 21);
+    let second = repeated_blocks(1, 22);
+    store
+        .append_stream(&stream, &first, WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .append_stream(&stream, &second, WriteDurability::Acknowledged)
+        .unwrap();
+    store
+        .publish_append_stream(&stream, (first.len() + second.len()) as u64)
+        .unwrap();
+
+    let before = store.durable.data_log_states_for_test().unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|(_, state)| state.starts_with("stream-active-")),
+        "published multi-lane append runs should keep suffixed stream data-log state"
+    );
+    let report = store
+        .compact_data_logs(DurableDataLogPolicy::compact_everything_for_test())
+        .unwrap();
+    assert!(
+        report.deleted_logs.is_empty(),
+        "stream append-run logs must not look reclaimable to segment compaction"
+    );
+
+    drop(store);
+    let reopened =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            data_log_policy,
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: ingest_data_log_policy,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .unwrap();
+    let mut read = vec![0; first.len() + second.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, read.len() as u64),
+            &mut read,
+        )
+        .unwrap();
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(read, expected);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_store_selects_append_run_manifests_and_sealed_refs() {
     let root = durable_temp_dir("append-run-manifest-selection");
     let cfg = config();
@@ -9956,7 +10230,35 @@ fn durable_append_ingest_admission_policy_rejects_invalid_values() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
-            invalid,
+            AppendIngestPolicy {
+                admission: invalid,
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .is_err()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_ingest_data_log_policy_rejects_invalid_values() {
+    let root = durable_temp_dir("append-ingest-data-log-policy-invalid");
+    let cfg = config();
+    let invalid = AppendIngestDataLogPolicy {
+        active_log_lanes: 0,
+    };
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: invalid,
+                ..AppendIngestPolicy::default()
+            },
         )
         .is_err()
     );
@@ -9978,7 +10280,10 @@ fn durable_append_ingest_profile_records_payload_write() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
-            policy,
+            AppendIngestPolicy {
+                admission: policy,
+                ..AppendIngestPolicy::default()
+            },
         )
         .unwrap();
     assert_eq!(store.append_ingest_admission_policy(), policy);

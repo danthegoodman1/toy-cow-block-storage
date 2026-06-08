@@ -233,7 +233,7 @@ fn append_append_ingest_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,stream_id,storage_node,payload_bytes,total_nanos,admission_wait_nanos,stream_lock_wait_nanos,pending_lock_wait_nanos,active_log_lock_wait_nanos,metadata_prepare_nanos,metadata_record_nanos,payload_encode_nanos,payload_write_nanos,auto_persist_nanos,background_sync_requested_bytes,max_in_flight_bytes,success";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,stream_id,storage_node,active_log_lane,active_log_lanes,payload_bytes,total_nanos,admission_wait_nanos,stream_lock_wait_nanos,pending_lock_wait_nanos,active_log_lock_wait_nanos,metadata_prepare_nanos,metadata_record_nanos,payload_encode_nanos,payload_write_nanos,auto_persist_nanos,background_sync_requested_bytes,max_in_flight_bytes,success";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -247,6 +247,8 @@ fn append_append_ingest_profile_csv(
             profile.sequence.to_string(),
             profile.stream_id.to_string(),
             profile.storage_node.to_string(),
+            profile.active_log_lane.to_string(),
+            profile.active_log_lanes.to_string(),
             profile.payload_bytes.to_string(),
             profile.total_nanos.to_string(),
             profile.admission_wait_nanos.to_string(),

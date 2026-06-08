@@ -4,6 +4,7 @@ pub(super) struct DurableSqliteStore {
     conn: Arc<Mutex<Connection>>,
     node_catalogs: Arc<NodeCatalogs>,
     policy: DurableDataLogPolicy,
+    append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     append_log_service: Arc<StorageNodeAppendLogService>,
     native_publish_journal_lock: Arc<Mutex<()>>,
@@ -161,6 +162,8 @@ pub struct AppendIngestProfile {
     pub sequence: u64,
     pub stream_id: u128,
     pub storage_node: u128,
+    pub active_log_lane: u64,
+    pub active_log_lanes: u64,
     pub payload_bytes: u64,
     pub total_nanos: u64,
     pub admission_wait_nanos: u64,
@@ -446,6 +449,8 @@ pub(super) struct DataLogAppendProfile {
     encode_nanos: u64,
     write_nanos: u64,
     active_log_lock_wait_nanos: u64,
+    active_log_lane: u64,
+    active_log_lanes: u64,
     file_sync_nanos: u64,
     file_sync_sum_nanos: u64,
     file_sync_max_nanos: u64,
@@ -463,6 +468,8 @@ impl DataLogAppendProfile {
         self.active_log_lock_wait_nanos = self
             .active_log_lock_wait_nanos
             .saturating_add(other.active_log_lock_wait_nanos);
+        self.active_log_lane = self.active_log_lane.max(other.active_log_lane);
+        self.active_log_lanes = self.active_log_lanes.max(other.active_log_lanes);
         self.file_sync_nanos = self.file_sync_nanos.saturating_add(other.file_sync_nanos);
         self.file_sync_sum_nanos = self
             .file_sync_sum_nanos
@@ -784,6 +791,7 @@ struct StorageNodeAppendLogService {
     paths: DurableStorePaths,
     node_catalogs: Arc<NodeCatalogs>,
     policy: DurableDataLogPolicy,
+    append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     lanes: Mutex<BTreeMap<StorageNodeId, Arc<StorageNodeAppendLogLane>>>,
     synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
@@ -908,7 +916,9 @@ impl StorageNodeAppendLogService {
 
         let record_len = payload_bytes;
         let storage_node = payload.storage_node;
-        let active_state = STREAM_DATA_LOG_STATE_ACTIVE.to_string();
+        let active_log_lanes = self.append_ingest_data_log_policy.active_log_lanes;
+        let active_log_lane = stream_data_log_lane_for_stream(payload.stream_id, active_log_lanes);
+        let active_state = stream_data_log_state_for_lane(active_log_lane, active_log_lanes);
         let lane = self.lane_for_node(storage_node)?;
         let active_handle = lane.active_handle_for_state(
             &active_state,
@@ -919,7 +929,11 @@ impl StorageNodeAppendLogService {
             },
         )?;
 
-        let mut profile = DataLogAppendProfile::default();
+        let mut profile = DataLogAppendProfile {
+            active_log_lane: usize_to_u64(active_log_lane),
+            active_log_lanes: usize_to_u64(active_log_lanes),
+            ..DataLogAppendProfile::default()
+        };
         let active_lock_started = Instant::now();
         let mut active = lock(active_handle.as_ref())?;
         profile.active_log_lock_wait_nanos = duration_nanos_u64(active_lock_started.elapsed());
@@ -1969,15 +1983,36 @@ pub(super) const STREAM_DATA_LOG_STATE_ACTIVE: &str = "stream-active";
 
 pub(super) fn is_stream_data_log_state(state: &str) -> bool {
     state == STREAM_DATA_LOG_STATE_ACTIVE
+        || state
+            .strip_prefix("stream-active-")
+            .is_some_and(|lane| !lane.is_empty() && lane.parse::<usize>().is_ok())
+}
+
+fn stream_data_log_state_for_lane(lane: usize, lane_count: usize) -> String {
+    if lane_count <= 1 {
+        STREAM_DATA_LOG_STATE_ACTIVE.to_string()
+    } else {
+        format!("{STREAM_DATA_LOG_STATE_ACTIVE}-{lane}")
+    }
+}
+
+fn stream_data_log_lane_for_stream(stream_id: AppendStreamId, lane_count: usize) -> usize {
+    if lane_count <= 1 {
+        0
+    } else {
+        (stream_id.raw() % lane_count as u128) as usize
+    }
 }
 
 impl DurableSqliteStore {
     fn open(
         paths: DurableStorePaths,
         policy: DurableDataLogPolicy,
+        append_ingest_data_log_policy: AppendIngestDataLogPolicy,
         configured_storage_nodes: Vec<StorageNodeId>,
     ) -> Result<Self> {
         policy.validate()?;
+        append_ingest_data_log_policy.validate()?;
         let metadata_existed = paths.metadata.exists();
         let conn = Connection::open(&paths.metadata).map_err(sqlite_error)?;
         configure_sqlite_connection(&conn)?;
@@ -1986,6 +2021,11 @@ impl DurableSqliteStore {
         reject_legacy_device_head_tables_if_present(&conn)?;
         reject_legacy_keyspace_head_tables_if_present(&conn)?;
         let node_catalogs = Arc::new(NodeCatalogs::open(&paths, configured_storage_nodes)?);
+        Self::validate_or_initialize_store_layout(
+            &conn,
+            node_catalogs.as_ref(),
+            append_ingest_data_log_policy,
+        )?;
         let data_log_allocation_locks =
             Arc::new(StorageNodeDataLogAllocationLocks::default());
         #[cfg(test)]
@@ -2002,6 +2042,7 @@ impl DurableSqliteStore {
             paths: paths.clone(),
             node_catalogs: Arc::clone(&node_catalogs),
             policy,
+            append_ingest_data_log_policy,
             allocation_locks: Arc::clone(&data_log_allocation_locks),
             lanes: Mutex::new(BTreeMap::new()),
             synced_logs: synced_append_logs,
@@ -2018,6 +2059,7 @@ impl DurableSqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             node_catalogs,
             policy,
+            append_ingest_data_log_policy,
             data_log_allocation_locks,
             append_log_service,
             native_publish_journal_lock: Arc::new(Mutex::new(())),
@@ -2058,6 +2100,11 @@ impl DurableSqliteStore {
               next_extent_id TEXT NOT NULL,
               next_segment_id TEXT NOT NULL,
               next_placement_index INTEGER NOT NULL CHECK (next_placement_index >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS store_layout (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              append_ingest_active_log_lanes INTEGER NOT NULL
+                CHECK (append_ingest_active_log_lanes > 0)
             );
             CREATE TABLE IF NOT EXISTS maintenance_state (
               id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -2454,6 +2501,82 @@ impl DurableSqliteStore {
             tx.commit().map_err(sqlite_error)?;
         }
         Ok(())
+    }
+
+    fn validate_or_initialize_store_layout(
+        conn: &Connection,
+        node_catalogs: &NodeCatalogs,
+        append_ingest_data_log_policy: AppendIngestDataLogPolicy,
+    ) -> Result<()> {
+        let expected_lanes = append_ingest_data_log_policy.active_log_lanes;
+        let existing_lanes = conn
+            .query_row(
+                "SELECT append_ingest_active_log_lanes FROM store_layout WHERE id = 1",
+                [],
+                |row| i64_to_u64(row.get::<_, i64>(0)?),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .map(|lanes| {
+                usize::try_from(lanes).map_err(|_| {
+                    StorageError::corrupt("append ingest active log lane count overflows usize")
+                })
+            })
+            .transpose()?;
+        if let Some(existing_lanes) = existing_lanes {
+            if existing_lanes != expected_lanes {
+                return Err(StorageError::corrupt(
+                    "durable SQLite layout disagrees with append ingest data-log lane policy",
+                ));
+            }
+            return Ok(());
+        }
+
+        if expected_lanes != AppendIngestDataLogPolicy::default().active_log_lanes
+            && (Self::has_materialized_store_state(conn)?
+                || Self::has_any_stream_data_log_rows(node_catalogs)?)
+        {
+            return Err(StorageError::corrupt(
+                "existing durable SQLite layout has no append ingest lane policy",
+            ));
+        }
+
+        conn.execute(
+            "INSERT INTO store_layout(id, append_ingest_active_log_lanes)
+             VALUES (1, ?1)",
+            params![u64_to_i64(usize_to_u64(expected_lanes))?],
+        )
+        .map_err(sqlite_error)?;
+        Ok(())
+    }
+
+    fn has_materialized_store_state(conn: &Connection) -> Result<bool> {
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM store_meta", [], |row| row.get(0))
+            .map_err(sqlite_error)?;
+        Ok(count > 0)
+    }
+
+    fn has_any_stream_data_log_rows(node_catalogs: &NodeCatalogs) -> Result<bool> {
+        for storage_node in node_catalogs.storage_nodes() {
+            let conn = node_catalogs.lock(storage_node)?;
+            let data_logs = node_catalog_table(storage_node, "data_logs")?;
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT state
+                     FROM {data_logs}
+                     WHERE state != 'deleted'"
+                ))
+                .map_err(sqlite_error)?;
+            let mut rows = stmt.query([]).map_err(sqlite_error)?;
+            while let Some(row) = rows.next().map_err(sqlite_error)? {
+                let state: String = row.get(0).map_err(sqlite_error)?;
+                if is_stream_data_log_state(&state) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn load_storage_registry_from_node_catalogs(
@@ -3627,20 +3750,54 @@ impl DurableSqliteStore {
             .unwrap_or_default();
         let pending_refs = pending.log_refs();
         for log_ref in log_refs.difference(&pending_refs) {
-            let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
-            let total_bytes = path.metadata().map_err(fs_error)?.len();
-            pending.logs.insert(
-                *log_ref,
-                PendingDataLogManifest {
-                    storage_node: log_ref.storage_node,
-                    log_id: log_ref.log_id,
-                    state: STREAM_DATA_LOG_STATE_ACTIVE.to_string(),
-                    total_bytes,
-                    needs_dir_sync: false,
-                },
-            );
+            pending.logs.insert(*log_ref, self.data_log_manifest_for_ref(*log_ref)?);
         }
         Ok(pending)
+    }
+
+    fn data_log_manifest_for_ref(
+        &self,
+        log_ref: DurableDataLogRef,
+    ) -> Result<PendingDataLogManifest> {
+        let node_conn = self.node_catalogs.lock(log_ref.storage_node)?;
+        let data_logs = node_catalog_table(log_ref.storage_node, "data_logs")?;
+        let row = node_conn
+            .query_row(
+                &format!(
+                    "SELECT state, total_bytes
+                     FROM {data_logs}
+                     WHERE log_id = ?1"
+                ),
+                params![u64_to_i64(log_ref.log_id)?],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        i64_to_u64(row.get::<_, i64>(1)?)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let path = data_log_path(&self.paths.data_dir, log_ref.storage_node, log_ref.log_id);
+        let file_bytes = path.metadata().map_err(fs_error)?.len();
+        let (state, total_bytes) = match row {
+            Some(row) => row,
+            None if self.append_ingest_data_log_policy.active_log_lanes <= 1 => {
+                (STREAM_DATA_LOG_STATE_ACTIVE.to_string(), file_bytes)
+            }
+            None => {
+                return Err(StorageError::corrupt(
+                    "append-run data-log manifest is missing lane state",
+                ));
+            }
+        };
+        Ok(PendingDataLogManifest {
+            storage_node: log_ref.storage_node,
+            log_id: log_ref.log_id,
+            state,
+            total_bytes: total_bytes.max(file_bytes),
+            needs_dir_sync: false,
+        })
     }
 
     fn read_append_run_source_payload(
@@ -4094,7 +4251,7 @@ impl DurableSqliteStore {
             let mut reclaimable_bytes = 0u64;
             let mut observed_logs = Vec::new();
             for (row, state) in logs {
-                if state == "active" {
+                if state == GENERIC_DATA_LOG_STATE_ACTIVE || is_stream_data_log_state(&state) {
                     active_log_bytes = active_log_bytes.saturating_add(row.total_bytes);
                     continue;
                 }
