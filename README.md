@@ -443,10 +443,31 @@ metadata-gate wait is effectively zero. Further throughput gains need to
 account for data-device queueing rather than treating SQLite row work as the
 append-publish limiter.
 
+A follow-up unbounded drain-owner scheduler experiment kept one waiter in
+charge across consecutive append-publish batches. That preserved throughput
+but was rejected for latency: on the same `c4-standard-288-lssd` split-journal
+shape, median throughput rose slightly from `12.67 GiB/s` to `12.86 GiB/s` and
+the best row reached `15.22 GiB/s`, but median publish p99 rose from `14.0 ms`
+to `20.9 ms`. The worst driver rows accumulated multiple append-visible
+journal syncs inside one `wait_append_publish` call, so c64 publish p99
+regressed even though coalesce waits fell. The code path remains bounded to one
+physical publish per owner.
+
+An RTT-order follow-up kept the same runtime and added benchmark controls for
+repeat visibility. A randomized `REPEATS=2` run showed that the low `200us`
+throughput was first-pass/layout-state variance, not an intrinsic modeled-RTT
+effect: the first `200us` pass was `9.14-9.38 GB/s`, while the next `200us`
+pass recovered to `14.38-15.12 GB/s`. An opt-in warmup pass alone was not
+sufficient to make the first measured root steady, so future GCP comparisons
+should use repeated randomized RTTs and treat the first measured pass after
+layout setup separately.
+
 Raw C4 artifacts are local and ignored under
 `infra/gcp-local-nvme-bench/results/`, specifically
 `gcp-c4-192-layout-20260607-125041`, `c48887-06071318`, and
-`c4288-sharded-publish-06071540`, and `c4288-group-commit-06071625`. The
+`c4288-sharded-publish-06071540`, `c4288-group-commit-06071625`,
+`c4288-drain-owner-0607`, `c4288-rtt-random-spin-06071725`, and
+`c4288-warm-200first-spin-06071742`. The
 temporary GCP instances, networks, subnets, and firewall rules were deleted
 after the runs.
 

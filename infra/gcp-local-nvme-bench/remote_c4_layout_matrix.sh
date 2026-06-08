@@ -11,9 +11,25 @@ STORAGE_NODES="${STORAGE_NODES:-4}"
 MIN_LOCAL_SSDS="${MIN_LOCAL_SSDS:-32}"
 LAYOUTS="${LAYOUTS:-raid-shared,raid-split-journal,node-private-journal}"
 NODE_RAID_GROUPS="${NODE_RAID_GROUPS:-}"
-RTTS=(0 200 700 3600)
+RTTS="${RTTS:-0,200,700,3600}"
+REPEATS="${REPEATS:-1}"
+RANDOMIZE_RTT_ORDER="${RANDOMIZE_RTT_ORDER:-0}"
+DELAY_MODE="${DELAY_MODE:-spin}"
+WARMUP_BEFORE_MEASURED="${WARMUP_BEFORE_MEASURED:-0}"
+WARMUP_RTT_US="${WARMUP_RTT_US:-0}"
+WARMUP_CONCURRENCY="${WARMUP_CONCURRENCY:-32}"
 CONCURRENCY="${CONCURRENCY:-16,32}"
 WORKLOADS="native-stream-publish-at-end-32m,native-stream-publish-interval-32m"
+
+IFS=',' read -r -a RTT_VALUES <<<"${RTTS}"
+if (( ${#RTT_VALUES[@]} == 0 )); then
+  printf 'RTTS must include at least one modeled RTT value\n' >&2
+  exit 1
+fi
+if ! [[ "${REPEATS}" =~ ^[0-9]+$ ]] || (( REPEATS < 1 )); then
+  printf 'REPEATS must be a positive integer, got %s\n' "${REPEATS}" >&2
+  exit 1
+fi
 
 mkdir -p "${RESULT_ROOT}/loadbench" "${RESULT_ROOT}/monitor"
 
@@ -77,7 +93,13 @@ fi
   echo "min_local_ssds=${MIN_LOCAL_SSDS}"
   echo "layouts=${LAYOUTS}"
   echo "node_raid_groups=${NODE_RAID_GROUPS}"
-  echo "rtts=${RTTS[*]}"
+  echo "rtts=${RTT_VALUES[*]}"
+  echo "repeats=${REPEATS}"
+  echo "randomize_rtt_order=${RANDOMIZE_RTT_ORDER}"
+  echo "delay_mode=${DELAY_MODE}"
+  echo "warmup_before_measured=${WARMUP_BEFORE_MEASURED}"
+  echo "warmup_rtt_us=${WARMUP_RTT_US}"
+  echo "warmup_concurrency=${WARMUP_CONCURRENCY}"
   echo "concurrency=${CONCURRENCY}"
   echo "workloads=${WORKLOADS}"
   echo "disk_count=${#DISKS[@]}"
@@ -250,18 +272,18 @@ run_layout() {
   } > "${out}/layout.txt"
 
   start_monitors "${mode}"
-  for rtt in "${RTTS[@]}"; do
-    local rtt_out="${out}/rtt-${rtt}"
-    mkdir -p "${rtt_out}"
-    local cmd=(
+  if [[ "${WARMUP_BEFORE_MEASURED}" == "1" ]]; then
+    local warmup_out="${out}/warmup"
+    mkdir -p "${warmup_out}"
+    local warmup_cmd=(
       "${LOADBENCH}"
       --provider durable
       --durability ack
       --workloads "${WORKLOADS}"
-      --concurrency "${CONCURRENCY}"
+      --concurrency "${WARMUP_CONCURRENCY}"
       --warmup-ms 0
-      --rtt-us "${rtt}"
-      --delay-mode spin
+      --rtt-us "${WARMUP_RTT_US}"
+      --delay-mode "${DELAY_MODE}"
       --storage-nodes "${STORAGE_NODES}"
       --files 128
       --stream-total-mib 512
@@ -269,19 +291,58 @@ run_layout() {
       --stream-auto-persist-mib 32
       --target-data-log-mib 64
       --data-log-file-sync-fanout 16
-      --root "${root}/rtt-${rtt}/root"
-      --matrix-csv "${rtt_out}/matrix.csv"
-      --durable-profile-csv "${rtt_out}/durable-profile.csv"
-      --append-publish-profile-csv "${rtt_out}/append-publish-profile.csv"
+      --root "${root}/warmup/root"
+      --matrix-csv "${warmup_out}/matrix.csv"
+      --durable-profile-csv "${warmup_out}/durable-profile.csv"
+      --append-publish-profile-csv "${warmup_out}/append-publish-profile.csv"
     )
     if [[ -n "${journal_dir}" ]]; then
-      cmd+=(--append-visible-journal-dir "${journal_dir}/rtt-${rtt}")
+      warmup_cmd+=(--append-visible-journal-dir "${journal_dir}/warmup")
     fi
     if [[ -n "${node_dirs}" ]]; then
-      cmd+=(--storage-node-data-dirs "${node_dirs}")
+      warmup_cmd+=(--storage-node-data-dirs "${node_dirs}")
     fi
-    log "running ${mode} rtt=${rtt}"
-    "${cmd[@]}" | tee "${rtt_out}/stdout.csv"
+    log "warming ${mode} rtt=${WARMUP_RTT_US} concurrency=${WARMUP_CONCURRENCY}"
+    "${warmup_cmd[@]}" | tee "${warmup_out}/stdout.csv"
+  fi
+  for repeat in $(seq 1 "${REPEATS}"); do
+    local repeat_rtts=("${RTT_VALUES[@]}")
+    if [[ "${RANDOMIZE_RTT_ORDER}" == "1" ]]; then
+      mapfile -t repeat_rtts < <(printf '%s\n' "${RTT_VALUES[@]}" | shuf)
+    fi
+    for rtt in "${repeat_rtts[@]}"; do
+      local rtt_out="${out}/rtt-${rtt}-rep-${repeat}"
+      mkdir -p "${rtt_out}"
+      local cmd=(
+        "${LOADBENCH}"
+        --provider durable
+        --durability ack
+        --workloads "${WORKLOADS}"
+        --concurrency "${CONCURRENCY}"
+        --warmup-ms 0
+        --rtt-us "${rtt}"
+        --delay-mode "${DELAY_MODE}"
+        --storage-nodes "${STORAGE_NODES}"
+        --files 128
+        --stream-total-mib 512
+        --stream-publish-mib 128
+        --stream-auto-persist-mib 32
+        --target-data-log-mib 64
+        --data-log-file-sync-fanout 16
+        --root "${root}/rtt-${rtt}-rep-${repeat}/root"
+        --matrix-csv "${rtt_out}/matrix.csv"
+        --durable-profile-csv "${rtt_out}/durable-profile.csv"
+        --append-publish-profile-csv "${rtt_out}/append-publish-profile.csv"
+      )
+      if [[ -n "${journal_dir}" ]]; then
+        cmd+=(--append-visible-journal-dir "${journal_dir}/rtt-${rtt}-rep-${repeat}")
+      fi
+      if [[ -n "${node_dirs}" ]]; then
+        cmd+=(--storage-node-data-dirs "${node_dirs}")
+      fi
+      log "running ${mode} repeat=${repeat} rtt=${rtt}"
+      "${cmd[@]}" | tee "${rtt_out}/stdout.csv"
+    done
   done
   stop_monitors
 }
@@ -298,19 +359,22 @@ root = Path(sys.argv[1])
 def rows_for(name):
     for path in sorted(root.glob(f"*/rtt-*/*{name}")):
         mode = path.parts[-3]
-        rtt_effective = path.parts[-2].split("-", 1)[1]
+        parts = path.parts[-2].split("-")
+        rtt_effective = parts[1] if len(parts) > 1 else ""
+        repeat = parts[3] if len(parts) > 3 and parts[2] == "rep" else "1"
         with path.open(newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 row["mode"] = mode
                 row["rtt_us_effective"] = rtt_effective
+                row["repeat"] = repeat
                 yield row
 
 def write_combined(name, output):
     rows = list(rows_for(name))
     if not rows:
         return
-    fields = ["mode", "rtt_us_effective"] + list(rows[0].keys())
+    fields = ["mode", "rtt_us_effective", "repeat"] + list(rows[0].keys())
     fields = list(dict.fromkeys(fields))
     with (root / output).open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -349,7 +413,7 @@ write_combined("append-publish-profile.csv", "combined-append-publish-profile.cs
 matrix = list(rows_for("matrix.csv"))
 with (root / "headline-summary.csv").open("w", newline="") as f:
     fields = [
-        "mode","rtt_us","workload","concurrency","published_mbps",
+        "mode","rtt_us","repeat","workload","concurrency","published_mbps",
         "stream_append_p99_ms","stream_publish_p99_ms","stream_final_drain_p99_ms",
         "stream_append_phase_seconds","stream_boundary_phase_seconds",
     ]
@@ -359,6 +423,7 @@ with (root / "headline-summary.csv").open("w", newline="") as f:
         writer.writerow({
             "mode": row["mode"],
             "rtt_us": row["rtt_us"],
+            "repeat": row["repeat"],
             "workload": row["workload"],
             "concurrency": row["concurrency"],
             "published_mbps": row["published_mbps"],
@@ -372,7 +437,7 @@ with (root / "headline-summary.csv").open("w", newline="") as f:
 append_rows = list(rows_for("append-publish-profile.csv"))
 groups = {}
 for row in append_rows:
-    key = (row["mode"], row["rtt_us"], row["workload"], row["concurrency"])
+    key = (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"])
     groups.setdefault(key, []).append(row)
 
 append_fields = [
@@ -396,7 +461,7 @@ append_count_fields = [
     "post_batch_pending_ticket_count",
 ]
 with (root / "append-publish-profile-summary.csv").open("w", newline="") as f:
-    fields = ["mode","rtt_us","workload","concurrency","samples"]
+    fields = ["mode","rtt_us","repeat","workload","concurrency","samples"]
     for name in append_fields:
         fields.extend([f"{name}_p50_ms", f"{name}_p99_ms", f"{name}_max_ms"])
     for name in append_count_fields:
@@ -418,8 +483,9 @@ with (root / "append-publish-profile-summary.csv").open("w", newline="") as f:
         out = {
             "mode": key[0],
             "rtt_us": key[1],
-            "workload": key[2],
-            "concurrency": key[3],
+            "repeat": key[2],
+            "workload": key[3],
+            "concurrency": key[4],
             "samples": len(rows),
             "persist_batches_started_sum": sum(int(to_float(r, "persist_batches_started")) for r in rows),
             "in_flight_waits_sum": sum(int(to_float(r, "in_flight_waits")) for r in rows),
@@ -456,7 +522,7 @@ driver_batch_rows = [
 ]
 with (root / "append-publish-driver-batches.csv").open("w", newline="") as f:
     fields = [
-        "mode","rtt_us","workload","concurrency","sequence","append_publish_batch_id",
+        "mode","rtt_us","repeat","workload","concurrency","sequence","append_publish_batch_id",
         "total_ms","coordinator_wait_ms","in_flight_wait_ms","coalesce_wait_ms",
         "persist_batch_ms","visible_metadata_commit_ms","append_visible_journal_sync_ms",
         "max_batch_ticket_count","batch_waiter_request_count",
@@ -472,6 +538,7 @@ with (root / "append-publish-driver-batches.csv").open("w", newline="") as f:
         writer.writerow({
             "mode": row["mode"],
             "rtt_us": row["rtt_us"],
+            "repeat": row["repeat"],
             "workload": row["workload"],
             "concurrency": row["concurrency"],
             "sequence": row["sequence"],
@@ -499,7 +566,7 @@ with (root / "append-publish-driver-batches.csv").open("w", newline="") as f:
 durable_rows = list(rows_for("durable-profile.csv"))
 groups = {}
 for row in durable_rows:
-    key = (row["mode"], row["rtt_us"], row["workload"], row["concurrency"])
+    key = (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"])
     groups.setdefault(key, []).append(row)
 
 durable_fields = [
@@ -510,7 +577,7 @@ durable_fields = [
     "append_visible_journal_sync_nanos","append_visible_journal_dir_sync_nanos",
 ]
 with (root / "durable-profile-summary.csv").open("w", newline="") as f:
-    fields = ["mode","rtt_us","workload","concurrency","samples"]
+    fields = ["mode","rtt_us","repeat","workload","concurrency","samples"]
     for name in durable_fields:
         fields.extend([f"{name}_p50_ms", f"{name}_p99_ms", f"{name}_max_ms"])
     fields.extend([
@@ -523,8 +590,9 @@ with (root / "durable-profile-summary.csv").open("w", newline="") as f:
         out = {
             "mode": key[0],
             "rtt_us": key[1],
-            "workload": key[2],
-            "concurrency": key[3],
+            "repeat": key[2],
+            "workload": key[3],
+            "concurrency": key[4],
             "samples": len(rows),
             "data_log_sync_bytes_sum": sum(int(to_float(r, "data_log_sync_bytes")) for r in rows),
             "data_log_write_bytes_sum": sum(int(to_float(r, "data_log_write_bytes")) for r in rows),
@@ -638,15 +706,15 @@ for mode in modes:
     }
 
 headline_by_key = {
-    (row["mode"], row["rtt_us"], row["workload"], row["concurrency"]): row
+    (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"]): row
     for row in csv.DictReader((root / "headline-summary.csv").open())
 }
 append_summary_by_key = {
-    (row["mode"], row["rtt_us"], row["workload"], row["concurrency"]): row
+    (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"]): row
     for row in csv.DictReader((root / "append-publish-profile-summary.csv").open())
 }
 durable_summary_by_key = {
-    (row["mode"], row["rtt_us"], row["workload"], row["concurrency"]): row
+    (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"]): row
     for row in csv.DictReader((root / "durable-profile-summary.csv").open())
 }
 
@@ -744,7 +812,7 @@ def combined_classification(row, append, publish_tail, throughput):
 
 with (root / "bottleneck-summary.csv").open("w", newline="") as f:
     fields = [
-        "mode","rtt_us","workload","concurrency","published_mbps",
+        "mode","rtt_us","repeat","workload","concurrency","published_mbps",
         "stream_append_p99_ms","stream_publish_p99_ms",
         "bottleneck","publish_tail_bottleneck","throughput_bottleneck",
         "recommended_next_action",
@@ -785,8 +853,9 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
         writer.writerow({
             "mode": key[0],
             "rtt_us": key[1],
-            "workload": key[2],
-            "concurrency": key[3],
+            "repeat": key[2],
+            "workload": key[3],
+            "concurrency": key[4],
             "published_mbps": row["published_mbps"],
             "stream_append_p99_ms": row["stream_append_p99_ms"],
             "stream_publish_p99_ms": row["stream_publish_p99_ms"],

@@ -1158,6 +1158,111 @@ Read:
   12.4-14.7 GB/s on nonzero modeled RTT rows, and publish p99 in the low
   tens of milliseconds.
 
+## GCP C4 Drain-Owner Scheduler Experiment
+
+The June 7, 2026 follow-up tested an unbounded append-publish drain-owner
+scheduler. The hypothesis was that keeping one waiter in ownership across a
+publish wave would reduce handoff/coalesce delay and lower publish tail. The
+run used the same `c4-standard-288-lssd`, 48 local SSDs, `raid-split-journal`,
+4 storage nodes, 32 MiB appends, 128 MiB publish boundaries, 512 MiB per
+worker, concurrency `32,64`, and modeled RTTs `0us`, `200us`, `700us`, and
+`3600us`.
+
+Raw artifacts:
+
+- `infra/gcp-local-nvme-bench/results/c4288-drain-owner-0607/`
+- `infra/gcp-local-nvme-bench/results/c4288-drain-owner-0607-results.tgz`
+
+Headline rows:
+
+| RTT | Workload | c | `published_mbps` | publish p99 | final drain p99 | append p99 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `0us` | at-end 32 MiB | 32 | 9084.77 | 12.1 ms | 12.1 ms | 207.7 ms |
+| `0us` | at-end 32 MiB | 64 | 9393.27 | 28.8 ms | 28.8 ms | 393.8 ms |
+| `200us` | at-end 32 MiB | 32 | 13232.00 | 23.8 ms | 23.8 ms | 138.3 ms |
+| `200us` | at-end 32 MiB | 64 | 12648.66 | 26.2 ms | 26.2 ms | 308.9 ms |
+| `700us` | at-end 32 MiB | 32 | 13098.79 | 11.7 ms | 11.7 ms | 133.3 ms |
+| `700us` | at-end 32 MiB | 64 | 14390.84 | 29.4 ms | 29.4 ms | 281.4 ms |
+| `3600us` | at-end 32 MiB | 32 | 13250.46 | 14.2 ms | 14.2 ms | 141.8 ms |
+| `3600us` | at-end 32 MiB | 64 | 14382.53 | 25.0 ms | 25.0 ms | 289.4 ms |
+| `0us` | interval 32 MiB | 32 | 9359.25 | 18.0 ms | 8.8 ms | 194.2 ms |
+| `0us` | interval 32 MiB | 64 | 9385.79 | 18.0 ms | 18.8 ms | 407.5 ms |
+| `200us` | interval 32 MiB | 32 | 12545.74 | 9.0 ms | 5.2 ms | 137.4 ms |
+| `200us` | interval 32 MiB | 64 | 12607.15 | 33.8 ms | 8.4 ms | 304.8 ms |
+| `700us` | interval 32 MiB | 32 | 14502.05 | 8.3 ms | 7.2 ms | 124.0 ms |
+| `700us` | interval 32 MiB | 64 | 13460.02 | 25.9 ms | 11.1 ms | 308.6 ms |
+| `3600us` | interval 32 MiB | 32 | 15588.46 | 9.2 ms | 9.2 ms | 78.2 ms |
+| `3600us` | interval 32 MiB | 64 | 13931.20 | 35.5 ms | 36.4 ms | 292.2 ms |
+
+Read:
+
+- Throughput was preserved but not enough to justify the tail regression:
+  matched-row median throughput rose from `12.67 GiB/s` to `12.86 GiB/s`, and
+  max throughput rose from `14.37 GiB/s` to `15.22 GiB/s`.
+- Publish p99 regressed in aggregate: matched-row median publish p99 rose from
+  `14.0 ms` to `20.9 ms`; the max stayed similar (`36.6 ms` before, `35.5 ms`
+  in the new run).
+- The regression came from the owner profile, not planning or SQLite row work.
+  The worst driver rows spent nearly all publish time in append-visible journal
+  sync: for example, `3600us` interval c64 had driver total `36.9 ms`,
+  persist `35.7 ms`, visible commit `27.8 ms`, and journal sync `27.8 ms`.
+- Coalesce waits fell in many rows, but the owner accumulated multiple durable
+  journal syncs inside one `wait_append_publish` call. That made driver samples
+  become the c64 p99 tail. The unbounded drain-owner code path was therefore
+  rejected and the runtime remains bounded to one physical publish per owner.
+
+## GCP C4 RTT Repeat And First-Pass Variance
+
+The same June 7, 2026 `c4-standard-288-lssd` split-journal shape was rerun
+with no storage-runtime changes, but with explicit benchmark controls for RTT
+ordering and repeat visibility. The goal was to test whether the lower `200us`
+rows were a modeled-RTT effect or a benchmark-state effect.
+
+Raw artifacts:
+
+- `infra/gcp-local-nvme-bench/results/c4288-rtt-random-spin-06071725/`
+- `infra/gcp-local-nvme-bench/results/c4288-rtt-random-spin-06071725-results.tgz`
+- `infra/gcp-local-nvme-bench/results/c4288-warm-200first-spin-06071742/`
+- `infra/gcp-local-nvme-bench/results/c4288-warm-200first-spin-06071742-results.tgz`
+
+The randomized run used `REPEATS=2`, `RANDOMIZE_RTT_ORDER=1`,
+`DELAY_MODE=spin`, RTTs `0,200,700,3600`, concurrency `32,64`, and the same
+two native append workloads. Repeat 1 happened to run `200us` first and showed
+the familiar low throughput: all four `200us` rows landed at `9.14-9.38 GB/s`
+published throughput. Repeat 2 also ran `200us` first within the repeat, but
+after the layout had already seen one measured pass; those same `200us` rows
+recovered to `14.38-15.12 GB/s`.
+
+Warm repeat 2 headline:
+
+| RTT | Workload | c32 throughput / publish p99 | c64 throughput / publish p99 |
+| ---: | --- | ---: | ---: |
+| `0us` | at-end 32 MiB | 15.78 GB/s / 3.6 ms | 14.48 GB/s / 16.6 ms |
+| `200us` | at-end 32 MiB | 14.98 GB/s / 6.0 ms | 14.48 GB/s / 9.4 ms |
+| `700us` | at-end 32 MiB | 15.00 GB/s / 4.5 ms | 14.71 GB/s / 15.4 ms |
+| `3600us` | at-end 32 MiB | 14.72 GB/s / 8.7 ms | 14.56 GB/s / 15.8 ms |
+| `0us` | interval 32 MiB | 15.25 GB/s / 5.5 ms | 12.50 GB/s / 9.6 ms |
+| `200us` | interval 32 MiB | 15.12 GB/s / 5.3 ms | 14.38 GB/s / 36.6 ms |
+| `700us` | interval 32 MiB | 15.35 GB/s / 6.5 ms | 15.10 GB/s / 8.0 ms |
+| `3600us` | interval 32 MiB | 15.87 GB/s / 9.1 ms | 14.60 GB/s / 9.7 ms |
+
+A follow-up run added an opt-in c32 warmup pass before measuring and then
+forced `200us` first with `RTTS=200,0,700,3600`. That was not sufficient by
+itself: the first measured `200us` at-end rows still landed at only
+`9.36-9.57 GB/s`, while later rows climbed back into the `12.3-14.9 GB/s`
+range. The read is that the artifact is first measured layout/root state, not
+the `200us` modeled RTT. For future comparisons, use repeated randomized RTTs
+and treat the first measured pass after layout setup separately from steady
+state.
+
+The benchmark harness now records `repeat` in the combined CSVs and supports
+`RTTS`, `REPEATS`, `RANDOMIZE_RTT_ORDER`, `DELAY_MODE`, and opt-in measured
+warmup controls. The same summaries also confirmed the remaining runtime
+bottlenecks on the best steady-state rows: the data RAID is at the device
+ceiling (`data_wMBps_p90_sum` about `14.2 GB/s`, `data_util_p90` about
+`99.4%`), while publish-tail outliers are wait-behind-active-publish plus
+append-visible journal sync, not SQLite row work.
+
 ## External North-Star Targets
 
 The June 6, 2026 Rapid Storage c3-88/Tier1 run is the current external
