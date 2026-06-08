@@ -54,7 +54,7 @@ impl BenchStore {
             }
             ProviderKind::Durable => {
                 let store = Arc::new(
-                    DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_publish_batch_policy(
+                    DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
                         root,
                         args.config(),
                         args.storage_node_ids(),
@@ -65,6 +65,7 @@ impl BenchStore {
                         },
                         append_visible_journal,
                         args.append_publish_batch_policy,
+                        args.append_ingest_admission_policy,
                     )?,
                 );
                 if args.durable_profile_csv.is_some() {
@@ -72,6 +73,9 @@ impl BenchStore {
                 }
                 if args.append_publish_profile_csv.is_some() {
                     store.enable_append_publish_wait_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                if args.append_ingest_profile_csv.is_some() {
+                    store.enable_append_ingest_profiling(DEFAULT_PROFILE_CAPACITY)?;
                 }
                 if args.read_profile_csv.is_some() {
                     store.enable_read_profiling(DEFAULT_PROFILE_CAPACITY)?;
@@ -342,6 +346,14 @@ impl BenchStore {
         match self {
             Self::Local(_) => Ok(Vec::new()),
             Self::Durable(store) => store.drain_append_publish_wait_profiles(max),
+            Self::Txn(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn drain_append_ingest_profiles(&self, max: usize) -> Result<Vec<AppendIngestProfile>> {
+        match self {
+            Self::Local(_) => Ok(Vec::new()),
+            Self::Durable(store) => store.drain_append_ingest_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }

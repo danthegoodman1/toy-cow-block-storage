@@ -9942,6 +9942,84 @@ fn durable_append_publish_batch_policy_rejects_invalid_values() {
 }
 
 #[test]
+fn durable_append_ingest_admission_policy_rejects_invalid_values() {
+    let root = durable_temp_dir("append-ingest-admission-policy-invalid");
+    let cfg = config();
+    let invalid = AppendIngestAdmissionPolicy {
+        max_in_flight_bytes: Some(0),
+    };
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            invalid,
+        )
+        .is_err()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_ingest_profile_records_payload_write() {
+    let root = durable_temp_dir("append-ingest-profile");
+    let cfg = config();
+    let policy = AppendIngestAdmissionPolicy {
+        max_in_flight_bytes: Some(4096),
+    };
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(store.append_ingest_admission_policy(), policy);
+    store.enable_append_ingest_profiling(16).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 111);
+    let ticket = store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+    assert_eq!(ticket.range, ByteRange::new(0, 4096));
+    let profiles = store.drain_append_ingest_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = profiles[0];
+    assert!(profile.success);
+    assert_eq!(profile.stream_id, stream.stream_id.raw());
+    assert_eq!(profile.storage_node, cfg.storage_node.raw());
+    assert_eq!(profile.payload_bytes, 4096);
+    assert_eq!(profile.max_in_flight_bytes, 4096);
+    assert!(profile.payload_write_nanos > 0);
+    assert!(profile.metadata_prepare_nanos > 0);
+    assert!(profile.metadata_record_nanos > 0);
+    assert!(profile.total_nanos >= profile.payload_write_nanos);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_append_publish_batch_policy_controls_target_demand() {
     let root = durable_temp_dir("append-publish-batch-policy-target");
     let cfg = config();

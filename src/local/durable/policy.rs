@@ -97,6 +97,32 @@ impl AppendPublishBatchPolicy {
     }
 }
 
+/// Provider-private admission policy for durable append ingest.
+///
+/// This is a queue-depth control below the public append-stream API. It may
+/// delay an append before payload bytes enter local data-log writers, but it
+/// does not change append ordering, visibility, or durability semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendIngestAdmissionPolicy {
+    /// Maximum append payload bytes concurrently writing through the provider.
+    ///
+    /// `None` disables the cap. A single append larger than the cap may proceed
+    /// alone after earlier admitted appends drain, which prevents deadlock.
+    pub max_in_flight_bytes: Option<u64>,
+}
+
+impl AppendIngestAdmissionPolicy {
+    /// Validate that append ingest admission can make deterministic progress.
+    pub fn validate(self) -> Result<()> {
+        if self.max_in_flight_bytes == Some(0) {
+            return Err(StorageError::invalid_argument(
+                "append ingest max_in_flight_bytes must be greater than zero when configured",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Durable data-log identity within a storage node.
 ///
 /// The pair is provider-owned diagnostic state. Public block and native callers

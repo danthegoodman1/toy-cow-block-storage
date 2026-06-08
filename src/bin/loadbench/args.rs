@@ -23,11 +23,13 @@ struct Args {
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
     block_batch_profile_csv: Option<PathBuf>,
+    append_ingest_profile_csv: Option<PathBuf>,
     append_log_profile_csv: Option<PathBuf>,
     read_profile_csv: Option<PathBuf>,
     target_data_log_bytes: u64,
     data_log_file_sync_fanout: usize,
     append_publish_batch_policy: AppendPublishBatchPolicy,
+    append_ingest_admission_policy: AppendIngestAdmissionPolicy,
     stream_publish_bytes: Option<u64>,
     stream_total_bytes: u64,
     stream_auto_persist_bytes: Option<u64>,
@@ -69,11 +71,13 @@ impl Args {
             metadata_profile_csv: None,
             block_write_profile_csv: None,
             block_batch_profile_csv: None,
+            append_ingest_profile_csv: None,
             append_log_profile_csv: None,
             read_profile_csv: None,
             target_data_log_bytes: 64 * 1024 * 1024,
             data_log_file_sync_fanout: 4,
             append_publish_batch_policy: AppendPublishBatchPolicy::default(),
+            append_ingest_admission_policy: AppendIngestAdmissionPolicy::default(),
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,
             stream_auto_persist_bytes: None,
@@ -174,6 +178,12 @@ impl Args {
                         "--block-batch-profile-csv",
                     )?));
                 }
+                "--append-ingest-profile-csv" => {
+                    args.append_ingest_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--append-ingest-profile-csv",
+                    )?));
+                }
                 "--append-log-profile-csv" => {
                     args.append_log_profile_csv = Some(PathBuf::from(parse_next::<String>(
                         &mut raw,
@@ -206,6 +216,11 @@ impl Args {
                     let micros: u64 = parse_next(&mut raw, flag.as_str())?;
                     args.append_publish_batch_policy.max_coalesce_delay =
                         Duration::from_micros(micros);
+                }
+                "--append-ingest-max-in-flight-mib" => {
+                    let mib: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.append_ingest_admission_policy.max_in_flight_bytes =
+                        Some(mib_to_bytes(mib, flag.as_str())?);
                 }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
@@ -315,6 +330,7 @@ impl Args {
             ));
         }
         args.append_publish_batch_policy.validate()?;
+        args.append_ingest_admission_policy.validate()?;
         if args.device_blocks < args.shards as u64 {
             return Err(StorageError::invalid_argument(
                 "device-blocks must be at least shards",
@@ -441,6 +457,7 @@ options:\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --block-batch-profile-csv PATH           append block batch commit profiles to CSV\n\
+  --append-ingest-profile-csv PATH         append durable append ingest profiles to CSV\n\
   --append-log-profile-csv PATH            append append-log microbench profiles to CSV\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
   --target-data-log-mib N                  durable data-log roll target, default: 64\n\
@@ -448,6 +465,7 @@ options:\n\
   --append-publish-batch-target N          durable append publish batch target, default: 4\n\
   --append-publish-idle-coalesce-us N      durable append publish idle coalesce wait, default: 250\n\
   --append-publish-max-coalesce-us N       durable append publish max coalesce wait, default: 5000\n\
+  --append-ingest-max-in-flight-mib N      durable append ingest max in-flight MiB, default: disabled\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --stream-auto-persist-mib N              durable stream payload dirty-tail sync threshold\n\

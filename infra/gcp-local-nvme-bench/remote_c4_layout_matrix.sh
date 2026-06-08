@@ -23,6 +23,7 @@ WORKLOADS="${WORKLOADS:-native-stream-publish-at-end-32m,native-stream-publish-i
 APPEND_PUBLISH_BATCH_TARGET="${APPEND_PUBLISH_BATCH_TARGET:-4}"
 APPEND_PUBLISH_IDLE_COALESCE_US="${APPEND_PUBLISH_IDLE_COALESCE_US:-250}"
 APPEND_PUBLISH_MAX_COALESCE_US="${APPEND_PUBLISH_MAX_COALESCE_US:-5000}"
+APPEND_INGEST_MAX_IN_FLIGHT_MIBS="${APPEND_INGEST_MAX_IN_FLIGHT_MIBS:-none}"
 
 IFS=',' read -r -a RTT_VALUES <<<"${RTTS}"
 if (( ${#RTT_VALUES[@]} == 0 )); then
@@ -108,6 +109,7 @@ fi
   echo "append_publish_batch_target=${APPEND_PUBLISH_BATCH_TARGET}"
   echo "append_publish_idle_coalesce_us=${APPEND_PUBLISH_IDLE_COALESCE_US}"
   echo "append_publish_max_coalesce_us=${APPEND_PUBLISH_MAX_COALESCE_US}"
+  echo "append_ingest_max_in_flight_mibs=${APPEND_INGEST_MAX_IN_FLIGHT_MIBS}"
   echo "disk_count=${#DISKS[@]}"
   printf 'disks=%s\n' "${DISKS[*]}"
   echo
@@ -263,10 +265,24 @@ run_layout() {
   local root="$2"
   local journal_dir="${3:-}"
   local node_dirs="${4:-}"
+  local append_ingest_cap_mib="${5:-none}"
+  local append_ingest_label
+  local append_ingest_args=()
+  case "${append_ingest_cap_mib}" in
+    ""|none|disabled|off|0)
+      append_ingest_label="ingest-unlimited"
+      ;;
+    *)
+      append_ingest_label="ingest-${append_ingest_cap_mib}m"
+      append_ingest_args+=(--append-ingest-max-in-flight-mib "${append_ingest_cap_mib}")
+      ;;
+  esac
+  mode="${mode}-${append_ingest_label}"
   local out="${RESULT_ROOT}/loadbench/${mode}"
   mkdir -p "${out}"
   {
     echo "mode=${mode}"
+    echo "append_ingest_max_in_flight_mib=${append_ingest_cap_mib}"
     echo "root=${root}"
     echo "journal_dir=${journal_dir}"
     echo "node_dirs=${node_dirs}"
@@ -304,6 +320,8 @@ run_layout() {
       --matrix-csv "${warmup_out}/matrix.csv"
       --durable-profile-csv "${warmup_out}/durable-profile.csv"
       --append-publish-profile-csv "${warmup_out}/append-publish-profile.csv"
+      --append-ingest-profile-csv "${warmup_out}/append-ingest-profile.csv"
+      "${append_ingest_args[@]}"
     )
     if [[ -n "${journal_dir}" ]]; then
       warmup_cmd+=(--append-visible-journal-dir "${journal_dir}/warmup")
@@ -345,6 +363,8 @@ run_layout() {
         --matrix-csv "${rtt_out}/matrix.csv"
         --durable-profile-csv "${rtt_out}/durable-profile.csv"
         --append-publish-profile-csv "${rtt_out}/append-publish-profile.csv"
+        --append-ingest-profile-csv "${rtt_out}/append-ingest-profile.csv"
+        "${append_ingest_args[@]}"
       )
       if [[ -n "${journal_dir}" ]]; then
         cmd+=(--append-visible-journal-dir "${journal_dir}/rtt-${rtt}-rep-${repeat}")
@@ -421,6 +441,7 @@ def max_int(rows, key):
 write_combined("matrix.csv", "combined-matrix.csv")
 write_combined("durable-profile.csv", "combined-durable-profile.csv")
 write_combined("append-publish-profile.csv", "combined-append-publish-profile.csv")
+write_combined("append-ingest-profile.csv", "combined-append-ingest-profile.csv")
 
 matrix = list(rows_for("matrix.csv"))
 with (root / "headline-summary.csv").open("w", newline="") as f:
@@ -527,6 +548,56 @@ with (root / "append-publish-profile-summary.csv").open("w", newline="") as f:
             out[f"{name}_p50"] = percentile(values, 0.50)
             out[f"{name}_p99"] = percentile(values, 0.99)
             out[f"{name}_max"] = max(values, default=0.0)
+        writer.writerow(out)
+
+append_ingest_rows = list(rows_for("append-ingest-profile.csv"))
+groups = {}
+for row in append_ingest_rows:
+    key = (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"])
+    groups.setdefault(key, []).append(row)
+
+append_ingest_fields = [
+    "total_nanos",
+    "admission_wait_nanos",
+    "stream_lock_wait_nanos",
+    "pending_lock_wait_nanos",
+    "active_log_lock_wait_nanos",
+    "metadata_prepare_nanos",
+    "metadata_record_nanos",
+    "payload_encode_nanos",
+    "payload_write_nanos",
+    "auto_persist_nanos",
+]
+with (root / "append-ingest-profile-summary.csv").open("w", newline="") as f:
+    fields = ["mode","rtt_us","repeat","workload","concurrency","samples"]
+    for name in append_ingest_fields:
+        fields.extend([f"{name}_p50_ms", f"{name}_p99_ms", f"{name}_max_ms"])
+    fields.extend([
+        "payload_bytes_sum",
+        "background_sync_requested_bytes_sum",
+        "max_in_flight_bytes_max",
+        "success_count",
+    ])
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
+    for key, rows in sorted(groups.items()):
+        out = {
+            "mode": key[0],
+            "rtt_us": key[1],
+            "repeat": key[2],
+            "workload": key[3],
+            "concurrency": key[4],
+            "samples": len(rows),
+            "payload_bytes_sum": sum(int(to_float(r, "payload_bytes")) for r in rows),
+            "background_sync_requested_bytes_sum": sum(int(to_float(r, "background_sync_requested_bytes")) for r in rows),
+            "max_in_flight_bytes_max": max((int(to_float(r, "max_in_flight_bytes")) for r in rows), default=0),
+            "success_count": sum(1 for r in rows if to_bool(r, "success")),
+        }
+        for name in append_ingest_fields:
+            values = [to_ms(r, name) for r in rows]
+            out[f"{name}_p50_ms"] = percentile(values, 0.50)
+            out[f"{name}_p99_ms"] = percentile(values, 0.99)
+            out[f"{name}_max_ms"] = max(values, default=0.0)
         writer.writerow(out)
 
 driver_batch_rows = [
@@ -725,6 +796,11 @@ append_summary_by_key = {
     (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"]): row
     for row in csv.DictReader((root / "append-publish-profile-summary.csv").open())
 }
+append_ingest_summary_path = root / "append-ingest-profile-summary.csv"
+append_ingest_summary_by_key = {
+    (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"]): row
+    for row in csv.DictReader(append_ingest_summary_path.open())
+} if append_ingest_summary_path.exists() else {}
 durable_summary_by_key = {
     (row["mode"], row["rtt_us"], row["repeat"], row["workload"], row["concurrency"]): row
     for row in csv.DictReader((root / "durable-profile-summary.csv").open())
@@ -837,11 +913,18 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
         "data_wMBps_p90_sum","data_w_await_p90_max_ms","data_util_p90_max",
         "journal_device","journal_wMBps_p90","journal_w_await_p90_ms",
         "journal_util_p90",
+        "append_ingest_total_p99_ms",
+        "append_ingest_admission_wait_p99_ms",
+        "append_ingest_active_log_lock_wait_p99_ms",
+        "append_ingest_payload_write_p99_ms",
+        "append_ingest_auto_persist_p99_ms",
+        "append_ingest_max_in_flight_bytes",
     ]
     writer = csv.DictWriter(f, fieldnames=fields)
     writer.writeheader()
     for key, row in sorted(headline_by_key.items()):
         append = append_summary_by_key.get(key, {})
+        ingest = append_ingest_summary_by_key.get(key, {})
         durable = durable_summary_by_key.get(key, {})
         devices = device_summaries.get(key[0], {
             "journal_device": "",
@@ -897,30 +980,48 @@ with (root / "bottleneck-summary.csv").open("w", newline="") as f:
             "journal_wMBps_p90": devices["journal_wMBps_p90"],
             "journal_w_await_p90_ms": devices["journal_w_await_p90_ms"],
             "journal_util_p90": devices["journal_util_p90"],
+            "append_ingest_total_p99_ms": ingest.get("total_nanos_p99_ms", 0),
+            "append_ingest_admission_wait_p99_ms": ingest.get("admission_wait_nanos_p99_ms", 0),
+            "append_ingest_active_log_lock_wait_p99_ms": ingest.get("active_log_lock_wait_nanos_p99_ms", 0),
+            "append_ingest_payload_write_p99_ms": ingest.get("payload_write_nanos_p99_ms", 0),
+            "append_ingest_auto_persist_p99_ms": ingest.get("auto_persist_nanos_p99_ms", 0),
+            "append_ingest_max_in_flight_bytes": ingest.get("max_in_flight_bytes_max", 0),
         })
 PY
 }
 
 IFS=',' read -r -a requested_layouts <<<"${LAYOUTS}"
+IFS=',' read -r -a requested_append_ingest_caps <<<"${APPEND_INGEST_MAX_IN_FLIGHT_MIBS}"
+if (( ${#requested_append_ingest_caps[@]} == 0 )); then
+  requested_append_ingest_caps=("none")
+fi
 for layout in "${requested_layouts[@]}"; do
   case "${layout}" in
     raid-shared)
       setup_raid_shared
-      run_layout "raid-shared" "/mnt/raid/loadbench" "" ""
+      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+        run_layout "raid-shared" "/mnt/raid/loadbench" "" "" "${append_ingest_cap}"
+      done
       ;;
     raid-split-journal)
       setup_raid_split_journal
-      run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" ""
+      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+        run_layout "raid-split-journal" "/mnt/data/loadbench" "/mnt/journal/journals" "" "${append_ingest_cap}"
+      done
       ;;
     node-private-journal)
       setup_node_private_journal
       NODE_DIRS="$(csv_join_node_dirs)"
-      run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}"
+      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+        run_layout "node-private-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}"
+      done
       ;;
     node-private-raid-journal)
       setup_node_private_raid_journal
       NODE_DIRS="$(csv_join_node_dirs)"
-      run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}"
+      for append_ingest_cap in "${requested_append_ingest_caps[@]}"; do
+        run_layout "node-private-raid-journal" "/mnt/journal/loadbench" "/mnt/journal/journals" "${NODE_DIRS}" "${append_ingest_cap}"
+      done
       ;;
     *)
       printf 'unknown layout: %s\n' "${layout}" >&2

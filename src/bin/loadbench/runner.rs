@@ -25,6 +25,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     let profile_store = context.store.clone();
     let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_append_publish_wait_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    let _ = profile_store.drain_append_ingest_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
@@ -35,6 +36,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
         let _ = execute_load(args, workload, concurrency, context.clone(), args.warmup)?;
         let _ = profile_store.drain_persist_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_append_publish_wait_profiles(DEFAULT_PROFILE_CAPACITY)?;
+        let _ = profile_store.drain_append_ingest_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_metadata_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
@@ -55,6 +57,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     report.op_size = workload.op_size(args)?;
     append_profile_csv(args, workload, concurrency, &profile_store)?;
     append_append_publish_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_append_ingest_profile_csv(args, workload, concurrency, &profile_store)?;
     append_metadata_profile_csv(args, workload, concurrency, &profile_store)?;
     append_block_write_profile_csv(args, workload, concurrency, &profile_store)?;
     append_read_profile_csv(args, workload, concurrency, &profile_store)?;

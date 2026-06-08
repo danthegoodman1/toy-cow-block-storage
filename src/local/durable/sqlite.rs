@@ -152,6 +152,31 @@ pub struct AppendPublishWaitProfile {
     pub success: bool,
 }
 
+/// Process-local timing for one durable append-stream ingest call.
+///
+/// Profiles are opt-in diagnostics for integration benchmarks. They are not
+/// durable state and are not part of the public append-stream contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendIngestProfile {
+    pub sequence: u64,
+    pub stream_id: u128,
+    pub storage_node: u128,
+    pub payload_bytes: u64,
+    pub total_nanos: u64,
+    pub admission_wait_nanos: u64,
+    pub stream_lock_wait_nanos: u64,
+    pub pending_lock_wait_nanos: u64,
+    pub active_log_lock_wait_nanos: u64,
+    pub metadata_prepare_nanos: u64,
+    pub metadata_record_nanos: u64,
+    pub payload_encode_nanos: u64,
+    pub payload_write_nanos: u64,
+    pub auto_persist_nanos: u64,
+    pub background_sync_requested_bytes: u64,
+    pub max_in_flight_bytes: u64,
+    pub success: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AppendVisibleJournalTarget {
     Shared,
@@ -350,6 +375,42 @@ impl AppendPublishWaitProfiler {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct AppendIngestProfiler {
+    capacity: usize,
+    next_sequence: u64,
+    profiles: VecDeque<AppendIngestProfile>,
+}
+
+impl AppendIngestProfiler {
+    fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "append ingest profile capacity must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            capacity,
+            next_sequence: 1,
+            profiles: VecDeque::with_capacity(capacity.min(1024)),
+        })
+    }
+
+    fn record(&mut self, mut profile: AppendIngestProfile) {
+        profile.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.profiles.len() == self.capacity {
+            self.profiles.pop_front();
+        }
+        self.profiles.push_back(profile);
+    }
+
+    fn drain(&mut self, max: usize) -> Vec<AppendIngestProfile> {
+        let count = max.min(self.profiles.len());
+        self.profiles.drain(..count).collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DurablePersistOutcome {
     kept_segments: BTreeSet<SegmentId>,
@@ -384,6 +445,7 @@ struct PreparedDurableBundlePayload {
 pub(super) struct DataLogAppendProfile {
     encode_nanos: u64,
     write_nanos: u64,
+    active_log_lock_wait_nanos: u64,
     file_sync_nanos: u64,
     file_sync_sum_nanos: u64,
     file_sync_max_nanos: u64,
@@ -398,6 +460,9 @@ impl DataLogAppendProfile {
     fn merge(&mut self, other: Self) {
         self.encode_nanos = self.encode_nanos.saturating_add(other.encode_nanos);
         self.write_nanos = self.write_nanos.saturating_add(other.write_nanos);
+        self.active_log_lock_wait_nanos = self
+            .active_log_lock_wait_nanos
+            .saturating_add(other.active_log_lock_wait_nanos);
         self.file_sync_nanos = self.file_sync_nanos.saturating_add(other.file_sync_nanos);
         self.file_sync_sum_nanos = self
             .file_sync_sum_nanos
@@ -854,7 +919,10 @@ impl StorageNodeAppendLogService {
             },
         )?;
 
+        let mut profile = DataLogAppendProfile::default();
+        let active_lock_started = Instant::now();
         let mut active = lock(active_handle.as_ref())?;
+        profile.active_log_lock_wait_nanos = duration_nanos_u64(active_lock_started.elapsed());
         let should_roll = {
             active.total_bytes != 0
                 && active
@@ -895,7 +963,6 @@ impl StorageNodeAppendLogService {
             log_id,
         };
 
-        let mut profile = DataLogAppendProfile::default();
         let started = Instant::now();
         let integrity =
             segment_payload_integrity_chunks(payload.payload_integrity, &payload.chunks);

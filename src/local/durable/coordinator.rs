@@ -19,8 +19,12 @@ pub struct DurableCoordinator {
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
     append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
     append_publish_batch_policy: AppendPublishBatchPolicy,
+    append_ingest_admission_policy: AppendIngestAdmissionPolicy,
+    append_ingest_admission: Arc<AppendIngestAdmissionGate>,
     persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
     append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
+    append_ingest_profiler: Arc<Mutex<Option<AppendIngestProfiler>>>,
+    append_ingest_profile_enabled: Arc<AtomicBool>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
@@ -45,6 +49,86 @@ impl StreamAppendLane {
             append: Mutex::new(()),
             pending: Mutex::new(PendingDataLogAppend::default()),
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AppendIngestAdmissionGate {
+    inner: Mutex<AppendIngestAdmissionState>,
+    cvar: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct AppendIngestAdmissionState {
+    in_flight_bytes: u64,
+}
+
+#[derive(Debug)]
+struct AppendIngestPermit {
+    gate: Option<Arc<AppendIngestAdmissionGate>>,
+    bytes: u64,
+    wait_nanos: u64,
+    max_in_flight_bytes: u64,
+}
+
+impl AppendIngestPermit {
+    fn disabled() -> Self {
+        Self {
+            gate: None,
+            bytes: 0,
+            wait_nanos: 0,
+            max_in_flight_bytes: 0,
+        }
+    }
+
+    fn wait_nanos(&self) -> u64 {
+        self.wait_nanos
+    }
+
+    fn max_in_flight_bytes(&self) -> u64 {
+        self.max_in_flight_bytes
+    }
+}
+
+impl Drop for AppendIngestPermit {
+    fn drop(&mut self) {
+        let Some(gate) = &self.gate else {
+            return;
+        };
+        if let Ok(mut state) = gate.inner.lock() {
+            state.in_flight_bytes = state.in_flight_bytes.saturating_sub(self.bytes);
+            gate.cvar.notify_all();
+        }
+    }
+}
+
+impl AppendIngestAdmissionGate {
+    fn acquire(
+        self: &Arc<Self>,
+        bytes: u64,
+        policy: AppendIngestAdmissionPolicy,
+        measure_wait: bool,
+    ) -> Result<AppendIngestPermit> {
+        let Some(max_in_flight_bytes) = policy.max_in_flight_bytes else {
+            return Ok(AppendIngestPermit::disabled());
+        };
+        let started = measure_wait.then(Instant::now);
+        let mut state = lock(&self.inner)?;
+        while state.in_flight_bytes != 0
+            && state.in_flight_bytes.saturating_add(bytes) > max_in_flight_bytes
+        {
+            state = wait_on_cvar(&self.cvar, state)?;
+        }
+        state.in_flight_bytes = state.in_flight_bytes.saturating_add(bytes);
+        Ok(AppendIngestPermit {
+            gate: Some(Arc::clone(self)),
+            bytes,
+            wait_nanos: started
+                .as_ref()
+                .map(|started| duration_nanos_u64(started.elapsed()))
+                .unwrap_or_default(),
+            max_in_flight_bytes,
+        })
     }
 }
 
@@ -193,6 +277,7 @@ impl DurableCoordinator {
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             AppendPublishBatchPolicy::default(),
+            AppendIngestAdmissionPolicy::default(),
         )
     }
 
@@ -216,6 +301,32 @@ impl DurableCoordinator {
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             append_publish_batch_policy,
+            AppendIngestAdmissionPolicy::default(),
+        )
+    }
+
+    /// Open a durable store with explicit storage nodes, split journal layout,
+    /// append publish batching, and append ingest admission policies.
+    ///
+    /// The policies change only local durable scheduling. They do not change the
+    /// visible or restart-durable append publish contract.
+    pub fn open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        policy: DurableDataLogPolicy,
+        append_visible_publish_journal: Option<PathBuf>,
+        append_publish_batch_policy: AppendPublishBatchPolicy,
+        append_ingest_admission_policy: AppendIngestAdmissionPolicy,
+    ) -> Result<Self> {
+        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+            root,
+            config,
+            storage_nodes,
+            MaintenancePolicy::manual(policy),
+            append_visible_publish_journal,
+            append_publish_batch_policy,
+            append_ingest_admission_policy,
         )
     }
 
@@ -255,6 +366,7 @@ impl DurableCoordinator {
             maintenance_policy,
             None,
             AppendPublishBatchPolicy::default(),
+            AppendIngestAdmissionPolicy::default(),
         )
     }
 
@@ -274,6 +386,7 @@ impl DurableCoordinator {
             maintenance_policy,
             None,
             append_publish_batch_policy,
+            AppendIngestAdmissionPolicy::default(),
         )
     }
 
@@ -284,10 +397,12 @@ impl DurableCoordinator {
         maintenance_policy: MaintenancePolicy,
         append_visible_publish_journal: Option<PathBuf>,
         append_publish_batch_policy: AppendPublishBatchPolicy,
+        append_ingest_admission_policy: AppendIngestAdmissionPolicy,
     ) -> Result<Self> {
         config.validate()?;
         maintenance_policy.validate()?;
         append_publish_batch_policy.validate()?;
+        append_ingest_admission_policy.validate()?;
         let storage_nodes = normalize_storage_nodes(config.storage_node, storage_nodes);
         let paths = match append_visible_publish_journal {
             Some(path) => DurableStorePaths::new_with_append_visible_publish_journal(
@@ -328,8 +443,12 @@ impl DurableCoordinator {
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
             append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
             append_publish_batch_policy,
+            append_ingest_admission_policy,
+            append_ingest_admission: Arc::new(AppendIngestAdmissionGate::default()),
             persist_profiler: Arc::new(Mutex::new(None)),
             append_publish_wait_profiler: Arc::new(Mutex::new(None)),
+            append_ingest_profiler: Arc::new(Mutex::new(None)),
+            append_ingest_profile_enabled: Arc::new(AtomicBool::new(false)),
             read_profiler: Arc::new(Mutex::new(None)),
             maintenance_policy,
             maintenance_cursor,
@@ -441,6 +560,48 @@ impl DurableCoordinator {
         let _ = self.record_append_publish_wait_profile(profile);
     }
 
+    pub fn enable_append_ingest_profiling(&self, capacity: usize) -> Result<()> {
+        *lock(&self.append_ingest_profiler)? = Some(AppendIngestProfiler::new(capacity)?);
+        self.append_ingest_profile_enabled
+            .store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn drain_append_ingest_profiles(&self, max: usize) -> Result<Vec<AppendIngestProfile>> {
+        let mut profiler = lock(&self.append_ingest_profiler)?;
+        Ok(profiler
+            .as_mut()
+            .map(|profiler| profiler.drain(max))
+            .unwrap_or_default())
+    }
+
+    fn record_append_ingest_profile(&self, profile: AppendIngestProfile) -> Result<()> {
+        if !self
+            .append_ingest_profile_enabled
+            .load(Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        if let Some(profiler) = lock(&self.append_ingest_profiler)?.as_mut() {
+            profiler.record(profile);
+        }
+        Ok(())
+    }
+
+    fn finish_append_ingest_profile(
+        &self,
+        mut profile: AppendIngestProfile,
+        total_started: Option<&Instant>,
+        success: bool,
+    ) {
+        let Some(total_started) = total_started else {
+            return;
+        };
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        profile.success = success;
+        let _ = self.record_append_ingest_profile(profile);
+    }
+
     fn append_publish_lane_key(ticket: &AppendPublishTicket) -> Result<AppendPublishLaneKey> {
         Ok(AppendPublishLaneKey {
             keyspace_id: ticket.keyspace_id,
@@ -462,6 +623,11 @@ impl DurableCoordinator {
     /// Return the provider-private append publish batching policy.
     pub fn append_publish_batch_policy(&self) -> AppendPublishBatchPolicy {
         self.append_publish_batch_policy
+    }
+
+    /// Return the provider-private append ingest admission policy.
+    pub fn append_ingest_admission_policy(&self) -> AppendIngestAdmissionPolicy {
+        self.append_ingest_admission_policy
     }
 
     fn maybe_auto_persist_append_stream(
@@ -2502,62 +2668,172 @@ impl DurableCoordinator {
         durability: crate::api::WriteDurability,
         payload_integrity: PayloadIntegrity,
     ) -> Result<AppendTicket> {
-        let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
-        let admission = self.admit_write(
-            u64::try_from(data.len())
-                .map_err(|_| StorageError::invalid_argument("append byte length overflows u64"))?,
-            flushed,
-        )?;
-        let lane = self.stream_append_lane(stream.stream_id)?;
-        let result = {
-            let _append_guard = lock(&lane.append)?;
-            self.local
-                .prepare_append_stream_run(
-                    stream,
-                    data.len(),
-                    crate::api::WriteDurability::Acknowledged,
-                )
-                .and_then(|prepared| {
-                    let chunks = self.append_stream_payload_chunks(data);
-                    let payload = DurableAppendRunChunkPayload {
-                        run_id: prepared.run_id,
-                        storage_node: prepared.storage_node,
-                        stream_id: prepared.stream.stream_id,
-                        writer_epoch: prepared.stream.writer_epoch,
-                        keyspace_id: prepared.stream.keyspace_id,
-                        file_id: prepared.stream.file_id,
-                        file_offset_start: prepared.range.offset,
-                        payload_integrity,
-                        chunks,
-                        background_sync_step_bytes: self
-                            .append_stream_background_sync_step_bytes(data.len()),
-                    };
-                    let pending_base = lock(&lane.pending)?.clone();
-                    let (run, append, _) = self
-                        .durable
-                        .write_append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
-                    let appended_log_refs = append.log_refs();
-                    lock(&lane.pending)?.merge(append);
-                    let record = self.local.record_prepared_append_stream_run(prepared, run);
-                    match record {
-                        Ok(ticket) => Ok(ticket),
-                        Err(error) => {
-                            lock(&lane.pending)?.remove_log_refs(&appended_log_refs);
-                            Err(error)
-                        }
-                    }
-                })
+        let ingest_profile_enabled = self
+            .append_ingest_profile_enabled
+            .load(Ordering::Relaxed);
+        let total_started = ingest_profile_enabled.then(Instant::now);
+        let payload_bytes = match u64::try_from(data.len()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(StorageError::invalid_argument(
+                    "append byte length overflows u64",
+                ));
+            }
         };
+        let mut profile = AppendIngestProfile {
+            stream_id: stream.stream_id.raw(),
+            payload_bytes,
+            ..AppendIngestProfile::default()
+        };
+        let flushed = matches!(durability, crate::api::WriteDurability::Flushed);
+        let admission_started = ingest_profile_enabled.then(Instant::now);
+        let admission = match self.admit_write(payload_bytes, flushed) {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Some(started) = admission_started.as_ref() {
+                    profile.admission_wait_nanos = duration_nanos_u64(started.elapsed());
+                }
+                self.finish_append_ingest_profile(profile, total_started.as_ref(), false);
+                return Err(error);
+            }
+        };
+        if let Some(started) = admission_started.as_ref() {
+            profile.admission_wait_nanos = duration_nanos_u64(started.elapsed());
+        }
+        let permit = match self
+            .append_ingest_admission
+            .acquire(
+                payload_bytes,
+                self.append_ingest_admission_policy,
+                ingest_profile_enabled,
+            )
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.finish_append_ingest_profile(profile, total_started.as_ref(), false);
+                return Err(error);
+            }
+        };
+        profile.admission_wait_nanos = profile
+            .admission_wait_nanos
+            .saturating_add(permit.wait_nanos());
+        profile.max_in_flight_bytes = permit.max_in_flight_bytes();
+        let lane = self.stream_append_lane(stream.stream_id)?;
+        let result = (|| {
+            let stream_lock_started = ingest_profile_enabled.then(Instant::now);
+            let _append_guard = lock(&lane.append)?;
+            if let Some(started) = stream_lock_started.as_ref() {
+                profile.stream_lock_wait_nanos = duration_nanos_u64(started.elapsed());
+            }
+            let prepare_started = ingest_profile_enabled.then(Instant::now);
+            let prepared = match self.local.prepare_append_stream_run(
+                stream,
+                data.len(),
+                crate::api::WriteDurability::Acknowledged,
+            ) {
+                Ok(prepared) => {
+                    if let Some(started) = prepare_started.as_ref() {
+                        profile.metadata_prepare_nanos = duration_nanos_u64(started.elapsed());
+                    }
+                    prepared
+                }
+                Err(error) => {
+                    if let Some(started) = prepare_started.as_ref() {
+                        profile.metadata_prepare_nanos = duration_nanos_u64(started.elapsed());
+                    }
+                    return Err(error);
+                }
+            };
+            profile.storage_node = prepared.storage_node.raw();
+            let chunks = self.append_stream_payload_chunks(data);
+            let background_sync_step_bytes =
+                self.append_stream_background_sync_step_bytes(data.len());
+            if background_sync_step_bytes.is_some() {
+                profile.background_sync_requested_bytes = payload_bytes;
+            }
+            let payload = DurableAppendRunChunkPayload {
+                run_id: prepared.run_id,
+                storage_node: prepared.storage_node,
+                stream_id: prepared.stream.stream_id,
+                writer_epoch: prepared.stream.writer_epoch,
+                keyspace_id: prepared.stream.keyspace_id,
+                file_id: prepared.stream.file_id,
+                file_offset_start: prepared.range.offset,
+                payload_integrity,
+                chunks,
+                background_sync_step_bytes,
+            };
+            let pending_lock_started = ingest_profile_enabled.then(Instant::now);
+            let pending_base = lock(&lane.pending)?.clone();
+            if let Some(started) = pending_lock_started.as_ref() {
+                profile.pending_lock_wait_nanos = profile
+                    .pending_lock_wait_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+            }
+            let (run, append, data_profile) = self
+                .durable
+                .write_append_run_payload_chunks_unsynced(payload, Some(&pending_base))?;
+            profile.payload_encode_nanos = data_profile.encode_nanos;
+            profile.payload_write_nanos = data_profile.write_nanos;
+            profile.active_log_lock_wait_nanos = data_profile.active_log_lock_wait_nanos;
+            let appended_log_refs = append.log_refs();
+            let pending_lock_started = ingest_profile_enabled.then(Instant::now);
+            lock(&lane.pending)?.merge(append);
+            if let Some(started) = pending_lock_started.as_ref() {
+                profile.pending_lock_wait_nanos = profile
+                    .pending_lock_wait_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+            }
+            let record_started = ingest_profile_enabled.then(Instant::now);
+            let record = self.local.record_prepared_append_stream_run(prepared, run);
+            if let Some(started) = record_started.as_ref() {
+                profile.metadata_record_nanos = duration_nanos_u64(started.elapsed());
+            }
+            match record {
+                Ok(ticket) => Ok(ticket),
+                Err(error) => {
+                    let pending_lock_started = ingest_profile_enabled.then(Instant::now);
+                    lock(&lane.pending)?.remove_log_refs(&appended_log_refs);
+                    if let Some(started) = pending_lock_started.as_ref() {
+                        profile.pending_lock_wait_nanos = profile
+                            .pending_lock_wait_nanos
+                            .saturating_add(duration_nanos_u64(started.elapsed()));
+                    }
+                    Err(error)
+                }
+            }
+        })();
         if result.is_ok() {
             self.after_successful_write(admission);
         }
-        let ticket = result?;
-        if flushed {
-            self.persist_append_stream(stream)?;
+        drop(permit);
+        let ticket = match result {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.finish_append_ingest_profile(profile, total_started.as_ref(), false);
+                return Err(error);
+            }
+        };
+        let auto_persist_started = ingest_profile_enabled.then(Instant::now);
+        let publish_result = if flushed {
+            let result = self.persist_append_stream(stream).map(|_| ticket);
+            if let Some(started) = auto_persist_started.as_ref() {
+                profile.auto_persist_nanos = duration_nanos_u64(started.elapsed());
+            }
+            result
         } else if let Some(threshold) = self.local.config().stream_auto_persist_bytes {
-            self.maybe_auto_persist_append_stream(stream, threshold)?;
-        }
-        Ok(ticket)
+            let result = self
+                .maybe_auto_persist_append_stream(stream, threshold)
+                .map(|_| ticket);
+            if let Some(started) = auto_persist_started.as_ref() {
+                profile.auto_persist_nanos = duration_nanos_u64(started.elapsed());
+            }
+            result
+        } else {
+            Ok(ticket)
+        };
+        self.finish_append_ingest_profile(profile, total_started.as_ref(), publish_result.is_ok());
+        publish_result
     }
 
     pub fn submit_append_publish(

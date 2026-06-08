@@ -220,6 +220,53 @@ fn append_append_publish_profile_csv(
     Ok(())
 }
 
+fn append_append_ingest_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.append_ingest_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_append_ingest_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,stream_id,storage_node,payload_bytes,total_nanos,admission_wait_nanos,stream_lock_wait_nanos,pending_lock_wait_nanos,active_log_lock_wait_nanos,metadata_prepare_nanos,metadata_record_nanos,payload_encode_nanos,payload_write_nanos,auto_persist_nanos,background_sync_requested_bytes,max_in_flight_bytes,success";
+    let mut file = open_csv_append(path, header)?;
+    for profile in profiles {
+        let row = [
+            workload.name().to_string(),
+            args.provider.to_string(),
+            args.durability.to_string(),
+            args.rtt.as_micros().to_string(),
+            args.serial_rtts.to_string(),
+            concurrency.to_string(),
+            workload.op_size(args)?.to_string(),
+            profile.sequence.to_string(),
+            profile.stream_id.to_string(),
+            profile.storage_node.to_string(),
+            profile.payload_bytes.to_string(),
+            profile.total_nanos.to_string(),
+            profile.admission_wait_nanos.to_string(),
+            profile.stream_lock_wait_nanos.to_string(),
+            profile.pending_lock_wait_nanos.to_string(),
+            profile.active_log_lock_wait_nanos.to_string(),
+            profile.metadata_prepare_nanos.to_string(),
+            profile.metadata_record_nanos.to_string(),
+            profile.payload_encode_nanos.to_string(),
+            profile.payload_write_nanos.to_string(),
+            profile.auto_persist_nanos.to_string(),
+            profile.background_sync_requested_bytes.to_string(),
+            profile.max_in_flight_bytes.to_string(),
+            profile.success.to_string(),
+        ];
+        writeln!(file, "{}", row.join(",")).map_err(fs_error)?;
+    }
+    Ok(())
+}
+
 fn append_append_log_profile_csv(args: &Args, report: &BenchReport) -> Result<()> {
     let Some(path) = &args.append_log_profile_csv else {
         return Ok(());
