@@ -252,6 +252,13 @@ impl fmt::Display for AppendAutoPersistMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppendAutoPersistPolicy {
     pub mode: AppendAutoPersistMode,
+    /// Bounded time for inline auto-persist to wait for already-queued
+    /// background payload sync before falling back to foreground sync.
+    ///
+    /// This does not relax durability. Bytes are marked durable only after the
+    /// existing append-log high-water proves that the referenced log payload is
+    /// synced.
+    pub payload_sync_wait: Duration,
 }
 
 impl AppendAutoPersistPolicy {

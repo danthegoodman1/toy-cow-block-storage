@@ -142,6 +142,7 @@ fi
   echo "append_ingest_background_sync_step_mibs=${APPEND_INGEST_BACKGROUND_SYNC_STEP_MIBS}"
   echo "stream_auto_persist_mibs=${STREAM_AUTO_PERSIST_MIBS}"
   echo "stream_auto_persist_modes=${STREAM_AUTO_PERSIST_MODES}"
+  echo "stream_auto_persist_payload_sync_wait_us_values=${STREAM_AUTO_PERSIST_PAYLOAD_SYNC_WAIT_US_VALUES}"
   echo "disk_count=${#DISKS[@]}"
   printf 'disks=%s\n' "${DISKS[*]}"
   echo
@@ -304,6 +305,7 @@ run_layout() {
   local append_ingest_background_sync_step_mib="${9:-}"
   local stream_auto_persist_mib="${10:-32}"
   local stream_auto_persist_mode="${11:-inline-sync}"
+  local stream_auto_persist_payload_sync_wait_us="${12:-0}"
   local append_ingest_label
   local append_ingest_args=()
   case "${append_ingest_cap_mib}" in
@@ -335,7 +337,7 @@ run_layout() {
       append_ingest_args+=(--append-ingest-background-sync-step-mib "${append_ingest_background_sync_step_mib}")
       ;;
   esac
-  mode="${mode}-nodes${STORAGE_NODES}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m-${stream_auto_persist_mode}"
+  mode="${mode}-nodes${STORAGE_NODES}-${append_ingest_label}-autopersist-${stream_auto_persist_mib}m-${stream_auto_persist_mode}-wait${stream_auto_persist_payload_sync_wait_us}us"
   local out="${RESULT_ROOT}/loadbench/${mode}"
   mkdir -p "${out}"
   {
@@ -348,6 +350,7 @@ run_layout() {
     echo "append_ingest_background_sync_step_mib=${append_ingest_background_sync_step_mib}"
     echo "stream_auto_persist_mib=${stream_auto_persist_mib}"
     echo "stream_auto_persist_mode=${stream_auto_persist_mode}"
+    echo "stream_auto_persist_payload_sync_wait_us=${stream_auto_persist_payload_sync_wait_us}"
     echo "root=${root}"
     echo "journal_dir=${journal_dir}"
     echo "node_dirs=${node_dirs}"
@@ -377,6 +380,7 @@ run_layout() {
       --stream-publish-mib 128
       --stream-auto-persist-mib "${stream_auto_persist_mib}"
       --stream-auto-persist-mode "${stream_auto_persist_mode}"
+      --stream-auto-persist-payload-sync-wait-us "${stream_auto_persist_payload_sync_wait_us}"
       --target-data-log-mib 64
       --data-log-file-sync-fanout 16
       --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
@@ -421,6 +425,7 @@ run_layout() {
         --stream-publish-mib 128
         --stream-auto-persist-mib "${stream_auto_persist_mib}"
         --stream-auto-persist-mode "${stream_auto_persist_mode}"
+        --stream-auto-persist-payload-sync-wait-us "${stream_auto_persist_payload_sync_wait_us}"
         --target-data-log-mib 64
         --data-log-file-sync-fanout 16
         --append-publish-batch-target "${APPEND_PUBLISH_BATCH_TARGET}"
@@ -1167,6 +1172,10 @@ IFS=',' read -r -a requested_stream_auto_persist_modes <<<"${STREAM_AUTO_PERSIST
 if (( ${#requested_stream_auto_persist_modes[@]} == 0 )); then
   requested_stream_auto_persist_modes=("inline-sync")
 fi
+IFS=',' read -r -a requested_stream_auto_persist_payload_sync_wait_us_values <<<"${STREAM_AUTO_PERSIST_PAYLOAD_SYNC_WAIT_US_VALUES}"
+if (( ${#requested_stream_auto_persist_payload_sync_wait_us_values[@]} == 0 )); then
+  requested_stream_auto_persist_payload_sync_wait_us_values=("0")
+fi
 
 run_layout_policy_matrix() {
   local mode="$1"
@@ -1180,18 +1189,21 @@ run_layout_policy_matrix() {
           for append_ingest_background_sync_step in "${requested_append_ingest_background_sync_steps[@]}"; do
             for stream_auto_persist_mib in "${requested_stream_auto_persist_mibs[@]}"; do
               for stream_auto_persist_mode in "${requested_stream_auto_persist_modes[@]}"; do
-                run_layout \
-                  "${mode}" \
-                  "${root}" \
-                  "${journal_dir}" \
-                  "${node_dirs}" \
-                  "${append_ingest_cap}" \
-                  "${append_ingest_node_cap}" \
-                  "${append_ingest_active_log_lanes}" \
-                  "${append_ingest_background_sync_workers}" \
-                  "${append_ingest_background_sync_step}" \
-                  "${stream_auto_persist_mib}" \
-                  "${stream_auto_persist_mode}"
+                for stream_auto_persist_payload_sync_wait_us in "${requested_stream_auto_persist_payload_sync_wait_us_values[@]}"; do
+                  run_layout \
+                    "${mode}" \
+                    "${root}" \
+                    "${journal_dir}" \
+                    "${node_dirs}" \
+                    "${append_ingest_cap}" \
+                    "${append_ingest_node_cap}" \
+                    "${append_ingest_active_log_lanes}" \
+                    "${append_ingest_background_sync_workers}" \
+                    "${append_ingest_background_sync_step}" \
+                    "${stream_auto_persist_mib}" \
+                    "${stream_auto_persist_mode}" \
+                    "${stream_auto_persist_payload_sync_wait_us}"
+                done
               done
             done
           done

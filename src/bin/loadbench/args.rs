@@ -248,6 +248,11 @@ impl Args {
                     args.append_ingest_policy.auto_persist.mode =
                         parse_next::<AppendAutoPersistMode>(&mut raw, flag.as_str())?;
                 }
+                "--stream-auto-persist-payload-sync-wait-us" => {
+                    let micros: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.append_ingest_policy.auto_persist.payload_sync_wait =
+                        Duration::from_micros(micros);
+                }
                 "--stream-publish-mib" => {
                     let mib: u64 = parse_next(&mut raw, "--stream-publish-mib")?;
                     args.stream_publish_bytes = Some(mib_to_bytes(mib, "--stream-publish-mib")?);
@@ -498,6 +503,7 @@ options:\n\
   --append-ingest-background-sync-workers N background append payload sync workers, default: 1\n\
   --append-ingest-background-sync-step-mib N background append payload sync request cadence\n\
   --stream-auto-persist-mode MODE          inline-sync or async-payload-sync, default: inline-sync\n\
+  --stream-auto-persist-payload-sync-wait-us N inline auto-persist background-sync wait, default: 0\n\
   --stream-publish-mib N                   publish append streams after N MiB per stream\n\
   --stream-total-mib N                     fixed stream workload MiB per worker, default: 1024\n\
   --stream-auto-persist-mib N              durable stream payload dirty-tail sync threshold\n\

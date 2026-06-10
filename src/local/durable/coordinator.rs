@@ -688,7 +688,102 @@ impl DurableCoordinator {
         target: u64,
         profile: Option<&mut AppendIngestProfile>,
     ) -> Result<()> {
+        if !self
+            .append_auto_persist_policy
+            .payload_sync_wait
+            .is_zero()
+        {
+            return self.maybe_auto_persist_append_stream_inline_with_wait(
+                stream, target, profile,
+            );
+        }
         let mut profile = profile;
+        let sync_result = match profile.as_mut() {
+            Some(profile) => {
+                self.sync_append_stream_payload_prefix_profiled(stream, target, Some(&mut **profile))
+            }
+            None => self.sync_append_stream_payload_prefix_profiled(stream, target, None),
+        };
+        if sync_result.is_ok() {
+            self.mark_append_stream_durable_through_profiled(stream, target, profile)?;
+        } else {
+            let _ = match profile.as_mut() {
+                Some(profile) => self.request_append_stream_payload_sync_profiled(
+                    stream,
+                    target,
+                    Some(&mut **profile),
+                ),
+                None => self.request_append_stream_payload_sync_profiled(stream, target, None),
+            };
+        }
+        Ok(())
+    }
+
+    fn maybe_auto_persist_append_stream_inline_with_wait(
+        &self,
+        stream: &AppendStream,
+        target: u64,
+        profile: Option<&mut AppendIngestProfile>,
+    ) -> Result<()> {
+        let mut profile = profile;
+        let pending_started = profile.is_some().then(Instant::now);
+        let (durable_before, records) = self
+            .local
+            .metadata
+            .append_stream_private_records_from_durable_through(stream, target)?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let remaining_log_refs = records
+            .iter()
+            .map(AppendStreamRunRecord::log_ref)
+            .collect::<BTreeSet<_>>();
+        let pending = self.pending_append_for_stream_log_refs(stream.stream_id, &remaining_log_refs)?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), pending_started.as_ref()) {
+            profile.auto_persist_pending_nanos = duration_nanos_u64(started.elapsed());
+            profile.auto_persist_pending_log_refs = pending.log_ref_count();
+            profile.auto_persist_pending_storage_nodes = pending.storage_node_count();
+        }
+
+        let request_started = profile.is_some().then(Instant::now);
+        let request_result = self.durable.request_pending_append_payload_sync(&pending);
+        if let (Some(profile), Some(started)) = (profile.as_mut(), request_started.as_ref()) {
+            profile.auto_persist_request_nanos = duration_nanos_u64(started.elapsed());
+            profile.auto_persist_request_submitted = request_result.is_ok() && !pending.is_empty();
+        }
+
+        let mut observed = durable_before;
+        if request_result.is_ok() {
+            let wait_started = profile.is_some().then(Instant::now);
+            if let Some(profile) = profile.as_mut() {
+                profile.auto_persist_wait_target_bytes = target;
+            }
+            observed = self.durable.wait_for_synced_append_stream_record_high_water(
+                durable_before,
+                &records,
+                target,
+                self.append_auto_persist_policy.payload_sync_wait,
+            )?;
+            if let (Some(profile), Some(started)) = (profile.as_mut(), wait_started.as_ref()) {
+                profile.auto_persist_wait_nanos = duration_nanos_u64(started.elapsed());
+                profile.auto_persist_observed_synced_bytes = observed;
+            }
+        }
+
+        if observed > durable_before {
+            self.mark_append_stream_durable_through_profiled(
+                stream,
+                observed,
+                profile.as_deref_mut(),
+            )?;
+        }
+        if observed >= target {
+            if let Some(profile) = profile.as_mut() {
+                profile.auto_persist_sync_success = true;
+            }
+            return Ok(());
+        }
+
         let sync_result = match profile.as_mut() {
             Some(profile) => {
                 self.sync_append_stream_payload_prefix_profiled(stream, target, Some(&mut **profile))

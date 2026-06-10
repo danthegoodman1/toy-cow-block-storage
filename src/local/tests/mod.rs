@@ -3337,6 +3337,7 @@ fn durable_stream_auto_persist_async_queues_payload_sync_without_inline_wait() {
             AppendIngestPolicy {
                 auto_persist: AppendAutoPersistPolicy {
                     mode: AppendAutoPersistMode::AsyncPayloadSync,
+                    ..AppendAutoPersistPolicy::default()
                 },
                 ..AppendIngestPolicy::default()
             },
@@ -3417,6 +3418,7 @@ fn durable_stream_auto_persist_async_marks_observed_background_sync() {
             AppendIngestPolicy {
                 auto_persist: AppendAutoPersistPolicy {
                     mode: AppendAutoPersistMode::AsyncPayloadSync,
+                    ..AppendAutoPersistPolicy::default()
                 },
                 ..AppendIngestPolicy::default()
             },
@@ -3580,6 +3582,33 @@ fn durable_append_payload_sync_skips_already_synced_log_bytes() {
         "payload sync high-water should avoid re-syncing already durable append-log bytes"
     );
     assert_eq!(second.sync_bytes, 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn append_log_payload_sync_reports_observed_file_len() {
+    let root = durable_temp_dir("append-log-sync-observed-file-len");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("append.log");
+    let mut writer = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    writer.write_all(&vec![17; 8192]).unwrap();
+    writer.flush().unwrap();
+
+    let file = append_log_file_to_sync_at_observed_len(File::open(&path).unwrap(), 4096).unwrap();
+    assert_eq!(
+        file.bytes, 8192,
+        "append-log sync high-water should advance to bytes present before sync"
+    );
+
+    assert!(
+        append_log_file_to_sync_at_observed_len(File::open(&path).unwrap(), 16 * 1024).is_err()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -10666,6 +10695,69 @@ fn durable_append_ingest_profile_records_payload_write() {
     assert!(profile.metadata_prepare_nanos > 0);
     assert!(profile.metadata_record_nanos > 0);
     assert!(profile.total_nanos >= profile.payload_write_nanos);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_ingest_profile_records_auto_persist_wait() {
+    let root = durable_temp_dir("append-ingest-auto-persist-wait-profile");
+    let cfg = LocalStoreConfig {
+        stream_auto_persist_bytes: Some(4096),
+        ..config()
+    };
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            AppendIngestPolicy {
+                data_log: AppendIngestDataLogPolicy {
+                    background_sync_step_bytes: Some(4096),
+                    ..AppendIngestDataLogPolicy::default()
+                },
+                auto_persist: AppendAutoPersistPolicy {
+                    mode: AppendAutoPersistMode::InlineSync,
+                    payload_sync_wait: Duration::from_millis(10),
+                },
+                ..AppendIngestPolicy::default()
+            },
+        )
+        .unwrap();
+    store.enable_append_ingest_profiling(16).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let stream = store.open_append_stream(keyspace_id, file_id).unwrap();
+    let payload = repeated_blocks(1, 112);
+    store
+        .append_stream(&stream, &payload, WriteDurability::Acknowledged)
+        .unwrap();
+
+    let profiles = store.drain_append_ingest_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = profiles[0];
+    assert!(profile.success);
+    assert_eq!(profile.auto_persist_target_bytes, 4096);
+    assert_eq!(profile.auto_persist_wait_target_bytes, 4096);
+    assert!(profile.auto_persist_request_submitted);
+    assert!(profile.auto_persist_wait_nanos > 0);
+    assert!(profile.auto_persist_observed_synced_bytes <= 4096);
+    assert!(profile.total_nanos >= profile.auto_persist_wait_nanos);
     let _ = fs::remove_dir_all(root);
 }
 

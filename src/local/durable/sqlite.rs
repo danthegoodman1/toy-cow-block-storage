@@ -540,6 +540,19 @@ fn data_log_file_to_sync(file: File, bytes: u64) -> DataLogFileToSync {
     DataLogFileToSync { file, bytes }
 }
 
+fn append_log_file_to_sync_at_observed_len(
+    file: File,
+    requested_bytes: u64,
+) -> Result<DataLogFileToSync> {
+    let bytes = file.metadata().map_err(fs_error)?.len();
+    if bytes < requested_bytes {
+        return Err(StorageError::corrupt(
+            "append-log payload sync request exceeds file length",
+        ));
+    }
+    Ok(DataLogFileToSync { file, bytes })
+}
+
 fn data_log_file_to_sync_with_metadata(file: File) -> Result<DataLogFileToSync> {
     let bytes = file.metadata().map_err(fs_error)?.len();
     Ok(DataLogFileToSync { file, bytes })
@@ -783,11 +796,12 @@ fn sync_append_run_log_requests(
             request.log_ref.storage_node,
             request.log_ref.log_id,
         );
-        files.push(data_log_file_to_sync(
+        let file = append_log_file_to_sync_at_observed_len(
             File::open(&path).map_err(fs_error)?,
             request.bytes,
-        ));
-        synced_after.insert(request.log_ref, request.bytes);
+        )?;
+        synced_after.insert(request.log_ref, file.bytes);
+        files.push(file);
     }
 
     if files.is_empty() && storage_nodes_needing_dir_sync.is_empty() {
@@ -1204,6 +1218,47 @@ impl StorageNodeAppendLogService {
             durable_before,
             records,
         )
+    }
+
+    fn wait_for_synced_append_stream_record_high_water(
+        &self,
+        durable_before: u64,
+        records: &[AppendStreamRunRecord],
+        target: u64,
+        timeout: Duration,
+    ) -> Result<u64> {
+        if timeout.is_zero() {
+            return self.synced_append_stream_record_high_water(durable_before, records);
+        }
+        let deadline = Instant::now() + timeout;
+        let mut synced = lock(&self.synced_logs)?;
+        loop {
+            let observed = Self::synced_append_stream_record_high_water_from_snapshot(
+                &synced,
+                durable_before,
+                records,
+            )?;
+            if observed >= target {
+                return Ok(observed);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(observed);
+            }
+            let (guard, wait_result) = self
+                .synced_log_cvar
+                .wait_timeout(synced, remaining)
+                .map_err(|_| StorageError::unavailable("append payload sync state poisoned"))?;
+            synced = guard;
+            if wait_result.timed_out() {
+                let observed = Self::synced_append_stream_record_high_water_from_snapshot(
+                    &synced,
+                    durable_before,
+                    records,
+                )?;
+                return Ok(observed);
+            }
+        }
     }
 
     fn sync_pending_append(&self, appended: &PendingDataLogAppend) -> Result<DataLogAppendProfile> {
@@ -3885,6 +3940,22 @@ impl DurableSqliteStore {
     ) -> Result<u64> {
         self.append_log_service
             .synced_append_stream_record_high_water(durable_before, records)
+    }
+
+    fn wait_for_synced_append_stream_record_high_water(
+        &self,
+        durable_before: u64,
+        records: &[AppendStreamRunRecord],
+        target: u64,
+        timeout: Duration,
+    ) -> Result<u64> {
+        self.append_log_service
+            .wait_for_synced_append_stream_record_high_water(
+                durable_before,
+                records,
+                target,
+                timeout,
+            )
     }
 
     fn data_log_manifest_for_ref(
