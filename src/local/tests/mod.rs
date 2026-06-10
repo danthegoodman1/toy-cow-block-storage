@@ -5881,20 +5881,34 @@ fn durable_sqlite_stores_native_keyspace_heads_as_per_shard_rows() {
         .unwrap();
     drop(store);
     let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
-    let after_first_manifest: Vec<u8> = conn
+    let after_first_delta_manifest: Vec<u8> = conn
         .query_row(
             "SELECT payload FROM keyspace_manifests WHERE keyspace_id = ?1",
             params![keyspace_id.raw().to_string()],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(after_first_manifest, initial_manifest);
+    assert_eq!(after_first_delta_manifest, initial_manifest);
+    let after_first_delta = keyspace_shard_payloads_for_test(&conn);
+    assert_eq!(
+        changed_payload_count(&initial_shards, &after_first_delta),
+        0,
+        "a flushed tiny write should persist as a compact delta before row-native fold"
+    );
+    assert_eq!(native_file_delta_commit_count(&root), 1);
+    drop(conn);
+
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.persist_now().unwrap();
+    drop(store);
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
     let after_first = keyspace_shard_payloads_for_test(&conn);
     assert_eq!(
         changed_payload_count(&initial_shards, &after_first),
         1,
-        "a single-file write should update one keyspace shard-head row"
+        "folding a single-file write should update one keyspace shard-head row"
     );
+    assert_eq!(native_file_delta_commit_count(&root), 0);
     drop(conn);
 
     let store = DurableCoordinator::open(&root, cfg).unwrap();
@@ -5908,12 +5922,26 @@ fn durable_sqlite_stores_native_keyspace_heads_as_per_shard_rows() {
         .unwrap();
     drop(store);
     let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    let after_second_delta = keyspace_shard_payloads_for_test(&conn);
+    assert_eq!(
+        changed_payload_count(&after_first, &after_second_delta),
+        0,
+        "a second flushed tiny write should also stay compact before row-native fold"
+    );
+    assert_eq!(native_file_delta_commit_count(&root), 1);
+    drop(conn);
+
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.persist_now().unwrap();
+    drop(store);
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
     let after_second = keyspace_shard_payloads_for_test(&conn);
     assert_eq!(
         changed_payload_count(&after_first, &after_second),
         1,
-        "an independent file write should update only its keyspace shard-head row"
+        "folding an independent file write should update only its keyspace shard-head row"
     );
+    assert_eq!(native_file_delta_commit_count(&root), 0);
     drop(conn);
 
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
@@ -6202,6 +6230,220 @@ fn durable_sqlite_persists_native_stream_run_extents_on_publish() {
         .unwrap();
     assert_eq!(bytes, repeated_blocks(1, 12));
     drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_visible_replay_interleaves_with_compact_deltas() {
+    let root = durable_temp_dir("append-visible-compact-delta-interleave");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let native_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("native".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let append_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("append".to_string()),
+                },
+            },
+        )
+        .unwrap();
+
+    let native_payload = repeated_blocks(1, 21);
+    store
+        .commit_file_batch(
+            keyspace_id,
+            native_file,
+            &[FileBatchWrite::new(0, native_payload.clone())],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    assert_eq!(native_file_delta_commit_count(&root), 1);
+
+    let block_payload = repeated_blocks(1, 22);
+    store
+        .write_device(device_id, 0, &block_payload, WriteDurability::Flushed)
+        .unwrap();
+    assert_eq!(native_file_delta_commit_count(&root), 1);
+    assert_eq!(block_delta_commit_count(&root), 1);
+
+    let append_payload = repeated_blocks(1, 23);
+    append_durable_store_once(
+        &store,
+        keyspace_id,
+        append_file,
+        &append_payload,
+        WriteDurability::Flushed,
+    )
+    .unwrap();
+    assert_eq!(
+        native_file_delta_commit_count(&root),
+        1,
+        "append publish should not fold unrelated native-file compact deltas"
+    );
+    assert_eq!(
+        block_delta_commit_count(&root),
+        1,
+        "append publish should not fold unrelated block compact deltas"
+    );
+    assert_eq!(
+        append_visible_publish_journal_count(&root, keyspace_id, append_file),
+        1
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut native_read = vec![0; native_payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            native_file,
+            ByteRange::new(0, native_payload.len() as u64),
+            &mut native_read,
+        )
+        .unwrap();
+    assert_eq!(native_read, native_payload);
+    let mut block_read = vec![0; block_payload.len()];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(0, block_payload.len() as u64),
+            &mut block_read,
+        )
+        .unwrap();
+    assert_eq!(block_read, block_payload);
+    let mut append_read = vec![0; append_payload.len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            append_file,
+            ByteRange::new(0, append_payload.len() as u64),
+            &mut append_read,
+        )
+        .unwrap();
+    assert_eq!(append_read, append_payload);
+    assert_eq!(native_file_delta_commit_count(&root), 1);
+    assert_eq!(block_delta_commit_count(&root), 1);
+
+    reopened.persist_now().unwrap();
+    assert_eq!(native_file_delta_commit_count(&root), 0);
+    assert_eq!(block_delta_commit_count(&root), 0);
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_append_publish_does_not_gate_unrelated_native_file_shard_commit() {
+    let root = durable_temp_dir("append-publish-unrelated-native-shard");
+    let cfg = config();
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest { name: None })
+        .unwrap();
+    let append_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("append".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let native_file = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("native".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    assert_ne!(
+        append_file.raw() % KEYSPACE_CATALOG_SHARD_COUNT as u128,
+        native_file.raw() % KEYSPACE_CATALOG_SHARD_COUNT as u128,
+        "test requires files in different native catalog shards"
+    );
+    store.persist_now().unwrap();
+    store.enable_native_file_batch_profiling(8).unwrap();
+    store
+        .set_persist_delay_for_test(Some(Duration::from_millis(200)))
+        .unwrap();
+
+    let stream = store.open_append_stream(keyspace_id, append_file).unwrap();
+    let append_payload = repeated_blocks(1, 31);
+    let ticket = store
+        .append_stream(&stream, &append_payload, WriteDurability::Acknowledged)
+        .unwrap();
+    let publish_through = ticket.range.end_exclusive().unwrap();
+    let publish = {
+        let store = Arc::clone(&store);
+        let stream = stream.clone();
+        thread::spawn(move || store.publish_append_stream(&stream, publish_through))
+    };
+
+    thread::sleep(Duration::from_millis(50));
+    let native_started = Instant::now();
+    store
+        .commit_file_batch(
+            keyspace_id,
+            native_file,
+            &[FileBatchWrite::new(0, repeated_blocks(1, 32))],
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    let native_elapsed = native_started.elapsed();
+    assert!(
+        native_elapsed < Duration::from_millis(150),
+        "unrelated native shard commit waited behind append publish for {native_elapsed:?}"
+    );
+
+    publish.join().unwrap().unwrap();
+    store.set_persist_delay_for_test(None).unwrap();
+
+    let mut append_read = vec![0; append_payload.len()];
+    store
+        .read_file(
+            keyspace_id,
+            append_file,
+            ByteRange::new(0, append_payload.len() as u64),
+            &mut append_read,
+        )
+        .unwrap();
+    assert_eq!(append_read, append_payload);
+    let mut native_read = vec![0; 4096];
+    store
+        .read_file(
+            keyspace_id,
+            native_file,
+            ByteRange::new(0, 4096),
+            &mut native_read,
+        )
+        .unwrap();
+    assert_eq!(native_read, repeated_blocks(1, 32));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -14272,6 +14514,43 @@ fn native_file_batch_commit_collapses_overlaps_and_advances_once() {
 }
 
 #[test]
+fn native_batch_writes_cover_range_detects_full_replacement() {
+    let full = vec![CollapsedFileWrite {
+        offset: 0,
+        bytes: vec![1; 4096],
+    }];
+    assert!(native_batch_writes_cover_range(&full, ByteRange::new(0, 4096)).unwrap());
+    assert!(native_batch_writes_cover_range(&full, ByteRange::new(1024, 2048)).unwrap());
+    assert!(native_batch_writes_cover_range(&full, ByteRange::new(2048, 0)).unwrap());
+    assert!(!native_batch_writes_cover_range(&full, ByteRange::new(0, 4097)).unwrap());
+    assert!(!native_batch_writes_cover_range(&full, ByteRange::new(4095, 2)).unwrap());
+
+    let stitched = vec![
+        CollapsedFileWrite {
+            offset: 0,
+            bytes: vec![2; 2048],
+        },
+        CollapsedFileWrite {
+            offset: 2048,
+            bytes: vec![3; 2048],
+        },
+    ];
+    assert!(native_batch_writes_cover_range(&stitched, ByteRange::new(0, 4096)).unwrap());
+
+    let gap = vec![
+        CollapsedFileWrite {
+            offset: 0,
+            bytes: vec![4; 2048],
+        },
+        CollapsedFileWrite {
+            offset: 3072,
+            bytes: vec![5; 1024],
+        },
+    ];
+    assert!(!native_batch_writes_cover_range(&gap, ByteRange::new(0, 4096)).unwrap());
+}
+
+#[test]
 fn native_file_batch_commit_is_the_single_write_helper_path() {
     let store = LocalCoordinator::with_config(config()).unwrap();
     let client = create_native_client(&store);
@@ -14351,6 +14630,230 @@ fn durable_native_file_batch_commit_survives_reopen() {
         .read_file(keyspace_id, file_id, ByteRange::new(0, 9), &mut bytes)
         .unwrap();
     assert_eq!(bytes.as_slice(), b"leftright");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn native_file_batch_profile_records_full_page_overwrite_without_preservation_read() {
+    let store = LocalCoordinator::new();
+    let keyspace_id = store
+        .metadata()
+        .create_keyspace(MetadataCreateKeyspaceRequest {
+            request: CreateKeyspaceRequest {
+                name: Some("ks".to_string()),
+            },
+        })
+        .map(|head| head.keyspace_id)
+        .unwrap();
+    let file_id = store
+        .metadata()
+        .create_file(MetadataCreateFileRequest {
+            keyspace_id,
+            request: CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        })
+        .map(|head| head.file_id)
+        .unwrap();
+
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, vec![1; 4096])],
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    store.enable_native_file_batch_profiling(4).unwrap();
+    assert!(
+        store
+            .drain_native_file_batch_commit_profiles(4)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, vec![2; 4096])],
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+
+    let profiles = store.drain_native_file_batch_commit_profiles(4).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = profiles[0];
+    assert_eq!(profile.write_count, 1);
+    assert_eq!(profile.collapsed_range_count, 1);
+    assert_eq!(profile.segment_group_count, 1);
+    assert_eq!(profile.segment_count, 1);
+    assert_eq!(profile.requested_bytes, 4096);
+    assert_eq!(profile.committed_bytes, 4096);
+    assert_eq!(profile.committed_range_bytes, 4096);
+    assert_eq!(profile.preserved_read_bytes, 0);
+    assert!(profile.preservation_check_nanos > 0);
+    assert!(profile.tree_path_copy_nanos > 0);
+    assert!(profile.total_nanos >= profile.tree_path_copy_nanos);
+
+    let mut bytes = vec![0; 4096];
+    store
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, vec![2; 4096]);
+}
+
+#[test]
+fn durable_native_file_batch_flushed_uses_delta_and_replays_partial_overwrite() {
+    let root = durable_temp_dir("native-file-batch-delta-replay");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    store.persist_now().unwrap();
+    assert_eq!(native_file_delta_commit_count(&root), 0);
+    store.enable_persist_profiling(16).unwrap();
+    let _ = store.drain_persist_profiles(16).unwrap();
+
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, vec![1; 4096])],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(1024, vec![2; 2048])],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    assert_eq!(native_file_delta_commit_count(&root), 2);
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.native_file_delta_selected_count)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.native_file_delta_selected_bytes)
+            .sum::<u64>(),
+        4096 + 2048
+    );
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.block_delta_selected_count)
+            .sum::<u64>(),
+        0
+    );
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; 4096];
+    reopened
+        .read_file(keyspace_id, file_id, ByteRange::new(0, 4096), &mut bytes)
+        .unwrap();
+    let mut expected = vec![1; 4096];
+    expected[1024..3072].fill(2);
+    assert_eq!(bytes, expected);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_native_file_delta_rows_prune_after_full_persist() {
+    let root = durable_temp_dir("native-file-delta-prune");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    store.persist_now().unwrap();
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, vec![7; 4096])],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    assert_eq!(native_file_delta_commit_count(&root), 1);
+    store.persist_now().unwrap();
+    assert_eq!(native_file_delta_commit_count(&root), 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_sqlite_rejects_corrupt_native_file_delta_payload() {
+    let root = durable_temp_dir("native-file-delta-corrupt-payload");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    store.persist_now().unwrap();
+    store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, vec![9; 4096])],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    drop(store);
+
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    conn.execute("UPDATE native_file_delta_commits SET payload = x'ff'", [])
+        .unwrap();
+    drop(conn);
+
+    assert!(DurableCoordinator::open(&root, cfg).is_err());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -16369,6 +16872,16 @@ fn block_delta_commit_count(root: &Path) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM block_delta_commits", [], |row| {
         row.get(0)
     })
+    .unwrap()
+}
+
+fn native_file_delta_commit_count(root: &Path) -> i64 {
+    let conn = Connection::open(root.join("metadata.sqlite")).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM native_file_delta_commits",
+        [],
+        |row| row.get(0),
+    )
     .unwrap()
 }
 

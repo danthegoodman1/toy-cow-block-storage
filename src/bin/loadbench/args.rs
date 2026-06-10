@@ -23,6 +23,8 @@ struct Args {
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
     block_batch_profile_csv: Option<PathBuf>,
+    native_file_batch_profile_csv: Option<PathBuf>,
+    native_file_batch_commit_profile_csv: Option<PathBuf>,
     append_ingest_profile_csv: Option<PathBuf>,
     append_log_profile_csv: Option<PathBuf>,
     read_profile_csv: Option<PathBuf>,
@@ -71,6 +73,8 @@ impl Args {
             metadata_profile_csv: None,
             block_write_profile_csv: None,
             block_batch_profile_csv: None,
+            native_file_batch_profile_csv: None,
+            native_file_batch_commit_profile_csv: None,
             append_ingest_profile_csv: None,
             append_log_profile_csv: None,
             read_profile_csv: None,
@@ -177,6 +181,19 @@ impl Args {
                         &mut raw,
                         "--block-batch-profile-csv",
                     )?));
+                }
+                "--native-file-batch-profile-csv" => {
+                    args.native_file_batch_profile_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--native-file-batch-profile-csv",
+                    )?));
+                }
+                "--native-file-batch-commit-profile-csv" => {
+                    args.native_file_batch_commit_profile_csv =
+                        Some(PathBuf::from(parse_next::<String>(
+                            &mut raw,
+                            "--native-file-batch-commit-profile-csv",
+                        )?));
                 }
                 "--append-ingest-profile-csv" => {
                     args.append_ingest_profile_csv = Some(PathBuf::from(parse_next::<String>(
@@ -414,7 +431,7 @@ options:\n\
                                            default: local\n\
   --durability ack|flushed|ack-flush:N     default: ack\n\
   --workloads LIST                         default: north-star\n\
-                                           aliases: north-star, durable-publish, append-batch, append-stream, block-metadata, block-batch, block-durable-boundary, block-writeback, block-writeback-prestaged, native-metadata, native-file-batch\n\
+                                           aliases: north-star, durable-publish, append-batch, append-stream, block-metadata, block-batch, block-durable-boundary, block-writeback, block-writeback-prestaged, native-metadata, native-file-batch, native-mixed\n\
                                            names: block-write-4k,\n\
                                            block-write-4k-same-shard-contended,\n\
                                            block-write-4k-same-shard-serialized,\n\
@@ -448,6 +465,8 @@ options:\n\
                                            native-file-batch-1m-16ops,\n\
                                            native-file-batch-overwrite-collapse,\n\
                                            native-file-batch-fsync-interval,\n\
+                                           native-mixed-append-batch-4k-16ops,\n\
+                                           native-mixed-append-batch-4k-256ops,\n\
                                            native-append-4k, native-append-4k-same-file,\n\
                                            native-append-4k-file-lanes, native-append-1m,\n\
                                            native-append-4m, native-append-32m,\n\
@@ -489,6 +508,8 @@ options:\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\
   --block-batch-profile-csv PATH           append block batch commit profiles to CSV\n\
+  --native-file-batch-profile-csv PATH     append native file batch commit profiles to CSV\n\
+  --native-file-batch-commit-profile-csv PATH append native file batch internal commit phase profiles to CSV\n\
   --append-ingest-profile-csv PATH         append durable append ingest profiles to CSV\n\
   --append-log-profile-csv PATH            append append-log microbench profiles to CSV\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
@@ -634,6 +655,7 @@ fn parse_workloads(value: &str) -> Result<Vec<Workload>> {
             }
             "native-metadata" => workloads.extend(Workload::native_metadata_suite()),
             "native-file-batch" => workloads.extend(Workload::native_file_batch_suite()),
+            "native-mixed" => workloads.extend(Workload::native_mixed_suite()),
             _ => workloads.push(Workload::from_str(part)?),
         }
     }

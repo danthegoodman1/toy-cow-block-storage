@@ -20,6 +20,9 @@ impl BenchStore {
                 if args.read_profile_csv.is_some() {
                     store.enable_read_profiling(DEFAULT_PROFILE_CAPACITY)?;
                 }
+                if args.native_file_batch_commit_profile_csv.is_some() {
+                    store.enable_native_file_batch_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
                 Ok(Self::Local(store))
             }
             ProviderKind::TxnSerial => {
@@ -79,6 +82,9 @@ impl BenchStore {
                 }
                 if args.read_profile_csv.is_some() {
                     store.enable_read_profiling(DEFAULT_PROFILE_CAPACITY)?;
+                }
+                if args.native_file_batch_commit_profile_csv.is_some() {
+                    store.enable_native_file_batch_profiling(DEFAULT_PROFILE_CAPACITY)?;
                 }
                 Ok(Self::Durable(store))
             }
@@ -215,7 +221,7 @@ impl BenchStore {
         writes: &[FileBatchWrite],
         durability: WriteDurability,
         payload_integrity: PayloadIntegrity,
-    ) -> Result<()> {
+    ) -> Result<FileWriteCommit> {
         match self {
             Self::Local(store) => store.commit_file_batch_with_integrity(
                 keyspace_id,
@@ -235,7 +241,6 @@ impl BenchStore {
                 "txn metadata provider is block-only in loadbench",
             )),
         }
-        .map(|_| ())
     }
 
     fn open_append_stream(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<AppendStream> {
@@ -376,6 +381,17 @@ impl BenchStore {
         match self {
             Self::Local(store) => store.drain_read_profiles(max),
             Self::Durable(store) => store.drain_read_profiles(max),
+            Self::Txn(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn drain_native_file_batch_commit_profiles(
+        &self,
+        max: usize,
+    ) -> Result<Vec<NativeFileBatchCommitProfile>> {
+        match self {
+            Self::Local(store) => store.drain_native_file_batch_commit_profiles(max),
+            Self::Durable(store) => store.drain_native_file_batch_commit_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }

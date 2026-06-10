@@ -215,6 +215,7 @@ fn execute_append_log_microbench_load(
                 durable_bytes: worker_bytes,
                 published_bytes: 0,
                 block_batch_profile: None,
+                native_file_batch_profile: None,
             },
             true,
             &mut rng,

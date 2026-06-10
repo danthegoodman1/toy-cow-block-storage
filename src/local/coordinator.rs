@@ -27,6 +27,12 @@ pub(super) struct BlockMappingCommitWithDelta {
     delta: Option<BlockDeltaCommit>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct NativeFileCommitWithDelta {
+    commit: FileWriteCommit,
+    delta: Option<NativeFileDeltaCommit>,
+}
+
 /// In-process coordinator that owns request orchestration across metadata and
 /// storage-node roles.
 #[derive(Debug, Clone)]
@@ -41,6 +47,8 @@ pub struct LocalCoordinator {
     next_extent_id: Arc<Mutex<u128>>,
     observability: Arc<Observability>,
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
+    native_file_batch_profiler: Arc<Mutex<Option<NativeFileBatchCommitProfiler>>>,
+    verified_receipt_cache: Arc<Mutex<BTreeMap<SegmentId, VerifiedSegmentReceipt>>>,
 }
 
 impl LocalCoordinator {
@@ -73,6 +81,8 @@ impl LocalCoordinator {
             next_extent_id: Arc::new(Mutex::new(1)),
             observability,
             read_profiler: Arc::new(Mutex::new(None)),
+            native_file_batch_profiler: Arc::new(Mutex::new(None)),
+            verified_receipt_cache: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -99,6 +109,8 @@ impl LocalCoordinator {
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
             observability,
             read_profiler: Arc::new(Mutex::new(None)),
+            native_file_batch_profiler: Arc::new(Mutex::new(None)),
+            verified_receipt_cache: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -1115,6 +1127,37 @@ impl LocalCoordinator {
         Ok(())
     }
 
+    pub fn enable_native_file_batch_profiling(&self, capacity: usize) -> Result<()> {
+        *lock(&self.native_file_batch_profiler)? =
+            Some(NativeFileBatchCommitProfiler::new(capacity)?);
+        Ok(())
+    }
+
+    pub fn drain_native_file_batch_commit_profiles(
+        &self,
+        max: usize,
+    ) -> Result<Vec<NativeFileBatchCommitProfile>> {
+        let mut profiler = lock(&self.native_file_batch_profiler)?;
+        Ok(profiler
+            .as_mut()
+            .map(|profiler| profiler.drain(max))
+            .unwrap_or_default())
+    }
+
+    fn native_file_batch_profile_enabled(&self) -> Result<bool> {
+        Ok(lock(&self.native_file_batch_profiler)?.is_some())
+    }
+
+    fn record_native_file_batch_profile(
+        &self,
+        profile: NativeFileBatchCommitProfile,
+    ) -> Result<()> {
+        if let Some(profiler) = lock(&self.native_file_batch_profiler)?.as_mut() {
+            profiler.record(profile);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn storage_node_ids_for_test(&self) -> Vec<StorageNodeId> {
         self.storage_nodes.node_ids()
@@ -1426,15 +1469,6 @@ impl LocalCoordinator {
         })
     }
 
-    fn replay_block_delta_commits(&self, commits: &[BlockDeltaCommit]) -> Result<()> {
-        let mut commits = commits.to_vec();
-        commits.sort_by_key(|commit| commit.commit_seq.raw());
-        for commit in commits {
-            self.replay_block_delta_commit(&commit)?;
-        }
-        Ok(())
-    }
-
     fn replay_block_delta_commit(&self, commit: &BlockDeltaCommit) -> Result<()> {
         if commit.entries.is_empty() {
             return Err(StorageError::corrupt("block delta commit has no entries"));
@@ -1528,6 +1562,105 @@ impl LocalCoordinator {
                 self.authority.as_ref(),
             )?;
         }
+        Ok(())
+    }
+
+    fn replay_native_file_delta_commit(&self, commit: &NativeFileDeltaCommit) -> Result<()> {
+        if commit.entries.is_empty() {
+            return Err(StorageError::corrupt(
+                "native file delta commit has no entries",
+            ));
+        }
+        let current = self
+            .metadata
+            .get_file_head(commit.keyspace_id, commit.file_id)?;
+        if current.version != commit.base_file_version || current.size != commit.old_size {
+            return Err(StorageError::corrupt(
+                "native file delta base head disagrees with replay state",
+            ));
+        }
+        self.metadata
+            .set_next_commit_seq_for_replay(commit.commit_seq)?;
+
+        let mut receipts = BTreeMap::new();
+        for segment_id in commit.segment_ids() {
+            let receipt = self.storage_nodes.receipt_for_segment(segment_id)?;
+            receipts.insert(segment_id, self.authority.verify_segment_receipt(&receipt)?);
+        }
+        let all_receipts: Vec<_> = receipts.values().cloned().collect();
+
+        let root = self.metadata.get_metadata_node(current.root)?;
+        let mut new_root = current.root;
+        let mut entries = commit.entries.clone();
+        entries.sort_by_key(|entry| entry.range.start.raw());
+        for entry in entries {
+            if !root.covered_range.contains_range(entry.range)? {
+                return Err(StorageError::corrupt(
+                    "native file delta range exceeds file root coverage",
+                ));
+            }
+            let replacement = match entry.replacement {
+                NativeFileDeltaReplacement::Segment {
+                    segment_id,
+                    segment_offset,
+                } => {
+                    let Some(segment_base_raw) =
+                        entry.range.start.raw().checked_sub(segment_offset.raw())
+                    else {
+                        return Err(StorageError::corrupt(
+                            "native file delta segment offset exceeds logical start",
+                        ));
+                    };
+                    SegmentReplacement {
+                        segment_id,
+                        segment_base: BlockIndex::from_raw(segment_base_raw),
+                    }
+                }
+            };
+            new_root = self
+                .replace_tree_range_with_receipts(
+                    new_root,
+                    TreeRangeEdit {
+                        range: entry.range,
+                        replacement: Some(replacement),
+                    },
+                    &all_receipts,
+                )?
+                .root;
+        }
+
+        let group = self.publish_commit_group_observed(CommitGroupIntent {
+            owner: MappingOwner::NativeKeyspace(commit.keyspace_id),
+            fence: MetadataFence::FileVersion(commit.base_file_version),
+            updates: vec![RootUpdate::FileRoot {
+                file_id: commit.file_id,
+                old_root: current.root,
+                new_root,
+                new_size: commit.new_size,
+            }],
+        })?;
+        if group.commit_seq != commit.commit_seq {
+            return Err(StorageError::corrupt(
+                "native file delta replay produced unexpected commit sequence",
+            ));
+        }
+        let replayed = self
+            .metadata
+            .get_file_head(commit.keyspace_id, commit.file_id)?;
+        if replayed.version != commit.new_file_version || replayed.size != commit.new_size {
+            return Err(StorageError::corrupt(
+                "native file delta replay produced unexpected file head",
+            ));
+        }
+        for receipt in receipts.values() {
+            self.storage_nodes.mark_segment_referenced(
+                receipt.receipt(),
+                commit.commit_seq,
+                self.authority.as_ref(),
+            )?;
+        }
+        self.metadata
+            .invalidate_append_streams_for_file(commit.keyspace_id, commit.file_id)?;
         Ok(())
     }
 
@@ -2350,21 +2483,36 @@ impl LocalCoordinator {
                 "prepared append publish catalog shard changed before apply",
             ));
         }
+        let keyspace_commit = KeyspaceCommit {
+            old_file_count: current_keyspace.file_count,
+            new_file_count: current_keyspace.file_count,
+            ..plan.keyspace_commit.clone()
+        };
         let mut new_keyspace_head = current_keyspace.clone();
         new_keyspace_head.generation =
             InMemoryMetadataPlane::next_keyspace_generation(new_keyspace_head.generation)?;
         new_keyspace_head.latest_commit =
             new_keyspace_head.latest_commit.max(plan.commit.commit_seq);
         new_keyspace_head.shard_roots[shard_index] = plan.new_keyspace_shard.shard_id;
-        new_keyspace_head.file_count = plan.keyspace_commit.new_file_count;
+        new_keyspace_head.file_count = keyspace_commit.new_file_count;
         metadata
             .keyspace_heads
             .insert(plan.ticket.keyspace_id, new_keyspace_head);
         metadata
             .keyspace_catalog_shards
             .insert(plan.new_keyspace_shard.shard_id, plan.new_keyspace_shard.clone());
-        metadata.keyspace_commits.push(plan.keyspace_commit.clone());
+        metadata.keyspace_commits.push(keyspace_commit);
+        metadata
+            .keyspace_commits
+            .sort_by_key(|commit| (commit.commit_seq.raw(), commit.shard_index));
         metadata.file_commits.push(plan.file_commit.clone());
+        metadata.file_commits.sort_by_key(|commit| {
+            (
+                commit.commit_seq.raw(),
+                commit.keyspace_id.raw(),
+                commit.file_id.raw(),
+            )
+        });
         metadata
             .commit_groups
             .insert(plan.commit_group.commit_group, plan.commit_group.clone());
@@ -2379,27 +2527,6 @@ impl LocalCoordinator {
         self.metadata
             .complete_append_publish_ticket(&plan.ticket, plan.commit.clone())?;
         Ok(plan.commit)
-    }
-
-    fn materialize_append_visible_publish_records(
-        &self,
-        records: &[AppendVisiblePublish],
-    ) -> Result<()> {
-        let mut records = records.to_vec();
-        records.sort_by_key(|record| {
-            (
-                record.keyspace_id.raw(),
-                record.file_id.raw(),
-                record.base_file_version.raw(),
-                record.old_size,
-                record.commit_seq.raw(),
-                record.record_id.raw(),
-            )
-        });
-        for record in records {
-            self.materialize_append_visible_publish_record(&record)?;
-        }
-        Ok(())
     }
 
     fn append_visible_publish_already_materialized(
@@ -2661,21 +2788,66 @@ impl LocalCoordinator {
         durability: crate::api::WriteDurability,
         payload_integrity: PayloadIntegrity,
     ) -> Result<FileWriteCommit> {
+        self.commit_file_batch_with_delta_and_integrity(
+            keyspace_id,
+            file_id,
+            writes,
+            durability,
+            payload_integrity,
+        )
+        .map(|committed| committed.commit)
+    }
+
+    fn commit_file_batch_with_delta_and_integrity(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        writes: &[FileBatchWrite],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<NativeFileCommitWithDelta> {
+        let profile_enabled = self.native_file_batch_profile_enabled()?;
+        let total_started = profile_enabled.then(Instant::now);
+        let mut profile = profile_enabled.then(NativeFileBatchCommitProfile::default);
+
+        let started = profile_enabled.then(Instant::now);
         let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+            profile.metadata_head_nanos = duration_nanos_u64(started.elapsed());
+        }
+
+        let started = profile_enabled.then(Instant::now);
         let (collapsed, range, new_size) = collapse_native_file_batch_writes(
             writes,
             head.size,
             DEFAULT_NATIVE_FILE_BATCH_MAX_BYTES,
         )?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+            profile.collapse_nanos = duration_nanos_u64(started.elapsed());
+            profile.write_count = usize_to_u64(writes.len());
+            profile.collapsed_range_count = usize_to_u64(collapsed.len());
+            profile.committed_range_bytes = range.len;
+            profile.requested_bytes = writes
+                .iter()
+                .map(|write| usize_to_u64(write.bytes.len()))
+                .fold(0_u64, u64::saturating_add);
+        }
 
         if collapsed.is_empty() {
-            return Ok(FileWriteCommit {
-                keyspace_id,
-                file_id,
-                range,
-                version: head.version,
-                commit_seq: head.latest_commit,
-                durability,
+            if let (Some(mut profile), Some(started)) = (profile, total_started) {
+                profile.total_nanos = duration_nanos_u64(started.elapsed());
+                self.record_native_file_batch_profile(profile)?;
+            }
+            return Ok(NativeFileCommitWithDelta {
+                commit: FileWriteCommit {
+                    keyspace_id,
+                    file_id,
+                    range,
+                    version: head.version,
+                    commit_seq: head.latest_commit,
+                    durability,
+                },
+                delta: None,
             });
         }
         self.observability.record_with_update(
@@ -2691,8 +2863,18 @@ impl LocalCoordinator {
         );
 
         let block_size = u64::from(self.metadata.config.block_size);
+        let started = profile_enabled.then(Instant::now);
         let root = self.metadata.get_metadata_node(head.root)?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+            profile.root_load_nanos = duration_nanos_u64(started.elapsed());
+        }
+
+        let started = profile_enabled.then(Instant::now);
         let groups = native_batch_segment_groups(&collapsed, block_size)?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+            profile.segment_group_nanos = duration_nanos_u64(started.elapsed());
+            profile.segment_group_count = usize_to_u64(groups.len());
+        }
         let mut edits = Vec::with_capacity(groups.len());
         for group in groups {
             let first_block = group.start / block_size;
@@ -2716,50 +2898,121 @@ impl LocalCoordinator {
             if group.start < head.size {
                 let preserved_len = head.size.saturating_sub(group.start).min(segment_len);
                 let preserved_range = ByteRange::new(group.start, preserved_len);
-                let preserved_len_usize = usize::try_from(preserved_len).map_err(|_| {
-                    StorageError::invalid_argument("native preserved length overflows usize")
-                })?;
-                let (plan, _) = self.resolve_file_read_plan(keyspace_id, file_id, preserved_range)?;
-                assemble_read_plan(
-                    self,
-                    plan,
-                    ReadVerification::Default,
-                    &mut segment_bytes[..preserved_len_usize],
+                let started = profile_enabled.then(Instant::now);
+                let fully_covered = native_batch_writes_cover_range(
+                    &collapsed[group.first_write..group.last_write],
+                    preserved_range,
                 )?;
+                if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                    profile.preservation_check_nanos = profile
+                        .preservation_check_nanos
+                        .saturating_add(duration_nanos_u64(started.elapsed()));
+                }
+                if !fully_covered {
+                    let preserved_len_usize = usize::try_from(preserved_len).map_err(|_| {
+                        StorageError::invalid_argument("native preserved length overflows usize")
+                    })?;
+                    let started = profile_enabled.then(Instant::now);
+                    let (plan, _) =
+                        self.resolve_file_read_plan(keyspace_id, file_id, preserved_range)?;
+                    assemble_read_plan(
+                        self,
+                        plan,
+                        ReadVerification::Default,
+                        &mut segment_bytes[..preserved_len_usize],
+                    )?;
+                    if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                        profile.preservation_read_nanos = profile
+                            .preservation_read_nanos
+                            .saturating_add(duration_nanos_u64(started.elapsed()));
+                        profile.preserved_read_bytes =
+                            profile.preserved_read_bytes.saturating_add(preserved_len);
+                    }
+                }
             }
+            let started = profile_enabled.then(Instant::now);
             overlay_native_batch_writes(
                 group.start,
                 &collapsed[group.first_write..group.last_write],
                 &mut segment_bytes,
             )?;
+            if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                profile.overlay_nanos = profile
+                    .overlay_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+            }
             let segment_range = ByteRange::new(group.start, segment_len);
-            let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
-                WriteGrantIntent::NativeWrite {
+            let intent = WriteGrantIntent::NativeWrite {
                     keyspace_id,
                     file_id,
                     range: segment_range,
                     base_version: head.version,
-                },
-                self.next_write_intent()?,
-                segment_bytes,
-                durability,
-                payload_integrity,
-            )?;
+                };
+            let write_started = profile_enabled.then(Instant::now);
+            let verified_receipt = if profile.is_some() {
+                let (receipt, segment_profile) =
+                    self.write_segment_for_intent_with_id_owned_verified_profiled(
+                        intent,
+                        self.next_write_intent()?,
+                        segment_bytes,
+                        durability,
+                        payload_integrity,
+                    )?;
+                if let Some(profile) = profile.as_mut() {
+                    profile.absorb_segment_write(segment_profile);
+                }
+                receipt
+            } else {
+                self.write_segment_for_intent_with_id_owned_verified(
+                    intent,
+                    self.next_write_intent()?,
+                    segment_bytes,
+                    durability,
+                    payload_integrity,
+                )?
+            };
+            if let (Some(profile), Some(started)) = (profile.as_mut(), write_started) {
+                profile.segment_write_nanos = profile
+                    .segment_write_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+                profile.segment_count = profile.segment_count.saturating_add(1);
+            }
             edits.push(NativeFileReceiptEdit {
                 range: write_range,
                 receipt: verified_receipt,
             });
         }
 
-        self.publish_native_file_receipt_edits(NativeFileReceiptPublish {
-            keyspace_id,
-            file_id,
-            base_version: head.version,
-            committed_range: range,
-            new_size,
-            edits,
-            durability,
-        })
+        let write_count = usize_to_u64(writes.len());
+        let collapsed_range_count = usize_to_u64(collapsed.len());
+        let committed_bytes = collapsed
+            .iter()
+            .map(|write| usize_to_u64(write.bytes.len()))
+            .fold(0u64, u64::saturating_add);
+        if let Some(profile) = profile.as_mut() {
+            profile.committed_bytes = committed_bytes;
+        }
+
+        let result = self.publish_native_file_receipt_edits_with_delta(
+            NativeFileReceiptPublish {
+                keyspace_id,
+                file_id,
+                base_version: head.version,
+                committed_range: range,
+                new_size,
+                edits,
+                durability,
+            },
+            write_count,
+            collapsed_range_count,
+            committed_bytes,
+            profile.as_mut(),
+        );
+        if let (Ok(_), Some(mut profile), Some(started)) = (&result, profile, total_started) {
+            profile.total_nanos = duration_nanos_u64(started.elapsed());
+            self.record_native_file_batch_profile(profile)?;
+        }
+        result
     }
 
     pub fn fork_device(&self, source: DeviceId, request: ForkRequest) -> Result<DeviceId> {
@@ -2818,6 +3071,7 @@ impl LocalCoordinator {
         let sweep = self.metadata.sweep_unmarked_after_mark(policy, epoch)?;
         self.retain_reachable_append_run_logs()?;
         for segment_id in &sweep.released_segments {
+            lock(&self.verified_receipt_cache)?.remove(segment_id);
             if self.storage_nodes.state(*segment_id)? == SegmentLifecycleState::Referenced {
                 self.storage_nodes.release_segment(*segment_id)?;
             }
@@ -3290,6 +3544,8 @@ impl LocalCoordinator {
     ) -> Result<VerifiedSegmentReceipt> {
         match self.authority.verify_segment_receipt(receipt) {
             Ok(verified) => {
+                lock(&self.verified_receipt_cache)?
+                    .insert(verified.descriptor.segment_id, verified.clone());
                 self.observability.record_with_update(
                     StorageEventKind::ReceiptVerified,
                     Some(receipt.storage_node),
@@ -3324,6 +3580,8 @@ impl LocalCoordinator {
     ) -> Result<VerifiedSegmentReceipt> {
         match self.authority.verify_receipt_matches_grant(grant, receipt) {
             Ok(verified) => {
+                lock(&self.verified_receipt_cache)?
+                    .insert(verified.descriptor.segment_id, verified.clone());
                 self.observability.record_with_update(
                     StorageEventKind::ReceiptVerified,
                     Some(receipt.storage_node),
@@ -3445,6 +3703,26 @@ impl LocalCoordinator {
         &self,
         publish: NativeFileReceiptPublish,
     ) -> Result<FileWriteCommit> {
+        let edit_count = usize_to_u64(publish.edits.len());
+        let committed_bytes = publish.committed_range.len;
+        self.publish_native_file_receipt_edits_with_delta(
+            publish,
+            edit_count,
+            edit_count,
+            committed_bytes,
+            None,
+        )
+        .map(|committed| committed.commit)
+    }
+
+    fn publish_native_file_receipt_edits_with_delta(
+        &self,
+        publish: NativeFileReceiptPublish,
+        write_count: u64,
+        collapsed_range_count: u64,
+        committed_bytes: u64,
+        mut profile: Option<&mut NativeFileBatchCommitProfile>,
+    ) -> Result<NativeFileCommitWithDelta> {
         if publish.edits.is_empty() {
             let head = self
                 .metadata
@@ -3452,13 +3730,16 @@ impl LocalCoordinator {
             if head.version != publish.base_version {
                 return Err(StorageError::conflict("stale native file version"));
             }
-            return Ok(FileWriteCommit {
-                keyspace_id: publish.keyspace_id,
-                file_id: publish.file_id,
-                range: publish.committed_range,
-                version: head.version,
-                commit_seq: head.latest_commit,
-                durability: publish.durability,
+            return Ok(NativeFileCommitWithDelta {
+                commit: FileWriteCommit {
+                    keyspace_id: publish.keyspace_id,
+                    file_id: publish.file_id,
+                    range: publish.committed_range,
+                    version: head.version,
+                    commit_seq: head.latest_commit,
+                    durability: publish.durability,
+                },
+                delta: None,
             });
         }
 
@@ -3490,6 +3771,7 @@ impl LocalCoordinator {
                     "native write receipt byte count does not match metadata intent",
                 ));
             }
+            let started = profile.is_some().then(Instant::now);
             new_root = self
                 .replace_tree_range_with_receipts(
                     new_root,
@@ -3503,8 +3785,14 @@ impl LocalCoordinator {
                     std::slice::from_ref(&edit.receipt),
                 )?
                 .root;
+            if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                profile.tree_path_copy_nanos = profile
+                    .tree_path_copy_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+            }
         }
 
+        let started = profile.is_some().then(Instant::now);
         let commit_group = self.publish_commit_group_observed(CommitGroupIntent {
             owner: MappingOwner::NativeKeyspace(publish.keyspace_id),
             fence: MetadataFence::FileVersion(publish.base_version),
@@ -3515,25 +3803,74 @@ impl LocalCoordinator {
                 new_size: publish.new_size,
             }],
         })?;
-        for edit in &publish.edits {
-            self.storage_nodes.mark_segment_referenced(
-                edit.receipt.receipt(),
-                commit_group.commit_seq,
-                self.authority.as_ref(),
-            )?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+            profile.metadata_publish_nanos = duration_nanos_u64(started.elapsed());
         }
+        for edit in &publish.edits {
+            let started = profile.is_some().then(Instant::now);
+            if let Some(profile) = profile.as_mut() {
+                let mark_profile = self.storage_nodes.mark_segment_referenced_profiled(
+                    edit.receipt.receipt(),
+                    commit_group.commit_seq,
+                    self.authority.as_ref(),
+                )?;
+                profile.absorb_mark_referenced(mark_profile);
+            } else {
+                self.storage_nodes.mark_segment_referenced(
+                    edit.receipt.receipt(),
+                    commit_group.commit_seq,
+                    self.authority.as_ref(),
+                )?;
+            }
+            if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                profile.mark_referenced_nanos = profile
+                    .mark_referenced_nanos
+                    .saturating_add(duration_nanos_u64(started.elapsed()));
+            }
+        }
+        let started = profile.is_some().then(Instant::now);
         self.metadata
             .invalidate_append_streams_for_file(publish.keyspace_id, publish.file_id)?;
+        if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+            profile.append_stream_invalidate_nanos = duration_nanos_u64(started.elapsed());
+        }
         let committed = self
             .metadata
             .get_file_head(publish.keyspace_id, publish.file_id)?;
-        Ok(FileWriteCommit {
+        let commit = FileWriteCommit {
             keyspace_id: publish.keyspace_id,
             file_id: publish.file_id,
             range: publish.committed_range,
             version: committed.version,
             commit_seq: committed.latest_commit,
             durability: publish.durability,
+        };
+        let entries = publish
+            .edits
+            .iter()
+            .map(|edit| NativeFileDeltaEntry {
+                range: edit.range,
+                replacement: NativeFileDeltaReplacement::Segment {
+                    segment_id: edit.receipt.descriptor.segment_id,
+                    segment_offset: BlockIndex::from_raw(0),
+                },
+            })
+            .collect();
+        Ok(NativeFileCommitWithDelta {
+            delta: Some(NativeFileDeltaCommit {
+                keyspace_id: publish.keyspace_id,
+                file_id: publish.file_id,
+                commit_seq: commit.commit_seq,
+                base_file_version: publish.base_version,
+                new_file_version: commit.version,
+                old_size: head.size,
+                new_size: publish.new_size,
+                write_count,
+                collapsed_range_count,
+                committed_bytes,
+                entries,
+            }),
+            commit,
         })
     }
 
@@ -3609,21 +3946,34 @@ impl LocalCoordinator {
         entries: &[LeafEntry],
         additional_receipts: &[VerifiedSegmentReceipt],
     ) -> Result<Vec<VerifiedSegmentReceipt>> {
-        let mut cache: BTreeMap<SegmentId, VerifiedSegmentReceipt> = additional_receipts
+        let mut local_cache: BTreeMap<SegmentId, VerifiedSegmentReceipt> = additional_receipts
             .iter()
             .map(|receipt| (receipt.descriptor.segment_id, receipt.clone()))
             .collect();
         let mut receipts: BTreeMap<SegmentId, VerifiedSegmentReceipt> = BTreeMap::new();
+        let mut newly_verified = Vec::new();
         for entry in entries {
             if let std::collections::btree_map::Entry::Vacant(vacant) =
                 receipts.entry(entry.segment_id)
             {
-                if let Some(receipt) = cache.remove(&entry.segment_id) {
+                if let Some(receipt) = local_cache.remove(&entry.segment_id) {
+                    vacant.insert(receipt);
+                } else if let Some(receipt) =
+                    lock(&self.verified_receipt_cache)?.get(&entry.segment_id).cloned()
+                {
                     vacant.insert(receipt);
                 } else {
                     let receipt = self.storage_nodes.receipt_for_segment(entry.segment_id)?;
-                    vacant.insert(self.authority.verify_segment_receipt(&receipt)?);
+                    let verified = self.authority.verify_segment_receipt(&receipt)?;
+                    newly_verified.push(verified.clone());
+                    vacant.insert(verified);
                 }
+            }
+        }
+        if !newly_verified.is_empty() {
+            let mut cache = lock(&self.verified_receipt_cache)?;
+            for receipt in newly_verified {
+                cache.insert(receipt.descriptor.segment_id, receipt);
             }
         }
         Ok(receipts.into_values().collect())
@@ -3780,6 +4130,11 @@ impl LocalCoordinator {
         additional_receipts: &[VerifiedSegmentReceipt],
     ) -> Result<TreeEditResult> {
         edit.range.validate_non_empty()?;
+        if let Some(result) =
+            self.try_replace_tree_range_single_path(root_id, edit, additional_receipts)?
+        {
+            return Ok(result);
+        }
         let root = self.metadata.get_metadata_node(root_id)?;
         if !root.covered_range.contains_range(edit.range)? {
             return Err(StorageError::invalid_argument(
@@ -3787,6 +4142,176 @@ impl LocalCoordinator {
             ));
         }
         self.replace_tree_range_at(&root, edit, additional_receipts)
+    }
+
+    fn try_replace_tree_range_single_path(
+        &self,
+        root_id: MetadataNodeId,
+        edit: TreeRangeEdit,
+        additional_receipts: &[VerifiedSegmentReceipt],
+    ) -> Result<Option<TreeEditResult>> {
+        if edit.replacement.is_none() {
+            return Ok(None);
+        }
+        let receipt_descriptors: BTreeMap<SegmentId, SegmentDescriptor> = additional_receipts
+            .iter()
+            .map(|receipt| (receipt.descriptor.segment_id, receipt.descriptor.clone()))
+            .collect();
+        if receipt_descriptors.is_empty() {
+            return Ok(None);
+        }
+        let mut inner = lock(&self.metadata.inner)?;
+        let root = inner
+            .metadata_nodes
+            .get(&root_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("metadata_node", root_id.to_string()))?;
+        if !root.covered_range.contains_range(edit.range)? {
+            return Err(StorageError::invalid_argument(
+                "edit range is outside metadata tree coverage",
+            ));
+        }
+        Self::try_replace_tree_range_single_path_at(
+            &mut inner,
+            &root,
+            edit,
+            &receipt_descriptors,
+            u64::from(self.metadata.config.block_size),
+        )
+    }
+
+    fn try_replace_tree_range_single_path_at(
+        inner: &mut MetadataInner,
+        node: &MetadataNode,
+        edit: TreeRangeEdit,
+        receipt_descriptors: &BTreeMap<SegmentId, SegmentDescriptor>,
+        block_size: u64,
+    ) -> Result<Option<TreeEditResult>> {
+        if !node.covered_range.overlaps(edit.range)? {
+            return Ok(Some(TreeEditResult {
+                root: node.node_id,
+                changed: false,
+            }));
+        }
+
+        match &node.kind {
+            MetadataNodeKind::Leaf {
+                entries,
+                run_extents,
+            } => {
+                let Some(overlap) = node.covered_range.intersection(edit.range)? else {
+                    return Ok(Some(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    }));
+                };
+                let replacement = edit.replacement.map(|replacement| {
+                    let offset = overlap.start.raw() - replacement.segment_base.raw();
+                    LeafEntry {
+                        logical_start: overlap.start,
+                        blocks: overlap.blocks,
+                        segment_id: replacement.segment_id,
+                        segment_offset: BlockIndex::from_raw(offset),
+                    }
+                });
+                let new_entries =
+                    replace_leaf_entries(entries, node.covered_range, overlap, replacement)?;
+                let overlap_bytes = block_range_to_byte_range(overlap, block_size)?;
+                let new_run_extents =
+                    replace_run_backed_file_extents(run_extents, overlap_bytes, Vec::new())?;
+                if new_entries == *entries && new_run_extents == *run_extents {
+                    return Ok(Some(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    }));
+                }
+                if !new_run_extents.is_empty() {
+                    return Ok(None);
+                }
+                let mut segment_descriptors = Vec::new();
+                for entry in &new_entries {
+                    let Some(descriptor) = receipt_descriptors.get(&entry.segment_id) else {
+                        return Ok(None);
+                    };
+                    if !segment_descriptors
+                        .iter()
+                        .any(|existing: &SegmentDescriptor| existing.segment_id == entry.segment_id)
+                    {
+                        segment_descriptors.push(descriptor.clone());
+                    }
+                }
+                let new_node = MetadataNode {
+                    node_id: inner.alloc_metadata_node_id(),
+                    covered_range: node.covered_range,
+                    kind: MetadataNodeKind::Leaf {
+                        entries: new_entries,
+                        run_extents: new_run_extents,
+                    },
+                };
+                new_node.validate(&segment_descriptors)?;
+                inner.metadata_nodes.insert(new_node.node_id, new_node.clone());
+                Ok(Some(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                }))
+            }
+            MetadataNodeKind::Internal { children } => {
+                let mut overlapping = children
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, child)| match child.range.overlaps(edit.range) {
+                        Ok(true) => Some(Ok((index, child))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if overlapping.len() != 1 {
+                    return Ok(None);
+                }
+                let (changed_index, child) = overlapping.pop().expect("length checked");
+                let child_node = inner
+                    .metadata_nodes
+                    .get(&child.node_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        StorageError::not_found("metadata_node", child.node_id.to_string())
+                    })?;
+                let Some(child_result) = Self::try_replace_tree_range_single_path_at(
+                    inner,
+                    &child_node,
+                    edit,
+                    receipt_descriptors,
+                    block_size,
+                )?
+                else {
+                    return Ok(None);
+                };
+                if !child_result.changed {
+                    return Ok(Some(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    }));
+                }
+                let mut new_children = children.clone();
+                new_children[changed_index] = MetadataChild {
+                    range: child.range,
+                    node_id: child_result.root,
+                };
+                let new_node = MetadataNode {
+                    node_id: inner.alloc_metadata_node_id(),
+                    covered_range: node.covered_range,
+                    kind: MetadataNodeKind::Internal {
+                        children: new_children,
+                    },
+                };
+                new_node.validate(&[])?;
+                inner.metadata_nodes.insert(new_node.node_id, new_node.clone());
+                Ok(Some(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                }))
+            }
+        }
     }
 
     fn replace_tree_range_at(

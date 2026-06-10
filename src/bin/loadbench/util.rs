@@ -217,6 +217,26 @@ mod tests {
     }
 
     #[test]
+    fn fixed_stream_at_end_does_not_require_interval_config() {
+        let at_end = FixedStreamPublishConfig {
+            workload: Workload::NativeStreamPublishAtEnd32m,
+            concurrency: 1,
+            modeled_delay: Duration::ZERO,
+            delay_mode: DelayMode::Spin,
+            samples_per_worker: 16,
+            stream_publish_bytes: None,
+            payload_integrity: PayloadIntegrity::Verified,
+        };
+        assert_eq!(fixed_stream_worker_publish_interval(&at_end).unwrap(), None);
+
+        let interval = FixedStreamPublishConfig {
+            workload: Workload::NativeStreamPublishInterval32m,
+            ..at_end
+        };
+        assert!(fixed_stream_worker_publish_interval(&interval).is_err());
+    }
+
+    #[test]
     fn fixed_stream_barrier_at_end_is_fixed_but_not_inline_at_end() {
         let workload = Workload::NativeStreamPublishBarrierAtEnd32m;
 
@@ -271,6 +291,27 @@ mod tests {
         assert!(suite.contains(&Workload::NativeFileBatch1m16Ops));
         assert!(suite.contains(&Workload::NativeFileBatchOverwriteCollapse));
         assert!(suite.contains(&Workload::NativeFileBatchFsyncInterval));
+    }
+
+    #[test]
+    fn native_mixed_suite_names_append_and_tiny_io_starvation_shapes() {
+        assert_eq!(
+            Workload::from_str("native-mixed-append-batch-4k-16ops").unwrap(),
+            Workload::NativeMixedAppendBatch4k16Ops
+        );
+        assert_eq!(
+            Workload::from_str("native-mixed-append-batch-4k-256ops").unwrap(),
+            Workload::NativeMixedAppendBatch4k256Ops
+        );
+        assert_eq!(
+            parse_workloads("native-mixed").unwrap(),
+            vec![
+                Workload::NativeMixedAppendBatch4k16Ops,
+                Workload::NativeMixedAppendBatch4k256Ops,
+            ]
+        );
+        assert!(Workload::NativeMixedAppendBatch4k16Ops.is_native_mixed());
+        assert!(!Workload::NativeMixedAppendBatch4k16Ops.is_native_file_batch());
     }
 
     #[test]
@@ -385,6 +426,7 @@ mod tests {
                 durable_bytes: 64,
                 published_bytes: 32,
                 block_batch_profile: None,
+                native_file_batch_profile: None,
             },
             true,
             &mut rng,
@@ -396,6 +438,7 @@ mod tests {
                 durable_bytes: 128,
                 published_bytes: 96,
                 block_batch_profile: None,
+                native_file_batch_profile: None,
             },
             true,
             &mut rng,

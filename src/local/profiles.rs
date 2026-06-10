@@ -134,6 +134,186 @@ impl ReadProfiler {
     }
 }
 
+/// Process-local timing for one native file batch commit.
+///
+/// Profiles are opt-in diagnostics for integration benchmarks. They are not
+/// durable state and are not part of the public native-file contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeFileBatchCommitProfile {
+    pub sequence: u64,
+    pub total_nanos: u64,
+    pub metadata_head_nanos: u64,
+    pub collapse_nanos: u64,
+    pub root_load_nanos: u64,
+    pub segment_group_nanos: u64,
+    pub preservation_check_nanos: u64,
+    pub preservation_read_nanos: u64,
+    pub overlay_nanos: u64,
+    pub segment_write_nanos: u64,
+    pub storage_node_ids_nanos: u64,
+    pub placement_select_nanos: u64,
+    pub segment_id_alloc_nanos: u64,
+    pub grant_issue_nanos: u64,
+    pub storage_node_transport_dispatch_nanos: u64,
+    pub grant_verify_nanos: u64,
+    pub catalog_duplicate_probe_nanos: u64,
+    pub catalog_duplicate_probe_lock_wait_nanos: u64,
+    pub catalog_reserve_nanos: u64,
+    pub catalog_reserve_lock_wait_nanos: u64,
+    pub catalog_begin_nanos: u64,
+    pub catalog_begin_lock_wait_nanos: u64,
+    pub segment_store_write_nanos: u64,
+    pub segment_store_lock_wait_nanos: u64,
+    pub checksum_integrity_nanos: u64,
+    pub segment_store_insert_nanos: u64,
+    pub segment_sync_nanos: u64,
+    pub segment_sync_lock_wait_nanos: u64,
+    pub receipt_create_nanos: u64,
+    pub receipt_verify_nanos: u64,
+    pub catalog_commit_nanos: u64,
+    pub catalog_commit_lock_wait_nanos: u64,
+    pub tree_path_copy_nanos: u64,
+    pub metadata_publish_nanos: u64,
+    pub mark_referenced_nanos: u64,
+    pub mark_reference_evidence_nanos: u64,
+    pub mark_reference_transport_dispatch_nanos: u64,
+    pub mark_reference_verify_nanos: u64,
+    pub mark_reference_catalog_nanos: u64,
+    pub mark_reference_catalog_lock_wait_nanos: u64,
+    pub append_stream_invalidate_nanos: u64,
+    pub write_count: u64,
+    pub collapsed_range_count: u64,
+    pub segment_group_count: u64,
+    pub segment_count: u64,
+    pub requested_bytes: u64,
+    pub committed_bytes: u64,
+    pub committed_range_bytes: u64,
+    pub preserved_read_bytes: u64,
+}
+
+impl NativeFileBatchCommitProfile {
+    fn absorb_segment_write(&mut self, profile: LocalSegmentWriteProfile) {
+        self.storage_node_ids_nanos = self
+            .storage_node_ids_nanos
+            .saturating_add(profile.storage_node_ids_nanos);
+        self.placement_select_nanos = self
+            .placement_select_nanos
+            .saturating_add(profile.placement_select_nanos);
+        self.segment_id_alloc_nanos = self
+            .segment_id_alloc_nanos
+            .saturating_add(profile.segment_id_alloc_nanos);
+        self.grant_issue_nanos = self.grant_issue_nanos.saturating_add(profile.grant_issue_nanos);
+        self.storage_node_transport_dispatch_nanos = self
+            .storage_node_transport_dispatch_nanos
+            .saturating_add(profile.storage_node_transport_dispatch_nanos);
+        self.grant_verify_nanos = self
+            .grant_verify_nanos
+            .saturating_add(profile.grant_verify_nanos);
+        self.catalog_duplicate_probe_nanos = self
+            .catalog_duplicate_probe_nanos
+            .saturating_add(profile.catalog_duplicate_probe_nanos);
+        self.catalog_duplicate_probe_lock_wait_nanos = self
+            .catalog_duplicate_probe_lock_wait_nanos
+            .saturating_add(profile.catalog_duplicate_probe_lock_wait_nanos);
+        self.catalog_reserve_nanos = self
+            .catalog_reserve_nanos
+            .saturating_add(profile.catalog_reserve_nanos);
+        self.catalog_reserve_lock_wait_nanos = self
+            .catalog_reserve_lock_wait_nanos
+            .saturating_add(profile.catalog_reserve_lock_wait_nanos);
+        self.catalog_begin_nanos = self
+            .catalog_begin_nanos
+            .saturating_add(profile.catalog_begin_nanos);
+        self.catalog_begin_lock_wait_nanos = self
+            .catalog_begin_lock_wait_nanos
+            .saturating_add(profile.catalog_begin_lock_wait_nanos);
+        self.segment_store_write_nanos = self
+            .segment_store_write_nanos
+            .saturating_add(profile.segment_store_write_nanos);
+        self.segment_store_lock_wait_nanos = self
+            .segment_store_lock_wait_nanos
+            .saturating_add(profile.segment_store_lock_wait_nanos);
+        self.checksum_integrity_nanos = self
+            .checksum_integrity_nanos
+            .saturating_add(profile.checksum_integrity_nanos);
+        self.segment_store_insert_nanos = self
+            .segment_store_insert_nanos
+            .saturating_add(profile.segment_store_insert_nanos);
+        self.segment_sync_nanos = self
+            .segment_sync_nanos
+            .saturating_add(profile.segment_sync_nanos);
+        self.segment_sync_lock_wait_nanos = self
+            .segment_sync_lock_wait_nanos
+            .saturating_add(profile.segment_sync_lock_wait_nanos);
+        self.receipt_create_nanos = self
+            .receipt_create_nanos
+            .saturating_add(profile.receipt_create_nanos);
+        self.receipt_verify_nanos = self
+            .receipt_verify_nanos
+            .saturating_add(profile.receipt_verify_nanos);
+        self.catalog_commit_nanos = self
+            .catalog_commit_nanos
+            .saturating_add(profile.catalog_commit_nanos);
+        self.catalog_commit_lock_wait_nanos = self
+            .catalog_commit_lock_wait_nanos
+            .saturating_add(profile.catalog_commit_lock_wait_nanos);
+    }
+
+    fn absorb_mark_referenced(&mut self, profile: LocalMarkReferencedProfile) {
+        self.mark_reference_evidence_nanos = self
+            .mark_reference_evidence_nanos
+            .saturating_add(profile.evidence_create_nanos);
+        self.mark_reference_transport_dispatch_nanos = self
+            .mark_reference_transport_dispatch_nanos
+            .saturating_add(profile.transport_dispatch_nanos);
+        self.mark_reference_verify_nanos = self
+            .mark_reference_verify_nanos
+            .saturating_add(profile.verify_nanos);
+        self.mark_reference_catalog_nanos = self
+            .mark_reference_catalog_nanos
+            .saturating_add(profile.catalog_mark_nanos);
+        self.mark_reference_catalog_lock_wait_nanos = self
+            .mark_reference_catalog_lock_wait_nanos
+            .saturating_add(profile.catalog_mark_lock_wait_nanos);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct NativeFileBatchCommitProfiler {
+    capacity: usize,
+    next_sequence: u64,
+    profiles: VecDeque<NativeFileBatchCommitProfile>,
+}
+
+impl NativeFileBatchCommitProfiler {
+    fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(StorageError::invalid_argument(
+                "native file batch profile capacity must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            capacity,
+            next_sequence: 1,
+            profiles: VecDeque::with_capacity(capacity.min(1024)),
+        })
+    }
+
+    fn record(&mut self, mut profile: NativeFileBatchCommitProfile) {
+        profile.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.profiles.len() == self.capacity {
+            self.profiles.pop_front();
+        }
+        self.profiles.push_back(profile);
+    }
+
+    fn drain(&mut self, max: usize) -> Vec<NativeFileBatchCommitProfile> {
+        let count = max.min(self.profiles.len());
+        self.profiles.drain(..count).collect()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct LocalSegmentWriteProfile {
     storage_node_ids_nanos: u64,

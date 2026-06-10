@@ -28,6 +28,7 @@ fn execute_load(
             None
         },
         block_batch_profiles_enabled: args.block_batch_profile_csv.is_some(),
+        native_file_batch_profiles_enabled: args.native_file_batch_profile_csv.is_some(),
         payload_integrity: args.payload_integrity,
         read_verification: args.read_verification,
     };
@@ -53,6 +54,81 @@ fn execute_load(
 
     let elapsed = started.elapsed();
     Ok(BenchReport::from_workers(elapsed, reports))
+}
+
+fn execute_mixed_native_load(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    context: BenchContext,
+    duration: Duration,
+) -> Result<BenchReport> {
+    if !workload.is_native_mixed() {
+        return Err(StorageError::invalid_argument(
+            "mixed native executor requires a mixed native workload",
+        ));
+    }
+    if concurrency < 2 {
+        return Err(StorageError::invalid_argument(
+            "mixed native workloads require concurrency of at least 2",
+        ));
+    }
+    let Target::Native { files, .. } = &context.target else {
+        return Err(StorageError::invalid_argument(
+            "mixed native workloads require native target",
+        ));
+    };
+    if files.len() < concurrency {
+        return Err(StorageError::invalid_argument(
+            "mixed native workloads require at least one file per worker",
+        ));
+    }
+
+    let started = Instant::now();
+    let deadline = started + duration;
+    let append_workers = (concurrency / 2).max(1);
+    let batch_workers = concurrency - append_workers;
+    let mixed_config = MixedNativeConfig {
+        workload,
+        total_concurrency: concurrency,
+        deadline,
+        modeled_delay: args.modeled_delay(),
+        delay_mode: args.delay_mode,
+        durability: args.durability,
+        samples_per_worker: args.samples_per_worker,
+        native_file_batch: workload.native_file_batch_spec(args)?,
+        native_file_batch_profiles_enabled: args.native_file_batch_profile_csv.is_some(),
+        payload_integrity: args.payload_integrity,
+    };
+
+    let reports = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(concurrency);
+        for worker in 0..append_workers {
+            let context = context.clone();
+            handles.push(scope.spawn(move || {
+                run_mixed_native_append_worker(context, worker as u64, mixed_config)
+            }));
+        }
+        for index in 0..batch_workers {
+            let context = context.clone();
+            let worker = append_workers + index;
+            handles.push(scope.spawn(move || {
+                run_mixed_native_batch_worker(context, worker as u64, mixed_config)
+            }));
+        }
+
+        let mut reports = Vec::with_capacity(concurrency);
+        for handle in handles {
+            reports.push(
+                handle
+                    .join()
+                    .map_err(|_| StorageError::unavailable("loadbench worker panicked"))??,
+            );
+        }
+        Ok::<_, StorageError>(reports)
+    })?;
+
+    Ok(BenchReport::from_workers(started.elapsed(), reports))
 }
 
 fn execute_fixed_stream_publish_load(
@@ -131,8 +207,23 @@ struct WorkerConfig {
     native_file_batch: Option<NativeFileBatchSpec>,
     block_batch: Option<BlockBatchSpec>,
     block_batch_profiles_enabled: bool,
+    native_file_batch_profiles_enabled: bool,
     payload_integrity: PayloadIntegrity,
     read_verification: ReadVerification,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MixedNativeConfig {
+    workload: Workload,
+    total_concurrency: usize,
+    deadline: Instant,
+    modeled_delay: Duration,
+    delay_mode: DelayMode,
+    durability: DurabilityMode,
+    samples_per_worker: usize,
+    native_file_batch: NativeFileBatchSpec,
+    native_file_batch_profiles_enabled: bool,
+    payload_integrity: PayloadIntegrity,
 }
 
 fn validate_fixed_stream_workload(workload: Workload, args: &Args) -> Result<u64> {
@@ -226,6 +317,190 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
         report.record(
             latency_nanos,
             context.op_size as u64,
+            progress,
+            result.is_ok(),
+            &mut rng,
+        );
+    }
+
+    Ok(report)
+}
+
+fn run_mixed_native_append_worker(
+    context: BenchContext,
+    worker: u64,
+    config: MixedNativeConfig,
+) -> Result<WorkerReport> {
+    let mut rng = Lcg::new(0x243f_6a88_85a3_08d3_u64 ^ worker.wrapping_mul(0x9e37_79b9));
+    let mut report = WorkerReport::new(config.samples_per_worker);
+    let mut state = WorkerState::default();
+    let Target::Native { keyspace_id, files } = &context.target else {
+        return Err(StorageError::invalid_argument(
+            "mixed append worker requires native target",
+        ));
+    };
+    let payload_len = context.payload.len() as u64;
+
+    while Instant::now() < config.deadline {
+        ensure_stream_append_state(
+            &context,
+            *keyspace_id,
+            files,
+            worker,
+            &mut state,
+            payload_len,
+        )?;
+        let stream = state
+            .stream_append
+            .as_ref()
+            .map(|stream| stream.stream.clone())
+            .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+
+        let append_started = Instant::now();
+        if !config.modeled_delay.is_zero() {
+            apply_modeled_delay(config.modeled_delay, config.delay_mode);
+        }
+        let append_result = context.store.append_stream(
+            &stream,
+            &context.payload,
+            WriteDurability::Acknowledged,
+            config.payload_integrity,
+        );
+        let append_nanos = elapsed_nanos_u64(append_started);
+        let ticket = match append_result {
+            Ok(ticket) => {
+                report.record_stream_append(
+                    append_nanos,
+                    context.payload.len() as u64,
+                    OpProgress::default(),
+                    true,
+                    &mut rng,
+                );
+                ticket
+            }
+            Err(error) => {
+                report.record_stream_append(
+                    append_nanos,
+                    context.payload.len() as u64,
+                    OpProgress::default(),
+                    false,
+                    &mut rng,
+                );
+                advance_stream_lane(&mut state, files.len());
+                return Err(error);
+            }
+        };
+
+        let publish_through = ticket.range.end_exclusive()?;
+        let previous_published = state
+            .stream_append
+            .as_ref()
+            .map(|stream| stream.published_offset)
+            .ok_or_else(|| StorageError::conflict("append stream state missing"))?;
+        if let Some(stream_state) = state.stream_append.as_mut() {
+            stream_state.next_offset = publish_through;
+            state.last_native_file_index = Some(stream_state.file_index);
+        }
+
+        let publish_started = Instant::now();
+        if !config.modeled_delay.is_zero() {
+            apply_modeled_delay(config.modeled_delay, config.delay_mode);
+        }
+        let publish_result = context.store.publish_append_stream(&stream, publish_through);
+        let publish_nanos = elapsed_nanos_u64(publish_started);
+        match publish_result {
+            Ok(()) => {
+                let published_bytes = publish_through.saturating_sub(previous_published);
+                if let Some(stream_state) = state.stream_append.as_mut() {
+                    stream_state.published_offset = publish_through;
+                }
+                report.record_stream_publish(
+                    publish_nanos,
+                    0,
+                    OpProgress {
+                        published_bytes,
+                        ..OpProgress::default()
+                    },
+                    true,
+                    &mut rng,
+                );
+            }
+            Err(error) => {
+                report.record_stream_publish(
+                    publish_nanos,
+                    0,
+                    OpProgress::default(),
+                    false,
+                    &mut rng,
+                );
+                advance_stream_lane(&mut state, files.len());
+                return Err(error);
+            }
+        }
+
+        if publish_through >= DEFAULT_FILE_CAPACITY_BYTES {
+            advance_stream_lane(&mut state, files.len());
+        }
+    }
+
+    Ok(report)
+}
+
+fn run_mixed_native_batch_worker(
+    context: BenchContext,
+    worker: u64,
+    config: MixedNativeConfig,
+) -> Result<WorkerReport> {
+    let mut rng = Lcg::new(0x1319_8a2e_0370_7344_u64 ^ worker.wrapping_mul(0xd1b5_4a32));
+    let mut report = WorkerReport::new(config.samples_per_worker);
+    let mut state = WorkerState::default();
+    let mut read_buf = Vec::new();
+    let worker_config = WorkerConfig {
+        workload: config.workload,
+        concurrency: config.total_concurrency,
+        deadline: config.deadline,
+        modeled_delay: config.modeled_delay,
+        delay_mode: config.delay_mode,
+        durability: config.durability,
+        samples_per_worker: config.samples_per_worker,
+        stream_publish_bytes: None,
+        native_file_batch: Some(config.native_file_batch),
+        block_batch: None,
+        block_batch_profiles_enabled: false,
+        native_file_batch_profiles_enabled: config.native_file_batch_profiles_enabled,
+        payload_integrity: config.payload_integrity,
+        read_verification: ReadVerification::Default,
+    };
+
+    while Instant::now() < config.deadline {
+        let started = Instant::now();
+        if !config.modeled_delay.is_zero() {
+            apply_modeled_delay(config.modeled_delay, config.delay_mode);
+        }
+        let result = run_one_op(
+            &context,
+            worker,
+            &mut state,
+            &mut rng,
+            &worker_config,
+            &mut read_buf,
+        )
+        .and_then(|mut progress| {
+            progress.merge(maybe_flush(
+                &context,
+                config.workload,
+                config.durability,
+                report.attempts + 1,
+                worker,
+                &mut state,
+            )?);
+            Ok(progress)
+        });
+        let latency_nanos = elapsed_nanos_u64(started);
+        let progress = result.as_ref().copied().unwrap_or_default();
+        report.record(
+            latency_nanos,
+            config.native_file_batch.ops as u64 * config.native_file_batch.write_bytes as u64,
             progress,
             result.is_ok(),
             &mut rng,
@@ -386,14 +661,7 @@ fn run_fixed_stream_publish_worker(
         ));
     }
 
-    let publish_interval = config
-        .workload
-        .is_native_stream_publish_interval()
-        .then_some(
-            config
-                .stream_publish_bytes
-                .ok_or_else(|| StorageError::corrupt("missing fixed stream publish interval"))?,
-        );
+    let publish_interval = fixed_stream_worker_publish_interval(&config)?;
     let mut next_publish_target =
         publish_interval.map(|interval| stream.visible_base_size.saturating_add(interval));
 
@@ -509,6 +777,15 @@ fn run_fixed_stream_publish_worker(
     Ok(report)
 }
 
+fn fixed_stream_worker_publish_interval(config: &FixedStreamPublishConfig) -> Result<Option<u64>> {
+    if config.workload.is_native_stream_publish_interval() {
+        return Ok(Some(config.stream_publish_bytes.ok_or_else(|| {
+            StorageError::corrupt("missing fixed stream publish interval")
+        })?));
+    }
+    Ok(None)
+}
+
 fn publish_fixed_stream_boundary(
     context: &BenchContext,
     stream: &AppendStream,
@@ -535,6 +812,7 @@ fn publish_fixed_stream_boundary(
                     durable_bytes: 0,
                     published_bytes: publish_through.saturating_sub(previous_published),
                     block_batch_profile: None,
+                    native_file_batch_profile: None,
                 },
                 true,
                 rng,
@@ -635,6 +913,7 @@ struct OpProgress {
     durable_bytes: u64,
     published_bytes: u64,
     block_batch_profile: Option<BlockBatchOpProfile>,
+    native_file_batch_profile: Option<NativeFileBatchOpProfile>,
 }
 
 impl OpProgress {
@@ -643,6 +922,9 @@ impl OpProgress {
         self.published_bytes = self.published_bytes.saturating_add(other.published_bytes);
         if self.block_batch_profile.is_none() {
             self.block_batch_profile = other.block_batch_profile;
+        }
+        if self.native_file_batch_profile.is_none() {
+            self.native_file_batch_profile = other.native_file_batch_profile;
         }
     }
 }
@@ -983,6 +1265,7 @@ fn run_one_op(
                 durable_bytes: commit.committed_bytes,
                 published_bytes: commit.committed_bytes,
                 block_batch_profile,
+                native_file_batch_profile: None,
             })
         }
         (
@@ -1252,6 +1535,7 @@ fn run_one_op(
                 durable_bytes: 0,
                 published_bytes: commit.committed_bytes,
                 block_batch_profile,
+                native_file_batch_profile: None,
             })
         }
         (Target::Native { keyspace_id, files }, Workload::NativeWrite4kSameFile) => {
@@ -1267,7 +1551,9 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, workload) if workload.is_native_file_batch() => {
+        (Target::Native { keyspace_id, files }, workload)
+            if workload.is_native_file_batch() || workload.is_native_mixed() =>
+        {
             let spec = config
                 .native_file_batch
                 .ok_or_else(|| StorageError::corrupt("missing native file batch spec"))?;
@@ -1277,7 +1563,18 @@ fn run_one_op(
             state.native_file_op = state.native_file_op.saturating_add(1);
             state.last_native_file_index = Some(file_index);
             let writes = build_native_file_batch_writes(spec, op_index, &context.payload, rng)?;
-            context
+            let requested_bytes = writes.iter().try_fold(0u64, |total, write| {
+                total
+                    .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
+                        StorageError::invalid_argument("native file batch byte length overflows u64")
+                    })?)
+                    .ok_or_else(|| {
+                        StorageError::invalid_argument("native file batch byte length overflows")
+                    })
+            })?;
+            let started = config.native_file_batch_profiles_enabled.then(Instant::now);
+            let commit_started = Instant::now();
+            let commit = context
                 .store
                 .commit_file_batch(
                     *keyspace_id,
@@ -1285,8 +1582,20 @@ fn run_one_op(
                     &writes,
                     durability,
                     config.payload_integrity,
-                )
-                .map(|_| OpProgress::default())
+                )?;
+            let commit_nanos = elapsed_nanos_u64(commit_started);
+            let native_file_batch_profile = started.map(|started| NativeFileBatchOpProfile {
+                total_nanos: elapsed_nanos_u64(started),
+                commit_nanos,
+                batch_operation_count: writes.len() as u64,
+                requested_bytes,
+                committed_range_bytes: commit.range.len,
+            });
+            Ok(OpProgress {
+                published_bytes: commit.range.len,
+                native_file_batch_profile,
+                ..OpProgress::default()
+            })
         }
         (Target::Native { keyspace_id, files }, workload) if workload.is_native_write() => {
             let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());

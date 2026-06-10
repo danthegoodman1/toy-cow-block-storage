@@ -289,9 +289,10 @@ debt can fall during normal traffic.
 These are short-run checkpoints from this dev host. The loadbench rows include
 `200us` modeled RTT; the fio controls are local filesystem runs inside the same
 dev container without modeled network delay. Treat them as local sanity numbers,
-not as portable hardware claims. Append publish rows should be compared with
-`published_mbps`, because that measures bytes that became visible and
-restart-durable inside the timed window.
+not as portable hardware claims. Most append rows below use `200us` modeled RTT;
+the compact native-file delta sanity rows are labeled separately at `0us`.
+Append publish rows should be compared with `published_mbps`, because that
+measures bytes that became visible and restart-durable inside the timed window.
 
 | Scenario | Workload shape | Result |
 | --- | --- | --- |
@@ -305,6 +306,17 @@ restart-durable inside the timed window.
 | Local FS, no fsync | `fio`, buffered writes, 16 jobs, 4 MiB writes, 1024 MiB/job | about 5.77 GB/s write-phase bandwidth |
 | Local FS, fsync at end | `fio`, buffered writes plus `--end_fsync=1`, same shape | about 3.49 GB/s write-phase bandwidth |
 | Local FS, direct with fsync at end | `fio`, direct writes plus `--end_fsync=1`, same shape | about 3.82 GB/s write-phase bandwidth |
+
+Compact native-file delta sanity from June 10, 2026, after the native batch
+delta/replay change. These rows are local Docker runs with `--rtt-us 0`,
+`--concurrency 16`, one durable storage node, 1024 files, and one-second timed
+windows:
+
+| Shape | Result | Read |
+| --- | --- | --- |
+| `native-file-batch-4k-16ops`, durable ack | 30.4k batch IOPS, `published_mbps` 1.99 GB/s, p50/p90/p99 0.49/0.87/1.31 ms | Positive tiny-I/O signal; the same local shape before the verified-receipt cache was about 20.9k batch IOPS with p99 about 1.77 ms. |
+| `native-mixed-append-batch-4k-16ops`, durable ack | `published_mbps` 0.69 GB/s, overall p99 0.83 ms | Overall samples are dominated by native batch ops; append publish had only 8 samples and a noisy 2.62 s p99 in this short run. |
+| `native-mixed-append-batch-4k-16ops`, durable flushed | `published_mbps` 27.6 MB/s, overall p99 1.05 s; append p99 1.90 ms, publish p99 1.05 s | Still unresolved. Flushed mixed tiny writes force append publish to wait for compact-delta ordering/folding, so this is the next architecture bottleneck rather than a device-throughput result. |
 
 Read the append/fio comparison as two separate pairs:
 

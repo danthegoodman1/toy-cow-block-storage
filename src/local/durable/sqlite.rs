@@ -32,6 +32,8 @@ pub struct DurablePersistProfile {
     pub block_delta_prestage_wait_nanos: u64,
     pub block_delta_selected_count: u64,
     pub block_delta_selected_bytes: u64,
+    pub native_file_delta_selected_count: u64,
+    pub native_file_delta_selected_bytes: u64,
     pub stream_prefix_request_count: u64,
     pub stream_prefix_plan_count: u64,
     pub stream_prefix_record_count: u64,
@@ -114,6 +116,11 @@ pub struct AppendPublishWaitProfile {
     pub persist_batch_plan_nanos: u64,
     pub persist_batch_durable_nanos: u64,
     pub persist_batch_apply_nanos: u64,
+    pub compact_delta_drain_nanos: u64,
+    pub compact_delta_drain_attempts: u64,
+    pub compact_delta_drain_successes: u64,
+    pub full_persist_nanos: u64,
+    pub full_persist_count: u64,
     pub wait_loops: u64,
     pub cvar_waits: u64,
     pub in_flight_waits: u64,
@@ -2017,13 +2024,40 @@ fn advance_cursor_for_append_visible_publish_records(
 ) -> Result<()> {
     for record in records {
         record.validate()?;
-        let next_commit_seq = record
-            .commit_seq
-            .raw()
-            .checked_add(1)
-            .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?;
-        cursor.next_commit_seq = cursor.next_commit_seq.max(next_commit_seq);
+        advance_cursor_for_commit_seq(cursor, record.commit_seq)?;
     }
+    Ok(())
+}
+
+fn advance_cursor_for_block_delta_commits(
+    cursor: &mut DurableExportCursor,
+    commits: &[BlockDeltaCommit],
+) -> Result<()> {
+    for commit in commits {
+        advance_cursor_for_commit_seq(cursor, commit.commit_seq)?;
+    }
+    Ok(())
+}
+
+fn advance_cursor_for_native_file_delta_commits(
+    cursor: &mut DurableExportCursor,
+    commits: &[NativeFileDeltaCommit],
+) -> Result<()> {
+    for commit in commits {
+        advance_cursor_for_commit_seq(cursor, commit.commit_seq)?;
+    }
+    Ok(())
+}
+
+fn advance_cursor_for_commit_seq(
+    cursor: &mut DurableExportCursor,
+    commit_seq: CommitSeq,
+) -> Result<()> {
+    let next_commit_seq = commit_seq
+        .raw()
+        .checked_add(1)
+        .ok_or_else(|| StorageError::conflict("durable cursor commit overflow"))?;
+    cursor.next_commit_seq = cursor.next_commit_seq.max(next_commit_seq);
     Ok(())
 }
 
@@ -2388,6 +2422,15 @@ impl DurableSqliteStore {
             );
             CREATE INDEX IF NOT EXISTS idx_block_delta_commits_order
               ON block_delta_commits(commit_seq, row_key);
+            CREATE TABLE IF NOT EXISTS native_file_delta_commits (
+              row_key TEXT PRIMARY KEY,
+              keyspace_id TEXT NOT NULL,
+              file_id TEXT NOT NULL,
+              commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
+              payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_native_file_delta_commits_order
+              ON native_file_delta_commits(commit_seq, row_key);
             CREATE TABLE IF NOT EXISTS keyspace_commits (
               row_key TEXT PRIMARY KEY,
               commit_seq INTEGER NOT NULL CHECK (commit_seq >= 0),
@@ -2507,42 +2550,74 @@ impl DurableSqliteStore {
             next_extent_id: effective_cursor.next_extent_id,
         };
         validate_row_native_state(&image)?;
-        let local = LocalCoordinator::from_durable_state(image)?;
         let append_visible_records = self.all_append_visible_publish_journal_records()?;
-        local.materialize_append_visible_publish_records(&append_visible_records)?;
+        let block_deltas = load_block_delta_commits_since(&conn, effective_cursor.next_commit_seq)?;
+        let native_file_deltas =
+            load_native_file_delta_commits_since(&conn, effective_cursor.next_commit_seq)?;
+        let local = LocalCoordinator::from_durable_state(image)?;
+        let mut delta_segment_ids: BTreeSet<_> = block_deltas
+            .iter()
+            .flat_map(|delta| delta.segment_ids())
+            .collect();
+        delta_segment_ids.extend(
+            native_file_deltas
+                .iter()
+                .flat_map(|delta| delta.segment_ids()),
+        );
+        let mut replay_order =
+            Vec::with_capacity(block_deltas.len() + native_file_deltas.len() + append_visible_records.len());
+        replay_order.extend(
+            block_deltas
+                .iter()
+                .enumerate()
+                .map(|(index, delta)| (delta.commit_seq.raw(), 0_u8, index)),
+        );
+        replay_order.extend(
+            native_file_deltas
+                .iter()
+                .enumerate()
+                .map(|(index, delta)| (delta.commit_seq.raw(), 1_u8, index)),
+        );
+        replay_order.extend(
+            append_visible_records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| (record.commit_seq.raw(), 2_u8, index)),
+        );
+        replay_order.sort_unstable();
+        let mut previous_commit_seq = None;
+        for (commit_seq, kind, index) in replay_order {
+            if previous_commit_seq == Some(commit_seq) {
+                return Err(StorageError::corrupt(
+                    "durable replay records share a commit sequence",
+                ));
+            }
+            previous_commit_seq = Some(commit_seq);
+            match kind {
+                0 => local.replay_block_delta_commit(&block_deltas[index])?,
+                1 => local.replay_native_file_delta_commit(&native_file_deltas[index])?,
+                2 => local.materialize_append_visible_publish_record(&append_visible_records[index])?,
+                _ => unreachable!(),
+            }
+        }
         let mut image = DurableStoreState {
             config: runtime_config,
             metadata: local.metadata.state_inner()?,
             storage_nodes,
-            next_write_intent,
-            next_extent_id: effective_cursor.next_extent_id,
+            next_write_intent: *lock(&local.next_write_intent)?,
+            next_extent_id: *lock(&local.next_extent_id)?,
         };
+        for segment_id in delta_segment_ids {
+            if durable_state_storage_node_for_catalog_segment(&image, segment_id).is_none() {
+                return Err(StorageError::corrupt(
+                    "compact delta segment missing catalog after replay",
+                ));
+            }
+        }
         let repairs =
             reconcile_catalog_references_from_metadata(&image.metadata, &mut image.storage_nodes);
         validate_row_native_state(&image)?;
         self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
-        let local = LocalCoordinator::from_durable_state(image)?;
-        let deltas = load_block_delta_commits_since(&conn, effective_cursor.next_commit_seq)?;
-        let delta_segment_ids: BTreeSet<_> = deltas
-            .iter()
-            .flat_map(|delta| delta.segment_ids())
-            .collect();
-        local.replay_block_delta_commits(&deltas)?;
-        if !delta_segment_ids.is_empty() {
-            let (image, _, _) = local.state_for_durable_persist(&BTreeSet::new())?;
-            let mut repairs = BTreeMap::<StorageNodeId, BTreeSet<SegmentId>>::new();
-            for segment_id in delta_segment_ids {
-                let storage_node = durable_state_storage_node_for_catalog_segment(
-                    &image,
-                    segment_id,
-                )
-                .ok_or_else(|| {
-                    StorageError::corrupt("block delta segment missing catalog after replay")
-                })?;
-                repairs.entry(storage_node).or_default().insert(segment_id);
-            }
-            self.persist_catalog_reference_repairs(&image.storage_nodes, &repairs)?;
-        }
         let _ = local.drain_events(usize::MAX)?;
         Ok(Some(local))
     }
@@ -2563,7 +2638,12 @@ impl DurableSqliteStore {
             &cursor,
             &native_delta_commits,
         )?;
+        let block_deltas = load_block_delta_commits_since(&conn, effective.next_commit_seq)?;
+        let native_file_deltas =
+            load_native_file_delta_commits_since(&conn, effective.next_commit_seq)?;
         let append_visible_records = self.all_append_visible_publish_journal_records()?;
+        advance_cursor_for_block_delta_commits(&mut effective, &block_deltas)?;
+        advance_cursor_for_native_file_delta_commits(&mut effective, &native_file_deltas)?;
         advance_cursor_for_append_visible_publish_records(&mut effective, &append_visible_records)?;
         Ok(Some(effective))
     }
@@ -2890,6 +2970,10 @@ impl DurableSqliteStore {
         let started = Instant::now();
         persist_row_native_state(&tx, previous_cursor.as_ref(), image)?;
         prune_block_delta_commits_through(
+            &tx,
+            CommitSeq::from_raw(image.metadata.next_commit_seq.saturating_sub(1)),
+        )?;
+        prune_native_file_delta_commits_through(
             &tx,
             CommitSeq::from_raw(image.metadata.next_commit_seq.saturating_sub(1)),
         )?;
@@ -3577,14 +3661,15 @@ impl DurableSqliteStore {
         let mut conn = lock(&self.conn)?;
         let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
         let previous_cursor = load_export_cursor(&conn)?;
+        let durable_high_water = native_metadata_delta_high_water(delta)?;
         let tx = conn.transaction().map_err(sqlite_error)?;
         let started = Instant::now();
         persist_row_native_metadata_delta(&tx, previous_cursor.as_ref(), delta)?;
+        prune_native_file_delta_commits_through(&tx, durable_high_water)?;
         let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
         let started = Instant::now();
         tx.commit().map_err(sqlite_error)?;
         let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
-        let durable_high_water = native_metadata_delta_high_water(delta)?;
         self.prune_native_publish_journal_through(durable_high_water)?;
 
         Ok(DurablePersistProfile {
@@ -3858,10 +3943,132 @@ impl DurableSqliteStore {
         })
     }
 
+    fn persist_native_file_delta_commits(
+        &self,
+        deltas: &[NativeFileDeltaCommit],
+        nodes: &SelectedStorageNodeState,
+        segment_ids: &BTreeSet<SegmentId>,
+        segments: Vec<DurableSegmentPayload>,
+        mut pending_append: PendingDataLogAppend,
+    ) -> Result<DurablePersistProfile> {
+        let total_started = Instant::now();
+        #[cfg(test)]
+        {
+            let delay = *lock(&self.persist_delay)?;
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable persist failure",
+                ));
+            }
+        }
+        if deltas.is_empty() {
+            return Err(StorageError::invalid_argument(
+                "native file delta persist requires at least one commit",
+            ));
+        }
+
+        let new_segment_bytes = segments
+            .iter()
+            .map(|segment| usize_to_u64(segment.bytes.len()))
+            .fold(0_u64, u64::saturating_add);
+        pending_append.retain_current_placements(segment_ids);
+        let prestaged_segment_count = pending_append.placement_count();
+        let prestaged_segment_bytes = pending_append.placement_payload_bytes();
+        let sync_only_bytes = prestaged_segment_bytes;
+        let flush_write_bytes = new_segment_bytes;
+
+        let prepared = self.prepare_durable_bundle_payload(
+            DurableBundlePayload::PrestagedBlockDelta {
+                pending_append,
+                segments,
+            },
+            segment_ids,
+        )?;
+
+        let started = Instant::now();
+        let catalog_profile = self.persist_durable_bundle_catalog(
+            nodes,
+            segment_ids,
+            prepared.appended,
+            &prepared.pre_root_pending_segments,
+        )?;
+        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
+
+        let sqlite_lock_started = Instant::now();
+        let mut conn = lock(&self.conn)?;
+        let sqlite_lock_wait_nanos = duration_nanos_u64(sqlite_lock_started.elapsed());
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        let started = Instant::now();
+        for delta in deltas {
+            persist_native_file_delta_commit(&tx, delta)?;
+        }
+        let root_sqlite_row_sync_nanos = duration_nanos_u64(started.elapsed());
+        let started = Instant::now();
+        tx.commit().map_err(sqlite_error)?;
+        let root_sqlite_commit_nanos = duration_nanos_u64(started.elapsed());
+        let durable_commit_high_water = deltas
+            .iter()
+            .map(|delta| delta.commit_seq.raw())
+            .max()
+            .unwrap_or_default();
+
+        Ok(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            data_log_append_sync_nanos: prepared.data_log_append_sync_nanos,
+            sqlite_lock_wait_nanos,
+            data_log_encode_nanos: prepared.data_log_profile.encode_nanos,
+            data_log_write_nanos: prepared.data_log_profile.write_nanos,
+            data_log_file_sync_nanos: prepared.data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: prepared.data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: prepared.data_log_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: prepared.data_log_profile.dir_sync_nanos,
+            data_log_files_synced: prepared.data_log_profile.files_synced,
+            data_log_sync_bytes: prepared.data_log_profile.sync_bytes,
+            data_log_records_written: prepared.data_log_profile.records_written,
+            data_log_write_bytes: prepared.data_log_profile.write_bytes,
+            data_log_prestaged_segment_count: prestaged_segment_count,
+            data_log_prestaged_segment_bytes: prestaged_segment_bytes,
+            data_log_sync_only_bytes: sync_only_bytes,
+            data_log_flush_write_bytes: flush_write_bytes,
+            data_log_sync_storage_node_count: prepared.sync_storage_node_count,
+            node_catalog_publish_nanos,
+            node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
+            node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
+            node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
+            node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
+            node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
+            node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
+            node_catalog_manifest_rows: catalog_profile.manifest_rows,
+            node_catalog_sealed_rows: catalog_profile.sealed_rows,
+            node_catalog_placement_rows: catalog_profile.placement_rows,
+            node_catalog_segment_rows: catalog_profile.segment_rows,
+            root_sqlite_row_sync_nanos,
+            root_sqlite_commit_nanos,
+            new_segment_count: prepared.new_segment_count,
+            new_segment_bytes: prepared.new_segment_bytes,
+            touched_node_count: catalog_profile.touched_node_count(),
+            durable_commit_high_water,
+            ..DurablePersistProfile::default()
+        })
+    }
+
     fn has_block_delta_commits(&self) -> Result<bool> {
         let conn = lock(&self.conn)?;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM block_delta_commits", [], |row| {
+                row.get(0)
+            })
+            .map_err(sqlite_error)?;
+        Ok(count > 0)
+    }
+
+    fn has_native_file_delta_commits(&self) -> Result<bool> {
+        let conn = lock(&self.conn)?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM native_file_delta_commits", [], |row| {
                 row.get(0)
             })
             .map_err(sqlite_error)?;

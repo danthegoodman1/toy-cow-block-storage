@@ -168,6 +168,16 @@ file_head {
 }
 ```
 
+Durable providers apply the same compact-delta principle to flushed native file
+batch commits. A flushed `commit_file_batch` may return after syncing the new
+segment data, publishing the touched storage-node catalog rows, and committing
+an ordered native-file delta row keyed by global commit sequence. Reopen starts
+from the row-native keyspace/file roots and replays retained block and native
+file deltas in commit-sequence order. A full metadata persist or checkpoint fold
+materializes those native deltas into row-native shard heads and prunes covered
+delta rows. This lets small random-write flushes use a group-commit path without
+making every 4 KiB page write rewrite the long-term native file tree.
+
 `file_version` is the fencing identity for ordinary file extent commits. Append
 streams carry writer epochs and separate private ingest from visible publish.
 Publish captures a stream prefix, persists any pending append-log bytes for that
@@ -205,8 +215,12 @@ commits that span lanes use the shared base append-visible journal so unrelated
 files can share one durable sync without returning to the old global
 `NativeMetadataDelta` cursor. SQLite row-native metadata is a materialized
 checkpoint for inspection and later pruning; durable reopen reads the legacy
-base append-visible journal plus every lane journal and materializes synced
-append-visible records before exposing the store.
+base append-visible journal plus every lane journal, then replays
+append-visible records together with retained block and native-file compact
+deltas in commit-sequence order before exposing the store. That ordering lets
+append publish stay on the append-visible journal fast path even when unrelated
+compact delta rows are already durable, without skipping older delta rows after
+the append-visible cursor advances.
 Append-publish group commit is demand-driven: a leader may wait briefly for
 submitted or waiting peer publishes, but a lone publish must not pay the full
 barrier coalescing window.
@@ -819,10 +833,13 @@ mapping and visible to later reads, but may be lost across process crash until a
 later `flush`, a `Flushed` write, or another synchronous metadata operation
 persists the current state. A successful `Flushed` write has appended all newly
 referenced segment data records, synced their data logs, committed the touched
-node catalogs, and committed the root metadata transaction before the call
-returns. `flush` persists the current live state with the same
-data-before-metadata ordering and reports the latest commit sequence visible to
-the relevant device or native file as `durable_through`.
+node catalogs, and committed the root SQLite transaction before the call
+returns. That transaction may materialize folded row-native roots or record an
+ordered compact delta row, but crash replay must reconstruct the same visible
+logical state through the reported commit sequence. `flush` persists the current
+live state with the same data-before-metadata ordering and reports the latest
+commit sequence visible to the relevant device or native file as
+`durable_through`.
 
 Synchronous metadata operations that do not carry a `WriteDurability` argument
 -- create, checkpoint, fork, restore, delete, keyspace snapshot, and custodian
@@ -1318,6 +1335,9 @@ Invariants:
   keyspace catalog shard exactly once.
 - Batches are fenced by the committed file version observed by the metadata
   plane.
+- Repeated writes to the same file page inside one batch publish only the latest
+  page image; flushed batches may be durable as compact native-file delta rows
+  before a later fold materializes row-native shard heads.
 - Failed batches leave the previous file version readable.
 - Segment/block alignment is not exposed to native callers.
 

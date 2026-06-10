@@ -705,6 +705,31 @@ pub(super) fn native_batch_segment_groups(
     Ok(groups)
 }
 
+pub(super) fn native_batch_writes_cover_range(
+    writes: &[CollapsedFileWrite],
+    range: ByteRange,
+) -> Result<bool> {
+    if range.len == 0 {
+        return Ok(true);
+    }
+    let target_end = range.end_exclusive()?;
+    let mut covered_through = range.offset;
+    for write in writes {
+        let write_end = write.end()?;
+        if write_end <= covered_through {
+            continue;
+        }
+        if write.offset > covered_through {
+            return Ok(false);
+        }
+        covered_through = write_end;
+        if covered_through >= target_end {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn overlay_native_batch_writes(
     group_start: u64,
     writes: &[CollapsedFileWrite],

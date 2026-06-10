@@ -234,6 +234,8 @@ enum Workload {
     AppendLogMicrobenchStreamPrivate4m,
     AppendLogMicrobenchNodeShared4m,
     NativeHotAppend4k,
+    NativeMixedAppendBatch4k16Ops,
+    NativeMixedAppendBatch4k256Ops,
 }
 
 impl Workload {
@@ -379,6 +381,13 @@ impl Workload {
         ]
     }
 
+    fn native_mixed_suite() -> Vec<Self> {
+        vec![
+            Self::NativeMixedAppendBatch4k16Ops,
+            Self::NativeMixedAppendBatch4k256Ops,
+        ]
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::BlockWrite4k => "block-write-4k",
@@ -457,6 +466,8 @@ impl Workload {
             }
             Self::AppendLogMicrobenchNodeShared4m => "append-log-microbench-node-shared-4m",
             Self::NativeHotAppend4k => "native-hot-append-4k",
+            Self::NativeMixedAppendBatch4k16Ops => "native-mixed-append-batch-4k-16ops",
+            Self::NativeMixedAppendBatch4k256Ops => "native-mixed-append-batch-4k-256ops",
         }
     }
 
@@ -492,7 +503,9 @@ impl Workload {
             | Self::NativeStreamPublishPipelined1m
             | Self::NativeStreamPublishInterval1m
             | Self::NativeStreamPublishAtEnd1m
-            | Self::NativeStreamPublishBarrierAtEnd1m => 1024 * 1024,
+            | Self::NativeStreamPublishBarrierAtEnd1m
+            | Self::NativeMixedAppendBatch4k16Ops
+            | Self::NativeMixedAppendBatch4k256Ops => 1024 * 1024,
             Self::NativeWrite4m
             | Self::NativeAppend4m
             | Self::NativeStreamIngest4m
@@ -576,6 +589,13 @@ impl Workload {
                 | Self::NativeFileBatch1m16Ops
                 | Self::NativeFileBatchOverwriteCollapse
                 | Self::NativeFileBatchFsyncInterval
+        )
+    }
+
+    fn is_native_mixed(self) -> bool {
+        matches!(
+            self,
+            Self::NativeMixedAppendBatch4k16Ops | Self::NativeMixedAppendBatch4k256Ops
         )
     }
 
@@ -685,6 +705,12 @@ impl Workload {
         let (ops, write_bytes, overlap) = match self {
             Self::NativeFileBatch4k16Ops => (16, 4096, NativeFileBatchOverlap::Sequential),
             Self::NativeFileBatch4k256Ops => (256, 4096, NativeFileBatchOverlap::Sequential),
+            Self::NativeMixedAppendBatch4k16Ops => {
+                (16, 4096, NativeFileBatchOverlap::Sequential)
+            }
+            Self::NativeMixedAppendBatch4k256Ops => {
+                (256, 4096, NativeFileBatchOverlap::Sequential)
+            }
             Self::NativeFileBatch4k4096Ops => (4096, 4096, NativeFileBatchOverlap::Sequential),
             Self::NativeFileBatch1m16Ops => (16, 1024 * 1024, NativeFileBatchOverlap::Sequential),
             Self::NativeFileBatchOverwriteCollapse => {
@@ -951,6 +977,8 @@ impl FromStr for Workload {
                 Ok(Self::AppendLogMicrobenchNodeShared4m)
             }
             "native-hot-append-4k" => Ok(Self::NativeHotAppend4k),
+            "native-mixed-append-batch-4k-16ops" => Ok(Self::NativeMixedAppendBatch4k16Ops),
+            "native-mixed-append-batch-4k-256ops" => Ok(Self::NativeMixedAppendBatch4k256Ops),
             _ => Err(StorageError::invalid_argument(format!(
                 "unknown workload {value}"
             ))),

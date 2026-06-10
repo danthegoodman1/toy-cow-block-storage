@@ -56,7 +56,7 @@ fn append_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,stream_prefix_request_count,stream_prefix_plan_count,stream_prefix_record_count,stream_prefix_payload_bytes,stream_prefix_storage_node_count,stream_prefix_pending_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,visible_metadata_write_bytes,append_visible_publish_batch_id,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,native_file_delta_selected_count,native_file_delta_selected_bytes,stream_prefix_request_count,stream_prefix_plan_count,stream_prefix_record_count,stream_prefix_payload_bytes,stream_prefix_storage_node_count,stream_prefix_pending_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,visible_metadata_write_bytes,append_visible_publish_batch_id,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -73,6 +73,8 @@ fn append_profile_csv(
             profile.block_delta_prestage_wait_nanos.to_string(),
             profile.block_delta_selected_count.to_string(),
             profile.block_delta_selected_bytes.to_string(),
+            profile.native_file_delta_selected_count.to_string(),
+            profile.native_file_delta_selected_bytes.to_string(),
             profile.stream_prefix_request_count.to_string(),
             profile.stream_prefix_plan_count.to_string(),
             profile.stream_prefix_record_count.to_string(),
@@ -151,7 +153,7 @@ fn append_append_publish_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,ticket_id,stream_id,publish_through,total_nanos,status_check_nanos,coordinator_lock_wait_nanos,coordinator_wait_nanos,in_flight_wait_nanos,coalesce_wait_nanos,persist_batch_nanos,persist_batch_metadata_gate_wait_nanos,persist_batch_plan_nanos,persist_batch_durable_nanos,persist_batch_apply_nanos,wait_loops,cvar_waits,in_flight_waits,in_flight_batches_waited,coalesce_waits,persist_batches_started,max_batch_ticket_count,batch_waiter_request_count,batch_metadata_pending_ticket_count,batch_coalesce_start_demand,batch_coalesce_end_demand,batch_coalesce_hit_target,batch_planned_ticket_count,batch_completed_ticket_count,batch_same_file_skip_count,batch_journal_lane_count,batch_shared_journal,post_batch_request_count,post_batch_pending_ticket_count,append_publish_batch_id,payload_already_durable_bytes,payload_synced_bytes,payload_sync_nanos,visible_metadata_commit_nanos,catalog_manifest_publish_nanos,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,registered,completed_without_register,success";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,ticket_id,stream_id,publish_through,total_nanos,status_check_nanos,coordinator_lock_wait_nanos,coordinator_wait_nanos,in_flight_wait_nanos,coalesce_wait_nanos,persist_batch_nanos,persist_batch_metadata_gate_wait_nanos,persist_batch_plan_nanos,persist_batch_durable_nanos,persist_batch_apply_nanos,compact_delta_drain_nanos,compact_delta_drain_attempts,compact_delta_drain_successes,full_persist_nanos,full_persist_count,wait_loops,cvar_waits,in_flight_waits,in_flight_batches_waited,coalesce_waits,persist_batches_started,max_batch_ticket_count,batch_waiter_request_count,batch_metadata_pending_ticket_count,batch_coalesce_start_demand,batch_coalesce_end_demand,batch_coalesce_hit_target,batch_planned_ticket_count,batch_completed_ticket_count,batch_same_file_skip_count,batch_journal_lane_count,batch_shared_journal,post_batch_request_count,post_batch_pending_ticket_count,append_publish_batch_id,payload_already_durable_bytes,payload_synced_bytes,payload_sync_nanos,visible_metadata_commit_nanos,catalog_manifest_publish_nanos,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,registered,completed_without_register,success";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -177,6 +179,11 @@ fn append_append_publish_profile_csv(
             profile.persist_batch_plan_nanos.to_string(),
             profile.persist_batch_durable_nanos.to_string(),
             profile.persist_batch_apply_nanos.to_string(),
+            profile.compact_delta_drain_nanos.to_string(),
+            profile.compact_delta_drain_attempts.to_string(),
+            profile.compact_delta_drain_successes.to_string(),
+            profile.full_persist_nanos.to_string(),
+            profile.full_persist_count.to_string(),
             profile.wait_loops.to_string(),
             profile.cvar_waits.to_string(),
             profile.in_flight_waits.to_string(),
@@ -483,6 +490,121 @@ fn append_block_batch_profile_csv(
             profile.committed_bytes,
         )
         .map_err(fs_error)?;
+    }
+    Ok(())
+}
+
+fn append_native_file_batch_profile_csv(
+    args: &Args,
+    report: &BenchReport,
+) -> Result<()> {
+    let Some(path) = &args.native_file_batch_profile_csv else {
+        return Ok(());
+    };
+    if report.native_file_batch_profiles.is_empty() {
+        return Ok(());
+    }
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,payload_integrity,total_nanos,commit_nanos,batch_operation_count,requested_bytes,committed_range_bytes";
+    let mut file = open_csv_append(path, header)?;
+    for profile in &report.native_file_batch_profiles {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            report.workload.name(),
+            report.provider,
+            report.durability,
+            report.rtt_us,
+            report.serial_rtts,
+            report.concurrency,
+            report.op_size,
+            args.storage_nodes,
+            payload_integrity_name(args.payload_integrity),
+            profile.total_nanos,
+            profile.commit_nanos,
+            profile.batch_operation_count,
+            profile.requested_bytes,
+            profile.committed_range_bytes,
+        )
+        .map_err(fs_error)?;
+    }
+    Ok(())
+}
+
+fn append_native_file_batch_commit_profile_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    store: &BenchStore,
+) -> Result<()> {
+    let Some(path) = &args.native_file_batch_commit_profile_csv else {
+        return Ok(());
+    };
+    let profiles = store.drain_native_file_batch_commit_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,metadata_head_nanos,collapse_nanos,root_load_nanos,segment_group_nanos,preservation_check_nanos,preservation_read_nanos,overlay_nanos,segment_write_nanos,storage_node_ids_nanos,placement_select_nanos,segment_id_alloc_nanos,grant_issue_nanos,storage_node_transport_dispatch_nanos,grant_verify_nanos,catalog_duplicate_probe_nanos,catalog_duplicate_probe_lock_wait_nanos,catalog_reserve_nanos,catalog_reserve_lock_wait_nanos,catalog_begin_nanos,catalog_begin_lock_wait_nanos,segment_store_write_nanos,segment_store_lock_wait_nanos,checksum_integrity_nanos,segment_store_insert_nanos,segment_sync_nanos,segment_sync_lock_wait_nanos,receipt_create_nanos,receipt_verify_nanos,catalog_commit_nanos,catalog_commit_lock_wait_nanos,tree_path_copy_nanos,metadata_publish_nanos,mark_referenced_nanos,mark_reference_evidence_nanos,mark_reference_transport_dispatch_nanos,mark_reference_verify_nanos,mark_reference_catalog_nanos,mark_reference_catalog_lock_wait_nanos,append_stream_invalidate_nanos,write_count,collapsed_range_count,segment_group_count,segment_count,requested_bytes,committed_bytes,committed_range_bytes,preserved_read_bytes";
+    let mut file = open_csv_append(path, header)?;
+    for profile in profiles {
+        let row = [
+            workload.name().to_string(),
+            args.provider.to_string(),
+            args.durability.to_string(),
+            args.rtt.as_micros().to_string(),
+            args.serial_rtts.to_string(),
+            concurrency.to_string(),
+            workload.op_size(args)?.to_string(),
+            profile.sequence.to_string(),
+            profile.total_nanos.to_string(),
+            profile.metadata_head_nanos.to_string(),
+            profile.collapse_nanos.to_string(),
+            profile.root_load_nanos.to_string(),
+            profile.segment_group_nanos.to_string(),
+            profile.preservation_check_nanos.to_string(),
+            profile.preservation_read_nanos.to_string(),
+            profile.overlay_nanos.to_string(),
+            profile.segment_write_nanos.to_string(),
+            profile.storage_node_ids_nanos.to_string(),
+            profile.placement_select_nanos.to_string(),
+            profile.segment_id_alloc_nanos.to_string(),
+            profile.grant_issue_nanos.to_string(),
+            profile.storage_node_transport_dispatch_nanos.to_string(),
+            profile.grant_verify_nanos.to_string(),
+            profile.catalog_duplicate_probe_nanos.to_string(),
+            profile.catalog_duplicate_probe_lock_wait_nanos.to_string(),
+            profile.catalog_reserve_nanos.to_string(),
+            profile.catalog_reserve_lock_wait_nanos.to_string(),
+            profile.catalog_begin_nanos.to_string(),
+            profile.catalog_begin_lock_wait_nanos.to_string(),
+            profile.segment_store_write_nanos.to_string(),
+            profile.segment_store_lock_wait_nanos.to_string(),
+            profile.checksum_integrity_nanos.to_string(),
+            profile.segment_store_insert_nanos.to_string(),
+            profile.segment_sync_nanos.to_string(),
+            profile.segment_sync_lock_wait_nanos.to_string(),
+            profile.receipt_create_nanos.to_string(),
+            profile.receipt_verify_nanos.to_string(),
+            profile.catalog_commit_nanos.to_string(),
+            profile.catalog_commit_lock_wait_nanos.to_string(),
+            profile.tree_path_copy_nanos.to_string(),
+            profile.metadata_publish_nanos.to_string(),
+            profile.mark_referenced_nanos.to_string(),
+            profile.mark_reference_evidence_nanos.to_string(),
+            profile.mark_reference_transport_dispatch_nanos.to_string(),
+            profile.mark_reference_verify_nanos.to_string(),
+            profile.mark_reference_catalog_nanos.to_string(),
+            profile.mark_reference_catalog_lock_wait_nanos.to_string(),
+            profile.append_stream_invalidate_nanos.to_string(),
+            profile.write_count.to_string(),
+            profile.collapsed_range_count.to_string(),
+            profile.segment_group_count.to_string(),
+            profile.segment_count.to_string(),
+            profile.requested_bytes.to_string(),
+            profile.committed_bytes.to_string(),
+            profile.committed_range_bytes.to_string(),
+            profile.preserved_read_bytes.to_string(),
+        ];
+        writeln!(file, "{}", row.join(",")).map_err(fs_error)?;
     }
     Ok(())
 }

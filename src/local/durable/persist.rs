@@ -277,6 +277,42 @@ pub(super) fn prune_block_delta_commits_through(
     Ok(())
 }
 
+pub(super) fn persist_native_file_delta_commit(
+    tx: &rusqlite::Transaction<'_>,
+    delta: &NativeFileDeltaCommit,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO native_file_delta_commits (row_key, keyspace_id, file_id, commit_seq, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(row_key) DO UPDATE SET
+           keyspace_id = excluded.keyspace_id,
+           file_id = excluded.file_id,
+           commit_seq = excluded.commit_seq,
+           payload = excluded.payload",
+        params![
+            delta.row_key(),
+            delta.keyspace_id.raw().to_string(),
+            delta.file_id.raw().to_string(),
+            u64_to_i64(delta.commit_seq.raw())?,
+            encode_row(delta)?,
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+pub(super) fn prune_native_file_delta_commits_through(
+    tx: &rusqlite::Transaction<'_>,
+    commit_seq: CommitSeq,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM native_file_delta_commits WHERE commit_seq <= ?1",
+        params![u64_to_i64(commit_seq.raw())?],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 pub(super) trait DurableTimelineRow: DurableCodec {
     fn commit_seq_raw(&self) -> u64;
     fn row_key(&self) -> String;

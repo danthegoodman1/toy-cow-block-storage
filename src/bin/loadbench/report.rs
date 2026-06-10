@@ -62,6 +62,15 @@ struct BlockBatchOpProfile {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct NativeFileBatchOpProfile {
+    total_nanos: u64,
+    commit_nanos: u64,
+    batch_operation_count: u64,
+    requested_bytes: u64,
+    committed_range_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum LatencyClass {
     StreamAppend,
     StreamPublish,
@@ -94,6 +103,7 @@ struct WorkerReport {
     stream_boundary_phase_max_nanos: u64,
     sample_limit: usize,
     block_batch_profiles: Vec<BlockBatchOpProfile>,
+    native_file_batch_profiles: Vec<NativeFileBatchOpProfile>,
 }
 
 impl WorkerReport {
@@ -124,6 +134,7 @@ impl WorkerReport {
             stream_boundary_phase_max_nanos: 0,
             sample_limit,
             block_batch_profiles: Vec::new(),
+            native_file_batch_profiles: Vec::new(),
         }
     }
 
@@ -234,6 +245,9 @@ impl WorkerReport {
             if let Some(profile) = progress.block_batch_profile {
                 self.block_batch_profiles.push(profile);
             }
+            if let Some(profile) = progress.native_file_batch_profile {
+                self.native_file_batch_profiles.push(profile);
+            }
         } else {
             self.errors = self.errors.saturating_add(1);
         }
@@ -312,6 +326,7 @@ struct BenchReport {
     durable_bytes: u64,
     published_bytes: u64,
     block_batch_profiles: Vec<BlockBatchOpProfile>,
+    native_file_batch_profiles: Vec<NativeFileBatchOpProfile>,
     append_log_profiles: Vec<AppendLogMicrobenchProfile>,
     p50_nanos: u64,
     p90_nanos: u64,
@@ -368,6 +383,7 @@ impl BenchReport {
         let mut stream_append_phase_nanos = 0_u64;
         let mut stream_boundary_phase_nanos = 0_u64;
         let mut block_batch_profiles = Vec::new();
+        let mut native_file_batch_profiles = Vec::new();
 
         for worker in workers {
             attempts = attempts.saturating_add(worker.attempts);
@@ -395,6 +411,7 @@ impl BenchReport {
             stream_boundary_phase_nanos =
                 stream_boundary_phase_nanos.max(worker.stream_boundary_phase_max_nanos);
             block_batch_profiles.extend(worker.block_batch_profiles);
+            native_file_batch_profiles.extend(worker.native_file_batch_profiles);
         }
         samples.sort_unstable();
         stream_append_samples.sort_unstable();
@@ -418,6 +435,7 @@ impl BenchReport {
             durable_bytes,
             published_bytes,
             block_batch_profiles,
+            native_file_batch_profiles,
             append_log_profiles: Vec::new(),
             p50_nanos: percentile(&samples, 0.50),
             p90_nanos: percentile(&samples, 0.90),

@@ -81,6 +81,7 @@ pub use txn_metadata::{
 include!("durable/paths.rs");
 include!("durable/policy.rs");
 include!("durable/block_delta.rs");
+include!("durable/native_file_delta.rs");
 include!("durable/sqlite.rs");
 include!("durable/data_log.rs");
 include!("durable/persist.rs");

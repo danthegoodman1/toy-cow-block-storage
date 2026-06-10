@@ -9,6 +9,7 @@ pub struct DurableCoordinator {
     durable: DurableSqliteStore,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     pending_block_deltas: Arc<Mutex<Vec<BlockDeltaCommit>>>,
+    pending_native_file_deltas: Arc<Mutex<Vec<NativeFileDeltaCommit>>>,
     pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     block_delta_staging_lock: Arc<Mutex<()>>,
     block_delta_prestage: Arc<BlockDeltaPrestageTracker>,
@@ -39,6 +40,12 @@ pub struct DurableCoordinator {
 struct AppendPublishLaneKey {
     keyspace_id: KeyspaceId,
     shard_index: usize,
+}
+
+#[derive(Debug)]
+enum PendingCompactDeltaRun {
+    Block(Vec<BlockDeltaCommit>),
+    NativeFile(Vec<NativeFileDeltaCommit>),
 }
 
 #[derive(Debug)]
@@ -169,6 +176,11 @@ struct AppendPublishBatchDiagnostics {
     plan_nanos: u64,
     durable_persist_nanos: u64,
     apply_nanos: u64,
+    compact_delta_drain_nanos: u64,
+    compact_delta_drain_attempts: u64,
+    compact_delta_drain_successes: u64,
+    full_persist_nanos: u64,
+    full_persist_count: u64,
     journal_lane_count: u64,
     shared_journal: bool,
 }
@@ -206,6 +218,11 @@ impl AppendPublishBatchDiagnostics {
             plan_nanos: 0,
             durable_persist_nanos: profile.total_nanos,
             apply_nanos: 0,
+            compact_delta_drain_nanos: 0,
+            compact_delta_drain_attempts: 0,
+            compact_delta_drain_successes: 0,
+            full_persist_nanos: 0,
+            full_persist_count: 0,
             journal_lane_count: 0,
             shared_journal: false,
         }
@@ -447,6 +464,7 @@ impl DurableCoordinator {
             durable,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             pending_block_deltas: Arc::new(Mutex::new(Vec::new())),
+            pending_native_file_deltas: Arc::new(Mutex::new(Vec::new())),
             pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             block_delta_staging_lock: Arc::new(Mutex::new(())),
             block_delta_prestage: Arc::new(BlockDeltaPrestageTracker::new()),
@@ -978,6 +996,17 @@ impl DurableCoordinator {
             .unwrap_or_default())
     }
 
+    pub fn enable_native_file_batch_profiling(&self, capacity: usize) -> Result<()> {
+        self.local.enable_native_file_batch_profiling(capacity)
+    }
+
+    pub fn drain_native_file_batch_commit_profiles(
+        &self,
+        max: usize,
+    ) -> Result<Vec<NativeFileBatchCommitProfile>> {
+        self.local.drain_native_file_batch_commit_profiles(max)
+    }
+
     fn record_read_profile(&self, profile: ReadProfile) -> Result<()> {
         if let Some(profiler) = lock(&self.read_profiler)?.as_mut() {
             profiler.record(profile);
@@ -1009,6 +1038,138 @@ impl DurableCoordinator {
         lock(&self.pending_block_deltas)?
             .retain(|delta| delta.commit_seq.raw() > durable_through.raw());
         Ok(())
+    }
+
+    fn record_pending_native_file_delta(&self, delta: Option<NativeFileDeltaCommit>) -> Result<()> {
+        if let Some(delta) = delta {
+            lock(&self.pending_native_file_deltas)?.push(delta);
+        }
+        Ok(())
+    }
+
+    fn prune_pending_native_file_deltas_through(&self, durable_through: CommitSeq) -> Result<()> {
+        lock(&self.pending_native_file_deltas)?
+            .retain(|delta| delta.commit_seq.raw() > durable_through.raw());
+        Ok(())
+    }
+
+    fn pending_compact_delta_high_water(&self) -> Result<Option<CommitSeq>> {
+        let block_high = lock(&self.pending_block_deltas)?
+            .iter()
+            .map(|delta| delta.commit_seq.raw())
+            .max();
+        let native_high = lock(&self.pending_native_file_deltas)?
+            .iter()
+            .map(|delta| delta.commit_seq.raw())
+            .max();
+        Ok(block_high
+            .into_iter()
+            .chain(native_high)
+            .max()
+            .map(CommitSeq::from_raw))
+    }
+
+    fn pending_compact_delta_run(
+        &self,
+        durable_through: CommitSeq,
+        target: CommitSeq,
+    ) -> Result<Option<PendingCompactDeltaRun>> {
+        if durable_through.raw() >= target.raw() {
+            return Ok(None);
+        }
+        let block_by_seq: BTreeMap<_, _> = lock(&self.pending_block_deltas)?
+            .iter()
+            .cloned()
+            .map(|delta| (delta.commit_seq.raw(), delta))
+            .collect();
+        let native_by_seq: BTreeMap<_, _> = lock(&self.pending_native_file_deltas)?
+            .iter()
+            .cloned()
+            .map(|delta| (delta.commit_seq.raw(), delta))
+            .collect();
+        let next = durable_through
+            .raw()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("compact delta sequence overflows"))?;
+        let has_block = block_by_seq.contains_key(&next);
+        let has_native = native_by_seq.contains_key(&next);
+        if has_block && has_native {
+            return Err(StorageError::corrupt(
+                "pending compact deltas share a commit sequence",
+            ));
+        }
+        if has_block {
+            let mut seq = next;
+            let mut deltas = Vec::new();
+            while seq <= target.raw() {
+                if native_by_seq.contains_key(&seq) {
+                    break;
+                }
+                let Some(delta) = block_by_seq.get(&seq) else {
+                    break;
+                };
+                deltas.push(delta.clone());
+                seq = seq
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("compact delta sequence overflows"))?;
+            }
+            return Ok(Some(PendingCompactDeltaRun::Block(deltas)));
+        }
+        if has_native {
+            let mut seq = next;
+            let mut deltas = Vec::new();
+            while seq <= target.raw() {
+                if block_by_seq.contains_key(&seq) {
+                    break;
+                }
+                let Some(delta) = native_by_seq.get(&seq) else {
+                    break;
+                };
+                deltas.push(delta.clone());
+                seq = seq
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::conflict("compact delta sequence overflows"))?;
+            }
+            return Ok(Some(PendingCompactDeltaRun::NativeFile(deltas)));
+        }
+        Ok(None)
+    }
+
+    fn contiguous_pending_native_file_deltas(
+        &self,
+        durable_through: CommitSeq,
+        target: CommitSeq,
+    ) -> Result<Option<Vec<NativeFileDeltaCommit>>> {
+        if durable_through.raw() >= target.raw() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut pending = lock(&self.pending_native_file_deltas)?.clone();
+        pending.sort_by_key(|delta| delta.commit_seq.raw());
+        let mut next = durable_through.raw().checked_add(1).ok_or_else(|| {
+            StorageError::conflict("durable native file delta sequence overflows")
+        })?;
+        let mut selected = Vec::new();
+        for delta in pending {
+            let seq = delta.commit_seq.raw();
+            if seq < next {
+                continue;
+            }
+            if seq > target.raw() {
+                break;
+            }
+            if seq != next {
+                return Ok(None);
+            }
+            selected.push(delta);
+            next = next.checked_add(1).ok_or_else(|| {
+                StorageError::conflict("durable native file delta sequence overflows")
+            })?;
+        }
+        if next == target.raw().saturating_add(1) {
+            Ok(Some(selected))
+        } else {
+            Ok(None)
+        }
     }
 
     fn begin_block_delta_prestage(&self, commit_seq: CommitSeq) -> Result<()> {
@@ -1328,6 +1489,220 @@ impl DurableCoordinator {
         Ok(durable_through)
     }
 
+    fn persist_native_file_deltas_until(&self, required: CommitSeq) -> Result<()> {
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            state.requested_through = state.requested_through.max(required);
+            if state.durable_through >= required {
+                return Ok(());
+            }
+            if !state.in_flight {
+                let target_commit = state.requested_through;
+                state.in_flight = true;
+                drop(state);
+                let result =
+                    self.persist_native_file_deltas_physical(Instant::now(), target_commit);
+                let mut state = lock(&self.persist_coordinator.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.saturating_add(1);
+                let generation = state.generation;
+                match result {
+                    Ok(durable_through) => {
+                        state.durable_through = state.durable_through.max(durable_through);
+                        state.requested_through =
+                            state.requested_through.max(state.durable_through);
+                        state.last_error = None;
+                        self.persist_coordinator.cvar.notify_all();
+                        if state.durable_through >= required {
+                            return Ok(());
+                        }
+                        return Err(StorageError::conflict(
+                            "durable native file delta persist did not reach required commit sequence",
+                        ));
+                    }
+                    Err(error) => {
+                        state.last_error = Some((generation, error.clone()));
+                        self.persist_coordinator.cvar.notify_all();
+                        return Err(error);
+                    }
+                }
+            }
+
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+            }
+            if state.durable_through >= required {
+                return Ok(());
+            }
+            if state.generation != generation
+                && let Some((error_generation, error)) = &state.last_error
+                && *error_generation == state.generation
+            {
+                return Err(error.clone());
+            }
+        }
+    }
+
+    fn persist_native_file_deltas_physical(
+        &self,
+        total_started: Instant,
+        minimum_target: CommitSeq,
+    ) -> Result<CommitSeq> {
+        let (durable_through, target_commit) = {
+            let state = lock(&self.persist_coordinator.inner)?;
+            (
+                state.durable_through,
+                state.requested_through.max(minimum_target),
+            )
+        };
+        let Some(deltas) =
+            self.contiguous_pending_native_file_deltas(durable_through, target_commit)?
+        else {
+            return self.persist_physical(total_started, None, Some(target_commit));
+        };
+        if deltas.is_empty() {
+            return Ok(durable_through);
+        }
+        self.persist_native_file_delta_batch(total_started, deltas)
+    }
+
+    fn persist_native_file_delta_batch(
+        &self,
+        total_started: Instant,
+        mut deltas: Vec<NativeFileDeltaCommit>,
+    ) -> Result<CommitSeq> {
+        let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
+        let durable_before = deltas
+            .first()
+            .and_then(|delta| delta.commit_seq.raw().checked_sub(1))
+            .map(CommitSeq::from_raw)
+            .ok_or_else(|| StorageError::conflict("native file delta batch has no first sequence"))?;
+        let requested_through = lock(&self.persist_coordinator.inner)?.requested_through;
+        if let Some(expanded) =
+            self.contiguous_pending_native_file_deltas(durable_before, requested_through)?
+            && expanded.len() > deltas.len()
+        {
+            deltas = expanded;
+        }
+        let native_file_delta_selected_count = usize_to_u64(deltas.len());
+        let native_file_delta_selected_bytes = deltas
+            .iter()
+            .map(|delta| delta.committed_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let lock_started = Instant::now();
+        let _persist_guard = lock(&self.persist_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let snapshot_started = Instant::now();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let mut segment_ids = BTreeSet::new();
+        for delta in &deltas {
+            segment_ids.extend(delta.segment_ids());
+        }
+        let mut pending_append = lock(&self.pending_data_log_append)?.clone();
+        pending_append.retain_current_placements(&segment_ids);
+        let pending_segments = pending_append.segment_ids();
+        let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+        let new_segments: Vec<_> = payloads
+            .into_iter()
+            .filter(|payload| {
+                !previous_segments.contains(&payload.segment_id)
+                    && !pending_segments.contains(&payload.segment_id)
+            })
+            .collect();
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+
+        let mut profile = self.durable.persist_native_file_delta_commits(
+            &deltas,
+            &nodes,
+            &segment_ids,
+            new_segments,
+            pending_append,
+        )?;
+        let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+        lock(&self.persisted_segments)?.extend(segment_ids.iter().copied());
+        lock(&self.pending_data_log_append)?.remove_segments(&segment_ids);
+        self.prune_pending_native_file_deltas_through(durable_through)?;
+        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        profile.native_file_delta_selected_count = native_file_delta_selected_count;
+        profile.native_file_delta_selected_bytes = native_file_delta_selected_bytes;
+        self.attach_metadata_publish_profile(&mut profile)?;
+        self.record_persist_profile(profile)?;
+        Ok(durable_through)
+    }
+
+    fn persist_pending_compact_deltas_for_append_publish(&self) -> Result<bool> {
+        let Some(required) = self.pending_compact_delta_high_water()? else {
+            return Ok(false);
+        };
+        self.persist_pending_compact_deltas_until(required)
+    }
+
+    fn persist_pending_compact_deltas_until(&self, required: CommitSeq) -> Result<bool> {
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            state.requested_through = state.requested_through.max(required);
+            if state.durable_through >= required {
+                return Ok(true);
+            }
+            if !state.in_flight {
+                let durable_before = state.durable_through;
+                let Some(run) = self.pending_compact_delta_run(durable_before, required)? else {
+                    return Ok(false);
+                };
+                state.in_flight = true;
+                drop(state);
+
+                let total_started = Instant::now();
+                let result = match run {
+                    PendingCompactDeltaRun::Block(deltas) => {
+                        self.persist_block_delta_batch(total_started, deltas)
+                    }
+                    PendingCompactDeltaRun::NativeFile(deltas) => {
+                        self.persist_native_file_delta_batch(total_started, deltas)
+                    }
+                };
+                let mut state = lock(&self.persist_coordinator.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.saturating_add(1);
+                let generation = state.generation;
+                match result {
+                    Ok(durable_through) => {
+                        state.durable_through = state.durable_through.max(durable_through);
+                        state.requested_through =
+                            state.requested_through.max(state.durable_through);
+                        state.last_error = None;
+                        self.persist_coordinator.cvar.notify_all();
+                        if state.durable_through >= required {
+                            return Ok(true);
+                        }
+                    }
+                    Err(error) => {
+                        state.last_error = Some((generation, error.clone()));
+                        self.persist_coordinator.cvar.notify_all();
+                        return Err(error);
+                    }
+                }
+            } else {
+                let generation = state.generation;
+                while state.in_flight && state.generation == generation {
+                    state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+                }
+                if state.durable_through >= required {
+                    return Ok(true);
+                }
+                if state.generation != generation
+                    && let Some((error_generation, error)) = &state.last_error
+                    && *error_generation == state.generation
+                {
+                    return Err(error.clone());
+                }
+            }
+        }
+    }
+
     fn persist_until(&self, required: CommitSeq) -> Result<()> {
         loop {
             let mut state = lock(&self.persist_coordinator.inner)?;
@@ -1422,12 +1797,20 @@ impl DurableCoordinator {
         self.persist_now_with_catalog_changes(None)
     }
 
-    fn has_unfolded_block_deltas(&self) -> Result<bool> {
-        Ok(!lock(&self.pending_block_deltas)?.is_empty() || self.durable.has_block_delta_commits()?)
+    fn has_unfolded_compact_deltas(&self) -> Result<bool> {
+        Ok(!lock(&self.pending_block_deltas)?.is_empty()
+            || !lock(&self.pending_native_file_deltas)?.is_empty()
+            || self.durable.has_block_delta_commits()?
+            || self.durable.has_native_file_delta_commits()?)
     }
 
-    fn fold_block_deltas_before_gc(&self) -> Result<()> {
-        if self.has_unfolded_block_deltas()? {
+    fn has_pending_compact_deltas(&self) -> Result<bool> {
+        Ok(!lock(&self.pending_block_deltas)?.is_empty()
+            || !lock(&self.pending_native_file_deltas)?.is_empty())
+    }
+
+    fn fold_compact_deltas_before_gc(&self) -> Result<()> {
+        if self.has_unfolded_compact_deltas()? {
             self.persist_now()?;
         }
         Ok(())
@@ -1484,6 +1867,7 @@ impl DurableCoordinator {
             profile.local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
             profile.total_nanos = duration_nanos_u64(total_started.elapsed());
             let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+            self.prune_pending_native_file_deltas_through(durable_through)?;
             self.attach_metadata_publish_profile(&mut profile)?;
             self.record_persist_profile(profile)?;
             return Ok(durable_through);
@@ -1515,6 +1899,7 @@ impl DurableCoordinator {
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
         self.prune_pending_block_deltas_through(durable_through)?;
+        self.prune_pending_native_file_deltas_through(durable_through)?;
         self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_through)
@@ -1915,7 +2300,7 @@ impl DurableCoordinator {
         let Some(previous_cursor) = self.durable.effective_export_cursor()? else {
             return Ok(true);
         };
-        if !lock(&self.pending_data_log_append)?.is_empty() || self.has_unfolded_block_deltas()? {
+        if !lock(&self.pending_data_log_append)?.is_empty() || self.has_pending_compact_deltas()? {
             return Ok(true);
         }
         let local_cursor = self.local.durable_export_cursor()?;
@@ -2160,6 +2545,48 @@ impl DurableCoordinator {
         Ok((durable_high_water, diagnostics))
     }
 
+    fn begin_ordered_append_publish_persist(&self, target_commit: CommitSeq) -> Result<()> {
+        loop {
+            let mut state = lock(&self.persist_coordinator.inner)?;
+            state.requested_through = state.requested_through.max(target_commit);
+            if !state.in_flight {
+                state.in_flight = true;
+                return Ok(());
+            }
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&self.persist_coordinator.cvar, state)?;
+            }
+            if state.generation != generation
+                && let Some((error_generation, error)) = &state.last_error
+                && *error_generation == state.generation
+            {
+                return Err(error.clone());
+            }
+        }
+    }
+
+    fn finish_ordered_append_publish_persist(&self, outcome: Result<CommitSeq>) -> Result<()> {
+        let mut state = lock(&self.persist_coordinator.inner)?;
+        state.in_flight = false;
+        state.generation = state.generation.saturating_add(1);
+        let generation = state.generation;
+        match &outcome {
+            Ok(durable_high_water) => {
+                state.durable_through = state.durable_through.max(*durable_high_water);
+                let durable_through = state.durable_through;
+                state.requested_through = state.requested_through.max(durable_through);
+                state.last_error = None;
+            }
+            Err(error) => {
+                state.last_error = Some((generation, error.clone()));
+            }
+        }
+        self.persist_coordinator.cvar.notify_all();
+        drop(state);
+        outcome.map(|_| ())
+    }
+
     fn persist_append_publish_ticket_batch(
         &self,
         batch_id: u64,
@@ -2169,10 +2596,15 @@ impl DurableCoordinator {
             return Ok(AppendPublishBatchDiagnostics::default());
         }
         enum BatchStep {
-            Published(CommitSeq, AppendPublishBatchDiagnostics),
+            Published(CommitSeq, Box<AppendPublishBatchDiagnostics>),
             NeedsFullPersist,
         }
 
+        let mut compact_delta_drain_nanos = 0_u64;
+        let mut compact_delta_drain_attempts = 0_u64;
+        let mut compact_delta_drain_successes = 0_u64;
+        let mut full_persist_nanos = 0_u64;
+        let mut full_persist_count = 0_u64;
         loop {
             let total_started = Instant::now();
             let mut metadata_gate_wait_nanos = 0_u64;
@@ -2244,34 +2676,66 @@ impl DurableCoordinator {
                             same_file_skip_count,
                             metadata_gate_wait_nanos,
                             plan_nanos,
+                            compact_delta_drain_nanos,
+                            compact_delta_drain_attempts,
+                            compact_delta_drain_successes,
+                            full_persist_nanos,
+                            full_persist_count,
                             ..AppendPublishBatchDiagnostics::default()
                         };
                         Ok(BatchStep::Published(
                             CommitSeq::from_raw(cursor.next_commit_seq.saturating_sub(1)),
-                            diagnostics,
+                            Box::new(diagnostics),
                         ))
                     } else {
                         let planned_ticket_count = usize_to_u64(plans.len());
-                        let (durable_high_water, diagnostics) =
-                            match self.persist_prepared_append_publish_plans(
-                                batch_id,
-                                &plans,
-                                total_started,
-                                0,
-                            ) {
-                                Ok(outcome) => outcome,
-                                Err(error) => {
-                                    for plan in &plans {
-                                        self.local.cancel_append_publish_plan(plan)?;
-                                    }
-                                    return Err(error);
+                        let target_commit =
+                            plans
+                                .last()
+                                .map(|plan| plan.commit.commit_seq)
+                                .ok_or_else(|| {
+                                    StorageError::invalid_argument(
+                                        "append publish batch is empty",
+                                    )
+                                })?;
+                        self.begin_ordered_append_publish_persist(target_commit)?;
+                        let persist_result = self.persist_prepared_append_publish_plans(
+                            batch_id,
+                            &plans,
+                            total_started,
+                            0,
+                        );
+                        let (durable_high_water, diagnostics) = match persist_result {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                for plan in &plans {
+                                    self.local.cancel_append_publish_plan(plan)?;
                                 }
-                            };
+                                self.finish_ordered_append_publish_persist(Err(error.clone()))?;
+                                return Err(error);
+                            }
+                        };
                         let apply_started = Instant::now();
-                        for plan in plans {
-                            self.local.apply_append_publish_plan(plan)?;
-                        }
+                        let apply_result = (|| -> Result<()> {
+                            for plan in plans {
+                                self.local.apply_append_publish_plan(plan)?;
+                            }
+                            Ok(())
+                        })();
                         apply_nanos = duration_nanos_u64(apply_started.elapsed());
+                        match apply_result {
+                            Ok(()) => {
+                                self.finish_ordered_append_publish_persist(Ok(
+                                    durable_high_water,
+                                ))?;
+                            }
+                            Err(error) => {
+                                self.finish_ordered_append_publish_persist(Err(
+                                    error.clone(),
+                                ))?;
+                                return Err(error);
+                            }
+                        }
                         let diagnostics = AppendPublishBatchDiagnostics {
                             planned_ticket_count,
                             completed_ticket_count,
@@ -2279,9 +2743,14 @@ impl DurableCoordinator {
                             metadata_gate_wait_nanos,
                             plan_nanos,
                             apply_nanos,
+                            compact_delta_drain_nanos,
+                            compact_delta_drain_attempts,
+                            compact_delta_drain_successes,
+                            full_persist_nanos,
+                            full_persist_count,
                             ..diagnostics
                         };
-                        Ok(BatchStep::Published(durable_high_water, diagnostics))
+                        Ok(BatchStep::Published(durable_high_water, Box::new(diagnostics)))
                     }
                 }
             })();
@@ -2294,14 +2763,29 @@ impl DurableCoordinator {
                     state.requested_through = state.requested_through.max(durable_through);
                     state.last_error = None;
                     self.persist_coordinator.cvar.notify_all();
-                    return Ok(diagnostics);
+                    return Ok(*diagnostics);
                 }
                 Ok(BatchStep::NeedsFullPersist) => {
                     let mut state = lock(&self.persist_coordinator.inner)?;
                     state.last_error = None;
                     self.persist_coordinator.cvar.notify_all();
                     drop(state);
+                    compact_delta_drain_attempts =
+                        compact_delta_drain_attempts.saturating_add(1);
+                    let compact_started = Instant::now();
+                    let compact_drained = self.persist_pending_compact_deltas_for_append_publish()?;
+                    compact_delta_drain_nanos = compact_delta_drain_nanos
+                        .saturating_add(duration_nanos_u64(compact_started.elapsed()));
+                    if compact_drained {
+                        compact_delta_drain_successes =
+                            compact_delta_drain_successes.saturating_add(1);
+                        continue;
+                    }
+                    full_persist_count = full_persist_count.saturating_add(1);
+                    let full_persist_started = Instant::now();
                     self.persist_now()?;
+                    full_persist_nanos = full_persist_nanos
+                        .saturating_add(duration_nanos_u64(full_persist_started.elapsed()));
                 }
                 Err(error) => {
                     let mut state = lock(&self.persist_coordinator.inner)?;
@@ -2715,15 +3199,15 @@ impl DurableCoordinator {
         })?;
         let admission = self.admit_write(total_bytes, flushed)?;
         let result = if flushed {
-            self.local
-                .commit_block_batch_with_delta(device_id, writes, durability)
-                .and_then(|committed| {
-                    let delta = committed.delta.clone();
-                    let commit = committed.commit;
-                    self.record_pending_block_delta(delta)?;
-                    self.persist_block_deltas_until(commit.commit_seq)?;
-                    Ok(commit)
-                })
+            (|| -> Result<BlockBatchCommit> {
+                let committed =
+                    self.local
+                        .commit_block_batch_with_delta(device_id, writes, durability)?;
+                self.record_pending_block_delta(committed.delta.clone())?;
+                let commit = committed.commit;
+                self.persist_block_deltas_until(commit.commit_seq)?;
+                Ok(commit)
+            })()
         } else {
             let committed = {
                 let _staging_guard = lock(&self.block_delta_staging_lock)?;
@@ -2776,19 +3260,21 @@ impl DurableCoordinator {
 
     pub fn write_zeroes(&self, device_id: DeviceId, offset: u64, len: u64) -> Result<WriteCommit> {
         let admission = self.admit_write(len, true)?;
-        let result = self
-            .local
-            .write_zeroes_with_delta(device_id, offset, len)
-            .and_then(|committed| {
+        let result = (|| -> Result<WriteCommit> {
+            let committed = self.local.write_zeroes_with_delta(device_id, offset, len)?;
+            if let Some(delta) = committed.delta.clone() {
+                self.record_pending_block_delta(Some(delta))?;
+            }
+            {
                 let commit = committed.commit;
-                if let Some(delta) = committed.delta {
-                    self.record_pending_block_delta(Some(delta))?;
+                if committed.delta.is_some() {
                     self.persist_block_deltas_until(commit.commit_seq)?;
                 } else {
                     self.persist_until(commit.commit_seq)?;
                 }
                 Ok(commit)
-            });
+            }
+        })();
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -2802,19 +3288,21 @@ impl DurableCoordinator {
         len: u64,
     ) -> Result<WriteCommit> {
         let admission = self.admit_write(len, true)?;
-        let result = self
-            .local
-            .discard_device_with_delta(device_id, offset, len)
-            .and_then(|committed| {
+        let result = (|| -> Result<WriteCommit> {
+            let committed = self.local.discard_device_with_delta(device_id, offset, len)?;
+            if let Some(delta) = committed.delta.clone() {
+                self.record_pending_block_delta(Some(delta))?;
+            }
+            {
                 let commit = committed.commit;
-                if let Some(delta) = committed.delta {
-                    self.record_pending_block_delta(Some(delta))?;
+                if committed.delta.is_some() {
                     self.persist_block_deltas_until(commit.commit_seq)?;
                 } else {
                     self.persist_until(commit.commit_seq)?;
                 }
                 Ok(commit)
-            });
+            }
+        })();
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -2856,21 +3344,27 @@ impl DurableCoordinator {
             })?,
             flushed,
         )?;
-        let result = self
-            .local
-            .commit_file_batch_with_integrity(
+        let result = (|| -> Result<FileWriteCommit> {
+            let committed = self.local.commit_file_batch_with_delta_and_integrity(
                 keyspace_id,
                 file_id,
                 writes,
                 durability,
                 payload_integrity,
-            )
-            .and_then(|commit| {
-                if flushed {
+            )?;
+            if flushed {
+                self.record_pending_native_file_delta(committed.delta.clone())?;
+            }
+            let commit = committed.commit;
+            if flushed {
+                if committed.delta.is_some() {
+                    self.persist_native_file_deltas_until(commit.commit_seq)?;
+                } else {
                     self.persist_until(commit.commit_seq)?;
                 }
-                Ok(commit)
-            });
+            }
+            Ok(commit)
+        })();
         if result.is_ok() {
             self.after_successful_write(admission);
         }
@@ -3376,6 +3870,21 @@ impl DurableCoordinator {
                 profile.persist_batch_apply_nanos = profile
                     .persist_batch_apply_nanos
                     .saturating_add(diagnostics.apply_nanos);
+                profile.compact_delta_drain_nanos = profile
+                    .compact_delta_drain_nanos
+                    .saturating_add(diagnostics.compact_delta_drain_nanos);
+                profile.compact_delta_drain_attempts = profile
+                    .compact_delta_drain_attempts
+                    .saturating_add(diagnostics.compact_delta_drain_attempts);
+                profile.compact_delta_drain_successes = profile
+                    .compact_delta_drain_successes
+                    .saturating_add(diagnostics.compact_delta_drain_successes);
+                profile.full_persist_nanos = profile
+                    .full_persist_nanos
+                    .saturating_add(diagnostics.full_persist_nanos);
+                profile.full_persist_count = profile
+                    .full_persist_count
+                    .saturating_add(diagnostics.full_persist_count);
                 profile.payload_already_durable_bytes = profile
                     .payload_already_durable_bytes
                     .saturating_add(diagnostics.payload_already_durable_bytes);
@@ -3577,7 +4086,7 @@ impl DurableCoordinator {
         &self,
         policy: RetentionPolicy,
     ) -> Result<MetadataCustodianReport> {
-        self.fold_block_deltas_before_gc()?;
+        self.fold_compact_deltas_before_gc()?;
         let result = self.local.run_metadata_custodian(policy);
         let changed = result.as_ref().ok().map(|report| {
             report
