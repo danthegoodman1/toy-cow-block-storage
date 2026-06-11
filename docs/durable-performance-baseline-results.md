@@ -1318,6 +1318,66 @@ The next latency work should attack the single global append-visible publish
 lane without allowing commit-sequence gaps to become visible after crash
 replay.
 
+## Block Sparse 4 KiB Batch Packing
+
+A June 11, 2026 local run fixed the loadbench interpretation of
+`--block-batch-overlap random` for block batches. The old random mode sampled
+`ops` writes from exactly `ops` power-of-two slots, and the deterministic LCG
+walked those slots as a full permutation. That accidentally collapsed the
+`block-batch-4k-*` rows into one contiguous range, so it did not stress sparse
+small block edits. The corrected mode samples random writes across the worker's
+full block lane after the first deterministic operation.
+
+The implementation now packs same-shard sparse block batch chunks with the same
+payload-integrity policy into one immutable segment and records per-entry
+segment offsets in the block delta. Public block semantics, replay ordering,
+fork/PITR behavior, and GC reachability are unchanged: reads still resolve
+ordinary leaf entries, and flushed deltas replay those offsets after reopen.
+
+Benchmark command shape:
+
+```sh
+docker compose exec dev cargo run --release --bin loadbench -- \
+  --provider durable \
+  --durability ack-flush:1 \
+  --workloads block-batch-4k-256ops,block-batch-4k-4096ops \
+  --block-batch-overlap random \
+  --duration-ms 1000 \
+  --warmup-ms 100 \
+  --concurrency 1,4,16 \
+  --device-blocks 1048576 \
+  --shards 64 \
+  --storage-nodes 4 \
+  --rtt-us 200 \
+  --delay-mode spin \
+  --payload-integrity verified
+```
+
+Before/after used isolated Cargo target directories to avoid sharing a release
+binary between the old-code worktree and the modified worktree.
+
+| Workload | c | Baseline MB/s | Packed MB/s | Baseline p99 | Packed p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `block-batch-4k-256ops`, sparse | 1 | 52.17 | 97.20 | 26.5 ms | 14.5 ms |
+| `block-batch-4k-256ops`, sparse | 4 | 73.64 | 222.24 | 74.4 ms | 23.9 ms |
+| `block-batch-4k-256ops`, sparse | 16 | 92.52 | 379.14 | 240.5 ms | 57.4 ms |
+| `block-batch-4k-4096ops`, sparse | 1 | 28.68 | 126.11 | 1.14 s | 155.4 ms |
+| `block-batch-4k-4096ops`, sparse | 4 | 25.36 | 178.75 | 5.23 s | 537.4 ms |
+| `block-batch-4k-4096ops`, sparse | 16 | 75.56 | 249.40 | 6.94 s | 1.99 s |
+
+Durable profiles show the intended mechanism change. For
+`block-batch-4k-4096ops` at c16, average prestaged segment count per physical
+persist fell from about `30,738` to about `40` while the selected durable bytes
+remained `256 MiB`; node-catalog publish time fell from about `125 ms` to about
+`3.3 ms`.
+
+Sequential `block-batch-4k-*` and 1 MiB writeback rows still collapse into one
+range and are not sparse-edit stressors. A c16 repeat of suspect regular rows
+showed no material regression: `block-batch-4k-16ops` improved from
+`126.24` to `130.63 MB/s`, `block-writeback-prestaged-fsync-1m` improved from
+`735.34` to `979.15 MB/s`, and `block-read-1m` improved from `4674.71` to
+`4816.38 MB/s`.
+
 ## External North-Star Targets
 
 The June 6, 2026 Rapid Storage c3-88/Tier1 run is the current external

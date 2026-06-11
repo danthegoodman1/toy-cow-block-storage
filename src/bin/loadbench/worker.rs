@@ -1092,8 +1092,13 @@ fn build_block_batch_writes(
     }
     let (lane_start, lane_end) = block_batch_lane(worker, concurrency, logical_blocks, batch_blocks);
     let lane_span = lane_end.saturating_sub(lane_start).min(logical_blocks - lane_start);
-    let usable_blocks = lane_span.saturating_sub(batch_blocks);
     let step_blocks = write_blocks.max(1);
+    let random_slots = lane_span
+        .saturating_sub(write_blocks)
+        .checked_div(step_blocks)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let usable_blocks = lane_span.saturating_sub(batch_blocks);
     let slots = usable_blocks
         .checked_div(step_blocks)
         .unwrap_or(0)
@@ -1131,8 +1136,8 @@ fn build_block_batch_writes(
                 )
                 .ok_or_else(|| StorageError::invalid_argument("block batch offset overflows"))?,
             BlockBatchOverlap::Random => {
-                let slot = rng.below(spec.ops as u64);
-                start_block
+                let slot = rng.below(random_slots);
+                lane_start
                     .checked_add(slot.saturating_mul(write_blocks))
                     .ok_or_else(|| StorageError::invalid_argument("block batch offset overflows"))?
             }

@@ -2,6 +2,7 @@
 /// data logs.
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
+const BLOCK_DELTA_PARALLEL_COMMIT_MIN_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DurableCoordinator {
@@ -3208,6 +3209,20 @@ impl DurableCoordinator {
                 self.persist_block_deltas_until(commit.commit_seq)?;
                 Ok(commit)
             })()
+        } else if total_bytes >= BLOCK_DELTA_PARALLEL_COMMIT_MIN_BYTES {
+            let committed =
+                self.local
+                    .commit_block_batch_with_delta(device_id, writes, durability)?;
+            if let Some(delta) = committed.delta.clone() {
+                let _staging_guard = lock(&self.block_delta_staging_lock)?;
+                self.record_pending_block_delta(Some(delta.clone()))?;
+                self.begin_block_delta_prestage(delta.commit_seq)?;
+            }
+            if let Some(delta) = committed.delta.clone() {
+                let result = self.prestage_block_delta_segments(&delta);
+                self.finish_block_delta_prestage(delta.commit_seq, result)?;
+            }
+            Ok(committed.commit)
         } else {
             let committed = {
                 let _staging_guard = lock(&self.block_delta_staging_lock)?;

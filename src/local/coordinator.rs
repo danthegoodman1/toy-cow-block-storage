@@ -13,6 +13,20 @@ struct BlockBatchShardEdits {
 struct BlockBatchShardEdit {
     range: BlockRange,
     receipt: VerifiedSegmentReceipt,
+    segment_offset: BlockIndex,
+}
+
+#[derive(Debug)]
+struct BlockBatchShardPending {
+    old_root: MetadataNodeId,
+    chunks: Vec<BlockBatchShardChunk>,
+}
+
+#[derive(Debug)]
+struct BlockBatchShardChunk {
+    range: BlockRange,
+    bytes: Vec<u8>,
+    payload_integrity: PayloadIntegrity,
 }
 
 #[derive(Debug, Clone)]
@@ -1311,7 +1325,7 @@ impl LocalCoordinator {
         let owner = MappingOwner::BlockDevice(device_id);
         let write_intent = self.next_write_intent()?;
         let current = self.metadata.get_head(device_id)?;
-        let mut shard_edits = BTreeMap::<ShardId, BlockBatchShardEdits>::new();
+        let mut shard_pending = BTreeMap::<ShardId, BlockBatchShardPending>::new();
         let mut segment_receipts = Vec::new();
 
         for write in &collapsed {
@@ -1335,66 +1349,126 @@ impl LocalCoordinator {
                 let chunk_bytes = write.bytes.get(byte_start..byte_end).ok_or_else(|| {
                     StorageError::corrupt("write chunk is outside collapsed batch bytes")
                 })?;
-                let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
-                    WriteGrantIntent::BlockWrite {
-                        device_id,
-                        range: chunk.range,
-                        fence: current.generation,
-                        shard_id: chunk.shard_id,
+                let shard = shard_pending.entry(chunk.shard_id).or_insert_with(|| {
+                    BlockBatchShardPending {
                         old_root: chunk.old_root,
-                    },
-                    write_intent,
-                    chunk_bytes.to_vec(),
-                    durability,
-                    write.payload_integrity,
-                )?;
-                let shard_edit = shard_edits.entry(chunk.shard_id).or_insert_with(|| {
-                    BlockBatchShardEdits {
-                        old_root: chunk.old_root,
-                        edits: Vec::new(),
+                        chunks: Vec::new(),
                     }
                 });
-                if shard_edit.old_root != chunk.old_root {
+                if shard.old_root != chunk.old_root {
                     return Err(StorageError::conflict(
                         "block batch observed inconsistent shard roots",
                     ));
                 }
-                shard_edit.edits.push(BlockBatchShardEdit {
+                shard.chunks.push(BlockBatchShardChunk {
                     range: chunk.range,
-                    receipt: verified_receipt.clone(),
+                    bytes: chunk_bytes.to_vec(),
+                    payload_integrity: write.payload_integrity,
                 });
+            }
+        }
+
+        let mut shard_edits = BTreeMap::<ShardId, BlockBatchShardEdits>::new();
+        for (shard_id, mut shard) in shard_pending {
+            shard.chunks.sort_by_key(|chunk| chunk.range.start.raw());
+            let mut edits = Vec::with_capacity(shard.chunks.len());
+            let mut index = 0usize;
+            while index < shard.chunks.len() {
+                let payload_integrity = shard.chunks[index].payload_integrity;
+                let run_start = index;
+                index += 1;
+                while index < shard.chunks.len()
+                    && shard.chunks[index].payload_integrity == payload_integrity
+                {
+                    index += 1;
+                }
+                let run = &shard.chunks[run_start..index];
+                let packed_blocks = run.iter().try_fold(0u64, |total, chunk| {
+                    total
+                        .checked_add(chunk.range.blocks.raw())
+                        .ok_or_else(|| StorageError::invalid_argument("block batch packed segment overflows"))
+                })?;
+                let packed_bytes_len = packed_blocks
+                    .checked_mul(block_size)
+                    .ok_or_else(|| StorageError::invalid_argument("block batch packed segment bytes overflow"))?;
+                let packed_capacity = usize::try_from(packed_bytes_len).map_err(|_| {
+                    StorageError::invalid_argument("block batch packed segment bytes overflow usize")
+                })?;
+                let mut packed_bytes = Vec::with_capacity(packed_capacity);
+                for chunk in run {
+                    packed_bytes.extend_from_slice(&chunk.bytes);
+                }
+                let intent = if run.len() == 1 {
+                    WriteGrantIntent::BlockWrite {
+                        device_id,
+                        range: run[0].range,
+                        fence: current.generation,
+                        shard_id,
+                        old_root: shard.old_root,
+                    }
+                } else {
+                    WriteGrantIntent::Internal { owner }
+                };
+                let verified_receipt = self.write_segment_for_intent_with_id_owned_verified(
+                    intent,
+                    write_intent,
+                    packed_bytes,
+                    durability,
+                    payload_integrity,
+                )?;
+                let mut segment_offset = 0u64;
+                for chunk in run {
+                    edits.push(BlockBatchShardEdit {
+                        range: chunk.range,
+                        receipt: verified_receipt.clone(),
+                        segment_offset: BlockIndex::from_raw(segment_offset),
+                    });
+                    segment_offset = segment_offset
+                        .checked_add(chunk.range.blocks.raw())
+                        .ok_or_else(|| StorageError::invalid_argument("block batch segment offset overflows"))?;
+                }
                 segment_receipts.push(verified_receipt);
             }
+            shard_edits.insert(
+                shard_id,
+                BlockBatchShardEdits {
+                    old_root: shard.old_root,
+                    edits,
+                },
+            );
         }
 
         let mut updates = Vec::with_capacity(shard_edits.len());
         let mut delta_entries = Vec::new();
         for (shard_id, mut shard) in shard_edits {
             shard.edits.sort_by_key(|edit| edit.range.start.raw());
-            let mut root = shard.old_root;
+            let mut tree_edits = Vec::with_capacity(shard.edits.len());
             for edit in &shard.edits {
-                root = self
-                    .replace_tree_range_with_receipts(
-                        root,
-                        TreeRangeEdit {
-                            range: edit.range,
-                            replacement: Some(SegmentReplacement {
-                                segment_id: edit.receipt.descriptor.segment_id,
-                                segment_base: edit.range.start,
-                            }),
-                        },
-                        &segment_receipts,
-                    )?
-                    .root;
+                let segment_base = edit
+                    .range
+                    .start
+                    .raw()
+                    .checked_sub(edit.segment_offset.raw())
+                    .ok_or_else(|| StorageError::invalid_argument("block batch segment offset exceeds logical start"))?;
+                tree_edits.push(TreeRangeEdit {
+                    range: edit.range,
+                    replacement: Some(SegmentReplacement {
+                        segment_id: edit.receipt.descriptor.segment_id,
+                        segment_base: BlockIndex::from_raw(segment_base),
+                    }),
+                });
                 delta_entries.push(BlockDeltaEntry {
                     shard_id,
                     range: edit.range,
                     replacement: BlockDeltaReplacement::Segment {
                         segment_id: edit.receipt.descriptor.segment_id,
-                        segment_offset: BlockIndex::from_raw(0),
+                        segment_offset: edit.segment_offset,
                     },
                 });
             }
+            let root = self
+                .replace_tree_ranges_with_receipts(shard.old_root, &tree_edits, &segment_receipts)?
+                .root;
             if root != shard.old_root {
                 updates.push(RootUpdate::BlockShard(ShardRootUpdate {
                     shard_id,
@@ -1502,6 +1576,7 @@ impl LocalCoordinator {
                 .get(shard_index)
                 .ok_or_else(|| StorageError::corrupt("block delta shard is outside device"))?;
             let old_root = root;
+            let mut tree_edits = Vec::with_capacity(entries.len());
             for entry in entries {
                 let replacement = match entry.replacement {
                     BlockDeltaReplacement::Segment {
@@ -1522,17 +1597,14 @@ impl LocalCoordinator {
                     }
                     BlockDeltaReplacement::Sparse => None,
                 };
-                root = self
-                    .replace_tree_range_with_receipts(
-                        root,
-                        TreeRangeEdit {
-                            range: entry.range,
-                            replacement,
-                        },
-                        &all_receipts,
-                    )?
-                    .root;
+                tree_edits.push(TreeRangeEdit {
+                    range: entry.range,
+                    replacement,
+                });
             }
+            root = self
+                .replace_tree_ranges_with_receipts(root, &tree_edits, &all_receipts)?
+                .root;
             if root != old_root {
                 updates.push(RootUpdate::BlockShard(ShardRootUpdate {
                     shard_id,
@@ -3996,6 +4068,53 @@ impl LocalCoordinator {
         self.replace_tree_range_with_receipts(root_id, edit, &[])
     }
 
+    fn replace_tree_ranges_with_receipts(
+        &self,
+        root_id: MetadataNodeId,
+        edits: &[TreeRangeEdit],
+        additional_receipts: &[VerifiedSegmentReceipt],
+    ) -> Result<TreeEditResult> {
+        if edits.is_empty() {
+            return Ok(TreeEditResult {
+                root: root_id,
+                changed: false,
+            });
+        }
+        if edits.len() == 1 {
+            return self.replace_tree_range_with_receipts(
+                root_id,
+                edits[0],
+                additional_receipts,
+            );
+        }
+
+        let mut sorted = edits.to_vec();
+        sorted.sort_by_key(|edit| edit.range.start.raw());
+        let mut previous_end = None;
+        for edit in &sorted {
+            edit.range.validate_non_empty()?;
+            let end = edit.range.end_exclusive()?.raw();
+            if let Some(previous_end) = previous_end
+                && edit.range.start.raw() < previous_end
+            {
+                return Err(StorageError::invalid_argument(
+                    "batched tree edits must not overlap",
+                ));
+            }
+            previous_end = Some(end);
+        }
+
+        let root = self.metadata.get_metadata_node(root_id)?;
+        for edit in &sorted {
+            if !root.covered_range.contains_range(edit.range)? {
+                return Err(StorageError::invalid_argument(
+                    "edit range is outside metadata tree coverage",
+                ));
+            }
+        }
+        self.replace_tree_ranges_at(&root, &sorted, additional_receipts)
+    }
+
     fn replace_tree_byte_range_with_run_extents(
         &self,
         root_id: MetadataNodeId,
@@ -4398,6 +4517,132 @@ impl LocalCoordinator {
                     } else {
                         new_children.push(child.clone());
                     }
+                }
+
+                if !changed {
+                    return Ok(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    });
+                }
+
+                let new_node = self.metadata.allocate_metadata_node(
+                    node.covered_range,
+                    MetadataNodeKind::Internal {
+                        children: new_children,
+                    },
+                )?;
+                new_node.validate(&[])?;
+                self.metadata
+                    .persist_metadata_node(MetadataNodeWrite::new(new_node.clone(), Vec::new()))?;
+                Ok(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                })
+            }
+        }
+    }
+
+    fn replace_tree_ranges_at(
+        &self,
+        node: &MetadataNode,
+        edits: &[TreeRangeEdit],
+        additional_receipts: &[VerifiedSegmentReceipt],
+    ) -> Result<TreeEditResult> {
+        let mut overlapping_edits = Vec::new();
+        for edit in edits {
+            if node.covered_range.overlaps(edit.range)? {
+                overlapping_edits.push(*edit);
+            }
+        }
+        if overlapping_edits.is_empty() {
+            return Ok(TreeEditResult {
+                root: node.node_id,
+                changed: false,
+            });
+        }
+
+        match &node.kind {
+            MetadataNodeKind::Leaf {
+                entries,
+                run_extents,
+            } => {
+                let block_size = u64::from(self.metadata.config.block_size);
+                let mut new_entries = entries.clone();
+                let mut new_run_extents = run_extents.clone();
+                for edit in &overlapping_edits {
+                    let Some(overlap) = node.covered_range.intersection(edit.range)? else {
+                        continue;
+                    };
+                    let replacement = edit.replacement.map(|replacement| {
+                        let offset = overlap.start.raw() - replacement.segment_base.raw();
+                        LeafEntry {
+                            logical_start: overlap.start,
+                            blocks: overlap.blocks,
+                            segment_id: replacement.segment_id,
+                            segment_offset: BlockIndex::from_raw(offset),
+                        }
+                    });
+                    new_entries =
+                        replace_leaf_entries(&new_entries, node.covered_range, overlap, replacement)?;
+                    let overlap_bytes = block_range_to_byte_range(overlap, block_size)?;
+                    new_run_extents = replace_run_backed_file_extents(
+                        &new_run_extents,
+                        overlap_bytes,
+                        Vec::new(),
+                    )?;
+                }
+                if new_entries == *entries && new_run_extents == *run_extents {
+                    return Ok(TreeEditResult {
+                        root: node.node_id,
+                        changed: false,
+                    });
+                }
+                let segment_receipts = self
+                    .verified_receipts_for_entries_with_cache(&new_entries, additional_receipts)?;
+                let new_node = self.metadata.allocate_metadata_node(
+                    node.covered_range,
+                    MetadataNodeKind::Leaf {
+                        entries: new_entries,
+                        run_extents: new_run_extents,
+                    },
+                )?;
+                let segment_descriptors: Vec<_> = segment_receipts
+                    .iter()
+                    .map(|receipt| receipt.descriptor.clone())
+                    .collect();
+                new_node.validate(&segment_descriptors)?;
+                self.metadata.persist_metadata_node(MetadataNodeWrite::new(
+                    new_node.clone(),
+                    segment_receipts,
+                ))?;
+                Ok(TreeEditResult {
+                    root: new_node.node_id,
+                    changed: true,
+                })
+            }
+            MetadataNodeKind::Internal { children } => {
+                let mut changed = false;
+                let mut new_children = Vec::with_capacity(children.len());
+                for child in children {
+                    let mut child_edits = Vec::new();
+                    for edit in &overlapping_edits {
+                        if child.range.overlaps(edit.range)? {
+                            child_edits.push(*edit);
+                        }
+                    }
+                    if child_edits.is_empty() {
+                        new_children.push(child.clone());
+                        continue;
+                    }
+                    let child_node = self.metadata.get_metadata_node(child.node_id)?;
+                    let child_result =
+                        self.replace_tree_ranges_at(&child_node, &child_edits, additional_receipts)?;
+                    changed |= child_result.changed;
+                    new_children.push(MetadataChild {
+                        range: child.range,
+                        node_id: child_result.root,
+                    });
                 }
 
                 if !changed {
