@@ -1819,6 +1819,25 @@ fn append_durable_journal_record<T: DurableCodec>(
     magic: &[u8; 8],
     too_large_reason: &'static str,
 ) -> Result<AppendVisibleJournalProfile> {
+    append_durable_journal_record_with_sync(path, record, magic, too_large_reason, true)
+}
+
+fn append_durable_journal_record_unsynced<T: DurableCodec>(
+    path: &Path,
+    record: &T,
+    magic: &[u8; 8],
+    too_large_reason: &'static str,
+) -> Result<AppendVisibleJournalProfile> {
+    append_durable_journal_record_with_sync(path, record, magic, too_large_reason, false)
+}
+
+fn append_durable_journal_record_with_sync<T: DurableCodec>(
+    path: &Path,
+    record: &T,
+    magic: &[u8; 8],
+    too_large_reason: &'static str,
+    sync_data: bool,
+) -> Result<AppendVisibleJournalProfile> {
     let encode_started = Instant::now();
     let frame = durable_journal_frame(record, magic, too_large_reason)?;
     let encode_nanos = duration_nanos_u64(encode_started.elapsed());
@@ -1848,9 +1867,13 @@ fn append_durable_journal_record<T: DurableCodec>(
     let started = Instant::now();
     file.write_all(&frame).map_err(fs_error)?;
     let write_nanos = duration_nanos_u64(started.elapsed());
-    let sync_started = Instant::now();
-    file.sync_data().map_err(fs_error)?;
-    let sync_nanos = duration_nanos_u64(sync_started.elapsed());
+    let sync_nanos = if sync_data {
+        let sync_started = Instant::now();
+        file.sync_data().map_err(fs_error)?;
+        duration_nanos_u64(sync_started.elapsed())
+    } else {
+        0
+    };
     if !existed {
         let dir_sync_started = Instant::now();
         sync_parent_dir(path)?;
@@ -1926,6 +1949,26 @@ pub(super) fn append_block_journal_records(
     }
     let records = records.to_vec();
     let mut profile = append_durable_journal_record(
+        path,
+        &records,
+        &BLOCK_JOURNAL_MAGIC,
+        "block journal record exceeds durable payload limit",
+    )?;
+    profile.record_count = usize_to_u64(records.len());
+    Ok(profile)
+}
+
+pub(super) fn append_block_journal_records_unsynced(
+    path: &Path,
+    records: &[BlockJournalRecord],
+) -> Result<AppendVisibleJournalProfile> {
+    if records.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "block journal batch must include records",
+        ));
+    }
+    let records = records.to_vec();
+    let mut profile = append_durable_journal_record_unsynced(
         path,
         &records,
         &BLOCK_JOURNAL_MAGIC,
@@ -2715,6 +2758,14 @@ impl DurableSqliteStore {
     ) -> Result<AppendVisibleJournalProfile> {
         let _journal_guard = lock(&self.block_journal_lock)?;
         append_block_journal_records(&self.paths.block_journal, records)
+    }
+
+    fn append_block_journal_records_unsynced(
+        &self,
+        records: &[BlockJournalRecord],
+    ) -> Result<AppendVisibleJournalProfile> {
+        let _journal_guard = lock(&self.block_journal_lock)?;
+        append_block_journal_records_unsynced(&self.paths.block_journal, records)
     }
 
     fn block_journal_records(&self) -> Result<Vec<BlockJournalRecord>> {

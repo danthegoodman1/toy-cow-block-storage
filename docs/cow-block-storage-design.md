@@ -148,20 +148,26 @@ Durable providers store checkpointed block heads as a stable device manifest
 plus one mutable row per shard head. Flushed block writes do not need to fold
 into those rows before returning: they may be recorded as ordered durable block
 delta rows that reference already-durable segment payloads. The durable provider
-also has a block-native journal fast path for small flushed writes and leased
-sparse zero/discard operations under an explicit whole-device writer lease. A
-journal batch contains lease, write or sparse-range, and flush-marker records in
-a framed append-only file. A flushed journal write returns only after the inline
-payload bytes and the flush marker covering that commit sequence are durable;
-a journal sparse operation returns only after the sparse range and covering
-flush marker are durable. Reopen loads the compact shard roots, replays retained
-SQLite block deltas, then rebuilds the provider-private block overlay from
-journal writes and sparse ranges covered by durable flush markers. Reads resolve
-the compact tree and then apply the journal overlay, so read-after-write
+also has a block-native journal fast path for small flushed writes, packed
+journal batches up to 1 MiB, and leased sparse zero/discard operations under an
+explicit whole-device writer lease. A journal batch contains lease, write or
+sparse-range, and flush-marker records in a framed append-only file. Large
+contiguous journal batches are split into block-sized inline entries so replay
+does not require a single oversized payload vector. A flushed journal write
+returns only after the inline payload bytes and the flush marker covering that
+commit sequence are durable; a journal sparse operation returns only after the
+sparse range and covering flush marker are durable. An acknowledged journal
+write appends its record and updates the in-process overlay without syncing a
+flush marker; it is visible to same-process reads, but reopen only replays it if
+a later durable flush marker covers its commit sequence. Reopen loads the
+compact shard roots, replays retained SQLite block deltas, then rebuilds the
+provider-private block overlay from journal writes and sparse ranges covered by
+durable flush markers. Reads resolve the compact tree and then apply the
+journal overlay, so read-after-write
 observes journal-backed writes without forcing immediate tree path-copy or
 node-catalog publication. Until journal materialization exists, a device with
 unmaterialized journal state must keep later journal-sized writes on the journal
-path; larger writes must fail until materialization or data-log-backed journal
+path; writes beyond the journal batch limit must fail until materialization or data-log-backed journal
 references exist, instead of publishing a newer compact-tree root that older
 overlay entries could incorrectly cover. SQLite block-delta checkpointing and
 maintenance fold durable deltas into immutable CoW shard roots before pruning

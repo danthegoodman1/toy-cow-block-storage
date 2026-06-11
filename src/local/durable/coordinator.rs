@@ -3,6 +3,7 @@
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 const BLOCK_DELTA_PARALLEL_COMMIT_MIN_BYTES: u64 = 16 * 1024 * 1024;
+const BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DurableCoordinator {
@@ -1829,6 +1830,7 @@ impl DurableCoordinator {
         target_commit: Option<CommitSeq>,
     ) -> Result<CommitSeq> {
         let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
+        self.flush_visible_block_journal_heads()?;
         let block_delta_prestage_wait_nanos = self.wait_for_all_block_delta_prestage()?;
         let lock_started = Instant::now();
         let _persist_guard = lock(&self.persist_lock)?;
@@ -3220,7 +3222,10 @@ impl DurableCoordinator {
         writes: &[BlockBatchWrite],
         durability: crate::api::WriteDurability,
     ) -> Result<bool> {
-        if !matches!(durability, crate::api::WriteDurability::Flushed) {
+        if !matches!(
+            durability,
+            crate::api::WriteDurability::Acknowledged | crate::api::WriteDurability::Flushed
+        ) {
             return Ok(false);
         }
         let total_bytes = writes.iter().try_fold(0_u64, |total, write| {
@@ -3230,7 +3235,76 @@ impl DurableCoordinator {
                 })?)
                 .ok_or_else(|| StorageError::invalid_argument("block batch byte length overflows"))
         })?;
-        Ok(total_bytes <= BLOCK_JOURNAL_INLINE_MAX_BYTES)
+        Ok(total_bytes <= BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES)
+    }
+
+    fn block_journal_entries_from_collapsed(
+        &self,
+        collapsed: Vec<CollapsedBlockWrite>,
+        block_size: u64,
+    ) -> Result<(Vec<BlockJournalEntry>, u64)> {
+        let block_size = usize::try_from(block_size)
+            .map_err(|_| StorageError::invalid_argument("block size overflows usize"))?;
+        if block_size == 0 {
+            return Err(StorageError::invalid_argument("block size must be nonzero"));
+        }
+        let max_entry_bytes = usize::try_from(BLOCK_JOURNAL_INLINE_MAX_BYTES)
+            .map_err(|_| StorageError::invalid_argument("block journal max overflows usize"))?;
+        let blocks_per_entry = max_entry_bytes / block_size;
+        if blocks_per_entry == 0 {
+            return Err(StorageError::invalid_argument(
+                "block size exceeds block journal inline entry limit",
+            ));
+        }
+        let entry_bytes = blocks_per_entry
+            .checked_mul(block_size)
+            .ok_or_else(|| StorageError::invalid_argument("block journal chunk size overflows"))?;
+        let mut entries = Vec::new();
+        let mut committed_bytes = 0_u64;
+        for write in collapsed {
+            let mut chunk_offset = write.offset;
+            for chunk in write.bytes.chunks(entry_bytes) {
+                let len = u64::try_from(chunk.len()).map_err(|_| {
+                    StorageError::invalid_argument("block journal payload length overflows u64")
+                })?;
+                committed_bytes = committed_bytes.checked_add(len).ok_or_else(|| {
+                    StorageError::invalid_argument("block journal bytes overflow")
+                })?;
+                entries.push(BlockJournalEntry::Write {
+                    range: ByteRange::new(chunk_offset, len),
+                    payload_integrity: write.payload_integrity,
+                    bytes: chunk.to_vec(),
+                });
+                chunk_offset = chunk_offset.checked_add(len).ok_or_else(|| {
+                    StorageError::invalid_argument("block journal chunk offset overflows")
+                })?;
+            }
+        }
+        Ok((entries, committed_bytes))
+    }
+
+    fn record_block_journal_profile(
+        &self,
+        total_started: Instant,
+        profile: AppendVisibleJournalProfile,
+        durable_commit_high_water: CommitSeq,
+        flush_group_size: u64,
+    ) -> Result<()> {
+        self.record_persist_profile(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            visible_metadata_write_bytes: profile.frame_bytes,
+            block_journal_encode_nanos: profile.encode_nanos,
+            block_journal_open_nanos: profile.open_nanos,
+            block_journal_write_nanos: profile.write_nanos,
+            block_journal_sync_nanos: profile.sync_nanos,
+            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
+            block_journal_record_count: profile.record_count,
+            block_journal_frame_bytes: profile.frame_bytes,
+            block_journal_created: profile.created,
+            block_journal_flush_group_size: flush_group_size,
+            durable_commit_high_water: durable_commit_high_water.raw(),
+            ..DurablePersistProfile::default()
+        })
     }
 
     fn enqueue_block_journal_commit(&self, commit: BlockJournalCommit) -> Result<()> {
@@ -3338,25 +3412,70 @@ impl DurableCoordinator {
                 return Err(error);
             }
         };
-        self.record_persist_profile(DurablePersistProfile {
-            total_nanos: duration_nanos_u64(total_started.elapsed()),
-            visible_metadata_write_bytes: profile.frame_bytes,
-            block_journal_encode_nanos: profile.encode_nanos,
-            block_journal_open_nanos: profile.open_nanos,
-            block_journal_write_nanos: profile.write_nanos,
-            block_journal_sync_nanos: profile.sync_nanos,
-            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
-            block_journal_record_count: profile.record_count,
-            block_journal_frame_bytes: profile.frame_bytes,
-            block_journal_created: profile.created,
-            block_journal_flush_group_size: usize_to_u64(commits.len()),
-            durable_commit_high_water: commits
+        self.record_block_journal_profile(
+            total_started,
+            profile,
+            commits
                 .iter()
-                .map(|commit| commit.commit_seq.raw())
+                .map(|commit| commit.commit_seq)
                 .max()
-                .unwrap_or_default(),
-            ..DurablePersistProfile::default()
-        })?;
+                .unwrap_or_else(|| CommitSeq::from_raw(0)),
+            usize_to_u64(commits.len()),
+        )?;
+        Ok(())
+    }
+
+    fn append_acknowledged_block_journal_commit(
+        &self,
+        total_started: Instant,
+        commit: &BlockJournalCommit,
+    ) -> Result<()> {
+        let profile = self
+            .durable
+            .append_block_journal_records_unsynced(&[BlockJournalRecord::Write(commit.clone())])?;
+        self.local
+            .metadata
+            .publish_reserved_block_journal_commit(commit.device_id, commit.commit_seq)?;
+        self.block_journal.apply_commit(commit)?;
+        self.record_block_journal_profile(
+            total_started,
+            profile,
+            self.block_journal.durable_through(commit.device_id)?,
+            0,
+        )
+    }
+
+    fn flush_block_journal_device_through(
+        &self,
+        total_started: Instant,
+        device_id: DeviceId,
+        durable_through: CommitSeq,
+    ) -> Result<bool> {
+        if self.block_journal.durable_through(device_id)?.raw() >= durable_through.raw() {
+            return Ok(true);
+        }
+        if self.block_journal.visible_through(device_id)?.raw() < durable_through.raw() {
+            return Ok(false);
+        }
+        let writer_epoch = self.block_journal.writer_epoch(device_id)?;
+        let profile = self
+            .durable
+            .append_block_journal_records(&[BlockJournalRecord::Flush {
+                device_id,
+                writer_epoch,
+                durable_through,
+            }])?;
+        self.block_journal
+            .mark_durable(device_id, writer_epoch, durable_through)?;
+        self.record_block_journal_profile(total_started, profile, durable_through, 0)?;
+        Ok(true)
+    }
+
+    fn flush_visible_block_journal_heads(&self) -> Result<()> {
+        for device_id in self.local.metadata.live_device_ids()? {
+            let info = self.local.metadata.device_info(device_id)?;
+            self.flush_block_journal_device_through(Instant::now(), device_id, info.latest_commit)?;
+        }
         Ok(())
     }
 
@@ -3377,40 +3496,36 @@ impl DurableCoordinator {
         }
         let info = self.local.metadata.device_info(lease.device_id)?;
         let collapsed =
-            collapse_block_batch_writes(writes, &info.spec, BLOCK_JOURNAL_INLINE_MAX_BYTES)?;
+            collapse_block_batch_writes(writes, &info.spec, BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES)?;
+        let total_started = Instant::now();
         let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
         let commit_seq = self
             .local
             .metadata
             .reserve_block_journal_commit_seq(lease.device_id)?;
-        let mut entries = Vec::with_capacity(collapsed.len());
-        let mut committed_bytes = 0_u64;
-        for write in collapsed {
-            let len = u64::try_from(write.bytes.len()).map_err(|_| {
-                StorageError::invalid_argument("block journal payload length overflows u64")
-            })?;
-            committed_bytes = committed_bytes
-                .checked_add(len)
-                .ok_or_else(|| StorageError::invalid_argument("block journal bytes overflow"))?;
-            entries.push(BlockJournalEntry::Write {
-                range: ByteRange::new(write.offset, len),
-                payload_integrity: write.payload_integrity,
-                bytes: write.bytes,
-            });
-        }
+        let collapsed_range_count = usize_to_u64(collapsed.len());
+        let (entries, committed_bytes) =
+            self.block_journal_entries_from_collapsed(collapsed, u64::from(info.spec.block_size))?;
         let commit = BlockJournalCommit {
             device_id: lease.device_id,
             writer_epoch: lease.writer_epoch,
             commit_seq,
             write_count: usize_to_u64(writes.len()),
-            collapsed_range_count: usize_to_u64(entries.len()),
+            collapsed_range_count,
             committed_bytes,
             entries,
         };
         commit.validate(&info.spec)?;
-        self.enqueue_block_journal_commit(commit.clone())?;
-        drop(_enqueue_guard);
-        self.wait_for_block_journal_commit(commit_seq)?;
+        match durability {
+            crate::api::WriteDurability::Flushed => {
+                self.enqueue_block_journal_commit(commit.clone())?;
+                drop(_enqueue_guard);
+                self.wait_for_block_journal_commit(commit_seq)?;
+            }
+            crate::api::WriteDurability::Acknowledged => {
+                self.append_acknowledged_block_journal_commit(total_started, &commit)?;
+            }
+        }
         Ok(BlockBatchCommit {
             device_id: lease.device_id,
             commit_seq,
@@ -4432,7 +4547,7 @@ impl DurableCoordinator {
             let _staging_guard = lock(&self.block_delta_staging_lock)?;
             self.local.metadata.device_info(device_id)?
         };
-        if self.block_journal.durable_through(device_id)?.raw() >= info.latest_commit.raw() {
+        if self.flush_block_journal_device_through(Instant::now(), device_id, info.latest_commit)? {
             return Ok(FlushResult {
                 device_id,
                 durable_through: info.latest_commit,
