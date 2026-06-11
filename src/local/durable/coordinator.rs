@@ -4422,6 +4422,12 @@ impl DurableCoordinator {
             let _staging_guard = lock(&self.block_delta_staging_lock)?;
             self.local.metadata.device_info(device_id)?
         };
+        if self.block_journal.durable_through(device_id)?.raw() >= info.latest_commit.raw() {
+            return Ok(FlushResult {
+                device_id,
+                durable_through: info.latest_commit,
+            });
+        }
         self.persist_block_deltas_until(info.latest_commit)?;
         Ok(FlushResult {
             device_id,

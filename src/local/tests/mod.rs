@@ -2630,6 +2630,9 @@ fn durable_block_journal_flushed_write_replays_after_reopen() {
             && profile.data_log_write_bytes == 0
     }));
     assert!(!store.durable.has_block_delta_commits().unwrap());
+    let flush = store.flush_device_with_writer(&lease).unwrap();
+    assert_eq!(flush.durable_through, commit.commit_seq);
+    assert!(store.drain_persist_profiles(16).unwrap().is_empty());
 
     let mut live = vec![0; 4096];
     store
@@ -2718,6 +2721,9 @@ fn durable_block_journal_leased_zero_and_discard_replay_after_reopen() {
     );
     assert!(!store.durable.has_block_delta_commits().unwrap());
     assert_eq!(block_delta_commit_count(&root), 0);
+    let flush = store.flush_device_with_writer(&lease).unwrap();
+    assert_eq!(flush.durable_through, discard.commit_seq);
+    assert!(store.drain_persist_profiles(16).unwrap().is_empty());
 
     let mut live = vec![0; 8 * 4096];
     store

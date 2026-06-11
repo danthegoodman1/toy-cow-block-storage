@@ -190,6 +190,13 @@ impl BlockJournalOverlay {
             .unwrap_or_else(|| WriterEpoch::from_raw(0)))
     }
 
+    fn durable_through(&self, device_id: DeviceId) -> Result<CommitSeq> {
+        Ok(lock(&self.inner)?
+            .get(&device_id)
+            .map(|device| device.durable_through)
+            .unwrap_or_else(|| CommitSeq::from_raw(0)))
+    }
+
     fn apply_commit(&self, commit: &BlockJournalCommit) -> Result<()> {
         let mut inner = lock(&self.inner)?;
         let device = inner.entry(commit.device_id).or_default();
