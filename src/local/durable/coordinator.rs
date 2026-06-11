@@ -9,6 +9,7 @@ pub struct DurableCoordinator {
     local: LocalCoordinator,
     durable: DurableSqliteStore,
     block_journal: Arc<BlockJournalOverlay>,
+    block_journal_flush: Arc<BlockJournalFlushCoordinator>,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     pending_block_deltas: Arc<Mutex<Vec<BlockDeltaCommit>>>,
     pending_native_file_deltas: Arc<Mutex<Vec<NativeFileDeltaCommit>>>,
@@ -466,6 +467,7 @@ impl DurableCoordinator {
             local,
             durable,
             block_journal,
+            block_journal_flush: Arc::new(BlockJournalFlushCoordinator::new()),
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             pending_block_deltas: Arc::new(Mutex::new(Vec::new())),
             pending_native_file_deltas: Arc::new(Mutex::new(Vec::new())),
@@ -3231,6 +3233,133 @@ impl DurableCoordinator {
         Ok(total_bytes <= BLOCK_JOURNAL_INLINE_MAX_BYTES)
     }
 
+    fn enqueue_block_journal_commit(&self, commit: BlockJournalCommit) -> Result<()> {
+        let mut state = lock(&self.block_journal_flush.inner)?;
+        if state
+            .pending
+            .insert(commit.commit_seq.raw(), commit)
+            .is_some()
+        {
+            return Err(StorageError::conflict(
+                "duplicate pending block journal commit sequence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_block_journal_commit(&self, commit_seq: CommitSeq) -> Result<()> {
+        let commit_seq = commit_seq.raw();
+        loop {
+            let mut state = lock(&self.block_journal_flush.inner)?;
+            if let Some(result) = state.completed.remove(&commit_seq) {
+                return result;
+            }
+            if !state.in_flight {
+                state.in_flight = true;
+                drop(state);
+                let _ = self.persist_pending_block_journal_commits(Instant::now());
+                let mut state = lock(&self.block_journal_flush.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.saturating_add(1);
+                self.block_journal_flush.cvar.notify_all();
+                continue;
+            }
+
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&self.block_journal_flush.cvar, state)?;
+            }
+        }
+    }
+
+    fn persist_pending_block_journal_commits(&self, total_started: Instant) -> Result<()> {
+        let commits = {
+            let mut state = lock(&self.block_journal_flush.inner)?;
+            if state.pending.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut state.pending)
+        };
+        let mut commits: Vec<_> = commits.into_values().collect();
+        commits.sort_by_key(|commit| commit.commit_seq.raw());
+        let mut records = Vec::with_capacity(commits.len().saturating_add(1));
+        let mut flushes = BTreeMap::<DeviceId, (WriterEpoch, CommitSeq)>::new();
+        for commit in &commits {
+            records.push(BlockJournalRecord::Write(commit.clone()));
+            flushes
+                .entry(commit.device_id)
+                .and_modify(|(epoch, durable)| {
+                    *epoch = (*epoch).max(commit.writer_epoch);
+                    *durable = (*durable).max(commit.commit_seq);
+                })
+                .or_insert((commit.writer_epoch, commit.commit_seq));
+        }
+        for (device_id, (writer_epoch, durable_through)) in &flushes {
+            records.push(BlockJournalRecord::Flush {
+                device_id: *device_id,
+                writer_epoch: *writer_epoch,
+                durable_through: *durable_through,
+            });
+        }
+
+        let result = (|| -> Result<AppendVisibleJournalProfile> {
+            let profile = self.durable.append_block_journal_records(&records)?;
+            for commit in &commits {
+                self.local
+                    .metadata
+                    .publish_reserved_block_journal_commit(commit.device_id, commit.commit_seq)?;
+                self.block_journal.apply_commit(commit)?;
+            }
+            for (device_id, (writer_epoch, durable_through)) in &flushes {
+                self.block_journal.mark_durable(
+                    *device_id,
+                    *writer_epoch,
+                    *durable_through,
+                )?;
+            }
+            Ok(profile)
+        })();
+
+        let profile = match result {
+            Ok(profile) => {
+                let mut state = lock(&self.block_journal_flush.inner)?;
+                for commit in &commits {
+                    state.completed.insert(commit.commit_seq.raw(), Ok(()));
+                }
+                profile
+            }
+            Err(error) => {
+                let mut state = lock(&self.block_journal_flush.inner)?;
+                for commit in &commits {
+                    state
+                        .completed
+                        .insert(commit.commit_seq.raw(), Err(error.clone()));
+                }
+                return Err(error);
+            }
+        };
+        self.record_persist_profile(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            visible_metadata_write_bytes: profile.frame_bytes,
+            block_journal_encode_nanos: profile.encode_nanos,
+            block_journal_open_nanos: profile.open_nanos,
+            block_journal_write_nanos: profile.write_nanos,
+            block_journal_sync_nanos: profile.sync_nanos,
+            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
+            block_journal_record_count: profile.record_count,
+            block_journal_frame_bytes: profile.frame_bytes,
+            block_journal_created: profile.created,
+            block_journal_flush_group_size: usize_to_u64(commits.len()),
+            durable_commit_high_water: commits
+                .iter()
+                .map(|commit| commit.commit_seq.raw())
+                .max()
+                .unwrap_or_default(),
+            ..DurablePersistProfile::default()
+        })?;
+        Ok(())
+    }
+
     fn commit_block_journal_batch_with_writer(
         &self,
         lease: &BlockWriterLease,
@@ -3241,10 +3370,10 @@ impl DurableCoordinator {
         if !self.should_use_block_journal_fast_path(writes, durability)? {
             return self.commit_block_batch(lease.device_id, writes, durability);
         }
-        let total_started = Instant::now();
         let info = self.local.metadata.device_info(lease.device_id)?;
         let collapsed =
             collapse_block_batch_writes(writes, &info.spec, BLOCK_JOURNAL_INLINE_MAX_BYTES)?;
+        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
         let commit_seq = self
             .local
             .metadata
@@ -3274,36 +3403,9 @@ impl DurableCoordinator {
             entries,
         };
         commit.validate(&info.spec)?;
-        let records = [
-            BlockJournalRecord::Write(commit.clone()),
-            BlockJournalRecord::Flush {
-                device_id: lease.device_id,
-                writer_epoch: lease.writer_epoch,
-                durable_through: commit_seq,
-            },
-        ];
-        let profile = self.durable.append_block_journal_records(&records)?;
-        self.local
-            .metadata
-            .publish_reserved_block_journal_commit(lease.device_id, commit_seq)?;
-        self.block_journal.apply_commit(&commit)?;
-        self.block_journal
-            .mark_durable(lease.device_id, lease.writer_epoch, commit_seq)?;
-        self.record_persist_profile(DurablePersistProfile {
-            total_nanos: duration_nanos_u64(total_started.elapsed()),
-            visible_metadata_write_bytes: profile.frame_bytes,
-            block_journal_encode_nanos: profile.encode_nanos,
-            block_journal_open_nanos: profile.open_nanos,
-            block_journal_write_nanos: profile.write_nanos,
-            block_journal_sync_nanos: profile.sync_nanos,
-            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
-            block_journal_record_count: profile.record_count,
-            block_journal_frame_bytes: profile.frame_bytes,
-            block_journal_created: profile.created,
-            block_journal_flush_group_size: 1,
-            durable_commit_high_water: commit_seq.raw(),
-            ..DurablePersistProfile::default()
-        })?;
+        self.enqueue_block_journal_commit(commit.clone())?;
+        drop(_enqueue_guard);
+        self.wait_for_block_journal_commit(commit_seq)?;
         Ok(BlockBatchCommit {
             device_id: lease.device_id,
             commit_seq,

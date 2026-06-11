@@ -2705,6 +2705,80 @@ fn durable_block_journal_ignores_incomplete_tail_after_reopen() {
 }
 
 #[test]
+fn durable_block_journal_flush_runner_coalesces_pending_commits() {
+    let root = durable_temp_dir("block-journal-coalesce");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("journal-coalesce".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let first_seq = store
+        .local
+        .metadata
+        .reserve_block_journal_commit_seq(device_id)
+        .unwrap();
+    let first = BlockJournalCommit {
+        device_id,
+        writer_epoch: lease.writer_epoch,
+        commit_seq: first_seq,
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: 4096,
+        entries: vec![BlockJournalEntry::Write {
+            range: ByteRange::new(0, 4096),
+            payload_integrity: PayloadIntegrity::Verified,
+            bytes: repeated_blocks(1, 41),
+        }],
+    };
+    let second_seq = store
+        .local
+        .metadata
+        .reserve_block_journal_commit_seq(device_id)
+        .unwrap();
+    let second = BlockJournalCommit {
+        device_id,
+        writer_epoch: lease.writer_epoch,
+        commit_seq: second_seq,
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: 4096,
+        entries: vec![BlockJournalEntry::Write {
+            range: ByteRange::new(4096, 4096),
+            payload_integrity: PayloadIntegrity::Verified,
+            bytes: repeated_blocks(1, 42),
+        }],
+    };
+    store.enqueue_block_journal_commit(first).unwrap();
+    store.enqueue_block_journal_commit(second).unwrap();
+
+    store.wait_for_block_journal_commit(second_seq).unwrap();
+    store.wait_for_block_journal_commit(first_seq).unwrap();
+
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(profiles.iter().any(|profile| {
+        profile.block_journal_flush_group_size == 2
+            && profile.block_journal_record_count == 3
+            && profile.block_journal_sync_nanos > 0
+    }));
+    let mut actual = vec![0; 2 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut actual)
+        .unwrap();
+    assert_eq!(&actual[0..4096], repeated_blocks(1, 41).as_slice());
+    assert_eq!(&actual[4096..2 * 4096], repeated_blocks(1, 42).as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_multi_node_reopens_block_and_native_placements() {
     let root = durable_temp_dir("multi-node-restart");
     let cfg = config();

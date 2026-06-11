@@ -75,6 +75,29 @@ pub(super) struct BlockJournalOverlay {
     inner: Mutex<BTreeMap<DeviceId, BlockJournalDeviceOverlay>>,
 }
 
+#[derive(Debug)]
+pub(super) struct BlockJournalFlushCoordinator {
+    inner: Mutex<BlockJournalFlushState>,
+    cvar: Condvar,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct BlockJournalFlushState {
+    in_flight: bool,
+    generation: u64,
+    pending: BTreeMap<u64, BlockJournalCommit>,
+    completed: BTreeMap<u64, Result<()>>,
+}
+
+impl BlockJournalFlushCoordinator {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(BlockJournalFlushState::default()),
+            cvar: Condvar::new(),
+        }
+    }
+}
+
 impl BlockJournalEntry {
     fn range(&self) -> ByteRange {
         match self {
