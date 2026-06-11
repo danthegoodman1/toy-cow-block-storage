@@ -400,6 +400,38 @@ mod tests {
     }
 
     #[test]
+    fn random_block_batch_writes_sample_sparse_lane_slots() {
+        let writes = build_block_batch_writes(
+            BlockBatchBuild {
+                spec: BlockBatchSpec {
+                    ops: 16,
+                    write_bytes: 4096,
+                    overlap: BlockBatchOverlap::Random,
+                },
+                worker: 0,
+                concurrency: 1,
+                logical_blocks: 1024,
+                op_index: 1,
+                payload: &make_payload(16 * 4096),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+            &mut Lcg::new(7),
+        )
+        .unwrap();
+
+        let blocks = writes
+            .iter()
+            .map(|write| write.offset / u64::from(BLOCK_SIZE))
+            .collect::<std::collections::BTreeSet<_>>();
+        let first = blocks.first().copied().unwrap();
+        let last = blocks.last().copied().unwrap();
+        assert!(
+            last - first + 1 > blocks.len() as u64,
+            "random batch should not collapse into one contiguous logical range"
+        );
+    }
+
+    #[test]
     fn integrity_flags_parse_explicit_modes() {
         assert_eq!(
             parse_payload_integrity("unchecked").unwrap(),

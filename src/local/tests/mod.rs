@@ -14107,6 +14107,131 @@ fn block_batch_commit_collapses_overlaps_by_request_order() {
 }
 
 #[test]
+fn block_batch_sparse_writes_pack_one_segment_with_offsets() {
+    let cfg = LocalStoreConfig {
+        shard_count: 1,
+        ..config()
+    };
+    let store = LocalCoordinator::with_config(cfg).unwrap();
+    let device = create_local_device(&store, 8);
+
+    let commit = device
+        .commit_batch(&[
+            BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(1, 31),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+            BlockBatchWrite {
+                offset: 2 * 4096,
+                bytes: repeated_blocks(1, 32),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+            BlockBatchWrite {
+                offset: 4 * 4096,
+                bytes: repeated_blocks(1, 33),
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(commit.write_count, 3);
+    assert_eq!(commit.collapsed_range_count, 3);
+    assert_eq!(commit.committed_bytes, 3 * 4096);
+    let segments = device_segment_ids(&store.metadata(), device.device_id);
+    assert_eq!(segments.len(), 1);
+
+    let entries = device_leaf_entries(&store.metadata(), device.device_id);
+    assert_eq!(entries.len(), 3);
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(entry.segment_id, segments[0]);
+        assert_eq!(
+            entry.logical_start,
+            BlockIndex::from_raw((index as u64) * 2)
+        );
+        assert_eq!(entry.segment_offset, BlockIndex::from_raw(index as u64));
+        assert_eq!(entry.blocks, BlockCount::from_raw(1));
+    }
+
+    let mut actual = vec![0; 5 * 4096];
+    device.read_at(0, &mut actual).unwrap();
+    assert_eq!(&actual[0..4096], repeated_blocks(1, 31).as_slice());
+    assert_eq!(&actual[4096..2 * 4096], vec![0; 4096].as_slice());
+    assert_eq!(
+        &actual[2 * 4096..3 * 4096],
+        repeated_blocks(1, 32).as_slice()
+    );
+    assert_eq!(&actual[3 * 4096..4 * 4096], vec![0; 4096].as_slice());
+    assert_eq!(
+        &actual[4 * 4096..5 * 4096],
+        repeated_blocks(1, 33).as_slice()
+    );
+}
+
+#[test]
+fn durable_sparse_block_batch_packed_offsets_replay_after_reopen() {
+    let root = durable_temp_dir("sparse-block-batch-packed");
+    let cfg = LocalStoreConfig {
+        shard_count: 1,
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("packed-sparse".to_string()),
+        })
+        .unwrap();
+    store
+        .commit_block_batch(
+            device_id,
+            &[
+                BlockBatchWrite {
+                    offset: 0,
+                    bytes: repeated_blocks(1, 41),
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+                BlockBatchWrite {
+                    offset: 2 * 4096,
+                    bytes: repeated_blocks(1, 42),
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+                BlockBatchWrite {
+                    offset: 4 * 4096,
+                    bytes: repeated_blocks(1, 43),
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+            ],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    assert_eq!(device_segment_ids(&store.metadata(), device_id).len(), 1);
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(device_segment_ids(&reopened.metadata(), device_id).len(), 1);
+    let mut actual = vec![0; 5 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 5 * 4096), &mut actual)
+        .unwrap();
+    assert_eq!(&actual[0..4096], repeated_blocks(1, 41).as_slice());
+    assert_eq!(&actual[4096..2 * 4096], vec![0; 4096].as_slice());
+    assert_eq!(
+        &actual[2 * 4096..3 * 4096],
+        repeated_blocks(1, 42).as_slice()
+    );
+    assert_eq!(&actual[3 * 4096..4 * 4096], vec![0; 4096].as_slice());
+    assert_eq!(
+        &actual[4 * 4096..5 * 4096],
+        repeated_blocks(1, 43).as_slice()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn block_batch_commit_publishes_multi_shard_update_in_one_commit_group() {
     let store = LocalCoordinator::with_config(config()).unwrap();
     let head = store.metadata().create_device(device_request()).unwrap();
@@ -17121,6 +17246,18 @@ fn device_segment_ids(
     out
 }
 
+fn device_leaf_entries(
+    metadata: &Arc<InMemoryMetadataPlane>,
+    device_id: DeviceId,
+) -> Vec<LeafEntry> {
+    let mut out = Vec::new();
+    for root in metadata.get_head(device_id).unwrap().shard_roots {
+        collect_tree_leaf_entries(metadata, root, &mut out);
+    }
+    out.sort_by_key(|entry| entry.logical_start.raw());
+    out
+}
+
 fn file_segment_ids(
     metadata: &Arc<InMemoryMetadataPlane>,
     keyspace_id: KeyspaceId,
@@ -17159,6 +17296,24 @@ fn collect_tree_segments(
         MetadataNodeKind::Internal { children } => {
             for child in children {
                 collect_tree_segments(metadata, child.node_id, out);
+            }
+        }
+    }
+}
+
+fn collect_tree_leaf_entries(
+    metadata: &Arc<InMemoryMetadataPlane>,
+    node_id: MetadataNodeId,
+    out: &mut Vec<LeafEntry>,
+) {
+    let node = metadata.get_metadata_node(node_id).unwrap();
+    match node.kind {
+        MetadataNodeKind::Leaf { entries, .. } => {
+            out.extend(entries);
+        }
+        MetadataNodeKind::Internal { children } => {
+            for child in children {
+                collect_tree_leaf_entries(metadata, child.node_id, out);
             }
         }
     }
