@@ -37,19 +37,21 @@ clean internal evolution.
 
 ## Development Environment
 
-- Run development commands and tests inside the Linux container:
+- On Linux hosts, run development commands, tests, and benchmarks directly on
+  the host machine.
+- On macOS hosts, run Rust commands inside the Linux container:
   `docker compose up -d dev`, then `docker compose exec dev ...`.
-- Run the full Rust gate inside the container when a change is ready:
+- Run the full Rust gate in the active Rust environment when a change is ready:
   `cargo fmt --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test`,
   `cargo doc --no-deps`, and
   `cargo bench --bench regression -- --test`.
-- Keep git operations on the macOS host: `git status`, `git diff`, `git add`,
+- Keep git operations on the host: `git status`, `git diff`, `git add`,
   `git commit`, and `git push`.
-- Shut the development container down with `docker compose down` when finished.
-  Do not use `docker compose down -v` unless intentionally discarding Docker
-  volumes and benchmark history.
+- If you used the development container, shut it down with
+  `docker compose down` when finished. Do not use `docker compose down -v`
+  unless intentionally discarding Docker volumes and benchmark history.
 
 ## Determinism And API Discipline
 

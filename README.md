@@ -622,10 +622,13 @@ after the runs.
 `cargo bench --bench regression` is the Criterion mechanism suite.
 `loadbench` is the integration runner for public block/native API behavior,
 modeled RTT, concurrency, latency percentiles, conflicts, and errors.
+The commands below are written for Linux hosts. On macOS hosts, run them inside
+the Linux container by starting `docker compose up -d dev` and prefixing the
+`cargo ...` invocation with `docker compose exec dev`.
 
 ```sh
 # Broad public API smoke.
-docker compose exec dev cargo run --release --bin loadbench -- \
+cargo run --release --bin loadbench -- \
   --provider durable \
   --durability ack-flush:1 \
   --duration-ms 1000 \
@@ -635,7 +638,7 @@ docker compose exec dev cargo run --release --bin loadbench -- \
   --rtt-us 200
 
 # Filesystem-shaped block fsync windows.
-docker compose exec dev cargo run --release --bin loadbench -- \
+cargo run --release --bin loadbench -- \
   --provider durable \
   --durability ack-flush:1 \
   --duration-ms 1000 \
@@ -646,7 +649,7 @@ docker compose exec dev cargo run --release --bin loadbench -- \
   --rtt-us 200
 
 # Native append ingest and publish boundaries.
-docker compose exec dev cargo run --release --bin loadbench -- \
+cargo run --release --bin loadbench -- \
   --provider durable \
   --durability ack \
   --warmup-ms 0 \
@@ -694,24 +697,25 @@ Useful workload aliases:
 
 ## Development
 
-Run Rust commands inside the Linux container from `docker-compose.yml`. Keep git
-commands on the macOS host.
+On Linux hosts, run Rust commands directly on the machine. On macOS hosts, use
+the Linux container from `docker-compose.yml` and keep git commands on the host.
+When using the macOS container, prefix the `cargo ...` commands below with
+`docker compose exec dev` after starting `docker compose up -d dev`, then shut
+it down with `docker compose down` when finished.
 
 ```sh
-docker compose up -d dev
-docker compose exec dev cargo test
-docker compose exec dev cargo bench --bench regression -- --test
-docker compose down
+cargo test
+cargo bench --bench regression -- --test
 ```
 
 Full gate:
 
 ```sh
-docker compose exec dev cargo fmt --check
-docker compose exec dev cargo clippy --all-targets --all-features -- -D warnings
-docker compose exec dev cargo test
-docker compose exec dev cargo doc --no-deps
-docker compose exec dev cargo bench --bench regression -- --test
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo doc --no-deps
+cargo bench --bench regression -- --test
 ```
 
 Use `cargo bench --bench regression` without `-- --test` when you want Criterion
