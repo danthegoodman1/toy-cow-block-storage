@@ -148,17 +148,19 @@ Durable providers store checkpointed block heads as a stable device manifest
 plus one mutable row per shard head. Flushed block writes do not need to fold
 into those rows before returning: they may be recorded as ordered durable block
 delta rows that reference already-durable segment payloads. The durable provider
-also has a block-native journal fast path for small flushed writes under an
-explicit whole-device writer lease. A journal batch contains lease, write, and
-flush-marker records in a framed append-only file. A flushed journal write
-returns only after the inline payload bytes and the flush marker covering that
-commit sequence are durable. Reopen loads the compact shard roots, replays
-retained SQLite block deltas, then rebuilds the provider-private block overlay
-from journal writes covered by durable flush markers. Reads resolve the compact
-tree and then apply the journal overlay, so read-after-write observes
-journal-backed writes without forcing immediate tree path-copy or node-catalog
-publication. SQLite block-delta checkpointing and maintenance fold durable
-deltas into immutable CoW shard roots before pruning covered rows. Journal
+also has a block-native journal fast path for small flushed writes and leased
+sparse zero/discard operations under an explicit whole-device writer lease. A
+journal batch contains lease, write or sparse-range, and flush-marker records in
+a framed append-only file. A flushed journal write returns only after the inline
+payload bytes and the flush marker covering that commit sequence are durable;
+a journal sparse operation returns only after the sparse range and covering
+flush marker are durable. Reopen loads the compact shard roots, replays retained
+SQLite block deltas, then rebuilds the provider-private block overlay from
+journal writes and sparse ranges covered by durable flush markers. Reads resolve
+the compact tree and then apply the journal overlay, so read-after-write
+observes journal-backed writes without forcing immediate tree path-copy or
+node-catalog publication. SQLite block-delta checkpointing and maintenance fold
+durable deltas into immutable CoW shard roots before pruning covered rows. Journal
 records remain retained replay roots until a materialization pass folds them
 into the CoW trees and proves no fork/PITR window needs the journal payloads.
 This keeps `flush_device` as a replayable durability boundary while preserving

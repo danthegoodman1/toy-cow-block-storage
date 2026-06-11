@@ -3453,6 +3453,51 @@ impl DurableCoordinator {
         })
     }
 
+    fn commit_sparse_block_journal_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
+        self.local.validate_block_writer(lease)?;
+        let info = self.local.metadata.device_info(lease.device_id)?;
+        let range = ByteRange::new(offset, len);
+        range.validate_for_device(&info.spec)?;
+        if len == 0 {
+            return Ok(WriteCommit {
+                device_id: lease.device_id,
+                commit_seq: info.latest_commit,
+                range,
+                durability: crate::api::WriteDurability::Acknowledged,
+            });
+        }
+
+        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
+        let commit_seq = self
+            .local
+            .metadata
+            .reserve_block_journal_commit_seq(lease.device_id)?;
+        let commit = BlockJournalCommit {
+            device_id: lease.device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq,
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: 0,
+            entries: vec![BlockJournalEntry::Sparse { range }],
+        };
+        commit.validate(&info.spec)?;
+        self.enqueue_block_journal_commit(commit)?;
+        drop(_enqueue_guard);
+        self.wait_for_block_journal_commit(commit_seq)?;
+        Ok(WriteCommit {
+            device_id: lease.device_id,
+            commit_seq,
+            range,
+            durability: crate::api::WriteDurability::Flushed,
+        })
+    }
+
     pub fn commit_block_batch(
         &self,
         device_id: DeviceId,
@@ -3588,8 +3633,7 @@ impl DurableCoordinator {
         offset: u64,
         len: u64,
     ) -> Result<WriteCommit> {
-        self.local.validate_block_writer(lease)?;
-        self.write_zeroes(lease.device_id, offset, len)
+        self.commit_sparse_block_journal_with_writer(lease, offset, len)
     }
 
     pub fn discard_device(
@@ -3626,8 +3670,7 @@ impl DurableCoordinator {
         offset: u64,
         len: u64,
     ) -> Result<WriteCommit> {
-        self.local.validate_block_writer(lease)?;
-        self.discard_device(lease.device_id, offset, len)
+        self.commit_sparse_block_journal_with_writer(lease, offset, len)
     }
 
     pub fn commit_file_batch(
