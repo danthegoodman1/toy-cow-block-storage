@@ -415,7 +415,7 @@ mod tests {
                 payload: &make_payload(16 * 4096),
                 payload_integrity: PayloadIntegrity::Verified,
             },
-            &mut Lcg::new(7),
+            &mut Lcg::new(0x9e37_79b9_7f4a_7c15_u64),
         )
         .unwrap();
 
@@ -429,6 +429,268 @@ mod tests {
             last - first + 1 > blocks.len() as u64,
             "random batch should not collapse into one contiguous logical range"
         );
+    }
+
+    #[test]
+    fn random_block_batch_commit_prestages_packed_segments() {
+        let root = std::env::temp_dir().join(format!(
+            "toy-cow-loadbench-random-block-pack-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = LocalStoreConfig {
+            shard_count: 64,
+            ..LocalStoreConfig::default()
+        };
+        let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+            &root,
+            cfg,
+            vec![
+                StorageNodeId::from_raw(1),
+                StorageNodeId::from_raw(2),
+                StorageNodeId::from_raw(3),
+                StorageNodeId::from_raw(4),
+            ],
+            DurableDataLogPolicy::default(),
+        )
+        .unwrap();
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: DEFAULT_DEVICE_BLOCKS,
+                    block_size: BLOCK_SIZE,
+                },
+                name: None,
+            })
+            .unwrap();
+        let spec = BlockBatchSpec {
+            ops: 4096,
+            write_bytes: 4096,
+            overlap: BlockBatchOverlap::Random,
+        };
+        let payload = make_payload(4096 * 4096);
+        let mut rng = Lcg::new(0x9e37_79b9_7f4a_7c15_u64);
+        for op_index in 0..1 {
+            let writes = build_block_batch_writes(
+                BlockBatchBuild {
+                    spec,
+                    worker: 0,
+                    concurrency: 1,
+                    logical_blocks: DEFAULT_DEVICE_BLOCKS,
+                    op_index,
+                    payload: &payload,
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+                &mut rng,
+            )
+            .unwrap();
+            store
+                .commit_block_batch(device_id, &writes, WriteDurability::Acknowledged)
+                .unwrap();
+            store.flush_device(device_id).unwrap();
+        }
+        let _ = store.drain_persist_profiles(16).unwrap();
+        store.enable_persist_profiling(16).unwrap();
+        let writes = build_block_batch_writes(
+            BlockBatchBuild {
+                spec,
+                worker: 0,
+                concurrency: 1,
+                logical_blocks: DEFAULT_DEVICE_BLOCKS,
+                op_index: 1,
+                payload: &payload,
+                payload_integrity: PayloadIntegrity::Verified,
+            },
+            &mut rng,
+        )
+        .unwrap();
+
+        let commit = store
+            .commit_block_batch(device_id, &writes, WriteDurability::Acknowledged)
+            .unwrap();
+        store.flush_device(device_id).unwrap();
+        let profiles = store.drain_persist_profiles(16).unwrap();
+        assert!(commit.collapsed_range_count > 1000);
+        assert_eq!(profiles.len(), 1);
+        assert!(
+            profiles[0].data_log_prestaged_segment_count <= 64,
+            "expected one packed segment per touched shard, got {}",
+            profiles[0].data_log_prestaged_segment_count
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_random_block_batch_commits_prestage_packed_segments() {
+        let root = std::env::temp_dir().join(format!(
+            "toy-cow-loadbench-concurrent-random-block-pack-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = LocalStoreConfig {
+            shard_count: 64,
+            ..LocalStoreConfig::default()
+        };
+        let store = std::sync::Arc::new(
+            DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+                &root,
+                cfg,
+                vec![
+                    StorageNodeId::from_raw(1),
+                    StorageNodeId::from_raw(2),
+                    StorageNodeId::from_raw(3),
+                    StorageNodeId::from_raw(4),
+                ],
+                DurableDataLogPolicy::default(),
+            )
+            .unwrap(),
+        );
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: DEFAULT_DEVICE_BLOCKS,
+                    block_size: BLOCK_SIZE,
+                },
+                name: None,
+            })
+            .unwrap();
+        store.enable_persist_profiling(64).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+        for worker in 0..16u64 {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut rng = Lcg::new(7 + worker);
+                let writes = build_block_batch_writes(
+                    BlockBatchBuild {
+                        spec: BlockBatchSpec {
+                            ops: 4096,
+                            write_bytes: 4096,
+                            overlap: BlockBatchOverlap::Random,
+                        },
+                        worker,
+                        concurrency: 16,
+                        logical_blocks: DEFAULT_DEVICE_BLOCKS,
+                        op_index: 1,
+                        payload: &make_payload(4096 * 4096),
+                        payload_integrity: PayloadIntegrity::Verified,
+                    },
+                    &mut rng,
+                )
+                .unwrap();
+                barrier.wait();
+                store
+                    .commit_block_batch(device_id, &writes, WriteDurability::Acknowledged)
+                    .unwrap();
+                store.flush_device(device_id).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let profiles = store.drain_persist_profiles(64).unwrap();
+        let prestaged_segments: u64 = profiles
+            .iter()
+            .map(|profile| profile.data_log_prestaged_segment_count)
+            .sum();
+        assert!(
+            prestaged_segments <= 16 * 4,
+            "expected one packed segment per touched worker shard, got {prestaged_segments}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_large_block_batch_commits_remain_readable_after_flush() {
+        let root = std::env::temp_dir().join(format!(
+            "toy-cow-loadbench-concurrent-large-block-readable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = LocalStoreConfig {
+            shard_count: 64,
+            ..LocalStoreConfig::default()
+        };
+        let store = std::sync::Arc::new(
+            DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+                &root,
+                cfg,
+                vec![
+                    StorageNodeId::from_raw(1),
+                    StorageNodeId::from_raw(2),
+                    StorageNodeId::from_raw(3),
+                    StorageNodeId::from_raw(4),
+                ],
+                DurableDataLogPolicy::default(),
+            )
+            .unwrap(),
+        );
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: DEFAULT_DEVICE_BLOCKS,
+                    block_size: BLOCK_SIZE,
+                },
+                name: None,
+            })
+            .unwrap();
+
+        let concurrency = 4usize;
+        let payload = std::sync::Arc::new(make_payload(4096 * 4096));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(concurrency));
+        let first_offsets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for worker in 0..concurrency as u64 {
+            let store = std::sync::Arc::clone(&store);
+            let payload = std::sync::Arc::clone(&payload);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let first_offsets = std::sync::Arc::clone(&first_offsets);
+            handles.push(std::thread::spawn(move || {
+                let mut rng = Lcg::new(0xfeed_0000 + worker);
+                let writes = build_block_batch_writes(
+                    BlockBatchBuild {
+                        spec: BlockBatchSpec {
+                            ops: 4096,
+                            write_bytes: 4096,
+                            overlap: BlockBatchOverlap::Sequential,
+                        },
+                        worker,
+                        concurrency,
+                        logical_blocks: DEFAULT_DEVICE_BLOCKS,
+                        op_index: 0,
+                        payload: payload.as_ref(),
+                        payload_integrity: PayloadIntegrity::Verified,
+                    },
+                    &mut rng,
+                )
+                .unwrap();
+                let first_offset = writes[0].offset;
+                barrier.wait();
+                store
+                    .commit_block_batch(device_id, &writes, WriteDurability::Acknowledged)
+                    .unwrap();
+                store.flush_device(device_id).unwrap();
+                first_offsets.lock().unwrap().push(first_offset);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let expected = &payload[..usize::try_from(BLOCK_SIZE).unwrap()];
+        for offset in first_offsets.lock().unwrap().iter().copied() {
+            let mut buf = vec![0; usize::try_from(BLOCK_SIZE).unwrap()];
+            store
+                .read_device(device_id, ByteRange::new(offset, u64::from(BLOCK_SIZE)), &mut buf)
+                .unwrap();
+            assert_eq!(buf, expected);
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

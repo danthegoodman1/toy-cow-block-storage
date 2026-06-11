@@ -14232,6 +14232,66 @@ fn durable_sparse_block_batch_packed_offsets_replay_after_reopen() {
 }
 
 #[test]
+fn durable_multi_shard_sparse_block_batch_prestages_packed_segments() {
+    let root = durable_temp_dir("multi-shard-sparse-block-batch-packed");
+    let cfg = LocalStoreConfig {
+        shard_count: 64,
+        ..config()
+    };
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        vec![
+            StorageNodeId::from_raw(1),
+            StorageNodeId::from_raw(2),
+            StorageNodeId::from_raw(3),
+            StorageNodeId::from_raw(4),
+        ],
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1_048_576,
+                block_size: 4096,
+            },
+            name: Some("multi-shard-packed-sparse".to_string()),
+        })
+        .unwrap();
+    store.enable_persist_profiling(16).unwrap();
+
+    let writes = (0..4096u64)
+        .map(|index| {
+            let block = index * 251;
+            BlockBatchWrite {
+                offset: block * 4096,
+                bytes: repeated_blocks(1, (index % 251) as u8),
+                payload_integrity: PayloadIntegrity::Verified,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    store
+        .commit_block_batch(device_id, &writes, WriteDurability::Acknowledged)
+        .unwrap();
+    let flush = store.flush_device(device_id).unwrap();
+    assert_eq!(flush.durable_through.raw(), 1);
+
+    let segment_count = device_segment_ids(&store.metadata(), device_id).len();
+    assert!(segment_count >= 60);
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(
+        profiles[0].data_log_prestaged_segment_count,
+        segment_count as u64
+    );
+    assert_eq!(profiles[0].data_log_prestaged_segment_bytes, 4096 * 4096);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn block_batch_commit_publishes_multi_shard_update_in_one_commit_group() {
     let store = LocalCoordinator::with_config(config()).unwrap();
     let head = store.metadata().create_device(device_request()).unwrap();

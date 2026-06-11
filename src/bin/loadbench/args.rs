@@ -14,6 +14,8 @@ struct Args {
     storage_node_data_dirs: Vec<PathBuf>,
     files: usize,
     shards: usize,
+    metadata_fanout: usize,
+    metadata_leaf_blocks: u64,
     storage_nodes: usize,
     device_blocks: u64,
     samples_per_worker: usize,
@@ -64,6 +66,8 @@ impl Args {
             storage_node_data_dirs: Vec::new(),
             files: 1024,
             shards: 64,
+            metadata_fanout: 4,
+            metadata_leaf_blocks: 1024,
             storage_nodes: 1,
             device_blocks: DEFAULT_DEVICE_BLOCKS,
             samples_per_worker: 200_000,
@@ -141,6 +145,12 @@ impl Args {
                 }
                 "--files" => args.files = parse_next(&mut raw, "--files")?,
                 "--shards" => args.shards = parse_next(&mut raw, "--shards")?,
+                "--metadata-fanout" => {
+                    args.metadata_fanout = parse_next(&mut raw, "--metadata-fanout")?;
+                }
+                "--metadata-leaf-blocks" => {
+                    args.metadata_leaf_blocks = parse_next(&mut raw, "--metadata-leaf-blocks")?;
+                }
                 "--storage-nodes" => args.storage_nodes = parse_next(&mut raw, "--storage-nodes")?,
                 "--device-blocks" => args.device_blocks = parse_next(&mut raw, "--device-blocks")?,
                 "--samples-per-worker" => {
@@ -360,6 +370,16 @@ impl Args {
                 "shards must be greater than zero",
             ));
         }
+        if args.metadata_fanout < 2 {
+            return Err(StorageError::invalid_argument(
+                "metadata-fanout must be at least two",
+            ));
+        }
+        if args.metadata_leaf_blocks == 0 {
+            return Err(StorageError::invalid_argument(
+                "metadata-leaf-blocks must be greater than zero",
+            ));
+        }
         if args.storage_nodes == 0 {
             return Err(StorageError::invalid_argument(
                 "storage-nodes must be greater than zero",
@@ -401,8 +421,8 @@ impl Args {
             shard_count: self.shards,
             block_size: BLOCK_SIZE,
             file_root_blocks: DEFAULT_FILE_ROOT_BLOCKS,
-            metadata_fanout: 4,
-            metadata_leaf_blocks: 1024,
+            metadata_fanout: self.metadata_fanout,
+            metadata_leaf_blocks: self.metadata_leaf_blocks,
             storage_node: StorageNodeId::from_raw(1),
             observability_event_capacity: 16_384,
             stream_auto_persist_bytes: self.stream_auto_persist_bytes,
@@ -499,6 +519,8 @@ options:\n\
   --delay-mode spin|sleep                  modeled RTT delay mode, default: spin\n\
   --files N                                native file count, default: 1024\n\
   --shards N                               block shard count, default: 64\n\
+  --metadata-fanout N                      metadata tree fanout, default: 4\n\
+  --metadata-leaf-blocks N                 metadata leaf span in blocks, default: 1024\n\
   --storage-nodes N                        local storage node count, default: 1\n\
   --device-blocks N                        logical device blocks, default: 1048576\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
