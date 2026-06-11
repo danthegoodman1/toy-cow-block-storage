@@ -418,8 +418,14 @@ enum Target {
     Native {
         keyspace_id: KeyspaceId,
         files: Arc<Vec<FileId>>,
+        hot_append: Option<Arc<Mutex<HotAppendState>>>,
     },
     AppendLogMicrobench {
         root: Arc<PathBuf>,
     },
+}
+
+struct HotAppendState {
+    stream: AppendStream,
+    published_offset: u64,
 }

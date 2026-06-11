@@ -183,9 +183,20 @@ fn setup_context(
             }
             files.push(file_id);
         }
+        let hot_append = if matches!(workload, Workload::NativeHotAppend4k) {
+            let file_id = files[0];
+            let stream = store.open_append_stream(keyspace_id, file_id)?;
+            Some(Arc::new(Mutex::new(HotAppendState {
+                published_offset: stream.visible_base_size,
+                stream,
+            })))
+        } else {
+            None
+        };
         Target::Native {
             keyspace_id,
             files: Arc::new(files),
+            hot_append,
         }
     };
 

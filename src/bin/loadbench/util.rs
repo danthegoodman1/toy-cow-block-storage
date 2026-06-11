@@ -283,6 +283,16 @@ mod tests {
     }
 
     #[test]
+    fn native_hot_append_c4_reports_successes_without_conflict_errors() {
+        assert_native_hot_append_reports_successes_without_errors(4);
+    }
+
+    #[test]
+    fn native_hot_append_c16_reports_successes_without_conflict_errors() {
+        assert_native_hot_append_reports_successes_without_errors(16);
+    }
+
+    #[test]
     fn native_file_batch_suite_names_client_commit_shapes() {
         let suite = parse_workloads("native-file-batch").unwrap();
         assert!(suite.contains(&Workload::NativeFileBatch4k16Ops));
@@ -504,5 +514,79 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "old,header\n1,2\n");
         let _ = fs::remove_file(&path);
+    }
+
+    fn assert_native_hot_append_reports_successes_without_errors(concurrency: usize) {
+        let root = env::temp_dir().join(format!(
+            "toy-cow-block-storage-hot-append-test-{}-c{}",
+            std::process::id(),
+            concurrency
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let args = test_loadbench_args(root.clone());
+
+        let report = run_case(&args, Workload::NativeHotAppend4k, concurrency).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(report.workload, Workload::NativeHotAppend4k);
+        assert_eq!(report.concurrency, concurrency);
+        assert!(
+            report.successes > 0,
+            "expected successful hot append operations at c{concurrency}"
+        );
+        assert_eq!(
+            report.errors, 0,
+            "native-hot-append-4k should not report expected fencing conflicts as errors"
+        );
+    }
+
+    fn test_loadbench_args(root: PathBuf) -> Args {
+        Args {
+            provider: ProviderKind::Durable,
+            durability: DurabilityMode::Acknowledged,
+            workloads: vec![Workload::NativeHotAppend4k],
+            concurrency: vec![1],
+            duration: Duration::from_millis(200),
+            warmup: Duration::ZERO,
+            rtt: Duration::ZERO,
+            serial_rtts: 1,
+            delay_mode: DelayMode::Spin,
+            root,
+            append_visible_journal_dir: None,
+            storage_node_data_dirs: Vec::new(),
+            files: 16,
+            shards: 64,
+            storage_nodes: 1,
+            device_blocks: DEFAULT_DEVICE_BLOCKS,
+            samples_per_worker: 1024,
+            matrix_csv: None,
+            durable_profile_csv: None,
+            append_publish_profile_csv: None,
+            metadata_profile_csv: None,
+            block_write_profile_csv: None,
+            block_batch_profile_csv: None,
+            native_file_batch_profile_csv: None,
+            native_file_batch_commit_profile_csv: None,
+            append_ingest_profile_csv: None,
+            append_log_profile_csv: None,
+            read_profile_csv: None,
+            target_data_log_bytes: 64 * 1024 * 1024,
+            data_log_file_sync_fanout: 4,
+            append_publish_batch_policy: AppendPublishBatchPolicy::default(),
+            append_ingest_policy: AppendIngestPolicy::default(),
+            stream_publish_bytes: None,
+            stream_total_bytes: 1024 * 1024 * 1024,
+            stream_auto_persist_bytes: None,
+            block_batch_ops: None,
+            block_batch_bytes: None,
+            block_batch_overlap: None,
+            block_batch_fsync_bytes: 128 * 1024 * 1024,
+            native_file_batch_ops: None,
+            native_file_batch_bytes: None,
+            native_file_batch_overlap: None,
+            native_file_batch_fsync_bytes: 16 * 1024 * 1024,
+            payload_integrity: PayloadIntegrity::Unchecked,
+            read_verification: ReadVerification::Default,
+        }
     }
 }

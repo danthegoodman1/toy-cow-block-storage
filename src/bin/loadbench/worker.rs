@@ -334,7 +334,10 @@ fn run_mixed_native_append_worker(
     let mut rng = Lcg::new(0x243f_6a88_85a3_08d3_u64 ^ worker.wrapping_mul(0x9e37_79b9));
     let mut report = WorkerReport::new(config.samples_per_worker);
     let mut state = WorkerState::default();
-    let Target::Native { keyspace_id, files } = &context.target else {
+    let Target::Native {
+        keyspace_id, files, ..
+    } = &context.target
+    else {
         return Err(StorageError::invalid_argument(
             "mixed append worker requires native target",
         ));
@@ -634,7 +637,10 @@ fn run_fixed_stream_publish_worker(
 ) -> Result<WorkerReport> {
     let mut rng = Lcg::new(0xa076_1d64_78bd_642f_u64 ^ worker.wrapping_mul(0xe703_7ed1_a0b4_28db));
     let mut report = WorkerReport::new(config.samples_per_worker);
-    let Target::Native { keyspace_id, files } = &context.target else {
+    let Target::Native {
+        keyspace_id, files, ..
+    } = &context.target
+    else {
         return Err(StorageError::invalid_argument(
             "fixed stream publish workloads require native target",
         ));
@@ -878,7 +884,10 @@ fn prepare_for_timed_op(
     if !config.workload.is_native_stream_publish_server_persisted() {
         return Ok(());
     }
-    let Target::Native { keyspace_id, files } = &context.target else {
+    let Target::Native {
+        keyspace_id, files, ..
+    } = &context.target
+    else {
         return Ok(());
     };
     let payload_len = context.payload.len() as u64;
@@ -1538,7 +1547,12 @@ fn run_one_op(
                 native_file_batch_profile: None,
             })
         }
-        (Target::Native { keyspace_id, files }, Workload::NativeWrite4kSameFile) => {
+        (
+            Target::Native {
+                keyspace_id, files, ..
+            },
+            Workload::NativeWrite4kSameFile,
+        ) => {
             let file_id = files[0];
             context
                 .store
@@ -1551,7 +1565,12 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, workload)
+        (
+            Target::Native {
+                keyspace_id, files, ..
+            },
+            workload,
+        )
             if workload.is_native_file_batch() || workload.is_native_mixed() =>
         {
             let spec = config
@@ -1597,7 +1616,12 @@ fn run_one_op(
                 ..OpProgress::default()
             })
         }
-        (Target::Native { keyspace_id, files }, workload) if workload.is_native_write() => {
+        (
+            Target::Native {
+                keyspace_id, files, ..
+            },
+            workload,
+        ) if workload.is_native_write() => {
             let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());
             let file_id = files[file_index];
             context
@@ -1611,7 +1635,12 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, Workload::NativeRead4k | Workload::NativeRead1m) => {
+        (
+            Target::Native {
+                keyspace_id, files, ..
+            },
+            Workload::NativeRead4k | Workload::NativeRead1m,
+        ) => {
             let file_id = files[rng.below(files.len() as u64) as usize];
             context
                 .store
@@ -1624,7 +1653,12 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, Workload::NativeAppend4kSameFile) => {
+        (
+            Target::Native {
+                keyspace_id, files, ..
+            },
+            Workload::NativeAppend4kSameFile,
+        ) => {
             let file_id = files[0];
             context
                 .store
@@ -1637,7 +1671,12 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, workload) if workload.is_native_append() => {
+        (
+            Target::Native {
+                keyspace_id, files, ..
+            },
+            workload,
+        ) if workload.is_native_append() => {
             let file_index = state.next_partitioned_file_index(worker, concurrency, files.len());
             let file_id = files[file_index];
             context
@@ -1651,7 +1690,12 @@ fn run_one_op(
                 )
                 .map(|_| OpProgress::default())
         }
-        (Target::Native { keyspace_id, files }, workload) if workload.is_native_stream() => {
+        (
+            Target::Native {
+                keyspace_id, files, ..
+            },
+            workload,
+        ) if workload.is_native_stream() => {
             let payload_len = context.payload.len() as u64;
             for _ in 0..files.len() {
                 let mut progress = OpProgress::default();
@@ -1755,24 +1799,48 @@ fn run_one_op(
                 "append-stream benchmark exhausted every file lane",
             ))
         }
-        (Target::Native { keyspace_id, files }, Workload::NativeHotAppend4k) => {
-            let file_id = files[0];
+        (
+            Target::Native {
+                keyspace_id: _,
+                files: _,
+                hot_append,
+            },
+            Workload::NativeHotAppend4k,
+        ) => {
             state.last_native_file_index = Some(0);
-            context
-                .store
-                .append_file_once(
-                    *keyspace_id,
-                    file_id,
-                    &context.payload,
-                    durability,
-                    config.payload_integrity,
-                )
-                .map(|_| OpProgress::default())
+            append_hot_file_once(context, hot_append.as_ref(), durability, config.payload_integrity)
         }
         _ => Err(StorageError::invalid_argument(
             "workload does not match benchmark target",
         )),
     }
+}
+
+fn append_hot_file_once(
+    context: &BenchContext,
+    hot_append: Option<&Arc<Mutex<HotAppendState>>>,
+    durability: WriteDurability,
+    payload_integrity: PayloadIntegrity,
+) -> Result<OpProgress> {
+    let hot_append = hot_append
+        .ok_or_else(|| StorageError::corrupt("native hot append state missing"))?;
+    let mut hot = hot_append
+        .lock()
+        .map_err(|_| StorageError::unavailable("native hot append lock poisoned"))?;
+    let ticket =
+        context
+            .store
+            .append_stream(&hot.stream, &context.payload, durability, payload_integrity)?;
+    let publish_through = ticket.range.end_exclusive()?;
+    let previous_published = hot.published_offset;
+    context
+        .store
+        .publish_append_stream(&hot.stream, publish_through)?;
+    hot.published_offset = publish_through;
+    Ok(OpProgress {
+        published_bytes: publish_through.saturating_sub(previous_published),
+        ..OpProgress::default()
+    })
 }
 
 fn should_publish_after_stream_append(workload: Workload, threshold_reached: bool) -> bool {
@@ -1817,7 +1885,9 @@ fn maybe_flush(
                 .map(|_| OpProgress::default())
         }
         Target::Native { .. } if workload.is_native_stream_ingest() => Ok(OpProgress::default()),
-        Target::Native { keyspace_id, files } => {
+        Target::Native {
+            keyspace_id, files, ..
+        } => {
             let file_id = if matches!(workload, Workload::NativeHotAppend4k) {
                 files[0]
             } else {
