@@ -69,6 +69,7 @@ pub struct ReadProfile {
     pub storage_node_lock_wait_nanos: u64,
     pub verification_nanos: u64,
     pub copy_nanos: u64,
+    pub block_journal_overlay_read_nanos: u64,
     pub logical_bytes: u64,
     pub extent_count: u64,
     pub zero_extent_count: u64,

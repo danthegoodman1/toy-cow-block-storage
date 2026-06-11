@@ -129,6 +129,41 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
+    fn acquire_writer(&self) -> Result<BlockWriterLease> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::AcquireWriter {
+                device_id: self.device_id,
+            },
+        ))?;
+        match response.response {
+            BlockResponse::WriterAcquired(lease) => Ok(lease),
+            _ => Err(StorageError::corrupt(
+                "unexpected block-writer-acquire response",
+            )),
+        }
+    }
+
+    fn release_writer(&self, lease: &BlockWriterLease) -> Result<()> {
+        let response = self.transport.call(BlockRequestEnvelope::new(
+            self.next_request_id()?,
+            self.client_epoch,
+            None,
+            BlockRequest::ReleaseWriter { lease: *lease },
+        ))?;
+        match response.response {
+            BlockResponse::WriterReleased(released) if released == *lease => Ok(()),
+            BlockResponse::WriterReleased(_) => Err(StorageError::corrupt(
+                "released block writer lease does not match request",
+            )),
+            _ => Err(StorageError::corrupt(
+                "unexpected block-writer-release response",
+            )),
+        }
+    }
+
     fn write_at_with_integrity(
         &self,
         offset: u64,
@@ -162,13 +197,17 @@ impl BlockDevice for LocalBlockDevice {
         })
     }
 
-    fn commit_batch(&self, writes: &[BlockBatchWrite]) -> Result<BlockBatchCommit> {
+    fn commit_batch_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+    ) -> Result<BlockBatchCommit> {
         let response = self.transport.call(BlockRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            BlockRequest::CommitBatch {
-                device_id: self.device_id,
+            BlockRequest::LeasedCommitBatch {
+                lease: *lease,
                 durability: crate::api::WriteDurability::Acknowledged,
                 writes: writes.to_vec(),
             },
@@ -179,13 +218,13 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn flush(&self) -> Result<FlushResult> {
+    fn flush_with_writer(&self, lease: &BlockWriterLease) -> Result<FlushResult> {
         let response = self.transport.call(BlockRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            BlockRequest::Flush {
-                device_id: self.device_id,
+            BlockRequest::LeasedFlush {
+                lease: *lease,
                 scope: crate::api::FlushScope::Device,
             },
         ))?;
@@ -195,13 +234,18 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn write_zeroes(&self, offset: u64, len: u64) -> Result<WriteCommit> {
+    fn write_zeroes_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
         let response = self.transport.call(BlockRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            BlockRequest::WriteZeroes {
-                device_id: self.device_id,
+            BlockRequest::LeasedWriteZeroes {
+                lease: *lease,
                 range: ByteRange::new(offset, len),
             },
         ))?;
@@ -211,13 +255,18 @@ impl BlockDevice for LocalBlockDevice {
         }
     }
 
-    fn discard(&self, offset: u64, len: u64) -> Result<WriteCommit> {
+    fn discard_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
         let response = self.transport.call(BlockRequestEnvelope::new(
             self.next_request_id()?,
             self.client_epoch,
             None,
-            BlockRequest::Discard {
-                device_id: self.device_id,
+            BlockRequest::LeasedDiscard {
+                lease: *lease,
                 range: ByteRange::new(offset, len),
             },
         ))?;

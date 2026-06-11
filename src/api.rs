@@ -1,7 +1,7 @@
 use crate::error::{Result, StorageError};
 use crate::id::{
     BlockCount, BlockIndex, CheckpointId, ClientEpoch, CommitSeq, DeviceGeneration, DeviceId,
-    LogicalDeadline, LogicalTime, RequestId,
+    LogicalDeadline, LogicalTime, RequestId, WriterEpoch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -109,6 +109,8 @@ pub enum BlockOperation {
     Create,
     Info,
     Read,
+    AcquireWriter,
+    ReleaseWriter,
     Write,
     CommitBatch,
     Flush,
@@ -297,6 +299,12 @@ pub struct BlockBatchCommit {
     pub durability: WriteDurability,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockWriterLease {
+    pub device_id: DeviceId,
+    pub writer_epoch: WriterEpoch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FlushResult {
     pub device_id: DeviceId,
@@ -365,6 +373,45 @@ pub trait BlockDevice: Send + Sync {
         verification: ReadVerification,
     ) -> Result<()>;
 
+    /// Acquire the active whole-device block writer lease.
+    ///
+    /// Acquiring a new lease fences any previous block writer for this device.
+    /// Implementations must reject later mutating operations that carry an
+    /// older lease.
+    fn acquire_writer(&self) -> Result<BlockWriterLease>;
+
+    /// Release an active whole-device block writer lease.
+    ///
+    /// Releasing the currently active lease is idempotent. A stale lease must
+    /// not regain write authority.
+    fn release_writer(&self, lease: &BlockWriterLease) -> Result<()>;
+
+    /// Commit a caller-owned dirty range batch under an explicit writer lease.
+    fn commit_batch_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+    ) -> Result<BlockBatchCommit>;
+
+    /// Flush acknowledged writes through the lease's current durable boundary.
+    fn flush_with_writer(&self, lease: &BlockWriterLease) -> Result<FlushResult>;
+
+    /// Commit a block-aligned zero-filled range under an explicit writer lease.
+    fn write_zeroes_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit>;
+
+    /// Discard a block-aligned range under an explicit writer lease.
+    fn discard_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit>;
+
     /// Write bytes at a block-aligned offset.
     ///
     /// Success means the whole request is committed atomically from the caller's
@@ -381,7 +428,14 @@ pub trait BlockDevice: Send + Sync {
     /// persist payloads before visible metadata when durability requires it,
     /// and publish one atomic copy-on-write metadata transition for the
     /// collapsed batch. A failed commit must not expose any partial range.
-    fn commit_batch(&self, writes: &[BlockBatchWrite]) -> Result<BlockBatchCommit>;
+    fn commit_batch(&self, writes: &[BlockBatchWrite]) -> Result<BlockBatchCommit> {
+        let lease = self.acquire_writer()?;
+        let commit = self.commit_batch_with_writer(&lease, writes);
+        if commit.is_ok() {
+            self.release_writer(&lease)?;
+        }
+        commit
+    }
 
     /// Write bytes with an explicit payload integrity policy.
     fn write_at_with_integrity(
@@ -421,20 +475,41 @@ pub trait BlockDevice: Send + Sync {
     ///
     /// Success means every acknowledged commit through `durable_through` has
     /// reached the durability level promised by the implementation.
-    fn flush(&self) -> Result<FlushResult>;
+    fn flush(&self) -> Result<FlushResult> {
+        let lease = self.acquire_writer()?;
+        let result = self.flush_with_writer(&lease);
+        if result.is_ok() {
+            self.release_writer(&lease)?;
+        }
+        result
+    }
 
     /// Commit a block-aligned zero-filled range.
     ///
     /// Success must make future reads of the range return zeroes without
     /// exposing a partially updated mapping.
-    fn write_zeroes(&self, offset: u64, len: u64) -> Result<WriteCommit>;
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<WriteCommit> {
+        let lease = self.acquire_writer()?;
+        let commit = self.write_zeroes_with_writer(&lease, offset, len);
+        if commit.is_ok() {
+            self.release_writer(&lease)?;
+        }
+        commit
+    }
 
     /// Discard a block-aligned range.
     ///
     /// Discard changes logical mappings but does not promise immediate physical
     /// reclamation. Future reads of a discarded sparse range must return
     /// zeroes unless a later write covers it.
-    fn discard(&self, offset: u64, len: u64) -> Result<WriteCommit>;
+    fn discard(&self, offset: u64, len: u64) -> Result<WriteCommit> {
+        let lease = self.acquire_writer()?;
+        let commit = self.discard_with_writer(&lease, offset, len);
+        if commit.is_ok() {
+            self.release_writer(&lease)?;
+        }
+        commit
+    }
 
     /// Create a new device head that initially shares this device's roots.
     ///
@@ -487,8 +562,21 @@ pub enum BlockRequest {
         range: ByteRange,
         verification: ReadVerification,
     },
+    AcquireWriter {
+        device_id: DeviceId,
+    },
+    ReleaseWriter {
+        lease: BlockWriterLease,
+    },
     Write {
         device_id: DeviceId,
+        offset: u64,
+        bytes: Vec<u8>,
+        payload_integrity: PayloadIntegrity,
+        durability: WriteDurability,
+    },
+    LeasedWrite {
+        lease: BlockWriterLease,
         offset: u64,
         bytes: Vec<u8>,
         payload_integrity: PayloadIntegrity,
@@ -499,16 +587,33 @@ pub enum BlockRequest {
         writes: Vec<BlockBatchWrite>,
         durability: WriteDurability,
     },
+    LeasedCommitBatch {
+        lease: BlockWriterLease,
+        writes: Vec<BlockBatchWrite>,
+        durability: WriteDurability,
+    },
     Flush {
         device_id: DeviceId,
+        scope: FlushScope,
+    },
+    LeasedFlush {
+        lease: BlockWriterLease,
         scope: FlushScope,
     },
     WriteZeroes {
         device_id: DeviceId,
         range: ByteRange,
     },
+    LeasedWriteZeroes {
+        lease: BlockWriterLease,
+        range: ByteRange,
+    },
     Discard {
         device_id: DeviceId,
+        range: ByteRange,
+    },
+    LeasedDiscard {
+        lease: BlockWriterLease,
         range: ByteRange,
     },
     Fork {
@@ -530,11 +635,18 @@ impl BlockRequest {
             Self::Create { .. } => BlockOperation::Create,
             Self::Info { .. } => BlockOperation::Info,
             Self::Read { .. } => BlockOperation::Read,
+            Self::AcquireWriter { .. } => BlockOperation::AcquireWriter,
+            Self::ReleaseWriter { .. } => BlockOperation::ReleaseWriter,
             Self::Write { .. } => BlockOperation::Write,
+            Self::LeasedWrite { .. } => BlockOperation::Write,
             Self::CommitBatch { .. } => BlockOperation::CommitBatch,
+            Self::LeasedCommitBatch { .. } => BlockOperation::CommitBatch,
             Self::Flush { .. } => BlockOperation::Flush,
+            Self::LeasedFlush { .. } => BlockOperation::Flush,
             Self::WriteZeroes { .. } => BlockOperation::WriteZeroes,
+            Self::LeasedWriteZeroes { .. } => BlockOperation::WriteZeroes,
             Self::Discard { .. } => BlockOperation::Discard,
+            Self::LeasedDiscard { .. } => BlockOperation::Discard,
             Self::Fork { .. } => BlockOperation::Fork,
             Self::Restore { .. } => BlockOperation::Restore,
             Self::Delete { .. } => BlockOperation::Delete,
@@ -545,12 +657,19 @@ impl BlockRequest {
         match self {
             Self::Info { device_id }
             | Self::Read { device_id, .. }
+            | Self::AcquireWriter { device_id }
             | Self::Write { device_id, .. }
             | Self::CommitBatch { device_id, .. }
             | Self::Flush { device_id, .. }
             | Self::WriteZeroes { device_id, .. }
             | Self::Discard { device_id, .. }
             | Self::Delete { device_id } => Some(*device_id),
+            Self::ReleaseWriter { lease }
+            | Self::LeasedWrite { lease, .. }
+            | Self::LeasedCommitBatch { lease, .. }
+            | Self::LeasedFlush { lease, .. }
+            | Self::LeasedWriteZeroes { lease, .. }
+            | Self::LeasedDiscard { lease, .. } => Some(lease.device_id),
             Self::Fork { source, .. } | Self::Restore { source, .. } => Some(*source),
             Self::Create { .. } => None,
         }
@@ -559,18 +678,23 @@ impl BlockRequest {
     pub fn byte_range(&self) -> Result<Option<ByteRange>> {
         match self {
             Self::Read { range, .. }
+            | Self::LeasedWriteZeroes { range, .. }
+            | Self::LeasedDiscard { range, .. }
             | Self::WriteZeroes { range, .. }
             | Self::Discard { range, .. } => Ok(Some(*range)),
-            Self::Write { offset, bytes, .. } => {
+            Self::Write { offset, bytes, .. } | Self::LeasedWrite { offset, bytes, .. } => {
                 let len = u64::try_from(bytes.len()).map_err(|_| {
                     StorageError::invalid_argument("write byte length overflows u64")
                 })?;
                 Ok(Some(ByteRange::new(*offset, len)))
             }
-            Self::CommitBatch { .. } => Ok(None),
+            Self::CommitBatch { .. } | Self::LeasedCommitBatch { .. } => Ok(None),
             Self::Create { .. }
             | Self::Info { .. }
+            | Self::AcquireWriter { .. }
+            | Self::ReleaseWriter { .. }
             | Self::Flush { .. }
+            | Self::LeasedFlush { .. }
             | Self::Fork { .. }
             | Self::Restore { .. }
             | Self::Delete { .. } => Ok(None),
@@ -582,11 +706,18 @@ impl BlockRequest {
             Self::Create { request } => request.validate(),
             Self::Info { .. }
             | Self::Read { .. }
+            | Self::AcquireWriter { .. }
+            | Self::ReleaseWriter { .. }
             | Self::Write { .. }
+            | Self::LeasedWrite { .. }
             | Self::Flush { .. }
+            | Self::LeasedFlush { .. }
             | Self::CommitBatch { .. }
+            | Self::LeasedCommitBatch { .. }
             | Self::WriteZeroes { .. }
+            | Self::LeasedWriteZeroes { .. }
             | Self::Discard { .. }
+            | Self::LeasedDiscard { .. }
             | Self::Fork { .. }
             | Self::Restore { .. }
             | Self::Delete { .. } => Err(StorageError::invalid_argument(
@@ -604,14 +735,17 @@ impl BlockRequest {
             )),
             Self::Read { .. }
             | Self::Write { .. }
+            | Self::LeasedWrite { .. }
             | Self::WriteZeroes { .. }
+            | Self::LeasedWriteZeroes { .. }
+            | Self::LeasedDiscard { .. }
             | Self::Discard { .. } => {
                 if let Some(range) = self.byte_range()? {
                     range.validate_for_device(spec)?;
                 }
                 Ok(())
             }
-            Self::CommitBatch { writes, .. } => {
+            Self::CommitBatch { writes, .. } | Self::LeasedCommitBatch { writes, .. } => {
                 if writes.is_empty() {
                     return Err(StorageError::invalid_argument(
                         "block batch must contain at least one write",
@@ -623,7 +757,10 @@ impl BlockRequest {
                 Ok(())
             }
             Self::Info { .. }
+            | Self::AcquireWriter { .. }
+            | Self::ReleaseWriter { .. }
             | Self::Flush { .. }
+            | Self::LeasedFlush { .. }
             | Self::Fork { .. }
             | Self::Restore { .. }
             | Self::Delete { .. } => Ok(()),
@@ -641,6 +778,8 @@ pub enum BlockResponse {
     Created(DeviceId),
     Info(DeviceInfo),
     Read(ReadResponse),
+    WriterAcquired(BlockWriterLease),
+    WriterReleased(BlockWriterLease),
     Write(WriteCommit),
     BatchCommitted(BlockBatchCommit),
     Flush(FlushResult),

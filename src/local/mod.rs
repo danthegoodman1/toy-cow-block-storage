@@ -22,9 +22,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::api::{
     BlockBatchCommit, BlockBatchWrite, BlockClient, BlockDevice, BlockRange, BlockRequest,
     BlockRequestEnvelope, BlockResponse, BlockResponseEnvelope, BlockServer, BlockTransport,
-    ByteRange, CreateDeviceRequest, DeleteResult, DeviceInfo, DeviceSpec, FlushResult, FlushScope,
-    ForkRequest, PayloadIntegrity, ReadResponse, ReadVerification, RestorePoint, WriteCommit,
-    WriteDurability,
+    BlockWriterLease, ByteRange, CreateDeviceRequest, DeleteResult, DeviceInfo, DeviceSpec,
+    FlushResult, FlushScope, ForkRequest, PayloadIntegrity, ReadResponse, ReadVerification,
+    RestorePoint, WriteCommit, WriteDurability,
 };
 use crate::error::{Result, StorageError};
 use crate::extent::{
@@ -81,6 +81,7 @@ pub use txn_metadata::{
 include!("durable/paths.rs");
 include!("durable/policy.rs");
 include!("durable/block_delta.rs");
+include!("durable/block_journal.rs");
 include!("durable/native_file_delta.rs");
 include!("durable/sqlite.rs");
 include!("durable/data_log.rs");

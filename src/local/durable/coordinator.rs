@@ -8,6 +8,7 @@ const BLOCK_DELTA_PARALLEL_COMMIT_MIN_BYTES: u64 = 16 * 1024 * 1024;
 pub struct DurableCoordinator {
     local: LocalCoordinator,
     durable: DurableSqliteStore,
+    block_journal: Arc<BlockJournalOverlay>,
     persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
     pending_block_deltas: Arc<Mutex<Vec<BlockDeltaCommit>>>,
     pending_native_file_deltas: Arc<Mutex<Vec<NativeFileDeltaCommit>>>,
@@ -452,6 +453,7 @@ impl DurableCoordinator {
         let local = durable
             .load(config)?
             .unwrap_or(LocalCoordinator::with_storage_nodes(config, storage_nodes)?);
+        let block_journal = Arc::new(durable.load_block_journal_overlay(&local)?);
         let append_stream_incarnation = durable.append_stream_incarnation()?;
         local
             .metadata
@@ -463,6 +465,7 @@ impl DurableCoordinator {
         let mut store = Self {
             local,
             durable,
+            block_journal,
             persisted_segments: Arc::new(Mutex::new(persisted_segments)),
             pending_block_deltas: Arc::new(Mutex::new(Vec::new())),
             pending_native_file_deltas: Arc::new(Mutex::new(Vec::new())),
@@ -3184,6 +3187,170 @@ impl DurableCoordinator {
         })
     }
 
+    pub fn acquire_block_writer(&self, device_id: DeviceId) -> Result<BlockWriterLease> {
+        let lease = self.local.acquire_block_writer(device_id)?;
+        let profile = self.durable.append_block_journal_records(&[BlockJournalRecord::Lease {
+            device_id,
+            writer_epoch: lease.writer_epoch,
+        }])?;
+        self.block_journal
+            .set_writer_epoch(device_id, lease.writer_epoch)?;
+        self.record_persist_profile(DurablePersistProfile {
+            block_journal_encode_nanos: profile.encode_nanos,
+            block_journal_open_nanos: profile.open_nanos,
+            block_journal_write_nanos: profile.write_nanos,
+            block_journal_sync_nanos: profile.sync_nanos,
+            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
+            block_journal_record_count: profile.record_count,
+            block_journal_frame_bytes: profile.frame_bytes,
+            block_journal_created: profile.created,
+            ..DurablePersistProfile::default()
+        })?;
+        Ok(lease)
+    }
+
+    pub fn release_block_writer(&self, lease: &BlockWriterLease) -> Result<()> {
+        self.local.release_block_writer(lease)
+    }
+
+    fn should_use_block_journal_fast_path(
+        &self,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<bool> {
+        if !matches!(durability, crate::api::WriteDurability::Flushed) {
+            return Ok(false);
+        }
+        let total_bytes = writes.iter().try_fold(0_u64, |total, write| {
+            total
+                .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
+                    StorageError::invalid_argument("block batch byte length overflows u64")
+                })?)
+                .ok_or_else(|| StorageError::invalid_argument("block batch byte length overflows"))
+        })?;
+        Ok(total_bytes <= BLOCK_JOURNAL_INLINE_MAX_BYTES)
+    }
+
+    fn commit_block_journal_batch_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<BlockBatchCommit> {
+        self.local.validate_block_writer(lease)?;
+        if !self.should_use_block_journal_fast_path(writes, durability)? {
+            return self.commit_block_batch(lease.device_id, writes, durability);
+        }
+        let total_started = Instant::now();
+        let info = self.local.metadata.device_info(lease.device_id)?;
+        let collapsed =
+            collapse_block_batch_writes(writes, &info.spec, BLOCK_JOURNAL_INLINE_MAX_BYTES)?;
+        let commit_seq = self
+            .local
+            .metadata
+            .reserve_block_journal_commit_seq(lease.device_id)?;
+        let mut entries = Vec::with_capacity(collapsed.len());
+        let mut committed_bytes = 0_u64;
+        for write in collapsed {
+            let len = u64::try_from(write.bytes.len()).map_err(|_| {
+                StorageError::invalid_argument("block journal payload length overflows u64")
+            })?;
+            committed_bytes = committed_bytes
+                .checked_add(len)
+                .ok_or_else(|| StorageError::invalid_argument("block journal bytes overflow"))?;
+            entries.push(BlockJournalEntry::Write {
+                range: ByteRange::new(write.offset, len),
+                payload_integrity: write.payload_integrity,
+                bytes: write.bytes,
+            });
+        }
+        let commit = BlockJournalCommit {
+            device_id: lease.device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq,
+            write_count: usize_to_u64(writes.len()),
+            collapsed_range_count: usize_to_u64(entries.len()),
+            committed_bytes,
+            entries,
+        };
+        commit.validate(&info.spec)?;
+        let records = [
+            BlockJournalRecord::Write(commit.clone()),
+            BlockJournalRecord::Flush {
+                device_id: lease.device_id,
+                writer_epoch: lease.writer_epoch,
+                durable_through: commit_seq,
+            },
+        ];
+        let profile = self.durable.append_block_journal_records(&records)?;
+        self.local
+            .metadata
+            .publish_reserved_block_journal_commit(lease.device_id, commit_seq)?;
+        self.block_journal.apply_commit(&commit)?;
+        self.block_journal
+            .mark_durable(lease.device_id, lease.writer_epoch, commit_seq)?;
+        self.record_persist_profile(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            visible_metadata_write_bytes: profile.frame_bytes,
+            block_journal_encode_nanos: profile.encode_nanos,
+            block_journal_open_nanos: profile.open_nanos,
+            block_journal_write_nanos: profile.write_nanos,
+            block_journal_sync_nanos: profile.sync_nanos,
+            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
+            block_journal_record_count: profile.record_count,
+            block_journal_frame_bytes: profile.frame_bytes,
+            block_journal_created: profile.created,
+            block_journal_flush_group_size: 1,
+            durable_commit_high_water: commit_seq.raw(),
+            ..DurablePersistProfile::default()
+        })?;
+        Ok(BlockBatchCommit {
+            device_id: lease.device_id,
+            commit_seq,
+            write_count: commit.write_count,
+            collapsed_range_count: commit.collapsed_range_count,
+            committed_bytes,
+            durability,
+        })
+    }
+
+    pub fn write_device_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<WriteCommit> {
+        self.local.validate_block_writer(lease)?;
+        let len = u64::try_from(data.len())
+            .map_err(|_| StorageError::invalid_argument("write byte length overflows u64"))?;
+        if data.is_empty() {
+            return self.write_device_with_integrity(
+                lease.device_id,
+                offset,
+                data,
+                durability,
+                payload_integrity,
+            );
+        }
+        let commit = self.commit_block_batch_with_writer(
+            lease,
+            &[BlockBatchWrite {
+                offset,
+                bytes: data.to_vec(),
+                payload_integrity,
+            }],
+            durability,
+        )?;
+        Ok(WriteCommit {
+            device_id: commit.device_id,
+            commit_seq: commit.commit_seq,
+            range: ByteRange::new(offset, len),
+            durability: commit.durability,
+        })
+    }
+
     pub fn commit_block_batch(
         &self,
         device_id: DeviceId,
@@ -3247,6 +3414,19 @@ impl DurableCoordinator {
         result
     }
 
+    pub fn commit_block_batch_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<BlockBatchCommit> {
+        self.local.validate_block_writer(lease)?;
+        if self.should_use_block_journal_fast_path(writes, durability)? {
+            return self.commit_block_journal_batch_with_writer(lease, writes, durability);
+        }
+        self.commit_block_batch(lease.device_id, writes, durability)
+    }
+
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
         self.read_device_with_verification(device_id, range, buf, ReadVerification::Default)
     }
@@ -3264,11 +3444,15 @@ impl DurableCoordinator {
             MetadataReadService::resolve_block_read(&self.local, device_id, range)?;
         let metadata_resolve_nanos = duration_nanos_u64(resolve_started.elapsed());
         let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
+        let overlay_nanos =
+            self.block_journal
+                .apply_read_overlay(device_id, range, verification, buf)?;
         profile.metadata_resolve_nanos = metadata_resolve_nanos;
         profile.metadata_lock_wait_nanos = resolve_profile.metadata_lock_wait_nanos;
         profile.metadata_tree_walk_nanos = resolve_profile.metadata_tree_walk_nanos;
         profile.metadata_placement_lookup_nanos =
             resolve_profile.metadata_placement_lookup_nanos;
+        profile.block_journal_overlay_read_nanos = overlay_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.record_read_profile(profile)
     }
@@ -3294,6 +3478,16 @@ impl DurableCoordinator {
             self.after_successful_write(admission);
         }
         result
+    }
+
+    pub fn write_zeroes_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
+        self.local.validate_block_writer(lease)?;
+        self.write_zeroes(lease.device_id, offset, len)
     }
 
     pub fn discard_device(
@@ -3322,6 +3516,16 @@ impl DurableCoordinator {
             self.after_successful_write(admission);
         }
         result
+    }
+
+    pub fn discard_device_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
+        self.local.validate_block_writer(lease)?;
+        self.discard_device(lease.device_id, offset, len)
     }
 
     pub fn commit_file_batch(
@@ -4078,6 +4282,11 @@ impl DurableCoordinator {
             device_id,
             durable_through: info.latest_commit,
         })
+    }
+
+    pub fn flush_device_with_writer(&self, lease: &BlockWriterLease) -> Result<FlushResult> {
+        self.local.validate_block_writer(lease)?;
+        self.flush_device(lease.device_id)
     }
 
     pub fn flush_file(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FlushResult> {

@@ -7,6 +7,7 @@ pub(super) struct DurableSqliteStore {
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     append_log_service: Arc<StorageNodeAppendLogService>,
+    block_journal_lock: Arc<Mutex<()>>,
     native_publish_journal_lock: Arc<Mutex<()>>,
     append_visible_publish_journal_lock: Arc<Mutex<()>>,
     append_visible_publish_journal_lane_locks: Arc<Vec<Mutex<()>>>,
@@ -84,6 +85,16 @@ pub struct DurablePersistProfile {
     pub append_visible_journal_record_count: u64,
     pub append_visible_journal_frame_bytes: u64,
     pub append_visible_journal_created: u64,
+    pub block_journal_encode_nanos: u64,
+    pub block_journal_open_nanos: u64,
+    pub block_journal_write_nanos: u64,
+    pub block_journal_sync_nanos: u64,
+    pub block_journal_dir_sync_nanos: u64,
+    pub block_journal_record_count: u64,
+    pub block_journal_frame_bytes: u64,
+    pub block_journal_created: u64,
+    pub block_journal_flush_group_size: u64,
+    pub block_journal_overlay_read_nanos: u64,
     pub new_segment_count: u64,
     pub new_segment_bytes: u64,
     pub touched_node_count: u64,
@@ -1904,6 +1915,38 @@ fn load_native_publish_journal_commits_since(
     .collect())
 }
 
+pub(super) fn append_block_journal_records(
+    path: &Path,
+    records: &[BlockJournalRecord],
+) -> Result<AppendVisibleJournalProfile> {
+    if records.is_empty() {
+        return Err(StorageError::invalid_argument(
+            "block journal batch must include records",
+        ));
+    }
+    let records = records.to_vec();
+    let mut profile = append_durable_journal_record(
+        path,
+        &records,
+        &BLOCK_JOURNAL_MAGIC,
+        "block journal record exceeds durable payload limit",
+    )?;
+    profile.record_count = usize_to_u64(records.len());
+    Ok(profile)
+}
+
+pub(super) fn load_block_journal_records(path: &Path) -> Result<Vec<BlockJournalRecord>> {
+    let batches = load_durable_journal_records::<Vec<BlockJournalRecord>>(
+        path,
+        &BLOCK_JOURNAL_MAGIC,
+        "block journal has invalid frame magic",
+        "block journal frame exceeds durable payload limit",
+        "block journal frame length overflows",
+        "block journal frame checksum mismatch",
+    )?;
+    Ok(batches.into_iter().flatten().collect())
+}
+
 pub(super) fn append_append_visible_publish_journal_records(
     path: &Path,
     records: &[AppendVisiblePublish],
@@ -2274,6 +2317,7 @@ impl DurableSqliteStore {
             append_ingest_data_log_policy,
             data_log_allocation_locks,
             append_log_service,
+            block_journal_lock: Arc::new(Mutex::new(())),
             native_publish_journal_lock: Arc::new(Mutex::new(())),
             append_visible_publish_journal_lock: Arc::new(Mutex::new(())),
             append_visible_publish_journal_lane_locks: Arc::new(
@@ -2663,6 +2707,24 @@ impl DurableSqliteStore {
     fn prune_native_publish_journal_through(&self, commit_seq: CommitSeq) -> Result<()> {
         let _journal_guard = lock(&self.native_publish_journal_lock)?;
         prune_native_publish_journal_through(&self.paths.native_publish_journal, commit_seq)
+    }
+
+    fn append_block_journal_records(
+        &self,
+        records: &[BlockJournalRecord],
+    ) -> Result<AppendVisibleJournalProfile> {
+        let _journal_guard = lock(&self.block_journal_lock)?;
+        append_block_journal_records(&self.paths.block_journal, records)
+    }
+
+    fn block_journal_records(&self) -> Result<Vec<BlockJournalRecord>> {
+        let _journal_guard = lock(&self.block_journal_lock)?;
+        load_block_journal_records(&self.paths.block_journal)
+    }
+
+    #[cfg(test)]
+    pub(super) fn block_journal_path(&self) -> PathBuf {
+        self.paths.block_journal.clone()
     }
 
     #[cfg(test)]

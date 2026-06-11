@@ -2594,6 +2594,117 @@ fn durable_block_batch_commit_survives_reopen_and_pitr() {
 }
 
 #[test]
+fn durable_block_journal_flushed_write_replays_after_reopen() {
+    let root = durable_temp_dir("block-journal-restart");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("journal-block".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let commit = store
+        .write_device_with_writer(
+            &lease,
+            4 * 4096,
+            &repeated_blocks(1, 77),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert_eq!(commit.durability, WriteDurability::Flushed);
+    assert_eq!(commit.range, ByteRange::new(4 * 4096, 4096));
+
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(profiles.iter().any(|profile| {
+        profile.block_journal_record_count >= 2
+            && profile.block_journal_sync_nanos > 0
+            && profile.root_sqlite_commit_nanos == 0
+            && profile.data_log_write_bytes == 0
+    }));
+    assert!(!store.durable.has_block_delta_commits().unwrap());
+
+    let mut live = vec![0; 4096];
+    store
+        .read_device(device_id, ByteRange::new(4 * 4096, 4096), &mut live)
+        .unwrap();
+    assert_eq!(live, repeated_blocks(1, 77));
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let fresh = reopened.acquire_block_writer(device_id).unwrap();
+    assert!(matches!(
+        reopened.write_device_with_writer(
+            &lease,
+            4 * 4096,
+            &repeated_blocks(1, 88),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Conflict { .. })
+    ));
+    reopened.release_block_writer(&fresh).unwrap();
+
+    let mut reopened_bytes = vec![0; 4096];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(4 * 4096, 4096),
+            &mut reopened_bytes,
+        )
+        .unwrap();
+    assert_eq!(reopened_bytes, repeated_blocks(1, 77));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_ignores_incomplete_tail_after_reopen() {
+    let root = durable_temp_dir("block-journal-tail");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("journal-tail".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 31),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let journal = store.durable.block_journal_path();
+    let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+    file.write_all(b"incomplete").unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut actual = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut actual)
+        .unwrap();
+    assert_eq!(actual, repeated_blocks(1, 31));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_multi_node_reopens_block_and_native_placements() {
     let root = durable_temp_dir("multi-node-restart");
     let cfg = config();
@@ -14035,6 +14146,104 @@ fn discard_removes_mapping_and_write_zeroes_reads_as_zeroes() {
         &actual[6 * 4096..8 * 4096],
         repeated_blocks(2, 8).as_slice()
     );
+}
+
+#[test]
+fn block_writer_lease_fences_stale_coordinator_writes() {
+    let store = LocalCoordinator::with_config(config()).unwrap();
+    let device = create_local_device(&store, 8);
+    let stale = store.acquire_block_writer(device.device_id()).unwrap();
+    let fresh = store.acquire_block_writer(device.device_id()).unwrap();
+
+    let stale_result = store.commit_block_batch_with_writer(
+        &stale,
+        &[BlockBatchWrite {
+            offset: 0,
+            bytes: repeated_blocks(1, 3),
+            payload_integrity: PayloadIntegrity::Verified,
+        }],
+        WriteDurability::Acknowledged,
+    );
+    assert!(matches!(stale_result, Err(StorageError::Conflict { .. })));
+
+    let commit = store
+        .commit_block_batch_with_writer(
+            &fresh,
+            &[BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(1, 4),
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    assert_eq!(commit.write_count, 1);
+
+    let mut actual = vec![0; 4096];
+    device.read_at(0, &mut actual).unwrap();
+    assert_eq!(actual, repeated_blocks(1, 4));
+}
+
+#[test]
+fn block_writer_release_is_idempotent_until_next_acquire() {
+    let store = LocalCoordinator::with_config(config()).unwrap();
+    let device = create_local_device(&store, 8);
+    let released = store.acquire_block_writer(device.device_id()).unwrap();
+
+    store.release_block_writer(&released).unwrap();
+    store.release_block_writer(&released).unwrap();
+
+    let fresh = store.acquire_block_writer(device.device_id()).unwrap();
+    assert!(matches!(
+        store.release_block_writer(&released),
+        Err(StorageError::Conflict { .. })
+    ));
+    store.release_block_writer(&fresh).unwrap();
+}
+
+#[test]
+fn block_writer_lease_fences_stale_client_requests() {
+    let store = LocalCoordinator::with_config(config()).unwrap();
+    let device = create_local_device(&store, 8);
+    let stale = device.acquire_writer().unwrap();
+    let fresh = device.acquire_writer().unwrap();
+
+    let stale_result = device.commit_batch_with_writer(
+        &stale,
+        &[BlockBatchWrite {
+            offset: 0,
+            bytes: repeated_blocks(1, 5),
+            payload_integrity: PayloadIntegrity::Verified,
+        }],
+    );
+    assert!(matches!(stale_result, Err(StorageError::Conflict { .. })));
+
+    device
+        .commit_batch_with_writer(
+            &fresh,
+            &[BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(1, 6),
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+        )
+        .unwrap();
+    device.write_zeroes_with_writer(&fresh, 4096, 4096).unwrap();
+    device.discard_with_writer(&fresh, 2 * 4096, 4096).unwrap();
+    device.flush_with_writer(&fresh).unwrap();
+
+    assert!(matches!(
+        device.write_zeroes_with_writer(&stale, 0, 4096),
+        Err(StorageError::Conflict { .. })
+    ));
+    assert!(matches!(
+        device.discard_with_writer(&stale, 0, 4096),
+        Err(StorageError::Conflict { .. })
+    ));
+    assert!(matches!(
+        device.flush_with_writer(&stale),
+        Err(StorageError::Conflict { .. })
+    ));
 }
 
 #[test]

@@ -147,14 +147,24 @@ deterministic tests in the same change.
 Durable providers store checkpointed block heads as a stable device manifest
 plus one mutable row per shard head. Flushed block writes do not need to fold
 into those rows before returning: they may be recorded as ordered durable block
-delta rows that reference already-durable segment payloads. Reopen reconstructs
-the logical `DeviceHead` by loading the checkpoint rows and replaying retained
-block deltas above the checkpoint high-water. Checkpointing folds those deltas
-into immutable CoW shard roots and prunes covered delta rows. This keeps
-`flush_device` as a replayable durability boundary while preserving CoW shard
-roots as the compact long-term representation for fork, PITR, validation, and
-GC. Durable metadata GC folds outstanding block deltas before sweeping so the
-delta replay chain never references segment payloads that storage-node
+delta rows that reference already-durable segment payloads. The durable provider
+also has a block-native journal fast path for small flushed writes under an
+explicit whole-device writer lease. A journal batch contains lease, write, and
+flush-marker records in a framed append-only file. A flushed journal write
+returns only after the inline payload bytes and the flush marker covering that
+commit sequence are durable. Reopen loads the compact shard roots, replays
+retained SQLite block deltas, then rebuilds the provider-private block overlay
+from journal writes covered by durable flush markers. Reads resolve the compact
+tree and then apply the journal overlay, so read-after-write observes
+journal-backed writes without forcing immediate tree path-copy or node-catalog
+publication. SQLite block-delta checkpointing and maintenance fold durable
+deltas into immutable CoW shard roots before pruning covered rows. Journal
+records remain retained replay roots until a materialization pass folds them
+into the CoW trees and proves no fork/PITR window needs the journal payloads.
+This keeps `flush_device` as a replayable durability boundary while preserving
+CoW shard roots as the compact long-term representation for fork, PITR,
+validation, and GC. Durable metadata GC folds outstanding block deltas before
+sweeping so replay chains never reference segment payloads that storage-node
 compaction has reclaimed.
 
 The logical state of a live native file is:
@@ -380,6 +390,9 @@ Public guarantees:
 
 - `read_at` and `write_at` require block-aligned offsets and lengths.
 - Zero-length aligned ranges are valid no-op requests.
+- Mutating block operations may be issued under a `BlockWriterLease`. Durable
+  providers persist lease epochs; acquiring a newer lease fences stale
+  whole-device writers. Native file writer epochs remain separate.
 - A successful `write_at` is atomic at request granularity from the caller's
   perspective.
 - Read-after-successful-write on the same device observes the write.

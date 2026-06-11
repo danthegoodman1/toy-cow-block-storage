@@ -923,6 +923,65 @@ impl InMemoryMetadataPlane {
         Ok(())
     }
 
+    fn reserve_block_journal_commit_seq(&self, device_id: DeviceId) -> Result<CommitSeq> {
+        let mut inner = lock(&self.inner)?;
+        inner
+            .device_heads
+            .get(&device_id)
+            .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
+        inner.alloc_commit_seq()
+    }
+
+    fn publish_reserved_block_journal_commit(
+        &self,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+    ) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        let current = inner
+            .device_heads
+            .get(&device_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
+        if commit_seq.raw() >= inner.next_commit_seq {
+            return Err(StorageError::conflict(
+                "reserved block journal commit sequence was not allocated",
+            ));
+        }
+        if commit_seq.raw() <= current.latest_commit.raw() {
+            return Err(StorageError::conflict(
+                "reserved block journal commit sequence is stale",
+            ));
+        }
+        let mut next = current;
+        next.generation = Self::next_generation(next.generation)?;
+        next.latest_commit = commit_seq;
+        inner.device_heads.insert(device_id, next);
+        Ok(())
+    }
+
+    fn replay_block_journal_commit(&self, device_id: DeviceId, commit_seq: CommitSeq) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        let current = inner
+            .device_heads
+            .get(&device_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
+        if commit_seq.raw() >= inner.next_commit_seq {
+            inner.next_commit_seq = commit_seq.raw().checked_add(1).ok_or_else(|| {
+                StorageError::conflict("block journal commit sequence overflows")
+            })?;
+        }
+        if commit_seq.raw() <= current.latest_commit.raw() {
+            return Ok(());
+        }
+        let mut next = current;
+        next.generation = Self::next_generation(next.generation)?;
+        next.latest_commit = commit_seq;
+        inner.device_heads.insert(device_id, next);
+        Ok(())
+    }
+
     pub fn allocate_metadata_node(
         &self,
         covered_range: crate::api::BlockRange,

@@ -106,6 +106,13 @@ impl BlockServer for LocalBlockServer {
                     )?;
                     Ok(BlockResponse::Read(ReadResponse { bytes }))
                 }
+                BlockRequest::AcquireWriter { device_id } => Ok(BlockResponse::WriterAcquired(
+                    self.store.acquire_block_writer(device_id)?,
+                )),
+                BlockRequest::ReleaseWriter { lease } => {
+                    self.store.release_block_writer(&lease)?;
+                    Ok(BlockResponse::WriterReleased(lease))
+                }
                 BlockRequest::Write {
                     device_id,
                     offset,
@@ -121,6 +128,19 @@ impl BlockServer for LocalBlockServer {
                         payload_integrity,
                     )?,
                 )),
+                BlockRequest::LeasedWrite {
+                    lease,
+                    offset,
+                    bytes,
+                    payload_integrity,
+                    durability,
+                } => Ok(BlockResponse::Write(self.store.write_device_with_writer(
+                    &lease,
+                    offset,
+                    &bytes,
+                    durability,
+                    payload_integrity,
+                )?)),
                 BlockRequest::CommitBatch {
                     device_id,
                     writes,
@@ -128,13 +148,29 @@ impl BlockServer for LocalBlockServer {
                 } => Ok(BlockResponse::BatchCommitted(
                     self.store.commit_block_batch(device_id, &writes, durability)?,
                 )),
+                BlockRequest::LeasedCommitBatch {
+                    lease,
+                    writes,
+                    durability,
+                } => Ok(BlockResponse::BatchCommitted(
+                    self.store
+                        .commit_block_batch_with_writer(&lease, &writes, durability)?,
+                )),
                 BlockRequest::WriteZeroes { device_id, range } => Ok(BlockResponse::Write(
                     self.store
                         .write_zeroes(device_id, range.offset, range.len)?,
                 )),
+                BlockRequest::LeasedWriteZeroes { lease, range } => Ok(BlockResponse::Write(
+                    self.store
+                        .write_zeroes_with_writer(&lease, range.offset, range.len)?,
+                )),
                 BlockRequest::Discard { device_id, range } => Ok(BlockResponse::Write(
                     self.store
                         .discard_device(device_id, range.offset, range.len)?,
+                )),
+                BlockRequest::LeasedDiscard { lease, range } => Ok(BlockResponse::Write(
+                    self.store
+                        .discard_device_with_writer(&lease, range.offset, range.len)?,
                 )),
                 BlockRequest::Flush { device_id, .. } => {
                     let info = self.store.metadata.device_info(device_id)?;
@@ -143,6 +179,9 @@ impl BlockServer for LocalBlockServer {
                         durable_through: info.latest_commit,
                     }))
                 }
+                BlockRequest::LeasedFlush { lease, .. } => Ok(BlockResponse::Flush(
+                    self.store.flush_device_with_writer(&lease)?,
+                )),
                 BlockRequest::Fork { source, request } => Ok(BlockResponse::Forked(
                     self.store.fork_device(source, request)?,
                 )),

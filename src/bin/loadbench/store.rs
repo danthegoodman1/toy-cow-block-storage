@@ -1,7 +1,13 @@
 #[derive(Clone)]
 enum BenchStore {
-    Local(Arc<LocalCoordinator>),
-    Durable(Arc<DurableCoordinator>),
+    Local {
+        store: Arc<LocalCoordinator>,
+        block_leases: Arc<Mutex<BTreeMap<DeviceId, BlockWriterLease>>>,
+    },
+    Durable {
+        store: Arc<DurableCoordinator>,
+        block_leases: Arc<Mutex<BTreeMap<DeviceId, BlockWriterLease>>>,
+    },
     Txn(Arc<TxnBlockCoordinator>),
 }
 
@@ -23,7 +29,10 @@ impl BenchStore {
                 if args.native_file_batch_commit_profile_csv.is_some() {
                     store.enable_native_file_batch_profiling(DEFAULT_PROFILE_CAPACITY)?;
                 }
-                Ok(Self::Local(store))
+                Ok(Self::Local {
+                    store,
+                    block_leases: Arc::new(Mutex::new(BTreeMap::new())),
+                })
             }
             ProviderKind::TxnSerial => {
                 let store = Arc::new(TxnBlockCoordinator::with_storage_nodes(
@@ -86,29 +95,54 @@ impl BenchStore {
                 if args.native_file_batch_commit_profile_csv.is_some() {
                     store.enable_native_file_batch_profiling(DEFAULT_PROFILE_CAPACITY)?;
                 }
-                Ok(Self::Durable(store))
+                Ok(Self::Durable {
+                    store,
+                    block_leases: Arc::new(Mutex::new(BTreeMap::new())),
+                })
             }
         }
     }
 
     fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
         match self {
-            Self::Local(store) => store
-                .metadata()
-                .create_device(MetadataCreateDeviceRequest::from(request))
-                .map(|head| head.device_id),
-            Self::Durable(store) => store.create_device(request),
+            Self::Local {
+                store,
+                block_leases,
+            } => {
+                let device_id = store
+                    .metadata()
+                    .create_device(MetadataCreateDeviceRequest::from(request))
+                    .map(|head| head.device_id)?;
+                let lease = store.acquire_block_writer(device_id)?;
+                block_leases
+                    .lock()
+                    .map_err(|_| StorageError::unavailable("block lease cache poisoned"))?
+                    .insert(device_id, lease);
+                Ok(device_id)
+            }
+            Self::Durable {
+                store,
+                block_leases,
+            } => {
+                let device_id = store.create_device(request)?;
+                let lease = store.acquire_block_writer(device_id)?;
+                block_leases
+                    .lock()
+                    .map_err(|_| StorageError::unavailable("block lease cache poisoned"))?
+                    .insert(device_id, lease);
+                Ok(device_id)
+            }
             Self::Txn(store) => store.create_device(request),
         }
     }
 
     fn create_keyspace(&self, request: CreateKeyspaceRequest) -> Result<KeyspaceId> {
         match self {
-            Self::Local(store) => store
+            Self::Local { store, .. } => store
                 .metadata()
                 .create_keyspace(MetadataCreateKeyspaceRequest { request })
                 .map(|head| head.keyspace_id),
-            Self::Durable(store) => store.create_keyspace(request),
+            Self::Durable { store, .. } => store.create_keyspace(request),
             Self::Txn(_) => Err(StorageError::unsupported(
                 "txn metadata provider is block-only in loadbench",
             )),
@@ -117,17 +151,33 @@ impl BenchStore {
 
     fn create_file(&self, keyspace_id: KeyspaceId, request: CreateFileRequest) -> Result<FileId> {
         match self {
-            Self::Local(store) => store
+            Self::Local { store, .. } => store
                 .metadata()
                 .create_file(MetadataCreateFileRequest {
                     keyspace_id,
                     request,
                 })
                 .map(|head| head.file_id),
-            Self::Durable(store) => store.create_file(keyspace_id, request),
+            Self::Durable { store, .. } => store.create_file(keyspace_id, request),
             Self::Txn(_) => Err(StorageError::unsupported(
                 "txn metadata provider is block-only in loadbench",
             )),
+        }
+    }
+
+    fn block_lease(&self, device_id: DeviceId) -> Result<Option<BlockWriterLease>> {
+        match self {
+            Self::Local { block_leases, .. } | Self::Durable { block_leases, .. } => {
+                Ok(Some(
+                    block_leases
+                        .lock()
+                        .map_err(|_| StorageError::unavailable("block lease cache poisoned"))?
+                        .get(&device_id)
+                        .copied()
+                        .ok_or_else(|| StorageError::corrupt("missing block writer lease"))?,
+                ))
+            }
+            Self::Txn(_) => Ok(None),
         }
     }
 
@@ -140,20 +190,18 @@ impl BenchStore {
         payload_integrity: PayloadIntegrity,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => store.write_device_with_integrity(
-                device_id,
-                offset,
-                data,
-                durability,
-                payload_integrity,
-            ),
-            Self::Durable(store) => store.write_device_with_integrity(
-                device_id,
-                offset,
-                data,
-                durability,
-                payload_integrity,
-            ),
+            Self::Local { store, .. } => {
+                let lease = self
+                    .block_lease(device_id)?
+                    .ok_or_else(|| StorageError::corrupt("missing block writer lease"))?;
+                store.write_device_with_writer(&lease, offset, data, durability, payload_integrity)
+            }
+            Self::Durable { store, .. } => {
+                let lease = self
+                    .block_lease(device_id)?
+                    .ok_or_else(|| StorageError::corrupt("missing block writer lease"))?;
+                store.write_device_with_writer(&lease, offset, data, durability, payload_integrity)
+            }
             Self::Txn(store) => store.write_device_with_integrity(
                 device_id,
                 offset,
@@ -172,8 +220,18 @@ impl BenchStore {
         durability: WriteDurability,
     ) -> Result<toy_cow_block_storage::BlockBatchCommit> {
         match self {
-            Self::Local(store) => store.commit_block_batch(device_id, writes, durability),
-            Self::Durable(store) => store.commit_block_batch(device_id, writes, durability),
+            Self::Local { store, .. } => {
+                let lease = self
+                    .block_lease(device_id)?
+                    .ok_or_else(|| StorageError::corrupt("missing block writer lease"))?;
+                store.commit_block_batch_with_writer(&lease, writes, durability)
+            }
+            Self::Durable { store, .. } => {
+                let lease = self
+                    .block_lease(device_id)?
+                    .ok_or_else(|| StorageError::corrupt("missing block writer lease"))?;
+                store.commit_block_batch_with_writer(&lease, writes, durability)
+            }
             Self::Txn(_) => Err(StorageError::unsupported(
                 "txn metadata provider does not implement block batch loadbench workloads",
             )),
@@ -188,10 +246,10 @@ impl BenchStore {
         verification: ReadVerification,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => {
+            Self::Local { store, .. } => {
                 store.read_device_with_verification(device_id, range, buf, verification)
             }
-            Self::Durable(store) => {
+            Self::Durable { store, .. } => {
                 store.read_device_with_verification(device_id, range, buf, verification)
             }
             Self::Txn(store) => {
@@ -202,14 +260,18 @@ impl BenchStore {
 
     fn flush_device(&self, device_id: DeviceId) -> Result<FlushResult> {
         match self {
-            Self::Local(store) => {
-                let info = store.metadata().device_info(device_id)?;
-                Ok(FlushResult {
-                    device_id,
-                    durable_through: info.latest_commit,
-                })
+            Self::Local { store, .. } => {
+                let lease = self
+                    .block_lease(device_id)?
+                    .ok_or_else(|| StorageError::corrupt("missing block writer lease"))?;
+                store.flush_device_with_writer(&lease)
             }
-            Self::Durable(store) => store.flush_device(device_id),
+            Self::Durable { store, .. } => {
+                let lease = self
+                    .block_lease(device_id)?
+                    .ok_or_else(|| StorageError::corrupt("missing block writer lease"))?;
+                store.flush_device_with_writer(&lease)
+            }
             Self::Txn(store) => store.flush_device(device_id),
         }
     }
@@ -223,14 +285,14 @@ impl BenchStore {
         payload_integrity: PayloadIntegrity,
     ) -> Result<FileWriteCommit> {
         match self {
-            Self::Local(store) => store.commit_file_batch_with_integrity(
+            Self::Local { store, .. } => store.commit_file_batch_with_integrity(
                 keyspace_id,
                 file_id,
                 writes,
                 durability,
                 payload_integrity,
             ),
-            Self::Durable(store) => store.commit_file_batch_with_integrity(
+            Self::Durable { store, .. } => store.commit_file_batch_with_integrity(
                 keyspace_id,
                 file_id,
                 writes,
@@ -245,8 +307,8 @@ impl BenchStore {
 
     fn open_append_stream(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<AppendStream> {
         match self {
-            Self::Local(store) => store.open_append_stream(keyspace_id, file_id),
-            Self::Durable(store) => store.open_append_stream(keyspace_id, file_id),
+            Self::Local { store, .. } => store.open_append_stream(keyspace_id, file_id),
+            Self::Durable { store, .. } => store.open_append_stream(keyspace_id, file_id),
             Self::Txn(_) => Err(StorageError::unsupported(
                 "txn metadata provider is block-only in loadbench",
             )),
@@ -274,10 +336,10 @@ impl BenchStore {
         payload_integrity: PayloadIntegrity,
     ) -> Result<AppendTicket> {
         match self {
-            Self::Local(store) => {
+            Self::Local { store, .. } => {
                 store.append_stream_with_integrity(stream, data, durability, payload_integrity)
             }
-            Self::Durable(store) => {
+            Self::Durable { store, .. } => {
                 store.append_stream_with_integrity(stream, data, durability, payload_integrity)
             }
             Self::Txn(_) => Err(StorageError::unsupported(
@@ -288,10 +350,10 @@ impl BenchStore {
 
     fn publish_append_stream(&self, stream: &AppendStream, publish_through: u64) -> Result<()> {
         match self {
-            Self::Local(store) => {
+            Self::Local { store, .. } => {
                 store.publish_append_stream(stream, publish_through, WriteDurability::Acknowledged)
             }
-            Self::Durable(store) => store.publish_append_stream(stream, publish_through),
+            Self::Durable { store, .. } => store.publish_append_stream(stream, publish_through),
             Self::Txn(_) => Err(StorageError::unsupported(
                 "txn metadata provider is block-only in loadbench",
             )),
@@ -308,10 +370,10 @@ impl BenchStore {
         verification: ReadVerification,
     ) -> Result<()> {
         match self {
-            Self::Local(store) => {
+            Self::Local { store, .. } => {
                 store.read_file_with_verification(keyspace_id, file_id, range, buf, verification)
             }
-            Self::Durable(store) => {
+            Self::Durable { store, .. } => {
                 store.read_file_with_verification(keyspace_id, file_id, range, buf, verification)
             }
             Self::Txn(_) => Err(StorageError::unsupported(
@@ -322,14 +384,14 @@ impl BenchStore {
 
     fn flush_file(&self, keyspace_id: KeyspaceId, file_id: FileId) -> Result<FlushResult> {
         match self {
-            Self::Local(store) => {
+            Self::Local { store, .. } => {
                 let head = store.metadata().get_file_head(keyspace_id, file_id)?;
                 Ok(FlushResult {
                     device_id: DeviceId::from_raw(file_id.raw()),
                     durable_through: head.latest_commit,
                 })
             }
-            Self::Durable(store) => store.flush_file(keyspace_id, file_id),
+            Self::Durable { store, .. } => store.flush_file(keyspace_id, file_id),
             Self::Txn(_) => Err(StorageError::unsupported(
                 "txn metadata provider is block-only in loadbench",
             )),
@@ -338,8 +400,8 @@ impl BenchStore {
 
     fn drain_persist_profiles(&self, max: usize) -> Result<Vec<DurablePersistProfile>> {
         match self {
-            Self::Local(_) => Ok(Vec::new()),
-            Self::Durable(store) => store.drain_persist_profiles(max),
+            Self::Local { .. } => Ok(Vec::new()),
+            Self::Durable { store, .. } => store.drain_persist_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }
@@ -349,16 +411,16 @@ impl BenchStore {
         max: usize,
     ) -> Result<Vec<AppendPublishWaitProfile>> {
         match self {
-            Self::Local(_) => Ok(Vec::new()),
-            Self::Durable(store) => store.drain_append_publish_wait_profiles(max),
+            Self::Local { .. } => Ok(Vec::new()),
+            Self::Durable { store, .. } => store.drain_append_publish_wait_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }
 
     fn drain_append_ingest_profiles(&self, max: usize) -> Result<Vec<AppendIngestProfile>> {
         match self {
-            Self::Local(_) => Ok(Vec::new()),
-            Self::Durable(store) => store.drain_append_ingest_profiles(max),
+            Self::Local { .. } => Ok(Vec::new()),
+            Self::Durable { store, .. } => store.drain_append_ingest_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }
@@ -366,21 +428,21 @@ impl BenchStore {
     fn drain_metadata_profiles(&self, max: usize) -> Result<Vec<MetadataTxnProfile>> {
         match self {
             Self::Txn(store) => store.drain_metadata_profiles(max),
-            Self::Local(_) | Self::Durable(_) => Ok(Vec::new()),
+            Self::Local { .. } | Self::Durable { .. } => Ok(Vec::new()),
         }
     }
 
     fn drain_block_write_profiles(&self, max: usize) -> Result<Vec<TxnBlockWriteProfile>> {
         match self {
             Self::Txn(store) => store.drain_block_write_profiles(max),
-            Self::Local(_) | Self::Durable(_) => Ok(Vec::new()),
+            Self::Local { .. } | Self::Durable { .. } => Ok(Vec::new()),
         }
     }
 
     fn drain_read_profiles(&self, max: usize) -> Result<Vec<ReadProfile>> {
         match self {
-            Self::Local(store) => store.drain_read_profiles(max),
-            Self::Durable(store) => store.drain_read_profiles(max),
+            Self::Local { store, .. } => store.drain_read_profiles(max),
+            Self::Durable { store, .. } => store.drain_read_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }
@@ -390,8 +452,8 @@ impl BenchStore {
         max: usize,
     ) -> Result<Vec<NativeFileBatchCommitProfile>> {
         match self {
-            Self::Local(store) => store.drain_native_file_batch_commit_profiles(max),
-            Self::Durable(store) => store.drain_native_file_batch_commit_profiles(max),
+            Self::Local { store, .. } => store.drain_native_file_batch_commit_profiles(max),
+            Self::Durable { store, .. } => store.drain_native_file_batch_commit_profiles(max),
             Self::Txn(_) => Ok(Vec::new()),
         }
     }

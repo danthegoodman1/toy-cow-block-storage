@@ -1621,6 +1621,20 @@ impl DurableCodec for BlockBatchCommit {
     }
 }
 
+impl DurableCodec for BlockWriterLease {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.device_id.encode(out)?;
+        self.writer_epoch.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            device_id: DeviceId::decode(input)?,
+            writer_epoch: WriterEpoch::decode(input)?,
+        })
+    }
+}
+
 impl DurableCodec for FlushResult {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         self.device_id.encode(out)?;
@@ -1696,6 +1710,14 @@ impl DurableCodec for BlockRequest {
                 range.encode(out)?;
                 verification.encode(out)
             }
+            Self::AcquireWriter { device_id } => {
+                12u8.encode(out)?;
+                device_id.encode(out)
+            }
+            Self::ReleaseWriter { lease } => {
+                13u8.encode(out)?;
+                lease.encode(out)
+            }
             Self::Write {
                 device_id,
                 offset,
@@ -1705,6 +1727,20 @@ impl DurableCodec for BlockRequest {
             } => {
                 4u8.encode(out)?;
                 device_id.encode(out)?;
+                offset.encode(out)?;
+                bytes.encode(out)?;
+                payload_integrity.encode(out)?;
+                durability.encode(out)
+            }
+            Self::LeasedWrite {
+                lease,
+                offset,
+                bytes,
+                payload_integrity,
+                durability,
+            } => {
+                14u8.encode(out)?;
+                lease.encode(out)?;
                 offset.encode(out)?;
                 bytes.encode(out)?;
                 payload_integrity.encode(out)?;
@@ -1720,9 +1756,24 @@ impl DurableCodec for BlockRequest {
                 writes.encode(out)?;
                 durability.encode(out)
             }
+            Self::LeasedCommitBatch {
+                lease,
+                writes,
+                durability,
+            } => {
+                15u8.encode(out)?;
+                lease.encode(out)?;
+                writes.encode(out)?;
+                durability.encode(out)
+            }
             Self::Flush { device_id, scope } => {
                 5u8.encode(out)?;
                 device_id.encode(out)?;
+                scope.encode(out)
+            }
+            Self::LeasedFlush { lease, scope } => {
+                16u8.encode(out)?;
+                lease.encode(out)?;
                 scope.encode(out)
             }
             Self::WriteZeroes { device_id, range } => {
@@ -1730,9 +1781,19 @@ impl DurableCodec for BlockRequest {
                 device_id.encode(out)?;
                 range.encode(out)
             }
+            Self::LeasedWriteZeroes { lease, range } => {
+                17u8.encode(out)?;
+                lease.encode(out)?;
+                range.encode(out)
+            }
             Self::Discard { device_id, range } => {
                 7u8.encode(out)?;
                 device_id.encode(out)?;
+                range.encode(out)
+            }
+            Self::LeasedDiscard { lease, range } => {
+                18u8.encode(out)?;
+                lease.encode(out)?;
                 range.encode(out)
             }
             Self::Fork { source, request } => {
@@ -1765,8 +1826,21 @@ impl DurableCodec for BlockRequest {
                 range: ByteRange::decode(input)?,
                 verification: ReadVerification::decode(input)?,
             }),
+            12 => Ok(Self::AcquireWriter {
+                device_id: DeviceId::decode(input)?,
+            }),
+            13 => Ok(Self::ReleaseWriter {
+                lease: BlockWriterLease::decode(input)?,
+            }),
             4 => Ok(Self::Write {
                 device_id: DeviceId::decode(input)?,
+                offset: u64::decode(input)?,
+                bytes: Vec::decode(input)?,
+                payload_integrity: PayloadIntegrity::decode(input)?,
+                durability: WriteDurability::decode(input)?,
+            }),
+            14 => Ok(Self::LeasedWrite {
+                lease: BlockWriterLease::decode(input)?,
                 offset: u64::decode(input)?,
                 bytes: Vec::decode(input)?,
                 payload_integrity: PayloadIntegrity::decode(input)?,
@@ -1777,16 +1851,33 @@ impl DurableCodec for BlockRequest {
                 writes: Vec::decode(input)?,
                 durability: WriteDurability::decode(input)?,
             }),
+            15 => Ok(Self::LeasedCommitBatch {
+                lease: BlockWriterLease::decode(input)?,
+                writes: Vec::decode(input)?,
+                durability: WriteDurability::decode(input)?,
+            }),
             5 => Ok(Self::Flush {
                 device_id: DeviceId::decode(input)?,
+                scope: FlushScope::decode(input)?,
+            }),
+            16 => Ok(Self::LeasedFlush {
+                lease: BlockWriterLease::decode(input)?,
                 scope: FlushScope::decode(input)?,
             }),
             6 => Ok(Self::WriteZeroes {
                 device_id: DeviceId::decode(input)?,
                 range: ByteRange::decode(input)?,
             }),
+            17 => Ok(Self::LeasedWriteZeroes {
+                lease: BlockWriterLease::decode(input)?,
+                range: ByteRange::decode(input)?,
+            }),
             7 => Ok(Self::Discard {
                 device_id: DeviceId::decode(input)?,
+                range: ByteRange::decode(input)?,
+            }),
+            18 => Ok(Self::LeasedDiscard {
+                lease: BlockWriterLease::decode(input)?,
                 range: ByteRange::decode(input)?,
             }),
             8 => Ok(Self::Fork {
@@ -1820,6 +1911,14 @@ impl DurableCodec for BlockResponse {
                 3u8.encode(out)?;
                 read.encode(out)
             }
+            Self::WriterAcquired(lease) => {
+                10u8.encode(out)?;
+                lease.encode(out)
+            }
+            Self::WriterReleased(lease) => {
+                11u8.encode(out)?;
+                lease.encode(out)
+            }
             Self::Write(commit) => {
                 4u8.encode(out)?;
                 commit.encode(out)
@@ -1852,6 +1951,8 @@ impl DurableCodec for BlockResponse {
             1 => Ok(Self::Created(DeviceId::decode(input)?)),
             2 => Ok(Self::Info(DeviceInfo::decode(input)?)),
             3 => Ok(Self::Read(ReadResponse::decode(input)?)),
+            10 => Ok(Self::WriterAcquired(BlockWriterLease::decode(input)?)),
+            11 => Ok(Self::WriterReleased(BlockWriterLease::decode(input)?)),
             4 => Ok(Self::Write(WriteCommit::decode(input)?)),
             9 => Ok(Self::BatchCommitted(BlockBatchCommit::decode(input)?)),
             5 => Ok(Self::Flush(FlushResult::decode(input)?)),

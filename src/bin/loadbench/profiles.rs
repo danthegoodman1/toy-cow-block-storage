@@ -56,7 +56,7 @@ fn append_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,native_file_delta_selected_count,native_file_delta_selected_bytes,stream_prefix_request_count,stream_prefix_plan_count,stream_prefix_record_count,stream_prefix_payload_bytes,stream_prefix_storage_node_count,stream_prefix_pending_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,visible_metadata_write_bytes,append_visible_publish_batch_id,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,sequence,total_nanos,persist_lock_wait_nanos,block_delta_prestage_wait_nanos,block_delta_selected_count,block_delta_selected_bytes,native_file_delta_selected_count,native_file_delta_selected_bytes,stream_prefix_request_count,stream_prefix_plan_count,stream_prefix_record_count,stream_prefix_payload_bytes,stream_prefix_storage_node_count,stream_prefix_pending_lock_wait_nanos,sqlite_lock_wait_nanos,local_snapshot_nanos,metadata_publish_lock_wait_nanos,commit_sequence_alloc_nanos,data_log_append_sync_nanos,data_log_encode_nanos,data_log_write_nanos,data_log_file_sync_nanos,data_log_file_sync_sum_nanos,data_log_file_sync_max_nanos,data_log_files_synced,data_log_sync_bytes,data_log_records_written,data_log_write_bytes,data_log_prestaged_segment_count,data_log_prestaged_segment_bytes,data_log_sync_only_bytes,data_log_flush_write_bytes,data_log_sync_storage_node_count,data_log_dir_sync_nanos,node_catalog_publish_nanos,node_catalog_manifest_lock_wait_nanos,node_catalog_manifest_row_sync_nanos,node_catalog_manifest_commit_nanos,node_catalog_segment_lock_wait_nanos,node_catalog_segment_row_sync_nanos,node_catalog_segment_commit_nanos,node_catalog_manifest_rows,node_catalog_sealed_rows,node_catalog_placement_rows,node_catalog_segment_rows,root_sqlite_row_sync_nanos,root_sqlite_commit_nanos,visible_metadata_write_bytes,append_visible_publish_batch_id,append_visible_journal_lock_wait_nanos,append_visible_journal_encode_nanos,append_visible_journal_open_nanos,append_visible_journal_write_nanos,append_visible_journal_sync_nanos,append_visible_journal_dir_sync_nanos,append_visible_journal_record_count,append_visible_journal_frame_bytes,append_visible_journal_created,block_journal_encode_nanos,block_journal_open_nanos,block_journal_write_nanos,block_journal_sync_nanos,block_journal_dir_sync_nanos,block_journal_record_count,block_journal_frame_bytes,block_journal_created,block_journal_flush_group_size,block_journal_overlay_read_nanos,new_segment_count,new_segment_bytes,touched_node_count,logical_conflict_count,touched_shard_head_rows,touched_manifest_rows,commit_rows_written,durable_commit_high_water";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         let row = [
@@ -125,6 +125,16 @@ fn append_profile_csv(
             profile.append_visible_journal_record_count.to_string(),
             profile.append_visible_journal_frame_bytes.to_string(),
             profile.append_visible_journal_created.to_string(),
+            profile.block_journal_encode_nanos.to_string(),
+            profile.block_journal_open_nanos.to_string(),
+            profile.block_journal_write_nanos.to_string(),
+            profile.block_journal_sync_nanos.to_string(),
+            profile.block_journal_dir_sync_nanos.to_string(),
+            profile.block_journal_record_count.to_string(),
+            profile.block_journal_frame_bytes.to_string(),
+            profile.block_journal_created.to_string(),
+            profile.block_journal_flush_group_size.to_string(),
+            profile.block_journal_overlay_read_nanos.to_string(),
             profile.new_segment_count.to_string(),
             profile.new_segment_bytes.to_string(),
             profile.touched_node_count.to_string(),
@@ -622,12 +632,12 @@ fn append_read_profile_csv(
     if profiles.is_empty() {
         return Ok(());
     }
-    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,payload_integrity,read_verification,sequence,total_nanos,metadata_resolve_nanos,metadata_lock_wait_nanos,metadata_tree_walk_nanos,metadata_placement_lookup_nanos,assemble_nanos,zero_fill_nanos,storage_node_read_nanos,storage_node_catalog_lookup_nanos,storage_node_payload_read_nanos,storage_node_lock_wait_nanos,verification_nanos,copy_nanos,logical_bytes,extent_count,zero_extent_count,segment_extent_count,append_run_extent_count,profile_storage_node_count";
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,payload_integrity,read_verification,sequence,total_nanos,metadata_resolve_nanos,metadata_lock_wait_nanos,metadata_tree_walk_nanos,metadata_placement_lookup_nanos,assemble_nanos,zero_fill_nanos,storage_node_read_nanos,storage_node_catalog_lookup_nanos,storage_node_payload_read_nanos,storage_node_lock_wait_nanos,verification_nanos,copy_nanos,block_journal_overlay_read_nanos,logical_bytes,extent_count,zero_extent_count,segment_extent_count,append_run_extent_count,profile_storage_node_count";
     let mut file = open_csv_append(path, header)?;
     for profile in profiles {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             workload.name(),
             args.provider,
             args.durability,
@@ -652,6 +662,7 @@ fn append_read_profile_csv(
             profile.storage_node_lock_wait_nanos,
             profile.verification_nanos,
             profile.copy_nanos,
+            profile.block_journal_overlay_read_nanos,
             profile.logical_bytes,
             profile.extent_count,
             profile.zero_extent_count,

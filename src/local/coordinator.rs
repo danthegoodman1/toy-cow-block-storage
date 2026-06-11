@@ -63,6 +63,7 @@ pub struct LocalCoordinator {
     read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
     native_file_batch_profiler: Arc<Mutex<Option<NativeFileBatchCommitProfiler>>>,
     verified_receipt_cache: Arc<Mutex<BTreeMap<SegmentId, VerifiedSegmentReceipt>>>,
+    block_writer_epochs: Arc<Mutex<BTreeMap<DeviceId, WriterEpoch>>>,
 }
 
 impl LocalCoordinator {
@@ -97,6 +98,7 @@ impl LocalCoordinator {
             read_profiler: Arc::new(Mutex::new(None)),
             native_file_batch_profiler: Arc::new(Mutex::new(None)),
             verified_receipt_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            block_writer_epochs: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -125,6 +127,7 @@ impl LocalCoordinator {
             read_profiler: Arc::new(Mutex::new(None)),
             native_file_batch_profiler: Arc::new(Mutex::new(None)),
             verified_receipt_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            block_writer_epochs: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -1236,6 +1239,69 @@ impl LocalCoordinator {
         }
     }
 
+    pub fn acquire_block_writer(&self, device_id: DeviceId) -> Result<BlockWriterLease> {
+        self.metadata.device_info(device_id)?;
+        let mut epochs = lock(&self.block_writer_epochs)?;
+        let current = epochs
+            .get(&device_id)
+            .map(|epoch| epoch.raw())
+            .unwrap_or_default();
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict("block writer epoch overflow"))?;
+        let lease = BlockWriterLease {
+            device_id,
+            writer_epoch: WriterEpoch::from_raw(next),
+        };
+        epochs.insert(device_id, lease.writer_epoch);
+        Ok(lease)
+    }
+
+    pub fn release_block_writer(&self, lease: &BlockWriterLease) -> Result<()> {
+        self.validate_block_writer(lease)
+    }
+
+    fn seed_block_writer_epoch(&self, device_id: DeviceId, writer_epoch: WriterEpoch) -> Result<()> {
+        self.metadata.device_info(device_id)?;
+        let mut epochs = lock(&self.block_writer_epochs)?;
+        let current = epochs
+            .get(&device_id)
+            .copied()
+            .unwrap_or_else(|| WriterEpoch::from_raw(0));
+        if writer_epoch.raw() > current.raw() {
+            epochs.insert(device_id, writer_epoch);
+        }
+        Ok(())
+    }
+
+    fn validate_block_writer(&self, lease: &BlockWriterLease) -> Result<()> {
+        self.metadata.device_info(lease.device_id)?;
+        let epochs = lock(&self.block_writer_epochs)?;
+        if epochs.get(&lease.device_id).copied() == Some(lease.writer_epoch) {
+            Ok(())
+        } else {
+            Err(StorageError::conflict("stale block writer lease"))
+        }
+    }
+
+    pub fn write_device_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        data: &[u8],
+        durability: crate::api::WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<WriteCommit> {
+        self.validate_block_writer(lease)?;
+        self.write_device_with_integrity(
+            lease.device_id,
+            offset,
+            data,
+            durability,
+            payload_integrity,
+        )
+    }
+
     pub fn write_device(
         &self,
         device_id: DeviceId,
@@ -1299,6 +1365,16 @@ impl LocalCoordinator {
     ) -> Result<BlockBatchCommit> {
         self.commit_block_batch_with_delta(device_id, writes, durability)
             .map(|committed| committed.commit)
+    }
+
+    pub fn commit_block_batch_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<BlockBatchCommit> {
+        self.validate_block_writer(lease)?;
+        self.commit_block_batch(lease.device_id, writes, durability)
     }
 
     fn commit_block_batch_with_delta(
@@ -1741,6 +1817,16 @@ impl LocalCoordinator {
             .map(|committed| committed.commit)
     }
 
+    pub fn write_zeroes_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
+        self.validate_block_writer(lease)?;
+        self.write_zeroes(lease.device_id, offset, len)
+    }
+
     fn write_zeroes_with_delta(
         &self,
         device_id: DeviceId,
@@ -1758,6 +1844,25 @@ impl LocalCoordinator {
     ) -> Result<WriteCommit> {
         self.discard_device_with_delta(device_id, offset, len)
             .map(|committed| committed.commit)
+    }
+
+    pub fn discard_device_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        offset: u64,
+        len: u64,
+    ) -> Result<WriteCommit> {
+        self.validate_block_writer(lease)?;
+        self.discard_device(lease.device_id, offset, len)
+    }
+
+    pub fn flush_device_with_writer(&self, lease: &BlockWriterLease) -> Result<FlushResult> {
+        self.validate_block_writer(lease)?;
+        let info = self.metadata.device_info(lease.device_id)?;
+        Ok(FlushResult {
+            device_id: lease.device_id,
+            durable_through: info.latest_commit,
+        })
     }
 
     fn discard_device_with_delta(
