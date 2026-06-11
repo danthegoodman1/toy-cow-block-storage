@@ -148,18 +148,23 @@ Durable providers store checkpointed block heads as a stable device manifest
 plus one mutable row per shard head. Flushed block writes do not need to fold
 into those rows before returning: they may be recorded as ordered durable block
 delta rows that reference already-durable segment payloads. The durable provider
-also has a block-native journal fast path for small flushed writes, packed
-journal batches up to 1 MiB, and leased sparse zero/discard operations under an
-explicit whole-device writer lease. A journal batch contains lease, write or
-sparse-range, and flush-marker records in a framed append-only file. Large
-contiguous journal batches are split into block-sized inline entries so replay
-does not require a single oversized payload vector. A flushed journal write
-returns only after the inline payload bytes and the flush marker covering that
-commit sequence are durable; a journal sparse operation returns only after the
-sparse range and covering flush marker are durable. An acknowledged journal
-write appends its record and updates the in-process overlay without syncing a
-flush marker; it is visible to same-process reads, but reopen only replays it if
-a later durable flush marker covers its commit sequence. Reopen loads the
+also has a block-native journal fast path for small flushed writes, inline
+journal batches up to 256 KiB, data-log-backed journal segment references for
+larger flushed writes, and leased sparse zero/discard operations under an
+explicit whole-device writer lease. A journal batch contains lease, write,
+segment-reference or sparse-range, and flush-marker records in a framed
+append-only file. Large contiguous inline journal batches are split into
+block-sized inline entries so replay does not require a single oversized payload
+vector. A flushed inline journal write returns only after the inline payload
+bytes and the flush marker covering that commit sequence are durable; a flushed
+segment-reference journal write returns only after the segment payload data,
+node-catalog placement, journal segment references, and covering flush marker
+are durable. A journal sparse operation returns only after the sparse range and
+covering flush marker are durable. An acknowledged journal write appends its
+record and updates the in-process overlay without syncing a flush marker; for
+writeback/fsync windows it may use unsynced inline journal staging up to 1 MiB.
+It is visible to same-process reads, but reopen only replays it if a later
+durable flush marker covers its commit sequence. Reopen loads the
 compact shard roots, replays retained SQLite block deltas, then rebuilds the
 provider-private block overlay from journal writes and sparse ranges covered by
 durable flush markers. Reads resolve the compact tree and then apply the
@@ -169,11 +174,11 @@ keep a coalesced current-view read index for that overlay, but retained journal
 records remain the replay and future materialization history. Until journal
 materialization exists, a device with
 unmaterialized journal state must keep later journal-sized writes on the journal
-path; writes beyond the journal batch limit must fail until materialization or data-log-backed journal
-references exist, instead of publishing a newer compact-tree root that older
-overlay entries could incorrectly cover. SQLite block-delta checkpointing and
-maintenance fold durable deltas into immutable CoW shard roots before pruning
-covered rows. Journal records remain retained replay roots until a
+path, either inline or as data-log-backed journal references, instead of
+publishing a newer compact-tree root that older overlay entries could
+incorrectly cover. SQLite block-delta checkpointing and maintenance fold durable
+deltas into immutable CoW shard roots before pruning covered rows. Journal
+records remain retained replay roots until a
 materialization pass folds them into the CoW trees and proves no fork/PITR
 window needs the journal payloads.
 This keeps `flush_device` as a replayable durability boundary while preserving

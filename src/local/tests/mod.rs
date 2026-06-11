@@ -2853,8 +2853,8 @@ fn durable_block_journal_leased_zero_and_discard_replay_after_reopen() {
 }
 
 #[test]
-fn durable_block_journal_rejects_nonjournal_write_after_overlay_write() {
-    let root = durable_temp_dir("block-journal-nonjournal-after-small");
+fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
+    let root = durable_temp_dir("block-journal-large-segment-refs");
     let cfg = config();
     let store = DurableCoordinator::open(&root, cfg).unwrap();
     store.enable_persist_profiling(16).unwrap();
@@ -2864,7 +2864,7 @@ fn durable_block_journal_rejects_nonjournal_write_after_overlay_write() {
                 logical_blocks: 1024,
                 block_size: 4096,
             },
-            name: Some("journal-nonjournal-after-small".to_string()),
+            name: Some("journal-large-segment-refs".to_string()),
         })
         .unwrap();
     let lease = store.acquire_block_writer(device_id).unwrap();
@@ -2916,8 +2916,9 @@ fn durable_block_journal_rejects_nonjournal_write_after_overlay_write() {
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(profiles.iter().any(|profile| {
         profile.block_journal_record_count == 2
-            && profile.block_journal_frame_bytes > 1024 * 1024
-            && profile.data_log_write_bytes == 0
+            && profile.block_journal_frame_bytes < 256 * 1024
+            && profile.data_log_write_bytes >= 1024 * 1024
+            && profile.new_segment_bytes == 1024 * 1024
             && profile.root_sqlite_commit_nanos == 0
     }));
     assert_eq!(block_delta_commit_count(&root), 0);
@@ -2927,29 +2928,51 @@ fn durable_block_journal_rejects_nonjournal_write_after_overlay_write() {
             &lease,
             0,
             &repeated_blocks(512, 14),
-            WriteDurability::Flushed,
+            WriteDurability::Acknowledged,
             PayloadIntegrity::Verified,
         ),
         Err(StorageError::Conflict { .. })
     ));
 
-    let mut live = vec![0; 1024 * 1024];
-    store
-        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut live)
+    let two_mib = repeated_blocks(512, 15);
+    let two_mib_commit = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &two_mib,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
         .unwrap();
-    assert_eq!(live, one_mib);
+    assert_eq!(two_mib_commit.range, ByteRange::new(0, 2 * 1024 * 1024));
+    assert_eq!(two_mib_commit.durability, WriteDurability::Flushed);
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(profiles.iter().any(|profile| {
+        profile.block_journal_record_count == 2
+            && profile.block_journal_frame_bytes < 256 * 1024
+            && profile.data_log_write_bytes >= 2 * 1024 * 1024
+            && profile.new_segment_bytes == 2 * 1024 * 1024
+            && profile.root_sqlite_commit_nanos == 0
+    }));
+    assert_eq!(block_delta_commit_count(&root), 0);
+
+    let mut live = vec![0; 2 * 1024 * 1024];
+    store
+        .read_device(device_id, ByteRange::new(0, 2 * 1024 * 1024), &mut live)
+        .unwrap();
+    assert_eq!(live, two_mib);
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, cfg).unwrap();
-    let mut reopened_bytes = vec![0; 1024 * 1024];
+    let mut reopened_bytes = vec![0; 2 * 1024 * 1024];
     reopened
         .read_device(
             device_id,
-            ByteRange::new(0, 1024 * 1024),
+            ByteRange::new(0, 2 * 1024 * 1024),
             &mut reopened_bytes,
         )
         .unwrap();
-    assert_eq!(reopened_bytes, one_mib);
+    assert_eq!(reopened_bytes, two_mib);
     let _ = fs::remove_dir_all(root);
 }
 

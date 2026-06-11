@@ -3,7 +3,14 @@
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 const BLOCK_DELTA_PARALLEL_COMMIT_MIN_BYTES: u64 = 16 * 1024 * 1024;
-const BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES: u64 = 1024 * 1024;
+const BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES: u64 = BLOCK_JOURNAL_INLINE_MAX_BYTES;
+const BLOCK_JOURNAL_ACK_INLINE_MAX_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockJournalFastPathMode {
+    Inline,
+    SegmentRefs,
+}
 
 #[derive(Debug, Clone)]
 pub struct DurableCoordinator {
@@ -3217,16 +3224,16 @@ impl DurableCoordinator {
         self.local.release_block_writer(lease)
     }
 
-    fn should_use_block_journal_fast_path(
+    fn block_journal_fast_path_mode(
         &self,
         writes: &[BlockBatchWrite],
         durability: crate::api::WriteDurability,
-    ) -> Result<bool> {
+    ) -> Result<Option<BlockJournalFastPathMode>> {
         if !matches!(
             durability,
             crate::api::WriteDurability::Acknowledged | crate::api::WriteDurability::Flushed
         ) {
-            return Ok(false);
+            return Ok(None);
         }
         let total_bytes = writes.iter().try_fold(0_u64, |total, write| {
             total
@@ -3235,7 +3242,28 @@ impl DurableCoordinator {
                 })?)
                 .ok_or_else(|| StorageError::invalid_argument("block batch byte length overflows"))
         })?;
-        Ok(total_bytes <= BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES)
+        if total_bytes <= BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES {
+            return Ok(Some(BlockJournalFastPathMode::Inline));
+        }
+        if matches!(durability, crate::api::WriteDurability::Acknowledged)
+            && total_bytes <= BLOCK_JOURNAL_ACK_INLINE_MAX_BYTES
+        {
+            return Ok(Some(BlockJournalFastPathMode::Inline));
+        }
+        if matches!(durability, crate::api::WriteDurability::Flushed) {
+            return Ok(Some(BlockJournalFastPathMode::SegmentRefs));
+        }
+        Ok(None)
+    }
+
+    fn should_use_block_journal_fast_path(
+        &self,
+        writes: &[BlockBatchWrite],
+        durability: crate::api::WriteDurability,
+    ) -> Result<bool> {
+        Ok(self
+            .block_journal_fast_path_mode(writes, durability)?
+            .is_some())
     }
 
     fn block_journal_entries_from_collapsed(
@@ -3290,21 +3318,36 @@ impl DurableCoordinator {
         durable_commit_high_water: CommitSeq,
         flush_group_size: u64,
     ) -> Result<()> {
-        self.record_persist_profile(DurablePersistProfile {
-            total_nanos: duration_nanos_u64(total_started.elapsed()),
-            visible_metadata_write_bytes: profile.frame_bytes,
-            block_journal_encode_nanos: profile.encode_nanos,
-            block_journal_open_nanos: profile.open_nanos,
-            block_journal_write_nanos: profile.write_nanos,
-            block_journal_sync_nanos: profile.sync_nanos,
-            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
-            block_journal_record_count: profile.record_count,
-            block_journal_frame_bytes: profile.frame_bytes,
-            block_journal_created: profile.created,
-            block_journal_flush_group_size: flush_group_size,
-            durable_commit_high_water: durable_commit_high_water.raw(),
-            ..DurablePersistProfile::default()
-        })
+        self.record_block_journal_profile_from_base(
+            DurablePersistProfile::default(),
+            total_started,
+            profile,
+            durable_commit_high_water,
+            flush_group_size,
+        )
+    }
+
+    fn record_block_journal_profile_from_base(
+        &self,
+        mut base: DurablePersistProfile,
+        total_started: Instant,
+        profile: AppendVisibleJournalProfile,
+        durable_commit_high_water: CommitSeq,
+        flush_group_size: u64,
+    ) -> Result<()> {
+        base.total_nanos = duration_nanos_u64(total_started.elapsed());
+        base.visible_metadata_write_bytes = profile.frame_bytes;
+        base.block_journal_encode_nanos = profile.encode_nanos;
+        base.block_journal_open_nanos = profile.open_nanos;
+        base.block_journal_write_nanos = profile.write_nanos;
+        base.block_journal_sync_nanos = profile.sync_nanos;
+        base.block_journal_dir_sync_nanos = profile.dir_sync_nanos;
+        base.block_journal_record_count = profile.record_count;
+        base.block_journal_frame_bytes = profile.frame_bytes;
+        base.block_journal_created = profile.created;
+        base.block_journal_flush_group_size = flush_group_size;
+        base.durable_commit_high_water = durable_commit_high_water.raw();
+        self.record_persist_profile(base)
     }
 
     fn enqueue_block_journal_commit(&self, commit: BlockJournalCommit) -> Result<()> {
@@ -3479,6 +3522,165 @@ impl DurableCoordinator {
         Ok(())
     }
 
+    fn block_journal_segment_ids(commits: &[BlockJournalCommit]) -> BTreeSet<SegmentId> {
+        commits
+            .iter()
+            .flat_map(|commit| commit.entries.iter().filter_map(BlockJournalEntry::segment_id))
+            .collect()
+    }
+
+    fn build_block_journal_segment_ref_commit_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+    ) -> Result<(BlockJournalCommit, BTreeSet<SegmentId>)> {
+        let info = self.local.metadata.device_info(lease.device_id)?;
+        let collapsed =
+            collapse_block_batch_writes(writes, &info.spec, DEFAULT_BLOCK_BATCH_MAX_BYTES)?;
+        let commit_seq = self
+            .local
+            .metadata
+            .reserve_block_journal_commit_seq(lease.device_id)?;
+        let collapsed_range_count = usize_to_u64(collapsed.len());
+        let write_intent = self.local.next_write_intent()?;
+        let mut entries = Vec::with_capacity(collapsed.len());
+        let mut segment_ids = BTreeSet::new();
+        let mut committed_bytes = 0_u64;
+
+        for write in collapsed {
+            let range = write.byte_range()?;
+            let payload_integrity = write.payload_integrity;
+            committed_bytes = committed_bytes.checked_add(range.len).ok_or_else(|| {
+                StorageError::invalid_argument("block journal committed bytes overflow")
+            })?;
+            let receipt = self.local.write_segment_for_intent_with_id_owned_verified(
+                WriteGrantIntent::Internal {
+                    owner: MappingOwner::BlockDevice(lease.device_id),
+                },
+                write_intent,
+                write.bytes,
+                WriteDurability::Flushed,
+                payload_integrity,
+            )?;
+            if receipt.descriptor().bytes != range.len {
+                return Err(StorageError::corrupt(
+                    "block journal segment payload length disagrees with range",
+                ));
+            }
+            let segment_id = receipt.descriptor().segment_id;
+            segment_ids.insert(segment_id);
+            entries.push(BlockJournalEntry::Segment {
+                range,
+                storage_node: receipt.receipt().storage_node,
+                segment_id,
+                segment_offset: 0,
+                integrity: receipt.descriptor().integrity,
+            });
+        }
+
+        let commit = BlockJournalCommit {
+            device_id: lease.device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq,
+            write_count: usize_to_u64(writes.len()),
+            collapsed_range_count,
+            committed_bytes,
+            entries,
+        };
+        commit.validate(&info.spec)?;
+        Ok((commit, segment_ids))
+    }
+
+    fn persist_block_journal_segment_ref_commits(
+        &self,
+        commits: &[BlockJournalCommit],
+    ) -> Result<Option<DurablePersistProfile>> {
+        let segment_ids = Self::block_journal_segment_ids(commits);
+        if segment_ids.is_empty() {
+            return Ok(None);
+        }
+        let lock_started = Instant::now();
+        let _persist_guard = lock(&self.persist_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let snapshot_started = Instant::now();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let mut pending_append = lock(&self.pending_data_log_append)?.clone();
+        pending_append.retain_current_placements(&segment_ids);
+        let pending_segments = pending_append.segment_ids();
+        let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+        let new_segments: Vec<_> = payloads
+            .into_iter()
+            .filter(|payload| {
+                !previous_segments.contains(&payload.segment_id)
+                    && !pending_segments.contains(&payload.segment_id)
+            })
+            .collect();
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+
+        let mut base_profile = self.durable.persist_block_journal_segment_refs(
+            &nodes,
+            &segment_ids,
+            new_segments,
+            pending_append,
+        )?;
+        lock(&self.persisted_segments)?.extend(segment_ids.iter().copied());
+        lock(&self.pending_data_log_append)?.remove_segments(&segment_ids);
+
+        base_profile.lock_wait_nanos = lock_wait_nanos;
+        base_profile.local_snapshot_nanos = local_snapshot_nanos;
+        Ok(Some(base_profile))
+    }
+
+    fn commit_block_journal_segment_ref_batch_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+        durability: WriteDurability,
+    ) -> Result<BlockBatchCommit> {
+        let total_started = Instant::now();
+        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
+        let (commit, _segment_ids) =
+            self.build_block_journal_segment_ref_commit_with_writer(lease, writes)?;
+        debug_assert!(matches!(durability, WriteDurability::Flushed));
+
+        let mut base_profile = self
+            .persist_block_journal_segment_ref_commits(std::slice::from_ref(&commit))?
+            .unwrap_or_default();
+        let records = [
+            BlockJournalRecord::Write(commit.clone()),
+            BlockJournalRecord::Flush {
+                device_id: lease.device_id,
+                writer_epoch: lease.writer_epoch,
+                durable_through: commit.commit_seq,
+            },
+        ];
+        let journal_profile = self.durable.append_block_journal_records(&records)?;
+        mark_block_journal_segment_refs_referenced(&self.local, &commit)?;
+        self.local
+            .metadata
+            .publish_reserved_block_journal_commit(lease.device_id, commit.commit_seq)?;
+        self.block_journal.apply_commit(&commit)?;
+        self.block_journal
+            .mark_durable(lease.device_id, lease.writer_epoch, commit.commit_seq)?;
+        self.attach_metadata_publish_profile(&mut base_profile)?;
+        self.record_block_journal_profile_from_base(
+            base_profile,
+            total_started,
+            journal_profile,
+            commit.commit_seq,
+            1,
+        )?;
+
+        Ok(BlockBatchCommit {
+            device_id: lease.device_id,
+            commit_seq: commit.commit_seq,
+            write_count: commit.write_count,
+            collapsed_range_count: commit.collapsed_range_count,
+            committed_bytes: commit.committed_bytes,
+            durability,
+        })
+    }
+
     fn commit_block_journal_batch_with_writer(
         &self,
         lease: &BlockWriterLease,
@@ -3486,17 +3688,26 @@ impl DurableCoordinator {
         durability: crate::api::WriteDurability,
     ) -> Result<BlockBatchCommit> {
         self.local.validate_block_writer(lease)?;
-        if !self.should_use_block_journal_fast_path(writes, durability)? {
+        let Some(mode) = self.block_journal_fast_path_mode(writes, durability)? else {
             if self.block_journal.visible_through(lease.device_id)?.raw() > 0 {
                 return Err(StorageError::conflict(
                     "block journal materialization is required before non-journal block writes",
                 ));
             }
             return self.commit_block_batch(lease.device_id, writes, durability);
+        };
+        if matches!(mode, BlockJournalFastPathMode::SegmentRefs) {
+            return self.commit_block_journal_segment_ref_batch_with_writer(
+                lease, writes, durability,
+            );
         }
         let info = self.local.metadata.device_info(lease.device_id)?;
-        let collapsed =
-            collapse_block_batch_writes(writes, &info.spec, BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES)?;
+        let max_inline_bytes = if matches!(durability, WriteDurability::Acknowledged) {
+            BLOCK_JOURNAL_ACK_INLINE_MAX_BYTES
+        } else {
+            BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES
+        };
+        let collapsed = collapse_block_batch_writes(writes, &info.spec, max_inline_bytes)?;
         let total_started = Instant::now();
         let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
         let commit_seq = self
@@ -3718,7 +3929,7 @@ impl DurableCoordinator {
         let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
         let overlay_nanos =
             self.block_journal
-                .apply_read_overlay(device_id, range, verification, buf)?;
+                .apply_read_overlay(self, device_id, range, verification, buf)?;
         profile.metadata_resolve_nanos = metadata_resolve_nanos;
         profile.metadata_lock_wait_nanos = resolve_profile.metadata_lock_wait_nanos;
         profile.metadata_tree_walk_nanos = resolve_profile.metadata_tree_walk_nanos;

@@ -4056,6 +4056,90 @@ impl DurableSqliteStore {
         })
     }
 
+    fn persist_block_journal_segment_refs(
+        &self,
+        nodes: &SelectedStorageNodeState,
+        segment_ids: &BTreeSet<SegmentId>,
+        segments: Vec<DurableSegmentPayload>,
+        mut pending_append: PendingDataLogAppend,
+    ) -> Result<DurablePersistProfile> {
+        let total_started = Instant::now();
+        #[cfg(test)]
+        {
+            let delay = *lock(&self.persist_delay)?;
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected durable persist failure",
+                ));
+            }
+        }
+
+        let new_segment_bytes = segments
+            .iter()
+            .map(|segment| usize_to_u64(segment.bytes.len()))
+            .fold(0_u64, u64::saturating_add);
+        pending_append.retain_current_placements(segment_ids);
+        let prestaged_segment_count = pending_append.placement_count();
+        let prestaged_segment_bytes = pending_append.placement_payload_bytes();
+        let sync_only_bytes = prestaged_segment_bytes;
+        let flush_write_bytes = new_segment_bytes;
+
+        let prepared = self.prepare_durable_bundle_payload(
+            DurableBundlePayload::PrestagedBlockDelta {
+                pending_append,
+                segments,
+            },
+            segment_ids,
+        )?;
+
+        let started = Instant::now();
+        let catalog_profile = self.persist_durable_bundle_catalog(
+            nodes,
+            segment_ids,
+            prepared.appended,
+            &prepared.pre_root_pending_segments,
+        )?;
+        let node_catalog_publish_nanos = duration_nanos_u64(started.elapsed());
+
+        Ok(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            data_log_append_sync_nanos: prepared.data_log_append_sync_nanos,
+            data_log_encode_nanos: prepared.data_log_profile.encode_nanos,
+            data_log_write_nanos: prepared.data_log_profile.write_nanos,
+            data_log_file_sync_nanos: prepared.data_log_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: prepared.data_log_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: prepared.data_log_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: prepared.data_log_profile.dir_sync_nanos,
+            data_log_files_synced: prepared.data_log_profile.files_synced,
+            data_log_sync_bytes: prepared.data_log_profile.sync_bytes,
+            data_log_records_written: prepared.data_log_profile.records_written,
+            data_log_write_bytes: prepared.data_log_profile.write_bytes,
+            data_log_prestaged_segment_count: prestaged_segment_count,
+            data_log_prestaged_segment_bytes: prestaged_segment_bytes,
+            data_log_sync_only_bytes: sync_only_bytes,
+            data_log_flush_write_bytes: flush_write_bytes,
+            data_log_sync_storage_node_count: prepared.sync_storage_node_count,
+            node_catalog_publish_nanos,
+            node_catalog_manifest_lock_wait_nanos: catalog_profile.manifest_lock_wait_nanos,
+            node_catalog_manifest_row_sync_nanos: catalog_profile.manifest_row_sync_nanos,
+            node_catalog_manifest_commit_nanos: catalog_profile.manifest_commit_nanos,
+            node_catalog_segment_lock_wait_nanos: catalog_profile.segment_lock_wait_nanos,
+            node_catalog_segment_row_sync_nanos: catalog_profile.segment_row_sync_nanos,
+            node_catalog_segment_commit_nanos: catalog_profile.segment_commit_nanos,
+            node_catalog_manifest_rows: catalog_profile.manifest_rows,
+            node_catalog_sealed_rows: catalog_profile.sealed_rows,
+            node_catalog_placement_rows: catalog_profile.placement_rows,
+            node_catalog_segment_rows: catalog_profile.segment_rows,
+            new_segment_count: prepared.new_segment_count,
+            new_segment_bytes: prepared.new_segment_bytes,
+            touched_node_count: catalog_profile.touched_node_count(),
+            ..DurablePersistProfile::default()
+        })
+    }
+
     fn persist_native_file_delta_commits(
         &self,
         deltas: &[NativeFileDeltaCommit],

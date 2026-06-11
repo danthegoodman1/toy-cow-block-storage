@@ -8,6 +8,13 @@ pub(super) enum BlockJournalEntry {
         payload_integrity: PayloadIntegrity,
         bytes: Vec<u8>,
     },
+    Segment {
+        range: ByteRange,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        segment_offset: u64,
+        integrity: SegmentPayloadIntegrity,
+    },
     Sparse {
         range: ByteRange,
     },
@@ -43,6 +50,12 @@ pub(super) enum BlockJournalOverlaySource {
     Bytes {
         payload_integrity: PayloadIntegrity,
         bytes: Vec<u8>,
+    },
+    Segment {
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        segment_offset: u64,
+        integrity: SegmentPayloadIntegrity,
     },
     Sparse,
 }
@@ -105,14 +118,23 @@ impl BlockJournalFlushCoordinator {
 impl BlockJournalEntry {
     fn range(&self) -> ByteRange {
         match self {
-            Self::Write { range, .. } | Self::Sparse { range } => *range,
+            Self::Write { range, .. } | Self::Segment { range, .. } | Self::Sparse { range } => {
+                *range
+            }
         }
     }
 
     fn committed_bytes(&self) -> u64 {
         match self {
-            Self::Write { range, .. } => range.len,
+            Self::Write { range, .. } | Self::Segment { range, .. } => range.len,
             Self::Sparse { .. } => 0,
+        }
+    }
+
+    fn segment_id(&self) -> Option<SegmentId> {
+        match self {
+            Self::Segment { segment_id, .. } => Some(*segment_id),
+            Self::Write { .. } | Self::Sparse { .. } => None,
         }
     }
 }
@@ -141,6 +163,15 @@ impl BlockJournalCommit {
                         ));
                     }
                 }
+                BlockJournalEntry::Segment {
+                    segment_offset,
+                    range,
+                    ..
+                } => {
+                    segment_offset.checked_add(range.len).ok_or_else(|| {
+                        StorageError::corrupt("block journal segment reference overflows")
+                    })?;
+                }
                 BlockJournalEntry::Sparse { .. } => {}
             }
             committed_bytes = committed_bytes
@@ -167,6 +198,18 @@ impl BlockJournalCommit {
                     } => BlockJournalOverlaySource::Bytes {
                         payload_integrity: *payload_integrity,
                         bytes: bytes.clone(),
+                    },
+                    BlockJournalEntry::Segment {
+                        storage_node,
+                        segment_id,
+                        segment_offset,
+                        integrity,
+                        ..
+                    } => BlockJournalOverlaySource::Segment {
+                        storage_node: *storage_node,
+                        segment_id: *segment_id,
+                        segment_offset: *segment_offset,
+                        integrity: *integrity,
                     },
                     BlockJournalEntry::Sparse { .. } => BlockJournalOverlaySource::Sparse,
                 };
@@ -217,6 +260,21 @@ fn block_journal_overlay_source_slice(
                 bytes,
             })
         }
+        BlockJournalOverlaySource::Segment {
+            storage_node,
+            segment_id,
+            segment_offset,
+            integrity,
+        } => Ok(BlockJournalOverlaySource::Segment {
+            storage_node: *storage_node,
+            segment_id: *segment_id,
+            segment_offset: segment_offset
+                .checked_add(slice.offset - source_range.offset)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal segment slice offset overflows")
+                })?,
+            integrity: *integrity,
+        }),
     }
 }
 
@@ -307,11 +365,35 @@ fn try_merge_block_journal_read_entry(
             left.range.len = merged_len;
             Ok(true)
         }
+        (
+            BlockJournalOverlaySource::Segment {
+                storage_node: left_storage_node,
+                segment_id: left_segment_id,
+                segment_offset: left_segment_offset,
+                integrity: left_integrity,
+            },
+            BlockJournalOverlaySource::Segment {
+                storage_node: right_storage_node,
+                segment_id: right_segment_id,
+                segment_offset: right_segment_offset,
+                integrity: right_integrity,
+            },
+        ) if left_storage_node == right_storage_node
+            && left_segment_id == right_segment_id
+            && left_integrity == right_integrity
+            && left_segment_offset
+                .checked_add(left.range.len)
+                .is_some_and(|end| end == *right_segment_offset) =>
+        {
+            left.range.len = merged_len;
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
 
 fn apply_block_journal_read_entries(
+    storage: &impl StorageNodeReadService,
     entries: &[BlockJournalOverlayEntry],
     requested: ByteRange,
     requested_end: u64,
@@ -361,7 +443,46 @@ fn apply_block_journal_read_entries(
                 }
                 output.copy_from_slice(source);
             }
+            BlockJournalOverlaySource::Segment {
+                storage_node,
+                segment_id,
+                segment_offset,
+                integrity,
+            } => {
+                let source_offset = segment_offset
+                    .checked_add(overlap.offset - entry.range.offset)
+                    .ok_or_else(|| {
+                        StorageError::corrupt("block journal segment read offset overflows")
+                    })?;
+                storage.read_segment_source(
+                    *storage_node,
+                    *segment_id,
+                    ByteRange::new(source_offset, overlap.len),
+                    *integrity,
+                    verification,
+                    output,
+                )?;
+            }
         }
+    }
+    Ok(())
+}
+
+fn mark_block_journal_segment_refs_referenced(
+    local: &LocalCoordinator,
+    commit: &BlockJournalCommit,
+) -> Result<()> {
+    for segment_id in commit
+        .entries
+        .iter()
+        .filter_map(BlockJournalEntry::segment_id)
+    {
+        let receipt = local.storage_nodes.receipt_for_segment(segment_id)?;
+        local.storage_nodes.mark_segment_referenced(
+            &receipt,
+            commit.commit_seq,
+            local.authority.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -423,6 +544,7 @@ impl BlockJournalOverlay {
 
     fn apply_read_overlay(
         &self,
+        storage: &impl StorageNodeReadService,
         device_id: DeviceId,
         requested: ByteRange,
         verification: ReadVerification,
@@ -438,6 +560,7 @@ impl BlockJournalOverlay {
             entry.range.offset.saturating_add(entry.range.len) <= requested.offset
         });
         apply_block_journal_read_entries(
+            storage,
             &device.read_entries[first_overlap..],
             requested,
             requested_end,
@@ -506,6 +629,7 @@ mod block_journal_tests {
         let mut read = vec![9; block * 4];
         overlay
             .apply_read_overlay(
+                &LocalCoordinator::new(),
                 device_id,
                 ByteRange::new(0, (block * 4) as u64),
                 ReadVerification::RequireVerified,
@@ -540,6 +664,7 @@ mod block_journal_tests {
         let mut read = vec![0; block * 2];
         overlay
             .apply_read_overlay(
+                &LocalCoordinator::new(),
                 device_id,
                 ByteRange::new(0, (block * 2) as u64),
                 ReadVerification::RequireVerified,
@@ -564,6 +689,20 @@ impl DurableCodec for BlockJournalEntry {
                 payload_integrity.encode(out)?;
                 bytes.encode(out)
             }
+            Self::Segment {
+                range,
+                storage_node,
+                segment_id,
+                segment_offset,
+                integrity,
+            } => {
+                3u8.encode(out)?;
+                range.encode(out)?;
+                storage_node.encode(out)?;
+                segment_id.encode(out)?;
+                segment_offset.encode(out)?;
+                integrity.encode(out)
+            }
             Self::Sparse { range } => {
                 2u8.encode(out)?;
                 range.encode(out)
@@ -580,6 +719,13 @@ impl DurableCodec for BlockJournalEntry {
             }),
             2 => Ok(Self::Sparse {
                 range: ByteRange::decode(input)?,
+            }),
+            3 => Ok(Self::Segment {
+                range: ByteRange::decode(input)?,
+                storage_node: StorageNodeId::decode(input)?,
+                segment_id: SegmentId::decode(input)?,
+                segment_offset: u64::decode(input)?,
+                integrity: SegmentPayloadIntegrity::decode(input)?,
             }),
             _ => Err(durable_codec_error("invalid block journal entry kind")),
         }
@@ -733,6 +879,7 @@ impl DurableSqliteStore {
                         "block journal write uses epoch above durable lease high-water",
                     ));
                 }
+                mark_block_journal_segment_refs_referenced(local, commit)?;
                 local
                     .metadata
                     .replay_block_journal_commit(device_id, commit.commit_seq)?;
