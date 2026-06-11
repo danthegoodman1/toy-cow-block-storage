@@ -159,10 +159,15 @@ SQLite block deltas, then rebuilds the provider-private block overlay from
 journal writes and sparse ranges covered by durable flush markers. Reads resolve
 the compact tree and then apply the journal overlay, so read-after-write
 observes journal-backed writes without forcing immediate tree path-copy or
-node-catalog publication. SQLite block-delta checkpointing and maintenance fold
-durable deltas into immutable CoW shard roots before pruning covered rows. Journal
-records remain retained replay roots until a materialization pass folds them
-into the CoW trees and proves no fork/PITR window needs the journal payloads.
+node-catalog publication. Until journal materialization exists, a device with
+unmaterialized journal state must keep later journal-sized writes on the journal
+path; larger writes must fail until materialization or data-log-backed journal
+references exist, instead of publishing a newer compact-tree root that older
+overlay entries could incorrectly cover. SQLite block-delta checkpointing and
+maintenance fold durable deltas into immutable CoW shard roots before pruning
+covered rows. Journal records remain retained replay roots until a
+materialization pass folds them into the CoW trees and proves no fork/PITR
+window needs the journal payloads.
 This keeps `flush_device` as a replayable durability boundary while preserving
 CoW shard roots as the compact long-term representation for fork, PITR,
 validation, and GC. Durable metadata GC folds outstanding block deltas before

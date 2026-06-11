@@ -2746,6 +2746,87 @@ fn durable_block_journal_leased_zero_and_discard_replay_after_reopen() {
 }
 
 #[test]
+fn durable_block_journal_rejects_nonjournal_write_after_overlay_write() {
+    let root = durable_temp_dir("block-journal-nonjournal-after-small");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 512,
+                block_size: 4096,
+            },
+            name: Some("journal-nonjournal-after-small".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let _ = store.drain_persist_profiles(16).unwrap();
+
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 11),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let _ = store.drain_persist_profiles(16).unwrap();
+
+    let large = repeated_blocks(64, 12);
+    let commit = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &large,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert_eq!(commit.range, ByteRange::new(0, 256 * 1024));
+
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(profiles.iter().any(|profile| {
+        profile.block_journal_record_count == 2
+            && profile.block_journal_frame_bytes > 256 * 1024
+            && profile.data_log_write_bytes == 0
+            && profile.root_sqlite_commit_nanos == 0
+    }));
+    assert_eq!(block_delta_commit_count(&root), 0);
+
+    assert!(matches!(
+        store.write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 13),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Conflict { .. })
+    ));
+
+    let mut live = vec![0; 256 * 1024];
+    store
+        .read_device(device_id, ByteRange::new(0, 256 * 1024), &mut live)
+        .unwrap();
+    assert_eq!(live, large);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut reopened_bytes = vec![0; 256 * 1024];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(0, 256 * 1024),
+            &mut reopened_bytes,
+        )
+        .unwrap();
+    assert_eq!(reopened_bytes, large);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_block_journal_ignores_incomplete_tail_after_reopen() {
     let root = durable_temp_dir("block-journal-tail");
     let cfg = config();

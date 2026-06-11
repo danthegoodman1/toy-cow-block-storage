@@ -3368,6 +3368,11 @@ impl DurableCoordinator {
     ) -> Result<BlockBatchCommit> {
         self.local.validate_block_writer(lease)?;
         if !self.should_use_block_journal_fast_path(writes, durability)? {
+            if self.block_journal.visible_through(lease.device_id)?.raw() > 0 {
+                return Err(StorageError::conflict(
+                    "block journal materialization is required before non-journal block writes",
+                ));
+            }
             return self.commit_block_batch(lease.device_id, writes, durability);
         }
         let info = self.local.metadata.device_info(lease.device_id)?;
@@ -3570,6 +3575,11 @@ impl DurableCoordinator {
         self.local.validate_block_writer(lease)?;
         if self.should_use_block_journal_fast_path(writes, durability)? {
             return self.commit_block_journal_batch_with_writer(lease, writes, durability);
+        }
+        if self.block_journal.visible_through(lease.device_id)?.raw() > 0 {
+            return Err(StorageError::conflict(
+                "block journal materialization is required before non-journal block writes",
+            ));
         }
         self.commit_block_batch(lease.device_id, writes, durability)
     }

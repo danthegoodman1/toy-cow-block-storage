@@ -57,6 +57,7 @@ pub(super) struct BlockJournalOverlayEntry {
 pub(super) struct BlockJournalDeviceOverlay {
     writer_epoch: WriterEpoch,
     durable_through: CommitSeq,
+    visible_through: CommitSeq,
     entries: Vec<BlockJournalOverlayEntry>,
 }
 
@@ -65,6 +66,7 @@ impl Default for BlockJournalDeviceOverlay {
         Self {
             writer_epoch: WriterEpoch::from_raw(0),
             durable_through: CommitSeq::from_raw(0),
+            visible_through: CommitSeq::from_raw(0),
             entries: Vec::new(),
         }
     }
@@ -197,10 +199,18 @@ impl BlockJournalOverlay {
             .unwrap_or_else(|| CommitSeq::from_raw(0)))
     }
 
+    fn visible_through(&self, device_id: DeviceId) -> Result<CommitSeq> {
+        Ok(lock(&self.inner)?
+            .get(&device_id)
+            .map(|device| device.visible_through)
+            .unwrap_or_else(|| CommitSeq::from_raw(0)))
+    }
+
     fn apply_commit(&self, commit: &BlockJournalCommit) -> Result<()> {
         let mut inner = lock(&self.inner)?;
         let device = inner.entry(commit.device_id).or_default();
         device.writer_epoch = device.writer_epoch.max(commit.writer_epoch);
+        device.visible_through = device.visible_through.max(commit.commit_seq);
         device.entries.extend(commit.overlay_entries());
         Ok(())
     }
