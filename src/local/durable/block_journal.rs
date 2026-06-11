@@ -59,6 +59,7 @@ pub(super) struct BlockJournalDeviceOverlay {
     durable_through: CommitSeq,
     visible_through: CommitSeq,
     entries: Vec<BlockJournalOverlayEntry>,
+    read_entries: Vec<BlockJournalOverlayEntry>,
 }
 
 impl Default for BlockJournalDeviceOverlay {
@@ -68,6 +69,7 @@ impl Default for BlockJournalDeviceOverlay {
             durable_through: CommitSeq::from_raw(0),
             visible_through: CommitSeq::from_raw(0),
             entries: Vec::new(),
+            read_entries: Vec::new(),
         }
     }
 }
@@ -177,6 +179,193 @@ impl BlockJournalCommit {
     }
 }
 
+fn block_journal_overlay_source_slice(
+    source: &BlockJournalOverlaySource,
+    source_range: ByteRange,
+    slice: ByteRange,
+) -> Result<BlockJournalOverlaySource> {
+    let source_end = source_range.end_exclusive()?;
+    let slice_end = slice.end_exclusive()?;
+    if slice.offset < source_range.offset || slice_end > source_end {
+        return Err(StorageError::corrupt(
+            "block journal read index slice is outside source range",
+        ));
+    }
+    match source {
+        BlockJournalOverlaySource::Sparse => Ok(BlockJournalOverlaySource::Sparse),
+        BlockJournalOverlaySource::Bytes {
+            payload_integrity,
+            bytes,
+        } => {
+            let start = usize::try_from(slice.offset - source_range.offset).map_err(|_| {
+                StorageError::corrupt("block journal read index slice offset overflows usize")
+            })?;
+            let len = usize::try_from(slice.len).map_err(|_| {
+                StorageError::corrupt("block journal read index slice length overflows usize")
+            })?;
+            let end = start.checked_add(len).ok_or_else(|| {
+                StorageError::corrupt("block journal read index slice end overflows")
+            })?;
+            let bytes = bytes
+                .get(start..end)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal read index slice out of bounds")
+                })?
+                .to_vec();
+            Ok(BlockJournalOverlaySource::Bytes {
+                payload_integrity: *payload_integrity,
+                bytes,
+            })
+        }
+    }
+}
+
+fn block_journal_overlay_slice(
+    entry: &BlockJournalOverlayEntry,
+    range: ByteRange,
+) -> Result<BlockJournalOverlayEntry> {
+    Ok(BlockJournalOverlayEntry {
+        range,
+        source: block_journal_overlay_source_slice(&entry.source, entry.range, range)?,
+    })
+}
+
+fn insert_block_journal_read_entry(
+    entries: &mut Vec<BlockJournalOverlayEntry>,
+    entry: BlockJournalOverlayEntry,
+) -> Result<()> {
+    let entry_end = entry.range.end_exclusive()?;
+    let mut next = Vec::with_capacity(entries.len().saturating_add(2));
+    for current in entries.drain(..) {
+        let current_end = current.range.end_exclusive()?;
+        if current_end <= entry.range.offset || current.range.offset >= entry_end {
+            next.push(current);
+            continue;
+        }
+        if current.range.offset < entry.range.offset {
+            next.push(block_journal_overlay_slice(
+                &current,
+                ByteRange::new(current.range.offset, entry.range.offset - current.range.offset),
+            )?);
+        }
+        if current_end > entry_end {
+            next.push(block_journal_overlay_slice(
+                &current,
+                ByteRange::new(entry_end, current_end - entry_end),
+            )?);
+        }
+    }
+    next.push(entry);
+    next.sort_by_key(|entry| entry.range.offset);
+    coalesce_block_journal_read_entries(&mut next)?;
+    *entries = next;
+    Ok(())
+}
+
+fn coalesce_block_journal_read_entries(entries: &mut Vec<BlockJournalOverlayEntry>) -> Result<()> {
+    let mut coalesced = Vec::<BlockJournalOverlayEntry>::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        if let Some(last) = coalesced.last_mut()
+            && try_merge_block_journal_read_entry(last, &entry)?
+        {
+            continue;
+        }
+        coalesced.push(entry);
+    }
+    *entries = coalesced;
+    Ok(())
+}
+
+fn try_merge_block_journal_read_entry(
+    left: &mut BlockJournalOverlayEntry,
+    right: &BlockJournalOverlayEntry,
+) -> Result<bool> {
+    if left.range.end_exclusive()? != right.range.offset {
+        return Ok(false);
+    }
+    let merged_len = left
+        .range
+        .len
+        .checked_add(right.range.len)
+        .ok_or_else(|| StorageError::corrupt("block journal read index range overflows"))?;
+    match (&mut left.source, &right.source) {
+        (BlockJournalOverlaySource::Sparse, BlockJournalOverlaySource::Sparse) => {
+            left.range.len = merged_len;
+            Ok(true)
+        }
+        (
+            BlockJournalOverlaySource::Bytes {
+                payload_integrity: left_integrity,
+                bytes: left_bytes,
+            },
+            BlockJournalOverlaySource::Bytes {
+                payload_integrity: right_integrity,
+                bytes: right_bytes,
+            },
+        ) if left_integrity == right_integrity && merged_len <= BLOCK_JOURNAL_INLINE_MAX_BYTES => {
+            left_bytes.extend_from_slice(right_bytes);
+            left.range.len = merged_len;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn apply_block_journal_read_entries(
+    entries: &[BlockJournalOverlayEntry],
+    requested: ByteRange,
+    requested_end: u64,
+    verification: ReadVerification,
+    buf: &mut [u8],
+    entries_are_ordered: bool,
+) -> Result<()> {
+    for entry in entries {
+        let entry_end = entry.range.end_exclusive()?;
+        if entry_end <= requested.offset {
+            continue;
+        }
+        if entries_are_ordered && entry.range.offset >= requested_end {
+            break;
+        }
+        let Some(overlap) = byte_range_intersection(entry.range, requested)? else {
+            continue;
+        };
+        let output_start = usize::try_from(overlap.offset - requested.offset)
+            .map_err(|_| StorageError::corrupt("block journal read output overflows usize"))?;
+        let output_len = usize::try_from(overlap.len)
+            .map_err(|_| StorageError::corrupt("block journal read length overflows usize"))?;
+        let output_end = output_start
+            .checked_add(output_len)
+            .ok_or_else(|| StorageError::corrupt("block journal read output end overflows"))?;
+        let output = buf
+            .get_mut(output_start..output_end)
+            .ok_or_else(|| StorageError::corrupt("block journal read output out of bounds"))?;
+        match &entry.source {
+            BlockJournalOverlaySource::Sparse => output.fill(0),
+            BlockJournalOverlaySource::Bytes {
+                payload_integrity,
+                bytes,
+            } => {
+                let source_start = usize::try_from(overlap.offset - entry.range.offset).map_err(
+                    |_| StorageError::corrupt("block journal read source overflows usize"),
+                )?;
+                let source_end = source_start.checked_add(output_len).ok_or_else(|| {
+                    StorageError::corrupt("block journal read source end overflows")
+                })?;
+                let source = bytes.get(source_start..source_end).ok_or_else(|| {
+                    StorageError::corrupt("block journal read source out of bounds")
+                })?;
+                if !matches!(verification, ReadVerification::Skip) {
+                    let integrity = segment_payload_integrity(*payload_integrity, source);
+                    verify_read_integrity_policy(integrity, verification)?;
+                }
+                output.copy_from_slice(source);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl BlockJournalOverlay {
     fn set_writer_epoch(&self, device_id: DeviceId, writer_epoch: WriterEpoch) -> Result<()> {
         let mut inner = lock(&self.inner)?;
@@ -211,7 +400,11 @@ impl BlockJournalOverlay {
         let device = inner.entry(commit.device_id).or_default();
         device.writer_epoch = device.writer_epoch.max(commit.writer_epoch);
         device.visible_through = device.visible_through.max(commit.commit_seq);
-        device.entries.extend(commit.overlay_entries());
+        let entries = commit.overlay_entries();
+        device.entries.extend(entries.iter().cloned());
+        for entry in entries {
+            insert_block_journal_read_entry(&mut device.read_entries, entry)?;
+        }
         Ok(())
     }
 
@@ -236,47 +429,125 @@ impl BlockJournalOverlay {
         buf: &mut [u8],
     ) -> Result<u64> {
         let started = Instant::now();
-        let entries = lock(&self.inner)?
-            .get(&device_id)
-            .map(|device| device.entries.clone())
-            .unwrap_or_default();
-        for entry in entries {
-            let Some(overlap) = byte_range_intersection(entry.range, requested)? else {
-                continue;
-            };
-            let output_start = usize::try_from(overlap.offset - requested.offset)
-                .map_err(|_| StorageError::corrupt("block journal read output overflows usize"))?;
-            let output_len = usize::try_from(overlap.len)
-                .map_err(|_| StorageError::corrupt("block journal read length overflows usize"))?;
-            let output_end = output_start
-                .checked_add(output_len)
-                .ok_or_else(|| StorageError::corrupt("block journal read output end overflows"))?;
-            let output = buf
-                .get_mut(output_start..output_end)
-                .ok_or_else(|| StorageError::corrupt("block journal read output out of bounds"))?;
-            match entry.source {
-                BlockJournalOverlaySource::Sparse => output.fill(0),
-                BlockJournalOverlaySource::Bytes {
-                    payload_integrity,
-                    bytes,
-                } => {
-                    let source_start = usize::try_from(overlap.offset - entry.range.offset)
-                        .map_err(|_| {
-                            StorageError::corrupt("block journal read source overflows usize")
-                        })?;
-                    let source_end = source_start.checked_add(output_len).ok_or_else(|| {
-                        StorageError::corrupt("block journal read source end overflows")
-                    })?;
-                    let source = bytes.get(source_start..source_end).ok_or_else(|| {
-                        StorageError::corrupt("block journal read source out of bounds")
-                    })?;
-                    let integrity = segment_payload_integrity(payload_integrity, &bytes);
-                    verify_read_integrity_policy(integrity, verification)?;
-                    output.copy_from_slice(source);
-                }
-            }
-        }
+        let requested_end = requested.end_exclusive()?;
+        let inner = lock(&self.inner)?;
+        let Some(device) = inner.get(&device_id) else {
+            return Ok(duration_nanos_u64(started.elapsed()));
+        };
+        let first_overlap = device.read_entries.partition_point(|entry| {
+            entry.range.offset.saturating_add(entry.range.len) <= requested.offset
+        });
+        apply_block_journal_read_entries(
+            &device.read_entries[first_overlap..],
+            requested,
+            requested_end,
+            verification,
+            buf,
+            true,
+        )?;
         Ok(duration_nanos_u64(started.elapsed()))
+    }
+
+    #[cfg(test)]
+    fn entry_counts_for_test(&self, device_id: DeviceId) -> Result<(usize, usize)> {
+        let inner = lock(&self.inner)?;
+        let Some(device) = inner.get(&device_id) else {
+            return Ok((0, 0));
+        };
+        Ok((device.entries.len(), device.read_entries.len()))
+    }
+}
+
+#[cfg(test)]
+mod block_journal_tests {
+    use super::*;
+
+    fn journal_commit(
+        device_id: DeviceId,
+        commit_seq: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> BlockJournalCommit {
+        BlockJournalCommit {
+            device_id,
+            writer_epoch: WriterEpoch::from_raw(1),
+            commit_seq: CommitSeq::from_raw(commit_seq),
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: bytes.len() as u64,
+            entries: vec![BlockJournalEntry::Write {
+                range: ByteRange::new(offset, bytes.len() as u64),
+                payload_integrity: PayloadIntegrity::Verified,
+                bytes,
+            }],
+        }
+    }
+
+    #[test]
+    fn block_journal_read_index_collapses_shadowed_ranges_without_pruning_history() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(7);
+        let block = 4096_usize;
+        overlay
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 4]))
+            .unwrap();
+        overlay
+            .apply_commit(&journal_commit(
+                device_id,
+                2,
+                block as u64,
+                vec![2; block],
+            ))
+            .unwrap();
+        let (history_count, read_count) = overlay.entry_counts_for_test(device_id).unwrap();
+        assert_eq!(history_count, 2);
+        assert_eq!(read_count, 1);
+
+        let mut read = vec![9; block * 4];
+        overlay
+            .apply_read_overlay(
+                device_id,
+                ByteRange::new(0, (block * 4) as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        assert_eq!(&read[..block], vec![1; block]);
+        assert_eq!(&read[block..block * 2], vec![2; block]);
+        assert_eq!(&read[block * 2..], vec![1; block * 2]);
+    }
+
+    #[test]
+    fn block_journal_read_index_coalesces_adjacent_current_ranges() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(8);
+        let block = 4096_usize;
+        overlay
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]))
+            .unwrap();
+        overlay
+            .apply_commit(&journal_commit(
+                device_id,
+                2,
+                block as u64,
+                vec![2; block],
+            ))
+            .unwrap();
+        let (history_count, read_count) = overlay.entry_counts_for_test(device_id).unwrap();
+        assert_eq!(history_count, 2);
+        assert_eq!(read_count, 1);
+
+        let mut read = vec![0; block * 2];
+        overlay
+            .apply_read_overlay(
+                device_id,
+                ByteRange::new(0, (block * 2) as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        assert_eq!(&read[..block], vec![1; block]);
+        assert_eq!(&read[block..], vec![2; block]);
     }
 }
 

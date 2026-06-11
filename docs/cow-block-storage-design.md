@@ -163,9 +163,11 @@ a later durable flush marker covers its commit sequence. Reopen loads the
 compact shard roots, replays retained SQLite block deltas, then rebuilds the
 provider-private block overlay from journal writes and sparse ranges covered by
 durable flush markers. Reads resolve the compact tree and then apply the
-journal overlay, so read-after-write
-observes journal-backed writes without forcing immediate tree path-copy or
-node-catalog publication. Until journal materialization exists, a device with
+journal overlay, so read-after-write observes journal-backed writes without
+forcing immediate tree path-copy or node-catalog publication. The provider may
+keep a coalesced current-view read index for that overlay, but retained journal
+records remain the replay and future materialization history. Until journal
+materialization exists, a device with
 unmaterialized journal state must keep later journal-sized writes on the journal
 path; writes beyond the journal batch limit must fail until materialization or data-log-backed journal
 references exist, instead of publishing a newer compact-tree root that older
