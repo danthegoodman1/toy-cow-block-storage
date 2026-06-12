@@ -297,8 +297,8 @@ measures bytes that became visible and restart-durable inside the timed window.
 | Scenario | Workload shape | Result |
 | --- | --- | --- |
 | Verified native reads | `native-read-4k`, c16 | about 72.8k IOPS, p99 about 468 us |
-| Block writeback fsync | `block-writeback-fsync-1m`, c16 | about 1.3 GB/s, p99 about 15 ms |
-| Larger block fsync window | `block-writeback-fsync-4m`, c16 | about 1.9 GB/s, p99 about 40 ms |
+| Block writeback fsync | `block-writeback-fsync-1m`, c16 | about 1.7 GB/s, p99 about 20 ms |
+| Larger block fsync window | `block-writeback-fsync-4m`, c16 | about 2.3 GB/s, p99 about 51 ms |
 | Append stream ingest | `native-stream-ingest-32m`, c16 | accepted private throughput peaks around 6.1 GB/s in the latest local sweep; this is not a visible durability result |
 | Publish at end, 1 MiB appends | `native-stream-publish-at-end-1m`, c16, 1024 MiB/worker | `published_mbps` about 2.77 GB/s with 1 node, 3.34 GB/s with 4 nodes, 3.31 GB/s with 16 nodes |
 | Publish at end, 4 MiB appends | `native-stream-publish-at-end-4m`, c16, 1024 MiB/worker | `published_mbps` about 2.51 GB/s with 1 node, 3.49 GB/s with 4 nodes, 3.17 GB/s with 16 nodes |
@@ -306,6 +306,50 @@ measures bytes that became visible and restart-durable inside the timed window.
 | Local FS, no fsync | `fio`, buffered writes, 16 jobs, 4 MiB writes, 1024 MiB/job | about 5.77 GB/s write-phase bandwidth |
 | Local FS, fsync at end | `fio`, buffered writes plus `--end_fsync=1`, same shape | about 3.49 GB/s write-phase bandwidth |
 | Local FS, direct with fsync at end | `fio`, direct writes plus `--end_fsync=1`, same shape | about 3.82 GB/s write-phase bandwidth |
+
+Block journal group-commit results from June 11, 2026. Every durable block
+boundary now joins one group-committed journal lane, payloads above the inline
+cap stage on per-node data logs in parallel, and acknowledged segment-ref
+payloads sync at the covering flush boundary. Local Docker A/B against the
+prior head, `block-batch` with one random write plus a durable boundary per
+op, `--rtt-us 0`, 4 storage nodes, 3-second windows:
+
+| Shape | Before | After |
+| --- | --- | --- |
+| 4k `ack-flush:1`, c16/c32 | 3.2k / 3.2k IOPS, p99 7.0 / 12.5 ms | 11.3k / 11.1k IOPS, p99 2.6 / 6.3 ms |
+| 64k `ack-flush:1`, c16/c32 | 142 / 154 MB/s | 466 / 471 MB/s |
+| 1m `flushed`, c16/c32 | 546 / 517 MB/s, p99 39 / 100 ms | 1683 / 1710 MB/s, p99 19 / 35 ms |
+| 32m `flushed`, c16/c32 | 1098 / 945 MB/s | 2227 / 1914 MB/s |
+
+The same change held or improved the north-star, `block-writeback`, and
+`durable-publish` aliases in a binary A/B on this host; no row regressed more
+than run-to-run noise, and `block-writeback-fsync-1m` c16 went from about
+0.56 GB/s to 1.73 GB/s at `200us` modeled RTT.
+
+GCP block-vs-RBD rerun from June 11, 2026, on `c4-standard-32-lssd` with five
+local NVMe SSDs: microceph Squid RBD (single node, `pool size 1`, fio librbd
+randwrite with `direct=1`) against `loadbench block-batch` on the same disks
+with 4 storage nodes and one random durable write per op. Toy rows are medians
+of two repeats at `--rtt-us 0`. Before is the prior head on the identical
+matrix, which ran `ack-flush:1`; ratios are toy/Ceph throughput.
+
+| Shape | Ceph RBD | Toy before | Toy after `ack-flush:1` | Toy after `flushed` |
+| --- | --- | --- | --- | --- |
+| 4k c16 | 120 MB/s | 12 MB/s (0.10x) | 66 MB/s (0.55x) | 139 MB/s (1.15x) |
+| 4k c32 | 208 MB/s | 12 MB/s (0.05x) | 64 MB/s (0.31x) | 156 MB/s (0.75x) |
+| 64k c32 | 1277 MB/s | 159 MB/s (0.11x) | 318 MB/s (0.25x) | 348 MB/s (0.27x) |
+| 256k c32 | 1463 MB/s | 339 MB/s (0.22x) | 334 MB/s (0.23x) | 335 MB/s (0.23x) |
+| 1m c4 | 1213 MB/s | 348 MB/s (0.29x) | 1285 MB/s (1.06x) | 1248 MB/s (1.03x) |
+| 1m c32 | 1531 MB/s | 346 MB/s (0.23x) | 1299 MB/s (0.85x) | 1320 MB/s (0.86x) |
+| 32m c4 | 1159 MB/s | 647 MB/s (0.55x) | 1112 MB/s (0.96x) | 1187 MB/s (1.02x) |
+| 32m c32 | 1461 MB/s | 548 MB/s (0.35x) | 1126 MB/s (0.77x) | 1099 MB/s (0.75x) |
+
+Fully durable toy writes now beat or tie Ceph RBD at 4k up to c16 and at 1m
+and 32m mid-concurrency, and hold 0.75-0.86x at c32 for the large sizes. The
+remaining gap is concentrated at 64k-256k high concurrency: the segment-ref
+path tops out near 1.3k ops/s regardless of payload size, and the inline path
+near 350 MB/s of journal bandwidth. Raw artifacts live in
+`infra/gcp-local-nvme-bench/results/gbvr-lane-06112011/`.
 
 Compact native-file delta sanity from June 10, 2026, after the native batch
 delta/replay change. These rows are local Docker runs with `--rtt-us 0`,
@@ -669,7 +713,18 @@ cargo run --release --bin loadbench -- \
 MB/s. Append publish rows also report `published_mbps`; use it for throughput
 comparisons when the benchmark includes a publish boundary. Plain stream ingest
 rows measure accepted private bytes and are useful for hot-path diagnostics, not
-for visible durability claims. `--stream-auto-persist-mib` is an internal
+for visible durability claims.
+
+`--block-journal-batch-target`, `--block-journal-idle-coalesce-us`, and
+`--block-journal-max-coalesce-us` schedule the group-committed block journal
+lane that every durable block boundary joins. The default adds no artificial
+coalesce wait: the in-flight batch sync is the batching window for the next
+batch. `--block-journal-inline-kib` sets the largest batch payload carried
+inline in journal records (default 64); larger writes stage chunked payload
+segments on per-node data logs and journal only segment references, so payload
+bandwidth uses the data disks instead of the journal device.
+
+`--stream-auto-persist-mib` is an internal
 durable-provider policy knob for append-stream latency experiments: it asks the
 server to persist private prefixes before publish once the dirty tail reaches
 the configured size. In `target/loadbench/stream-auto-persist-after-128/`, a

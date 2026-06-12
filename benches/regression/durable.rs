@@ -930,5 +930,43 @@ fn bench_durable_provider(c: &mut Criterion) {
         })
     });
 
+    // Per-write cost of the block journal read index must stay near-constant
+    // as the index grows; a superlinear trend here means overlay inserts will
+    // stall sustained random-write IOPS.
+    for writes in [4096_u64, 16384] {
+        group.bench_function(
+            BenchmarkId::new("block_journal_read_index_random_4k", writes),
+            |b| {
+                b.iter_custom(|iters| {
+                    let root = durable_bench_root("block-journal-read-index");
+                    let store = DurableCoordinator::open(&root, durable_bench_config()).unwrap();
+                    let elapsed = elapsed_durable_iters(iters, || {
+                        let device_id = create_durable_block_device(&store, 1 << 20);
+                        let lease = store.acquire_block_writer(device_id).unwrap();
+                        let mut rng = SeededRng::new(0x42);
+                        let payload = vec![7_u8; 4096];
+                        let started = Instant::now();
+                        for _ in 0..writes {
+                            let block = rng.next_u64() % (1 << 20);
+                            store
+                                .write_device_with_writer(
+                                    &lease,
+                                    block * 4096,
+                                    black_box(&payload),
+                                    WriteDurability::Acknowledged,
+                                    PayloadIntegrity::Verified,
+                                )
+                                .unwrap();
+                        }
+                        let elapsed = started.elapsed();
+                        elapsed.div_f64(writes as f64)
+                    });
+                    cleanup_durable_bench_root(&root);
+                    black_box(elapsed)
+                })
+            },
+        );
+    }
+
     group.finish();
 }

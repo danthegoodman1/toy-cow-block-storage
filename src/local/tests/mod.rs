@@ -2881,22 +2881,23 @@ fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
         .unwrap();
     let _ = store.drain_persist_profiles(16).unwrap();
 
-    let large = repeated_blocks(64, 12);
+    // At or below the inline cap, payload stays in the journal frame.
+    let inline_write = repeated_blocks(16, 12);
     let commit = store
         .write_device_with_writer(
             &lease,
             0,
-            &large,
+            &inline_write,
             WriteDurability::Flushed,
             PayloadIntegrity::Verified,
         )
         .unwrap();
-    assert_eq!(commit.range, ByteRange::new(0, 256 * 1024));
+    assert_eq!(commit.range, ByteRange::new(0, 64 * 1024));
 
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(profiles.iter().any(|profile| {
         profile.block_journal_record_count == 2
-            && profile.block_journal_frame_bytes > 256 * 1024
+            && profile.block_journal_frame_bytes > 64 * 1024
             && profile.data_log_write_bytes == 0
             && profile.root_sqlite_commit_nanos == 0
     }));
@@ -2914,25 +2915,20 @@ fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
         .unwrap();
     assert_eq!(one_mib_commit.range, ByteRange::new(0, 1024 * 1024));
     let profiles = store.drain_persist_profiles(16).unwrap();
+    // Segment-ref staging and the shared journal lane record separate
+    // profile rows: payload bytes prestage to data logs and sync before the
+    // catalog finalize, while journal frames stay small.
+    assert!(profiles.iter().any(|profile| {
+        profile.data_log_prestaged_segment_bytes >= 1024 * 1024
+            && profile.data_log_sync_only_bytes >= 1024 * 1024
+            && profile.root_sqlite_commit_nanos == 0
+    }));
     assert!(profiles.iter().any(|profile| {
         profile.block_journal_record_count == 2
             && profile.block_journal_frame_bytes < 256 * 1024
-            && profile.data_log_write_bytes >= 1024 * 1024
-            && profile.new_segment_bytes == 1024 * 1024
-            && profile.root_sqlite_commit_nanos == 0
+            && profile.block_journal_sync_nanos > 0
     }));
     assert_eq!(block_delta_commit_count(&root), 0);
-
-    assert!(matches!(
-        store.write_device_with_writer(
-            &lease,
-            0,
-            &repeated_blocks(512, 14),
-            WriteDurability::Acknowledged,
-            PayloadIntegrity::Verified,
-        ),
-        Err(StorageError::Conflict { .. })
-    ));
 
     let two_mib = repeated_blocks(512, 15);
     let two_mib_commit = store
@@ -2948,11 +2944,14 @@ fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
     assert_eq!(two_mib_commit.durability, WriteDurability::Flushed);
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(profiles.iter().any(|profile| {
+        profile.data_log_prestaged_segment_bytes >= 2 * 1024 * 1024
+            && profile.data_log_sync_only_bytes >= 2 * 1024 * 1024
+            && profile.root_sqlite_commit_nanos == 0
+    }));
+    assert!(profiles.iter().any(|profile| {
         profile.block_journal_record_count == 2
             && profile.block_journal_frame_bytes < 256 * 1024
-            && profile.data_log_write_bytes >= 2 * 1024 * 1024
-            && profile.new_segment_bytes == 2 * 1024 * 1024
-            && profile.root_sqlite_commit_nanos == 0
+            && profile.block_journal_sync_nanos > 0
     }));
     assert_eq!(block_delta_commit_count(&root), 0);
 
@@ -2973,6 +2972,180 @@ fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
         )
         .unwrap();
     assert_eq!(reopened_bytes, two_mib);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Acknowledged segment-ref writes are visible immediately but replay only
+// once a flush boundary makes their prestaged payload durable.
+#[test]
+fn durable_block_journal_acknowledged_segment_refs_replay_only_after_flush() {
+    let root = durable_temp_dir("block-journal-ack-segref");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("journal-ack-segref".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let unflushed = repeated_blocks(256, 21);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &unflushed,
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let mut live = vec![0; 1024 * 1024];
+    store
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut live)
+        .unwrap();
+    assert_eq!(live, unflushed);
+
+    // Without a flush boundary, the acknowledged payload must not replay.
+    drop(store);
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![9; 1024 * 1024];
+    store
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, vec![0; 1024 * 1024]);
+
+    // With a flush boundary, payload and reference both replay.
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let flushed = repeated_blocks(256, 22);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &flushed,
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.flush_device_with_writer(&lease).unwrap();
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 1024 * 1024];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, flushed);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Any flush boundary covering an acknowledged segment-ref sequence must make
+// that payload durable first, including the implicit boundary created by a
+// later flushed write on the same device.
+#[test]
+fn durable_block_journal_flushed_write_covers_earlier_acknowledged_segment_payload() {
+    let root = durable_temp_dir("block-journal-ack-segref-coverage");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("journal-ack-segref-coverage".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let acknowledged = repeated_blocks(256, 23);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &acknowledged,
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let flushed = repeated_blocks(1, 24);
+    store
+        .write_device_with_writer(
+            &lease,
+            512 * 4096,
+            &flushed,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 1024 * 1024];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, acknowledged);
+    let mut tail = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(512 * 4096, 4096), &mut tail)
+        .unwrap();
+    assert_eq!(tail, flushed);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Writes above the segment chunk size split into multiple placed segments
+// and still replay as one atomic commit.
+#[test]
+fn durable_block_journal_chunks_very_large_writes_across_segments() {
+    let root = durable_temp_dir("block-journal-chunked-segrefs");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("journal-chunked-segrefs".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    // 12 MiB splits into one 8 MiB segment plus one 4 MiB segment.
+    store.enable_persist_profiling(16).unwrap();
+    let large = repeated_blocks(3 * 1024, 25);
+    let commit = store
+        .commit_block_batch_with_writer(
+            &lease,
+            &[BlockBatchWrite {
+                offset: 0,
+                bytes: large.clone(),
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    assert_eq!(commit.collapsed_range_count, 1);
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(profiles.iter().any(|profile| {
+        profile.data_log_prestaged_segment_count == 2
+            && profile.data_log_prestaged_segment_bytes == 12 * 1024 * 1024
+    }));
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 12 * 1024 * 1024];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(0, 12 * 1024 * 1024),
+            &mut replayed,
+        )
+        .unwrap();
+    assert_eq!(replayed, large);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3069,11 +3242,17 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
             bytes: repeated_blocks(1, 42),
         }],
     };
-    store.enqueue_block_journal_commit(first).unwrap();
-    store.enqueue_block_journal_commit(second).unwrap();
+    let first_request = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(first))
+        .unwrap();
+    let second_request = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(second))
+        .unwrap();
 
-    store.wait_for_block_journal_commit(second_seq).unwrap();
-    store.wait_for_block_journal_commit(first_seq).unwrap();
+    store
+        .wait_for_block_journal_request(second_request)
+        .unwrap();
+    store.wait_for_block_journal_request(first_request).unwrap();
 
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(profiles.iter().any(|profile| {
@@ -3087,6 +3266,396 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
         .unwrap();
     assert_eq!(&actual[0..4096], repeated_blocks(1, 41).as_slice());
     assert_eq!(&actual[4096..2 * 4096], repeated_blocks(1, 42).as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+// One lane batch must share one journal append and one sync across write and
+// flush boundaries, and per-device Flush records must merge.
+#[test]
+fn durable_block_journal_lane_merges_concurrent_flush_boundaries() {
+    let root = durable_temp_dir("block-journal-lane-merge");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("journal-lane-merge".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let _ = store.drain_persist_profiles(16).unwrap();
+
+    let mut commits = Vec::new();
+    for block in 0..2_u64 {
+        let commit_seq = store
+            .local
+            .metadata
+            .reserve_block_journal_commit_seq(device_id)
+            .unwrap();
+        commits.push(BlockJournalCommit {
+            device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq,
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: 4096,
+            entries: vec![BlockJournalEntry::Write {
+                range: ByteRange::new(block * 4096, 4096),
+                payload_integrity: PayloadIntegrity::Verified,
+                bytes: repeated_blocks(1, 61 + block as u8),
+            }],
+        });
+    }
+    let last_seq = commits.last().unwrap().commit_seq;
+    let mut request_ids = Vec::new();
+    for commit in commits {
+        request_ids.push(
+            store
+                .enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))
+                .unwrap(),
+        );
+    }
+    request_ids.push(
+        store
+            .enqueue_block_journal_request(BlockJournalLaneRequest::Flush {
+                device_id,
+                writer_epoch: lease.writer_epoch,
+                durable_through: last_seq,
+            })
+            .unwrap(),
+    );
+    for request_id in request_ids {
+        store.wait_for_block_journal_request(request_id).unwrap();
+    }
+
+    // Two writes plus the explicit flush make one batch of three requests,
+    // and the explicit flush merges into the per-device Flush record.
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(profiles.iter().any(|profile| {
+        profile.block_journal_flush_group_size == 3
+            && profile.block_journal_record_count == 3
+            && profile.block_journal_sync_nanos > 0
+    }));
+    assert_eq!(
+        store.block_journal.durable_through(device_id).unwrap(),
+        last_seq
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+// A pending lane write must apply before any later acknowledged write to the
+// same device, so live reads and post-restart replay agree on commit-seq
+// order for overlapping ranges.
+#[test]
+fn durable_block_journal_lane_orders_acknowledged_writes_behind_pending_lane_writes() {
+    let root = durable_temp_dir("block-journal-lane-order");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("journal-lane-order".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let first_seq = store
+        .local
+        .metadata
+        .reserve_block_journal_commit_seq(device_id)
+        .unwrap();
+    let first_request = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(BlockJournalCommit {
+            device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq: first_seq,
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: 4096,
+            entries: vec![BlockJournalEntry::Write {
+                range: ByteRange::new(0, 4096),
+                payload_integrity: PayloadIntegrity::Verified,
+                bytes: repeated_blocks(1, 71),
+            }],
+        }))
+        .unwrap();
+
+    let ack = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 72),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert!(ack.commit_seq.raw() > first_seq.raw());
+    store.wait_for_block_journal_request(first_request).unwrap();
+
+    // The later sequence wins the overlapping range in live reads.
+    let mut live = vec![0; 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 4096), &mut live)
+        .unwrap();
+    assert_eq!(live, repeated_blocks(1, 72));
+
+    store.flush_device_with_writer(&lease).unwrap();
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, repeated_blocks(1, 72));
+    let _ = fs::remove_dir_all(root);
+}
+
+// A failed lane sync must fail every waiter in the batch without advancing
+// any durability high-water, and a crash after the failed boundary must not
+// replay the covered writes.
+#[test]
+fn durable_block_journal_lane_sync_failure_fails_waiters_without_durability() {
+    let root = durable_temp_dir("block-journal-lane-sync-failure");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("journal-lane-sync-failure".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let flushed = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 81),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.fail_next_block_journal_append_for_test();
+    assert!(matches!(
+        store.flush_device_with_writer(&lease),
+        Err(StorageError::Unavailable { .. })
+    ));
+    assert_eq!(
+        store
+            .block_journal
+            .durable_through(device_id)
+            .unwrap()
+            .raw(),
+        0
+    );
+
+    // The boundary works again once the journal recovers.
+    let recovered = store.flush_device_with_writer(&lease).unwrap();
+    assert_eq!(recovered.durable_through, flushed.commit_seq);
+
+    // A write whose only boundary failed must not replay after restart.
+    store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 82),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.fail_next_block_journal_append_for_test();
+    assert!(store.flush_device_with_writer(&lease).is_err());
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 2 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut replayed)
+        .unwrap();
+    assert_eq!(&replayed[0..4096], repeated_blocks(1, 81).as_slice());
+    assert_eq!(&replayed[4096..], vec![0; 4096].as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+// A segment-ref staging failure must expose nothing: no visible commit, no
+// device head movement, and nothing replayable after reopen. The staged
+// payload becomes invisible orphan data for custodian cleanup.
+#[test]
+fn durable_block_journal_segment_ref_staging_failure_exposes_nothing() {
+    let root = durable_temp_dir("block-journal-segref-staging-failure");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("journal-segref-staging-failure".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let first = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 31),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    store.fail_next_prestage_for_test();
+    assert!(matches!(
+        store.write_device_with_writer(
+            &lease,
+            512 * 4096,
+            &repeated_blocks(256, 32),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Unavailable { .. })
+    ));
+
+    let info = store.local.metadata.device_info(device_id).unwrap();
+    assert_eq!(info.latest_commit, first.commit_seq);
+    let mut failed_range = vec![9; 1024 * 1024];
+    store
+        .read_device(
+            device_id,
+            ByteRange::new(512 * 4096, 1024 * 1024),
+            &mut failed_range,
+        )
+        .unwrap();
+    assert_eq!(failed_range, vec![0; 1024 * 1024]);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 1024 * 1024];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, repeated_blocks(256, 31));
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(512 * 4096, 1024 * 1024),
+            &mut replayed,
+        )
+        .unwrap();
+    assert_eq!(replayed, vec![0; 1024 * 1024]);
+    let _ = fs::remove_dir_all(root);
+}
+
+// A lane append failure after segment payloads are already durable must fail
+// the write without exposing it; the durable payload stays an invisible
+// orphan and reopen sees a clean store.
+#[test]
+fn durable_block_journal_segment_ref_lane_failure_leaves_invisible_orphan() {
+    let root = durable_temp_dir("block-journal-segref-lane-failure");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("journal-segref-lane-failure".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    store.fail_next_block_journal_append_for_test();
+    assert!(matches!(
+        store.write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 41),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Unavailable { .. })
+    ));
+
+    let mut live = vec![9; 1024 * 1024];
+    store
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut live)
+        .unwrap();
+    assert_eq!(live, vec![0; 1024 * 1024]);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![9; 1024 * 1024];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, vec![0; 1024 * 1024]);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Concurrent acknowledged-write-plus-flush pairs on one device must each
+// observe their own durability boundary and replay identically after reopen.
+#[test]
+fn durable_block_journal_lane_supports_concurrent_boundaries_on_one_device() {
+    let root = durable_temp_dir("block-journal-lane-concurrent");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 64,
+                block_size: 4096,
+            },
+            name: Some("journal-lane-concurrent".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let threads = 8_u64;
+    let ops_per_thread = 8_u64;
+    thread::scope(|scope| {
+        for worker in 0..threads {
+            let store = &store;
+            let lease = &lease;
+            scope.spawn(move || {
+                for op in 0..ops_per_thread {
+                    let block = worker * ops_per_thread + op;
+                    store
+                        .write_device_with_writer(
+                            lease,
+                            block * 4096,
+                            &repeated_blocks(1, 100 + block as u8),
+                            WriteDurability::Acknowledged,
+                            PayloadIntegrity::Verified,
+                        )
+                        .unwrap();
+                    store.flush_device(device_id).unwrap();
+                }
+            });
+        }
+    });
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    for block in 0..threads * ops_per_thread {
+        let mut bytes = vec![0; 4096];
+        reopened
+            .read_device(device_id, ByteRange::new(block * 4096, 4096), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, repeated_blocks(1, 100 + block as u8));
+    }
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3831,6 +4400,7 @@ fn durable_stream_auto_persist_async_queues_payload_sync_without_inline_wait() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 auto_persist: AppendAutoPersistPolicy {
                     mode: AppendAutoPersistMode::AsyncPayloadSync,
@@ -3912,6 +4482,7 @@ fn durable_stream_auto_persist_async_marks_observed_background_sync() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 auto_persist: AppendAutoPersistPolicy {
                     mode: AppendAutoPersistMode::AsyncPayloadSync,
@@ -8073,6 +8644,7 @@ fn durable_append_run_payloads_can_shard_node_active_logs_by_stream() {
             },
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: ingest_data_log_policy,
                 ..AppendIngestPolicy::default()
@@ -8181,6 +8753,7 @@ fn durable_append_run_payloads_can_shard_node_active_logs_by_stream() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
         )
         .is_err(),
@@ -8194,6 +8767,7 @@ fn durable_append_run_payloads_can_shard_node_active_logs_by_stream() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: ingest_data_log_policy,
                 ..AppendIngestPolicy::default()
@@ -8247,6 +8821,7 @@ fn durable_multilane_append_run_survives_publish_compaction_and_reopen() {
             data_log_policy,
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: ingest_data_log_policy,
                 ..AppendIngestPolicy::default()
@@ -8305,6 +8880,7 @@ fn durable_multilane_append_run_survives_publish_compaction_and_reopen() {
             data_log_policy,
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: ingest_data_log_policy,
                 ..AppendIngestPolicy::default()
@@ -11253,6 +11829,7 @@ fn durable_append_ingest_admission_policy_rejects_invalid_values() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 admission: invalid,
                 ..AppendIngestPolicy::default()
@@ -11272,6 +11849,7 @@ fn durable_append_ingest_admission_policy_rejects_invalid_values() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 admission: invalid,
                 ..AppendIngestPolicy::default()
@@ -11291,6 +11869,7 @@ fn durable_append_ingest_admission_policy_rejects_invalid_values() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: invalid,
                 ..AppendIngestPolicy::default()
@@ -11317,6 +11896,7 @@ fn durable_append_ingest_data_log_policy_rejects_invalid_values() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: invalid,
                 ..AppendIngestPolicy::default()
@@ -11336,6 +11916,7 @@ fn durable_append_ingest_data_log_policy_rejects_invalid_values() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: invalid,
                 ..AppendIngestPolicy::default()
@@ -11390,6 +11971,7 @@ fn durable_append_ingest_profile_records_payload_write() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 admission: policy,
                 ..AppendIngestPolicy::default()
@@ -11452,6 +12034,7 @@ fn durable_append_ingest_profile_records_auto_persist_wait() {
             DurableDataLogPolicy::default(),
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy {
                 data_log: AppendIngestDataLogPolicy {
                     background_sync_step_bytes: Some(4096),

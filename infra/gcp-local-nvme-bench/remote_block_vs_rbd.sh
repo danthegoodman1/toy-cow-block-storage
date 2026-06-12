@@ -13,6 +13,8 @@ STORAGE_NODES="${STORAGE_NODES:-4}"
 CONCURRENCY="${CONCURRENCY:-1,4,16,32}"
 IO_SIZES="${IO_SIZES:-4k,64k,256k,1m,32m}"
 TOY_RTTS="${TOY_RTTS:-0,200}"
+TOY_DURABILITIES="${TOY_DURABILITIES:-ack-flush:1,flushed}"
+TOY_REPEATS="${TOY_REPEATS:-2}"
 SKIP_TOY="${SKIP_TOY:-0}"
 DELAY_MODE="${DELAY_MODE:-spin}"
 DURATION_MS="${DURATION_MS:-5000}"
@@ -115,6 +117,8 @@ fi
   echo "concurrency=${CONCURRENCY}"
   echo "io_sizes=${IO_SIZES}"
   echo "toy_rtts=${TOY_RTTS}"
+  echo "toy_durabilities=${TOY_DURABILITIES}"
+  echo "toy_repeats=${TOY_REPEATS}"
   echo "skip_toy=${SKIP_TOY}"
   echo "delay_mode=${DELAY_MODE}"
   echo "duration_ms=${DURATION_MS}"
@@ -228,53 +232,74 @@ setup_toy_storage() {
   done
 }
 
+run_toy_case() {
+  local run_key="$1"
+  local bytes="$2"
+  local rtt="$3"
+  local durability="$4"
+  local out="${RESULT_ROOT}/toy/${run_key}"
+  local root="/mnt/toy-journal/loadbench/${run_key}/root"
+  local node_dirs
+  node_dirs="$(toy_node_dirs_for_run "${run_key}")"
+  mkdir -p "${out}" "$(dirname "${root}")"
+  log "running toy block ${run_key} bytes=${bytes}"
+  "${LOADBENCH}" \
+    --provider durable \
+    --durability "${durability}" \
+    --workloads block-batch-4k-16ops \
+    --block-batch-ops 1 \
+    --block-batch-bytes "${bytes}" \
+    --block-batch-overlap random \
+    --duration-ms "${DURATION_MS}" \
+    --warmup-ms "${WARMUP_MS}" \
+    --concurrency "${CONCURRENCY}" \
+    --device-blocks "${DEVICE_BLOCKS}" \
+    --shards "${SHARDS}" \
+    --storage-nodes "${STORAGE_NODES}" \
+    --rtt-us "${rtt}" \
+    --delay-mode "${DELAY_MODE}" \
+    --payload-integrity verified \
+    --target-data-log-mib 64 \
+    --data-log-file-sync-fanout 16 \
+    --root "${root}" \
+    --storage-node-data-dirs "${node_dirs}" \
+    --matrix-csv "${out}/matrix.csv" \
+    --durable-profile-csv "${out}/durable-profile.csv" \
+    --block-batch-profile-csv "${out}/block-batch-profile.csv" \
+    | tee "${out}/stdout.csv"
+  rm -rf "/mnt/toy-journal/loadbench/${run_key}"
+  for index in $(seq 1 "${STORAGE_NODES}"); do
+    rm -rf "/mnt/toy-node-${index}/loadbench/${run_key}"
+  done
+}
+
 run_toy_matrix() {
   setup_toy_storage
   start_monitors toy
   IFS=',' read -r -a sizes <<<"${IO_SIZES}"
   IFS=',' read -r -a rtts <<<"${TOY_RTTS}"
+  IFS=',' read -r -a durabilities <<<"${TOY_DURABILITIES}"
+  local cases=()
   for raw_size in "${sizes[@]}"; do
     local label
     label="$(normalize_size_label "${raw_size}")"
     local bytes
     bytes="$(size_bytes "${raw_size}")"
     for rtt in "${rtts[@]}"; do
-      local run_key="size-${label}-rtt-${rtt}"
-      local out="${RESULT_ROOT}/toy/${run_key}"
-      local root="/mnt/toy-journal/loadbench/${run_key}/root"
-      local node_dirs
-      node_dirs="$(toy_node_dirs_for_run "${run_key}")"
-      mkdir -p "${out}" "$(dirname "${root}")"
-      log "running toy block size=${label} bytes=${bytes} rtt=${rtt}"
-      "${LOADBENCH}" \
-        --provider durable \
-        --durability ack-flush:1 \
-        --workloads block-batch-4k-16ops \
-        --block-batch-ops 1 \
-        --block-batch-bytes "${bytes}" \
-        --block-batch-overlap random \
-        --duration-ms "${DURATION_MS}" \
-        --warmup-ms "${WARMUP_MS}" \
-        --concurrency "${CONCURRENCY}" \
-        --device-blocks "${DEVICE_BLOCKS}" \
-        --shards "${SHARDS}" \
-        --storage-nodes "${STORAGE_NODES}" \
-        --rtt-us "${rtt}" \
-        --delay-mode "${DELAY_MODE}" \
-        --payload-integrity verified \
-        --target-data-log-mib 64 \
-        --data-log-file-sync-fanout 16 \
-        --root "${root}" \
-        --storage-node-data-dirs "${node_dirs}" \
-        --matrix-csv "${out}/matrix.csv" \
-        --durable-profile-csv "${out}/durable-profile.csv" \
-        --block-batch-profile-csv "${out}/block-batch-profile.csv" \
-        | tee "${out}/stdout.csv"
-      rm -rf "/mnt/toy-journal/loadbench/${run_key}"
-      for index in $(seq 1 "${STORAGE_NODES}"); do
-        rm -rf "/mnt/toy-node-${index}/loadbench/${run_key}"
+      for durability in "${durabilities[@]}"; do
+        local durlabel="${durability//:/-}"
+        cases+=("size-${label}-rtt-${rtt}-dur-${durlabel}|${bytes}|${rtt}|${durability}")
       done
     done
+  done
+  # Repeats run in shuffled order so first-pass layout effects show up as
+  # spread between repeats instead of biasing one configuration.
+  for repeat in $(seq 1 "${TOY_REPEATS}"); do
+    while IFS= read -r case_line; do
+      [[ -n "${case_line}" ]] || continue
+      IFS='|' read -r case_key bytes rtt durability <<<"${case_line}"
+      run_toy_case "${case_key}-rep-${repeat}" "${bytes}" "${rtt}" "${durability}"
+    done < <(printf '%s\n' "${cases[@]}" | shuf)
   done
   teardown_storage
 }
@@ -450,32 +475,64 @@ def fio_percentile(write, key):
             return as_float(percentiles[key]) / 1000.0
     return 0.0
 
-rows = []
+raw_rows = []
 for path in sorted((root / "toy").glob("size-*/matrix.csv")):
-    match = re.search(r"size-([^-]+)-rtt-([0-9]+)", str(path))
+    match = re.search(
+        r"size-([^-]+)-rtt-([0-9]+)-dur-([^/]+?)-rep-([0-9]+)", str(path)
+    )
     if not match:
         continue
     io_size = match.group(1)
     rtt_us = match.group(2)
+    durability = match.group(3)
+    repeat = int(match.group(4))
     with path.open(newline="") as f:
         for row in csv.DictReader(f):
-            rows.append({
-                "system": "toy-block",
+            raw_rows.append({
+                "system": f"toy-block-{durability}",
                 "io_size": io_size,
                 "size_bytes": parse_size_label(io_size),
                 "rtt_us": rtt_us,
+                "repeat": repeat,
                 "concurrency": row["concurrency"],
-                "throughput_MBps": row["published_mbps"],
-                "iops": row["success_iops"],
-                "p50_us": row["p50_us"],
-                "p90_us": row["p90_us"],
-                "p99_us": row["p99_us"],
-                "p999_us": row["p999_us"],
-                "max_us": row["max_us"],
+                "throughput_MBps": as_float(row["published_mbps"]),
+                "iops": as_float(row["success_iops"]),
+                "p50_us": as_float(row["p50_us"]),
+                "p90_us": as_float(row["p90_us"]),
+                "p99_us": as_float(row["p99_us"]),
+                "p999_us": as_float(row["p999_us"]),
+                "max_us": as_float(row["max_us"]),
                 "errors": row["errors"],
                 "source": str(path.relative_to(root)),
-                "semantics": "loadbench durable ack-flush:1, one random block-batch write per op",
+                "semantics": (
+                    f"loadbench durable {durability}, "
+                    "one random block-batch write per op"
+                ),
             })
+
+def median(values):
+    values = sorted(values)
+    if not values:
+        return 0.0
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2.0
+
+# Collapse repeats into per-cell medians so one anomalous pass cannot bias
+# the comparison.
+rows = []
+by_cell = {}
+for row in raw_rows:
+    key = (row["system"], row["io_size"], row["rtt_us"], row["concurrency"])
+    by_cell.setdefault(key, []).append(row)
+for cell_rows in by_cell.values():
+    base = dict(cell_rows[0])
+    for field in ("throughput_MBps", "iops", "p50_us", "p90_us", "p99_us", "p999_us", "max_us"):
+        base[field] = median([row[field] for row in cell_rows])
+    base["source"] = ";".join(sorted(row["source"] for row in cell_rows))
+    del base["repeat"]
+    rows.append(base)
 
 for path in sorted((root / "ceph").glob("size-*/fio.json")):
     match = re.search(r"size-([^-]+)-c([0-9]+)", str(path))
@@ -539,7 +596,7 @@ for row in rows:
 ratio_rows = []
 for toy_key, toy in by_key.items():
     system, io_size, rtt_us, concurrency = toy_key
-    if system != "toy-block":
+    if not system.startswith("toy-block"):
         continue
     ceph = by_key.get(("ceph-rbd", io_size, "0", concurrency))
     if not ceph:
@@ -549,6 +606,7 @@ for toy_key, toy in by_key.items():
     toy_p99 = as_float(toy["p99_us"])
     ceph_p99 = as_float(ceph["p99_us"])
     ratio_rows.append({
+        "system": system,
         "io_size": io_size,
         "rtt_us": rtt_us,
         "concurrency": concurrency,
@@ -562,6 +620,7 @@ for toy_key, toy in by_key.items():
 
 with (root / "relative-summary.csv").open("w", newline="") as f:
     fields = [
+        "system",
         "io_size",
         "rtt_us",
         "concurrency",
@@ -575,6 +634,7 @@ with (root / "relative-summary.csv").open("w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=fields)
     writer.writeheader()
     writer.writerows(sorted(ratio_rows, key=lambda row: (
+        row["system"],
         row["io_size"],
         int(row["concurrency"]),
         int(row["rtt_us"]),

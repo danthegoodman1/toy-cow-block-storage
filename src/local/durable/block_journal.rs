@@ -71,8 +71,11 @@ pub(super) struct BlockJournalDeviceOverlay {
     writer_epoch: WriterEpoch,
     durable_through: CommitSeq,
     visible_through: CommitSeq,
-    entries: Vec<BlockJournalOverlayEntry>,
-    read_entries: Vec<BlockJournalOverlayEntry>,
+    // Collapsed newest-wins read index keyed by range start, so inserts and
+    // range reads cost O(log n + overlaps) instead of shifting a sorted
+    // vector. Only the current bytes per range are retained; shadowed
+    // history lives in the journal file, not in memory.
+    read_entries: BTreeMap<u64, BlockJournalOverlayEntry>,
 }
 
 impl Default for BlockJournalDeviceOverlay {
@@ -81,8 +84,7 @@ impl Default for BlockJournalDeviceOverlay {
             writer_epoch: WriterEpoch::from_raw(0),
             durable_through: CommitSeq::from_raw(0),
             visible_through: CommitSeq::from_raw(0),
-            entries: Vec::new(),
-            read_entries: Vec::new(),
+            read_entries: BTreeMap::new(),
         }
     }
 }
@@ -90,6 +92,26 @@ impl Default for BlockJournalDeviceOverlay {
 #[derive(Debug, Default)]
 pub(super) struct BlockJournalOverlay {
     inner: Mutex<BTreeMap<DeviceId, BlockJournalDeviceOverlay>>,
+}
+
+/// One unit of work for the group-committed block journal lane.
+///
+/// Every durable block boundary becomes a lane request so concurrent waiters
+/// share one journal append and one data sync. Write requests carry full
+/// commits; Flush requests only advance a device durability high-water and may
+/// be merged per device inside one batch.
+#[derive(Debug, Clone)]
+pub(super) enum BlockJournalLaneRequest {
+    Write(BlockJournalCommit),
+    Flush {
+        device_id: DeviceId,
+        writer_epoch: WriterEpoch,
+        durable_through: CommitSeq,
+    },
+    Lease {
+        device_id: DeviceId,
+        writer_epoch: WriterEpoch,
+    },
 }
 
 #[derive(Debug)]
@@ -102,8 +124,42 @@ pub(super) struct BlockJournalFlushCoordinator {
 pub(super) struct BlockJournalFlushState {
     in_flight: bool,
     generation: u64,
-    pending: BTreeMap<u64, BlockJournalCommit>,
+    next_request_id: u64,
+    pending: BTreeMap<u64, BlockJournalLaneRequest>,
     completed: BTreeMap<u64, Result<()>>,
+    // Per-device count of lane writes whose overlay apply has not finished.
+    // Live applies must happen in commit-seq order per device, so an
+    // acknowledged write may bypass the lane only while this count is zero
+    // for its device.
+    unapplied_writes: BTreeMap<DeviceId, u64>,
+}
+
+impl BlockJournalFlushState {
+    fn enqueue(&mut self, request: BlockJournalLaneRequest) -> u64 {
+        if let BlockJournalLaneRequest::Write(commit) = &request {
+            *self.unapplied_writes.entry(commit.device_id).or_default() += 1;
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending.insert(request_id, request);
+        request_id
+    }
+
+    fn has_unapplied_writes(&self, device_id: DeviceId) -> bool {
+        self.unapplied_writes
+            .get(&device_id)
+            .is_some_and(|count| *count > 0)
+    }
+
+    fn release_unapplied_writes(&mut self, device_id: DeviceId, count: u64) {
+        let Some(outstanding) = self.unapplied_writes.get_mut(&device_id) else {
+            return;
+        };
+        *outstanding = outstanding.saturating_sub(count);
+        if *outstanding == 0 {
+            self.unapplied_writes.remove(&device_id);
+        }
+    }
 }
 
 impl BlockJournalFlushCoordinator {
@@ -289,70 +345,71 @@ fn block_journal_overlay_slice(
 }
 
 fn insert_block_journal_read_entry(
-    entries: &mut Vec<BlockJournalOverlayEntry>,
+    entries: &mut BTreeMap<u64, BlockJournalOverlayEntry>,
     entry: BlockJournalOverlayEntry,
 ) -> Result<()> {
     let entry_end = entry.range.end_exclusive()?;
-    let left = entries.partition_point(|current| {
-        current
-            .range
-            .end_exclusive()
-            .is_ok_and(|current_end| current_end <= entry.range.offset)
-    });
-    let right = entries.partition_point(|current| current.range.offset < entry_end);
-    let mut replace_start = left;
-    if replace_start > 0
-        && entries[replace_start - 1].range.end_exclusive()? == entry.range.offset
+
+    let mut overlapping = Vec::new();
+    if let Some((&key, existing)) = entries.range(..entry.range.offset).next_back()
+        && existing.range.end_exclusive()? > entry.range.offset
     {
-        replace_start -= 1;
+        overlapping.push(key);
     }
-    let mut replace_end = right;
-    if replace_end < entries.len() && entries[replace_end].range.offset == entry_end {
-        replace_end += 1;
-    }
-
-    let mut next = Vec::with_capacity(
-        replace_end
-            .saturating_sub(replace_start)
-            .saturating_add(2),
+    overlapping.extend(
+        entries
+            .range(entry.range.offset..entry_end)
+            .map(|(&key, _)| key),
     );
-    for current in &entries[replace_start..replace_end] {
-        let current_end = current.range.end_exclusive()?;
-        if current_end <= entry.range.offset || current.range.offset >= entry_end {
-            next.push(current.clone());
+    for key in overlapping {
+        let Some(existing) = entries.remove(&key) else {
             continue;
+        };
+        let existing_end = existing.range.end_exclusive()?;
+        if existing.range.offset < entry.range.offset {
+            let left = block_journal_overlay_slice(
+                &existing,
+                ByteRange::new(
+                    existing.range.offset,
+                    entry.range.offset - existing.range.offset,
+                ),
+            )?;
+            entries.insert(left.range.offset, left);
         }
-        if current.range.offset < entry.range.offset {
-            next.push(block_journal_overlay_slice(
-                current,
-                ByteRange::new(current.range.offset, entry.range.offset - current.range.offset),
-            )?);
-        }
-        if current_end > entry_end {
-            next.push(block_journal_overlay_slice(
-                current,
-                ByteRange::new(entry_end, current_end - entry_end),
-            )?);
+        if existing_end > entry_end {
+            let right = block_journal_overlay_slice(
+                &existing,
+                ByteRange::new(entry_end, existing_end - entry_end),
+            )?;
+            entries.insert(right.range.offset, right);
         }
     }
-    next.push(entry);
-    next.sort_by_key(|entry| entry.range.offset);
-    coalesce_block_journal_read_entries(&mut next)?;
-    entries.splice(replace_start..replace_end, next);
-    Ok(())
-}
 
-fn coalesce_block_journal_read_entries(entries: &mut Vec<BlockJournalOverlayEntry>) -> Result<()> {
-    let mut coalesced = Vec::<BlockJournalOverlayEntry>::with_capacity(entries.len());
-    for entry in entries.drain(..) {
-        if let Some(last) = coalesced.last_mut()
-            && try_merge_block_journal_read_entry(last, &entry)?
-        {
-            continue;
+    // Merge with adjacent same-source neighbors so contiguous writes keep
+    // the index minimal.
+    let mut merged = entry;
+    let previous_key = entries
+        .range(..merged.range.offset)
+        .next_back()
+        .map(|(&key, _)| key);
+    if let Some(previous_key) = previous_key
+        && let Some(previous) = entries.get(&previous_key)
+        && previous.range.end_exclusive()? == merged.range.offset
+    {
+        let mut candidate = previous.clone();
+        if try_merge_block_journal_read_entry(&mut candidate, &merged)? {
+            entries.remove(&previous_key);
+            merged = candidate;
         }
-        coalesced.push(entry);
     }
-    *entries = coalesced;
+    let merged_end = merged.range.end_exclusive()?;
+    if let Some(next) = entries.get(&merged_end) {
+        let next = next.clone();
+        if try_merge_block_journal_read_entry(&mut merged, &next)? {
+            entries.remove(&merged_end);
+        }
+    }
+    entries.insert(merged.range.offset, merged);
     Ok(())
 }
 
@@ -414,77 +471,65 @@ fn try_merge_block_journal_read_entry(
     }
 }
 
-fn apply_block_journal_read_entries(
+fn apply_block_journal_read_entry(
     storage: &impl StorageNodeReadService,
-    entries: &[BlockJournalOverlayEntry],
+    entry: &BlockJournalOverlayEntry,
     requested: ByteRange,
-    requested_end: u64,
     verification: ReadVerification,
     buf: &mut [u8],
-    entries_are_ordered: bool,
 ) -> Result<()> {
-    for entry in entries {
-        let entry_end = entry.range.end_exclusive()?;
-        if entry_end <= requested.offset {
-            continue;
-        }
-        if entries_are_ordered && entry.range.offset >= requested_end {
-            break;
-        }
-        let Some(overlap) = byte_range_intersection(entry.range, requested)? else {
-            continue;
-        };
-        let output_start = usize::try_from(overlap.offset - requested.offset)
-            .map_err(|_| StorageError::corrupt("block journal read output overflows usize"))?;
-        let output_len = usize::try_from(overlap.len)
-            .map_err(|_| StorageError::corrupt("block journal read length overflows usize"))?;
-        let output_end = output_start
-            .checked_add(output_len)
-            .ok_or_else(|| StorageError::corrupt("block journal read output end overflows"))?;
-        let output = buf
-            .get_mut(output_start..output_end)
-            .ok_or_else(|| StorageError::corrupt("block journal read output out of bounds"))?;
-        match &entry.source {
-            BlockJournalOverlaySource::Sparse => output.fill(0),
-            BlockJournalOverlaySource::Bytes {
-                payload_integrity,
-                bytes,
-            } => {
-                let source_start = usize::try_from(overlap.offset - entry.range.offset).map_err(
-                    |_| StorageError::corrupt("block journal read source overflows usize"),
-                )?;
-                let source_end = source_start.checked_add(output_len).ok_or_else(|| {
-                    StorageError::corrupt("block journal read source end overflows")
-                })?;
-                let source = bytes.get(source_start..source_end).ok_or_else(|| {
-                    StorageError::corrupt("block journal read source out of bounds")
-                })?;
-                if !matches!(verification, ReadVerification::Skip) {
-                    let integrity = segment_payload_integrity(*payload_integrity, source);
-                    verify_read_integrity_policy(integrity, verification)?;
-                }
-                output.copy_from_slice(source);
+    let Some(overlap) = byte_range_intersection(entry.range, requested)? else {
+        return Ok(());
+    };
+    let output_start = usize::try_from(overlap.offset - requested.offset)
+        .map_err(|_| StorageError::corrupt("block journal read output overflows usize"))?;
+    let output_len = usize::try_from(overlap.len)
+        .map_err(|_| StorageError::corrupt("block journal read length overflows usize"))?;
+    let output_end = output_start
+        .checked_add(output_len)
+        .ok_or_else(|| StorageError::corrupt("block journal read output end overflows"))?;
+    let output = buf
+        .get_mut(output_start..output_end)
+        .ok_or_else(|| StorageError::corrupt("block journal read output out of bounds"))?;
+    match &entry.source {
+        BlockJournalOverlaySource::Sparse => output.fill(0),
+        BlockJournalOverlaySource::Bytes {
+            payload_integrity,
+            bytes,
+        } => {
+            let source_start = usize::try_from(overlap.offset - entry.range.offset)
+                .map_err(|_| StorageError::corrupt("block journal read source overflows usize"))?;
+            let source_end = source_start.checked_add(output_len).ok_or_else(|| {
+                StorageError::corrupt("block journal read source end overflows")
+            })?;
+            let source = bytes.get(source_start..source_end).ok_or_else(|| {
+                StorageError::corrupt("block journal read source out of bounds")
+            })?;
+            if !matches!(verification, ReadVerification::Skip) {
+                let integrity = segment_payload_integrity(*payload_integrity, source);
+                verify_read_integrity_policy(integrity, verification)?;
             }
-            BlockJournalOverlaySource::Segment {
-                storage_node,
-                segment_id,
-                segment_offset,
-                integrity,
-            } => {
-                let source_offset = segment_offset
-                    .checked_add(overlap.offset - entry.range.offset)
-                    .ok_or_else(|| {
-                        StorageError::corrupt("block journal segment read offset overflows")
-                    })?;
-                storage.read_segment_source(
-                    *storage_node,
-                    *segment_id,
-                    ByteRange::new(source_offset, overlap.len),
-                    *integrity,
-                    verification,
-                    output,
-                )?;
-            }
+            output.copy_from_slice(source);
+        }
+        BlockJournalOverlaySource::Segment {
+            storage_node,
+            segment_id,
+            segment_offset,
+            integrity,
+        } => {
+            let source_offset = segment_offset
+                .checked_add(overlap.offset - entry.range.offset)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal segment read offset overflows")
+                })?;
+            storage.read_segment_source(
+                *storage_node,
+                *segment_id,
+                ByteRange::new(source_offset, overlap.len),
+                *integrity,
+                verification,
+                output,
+            )?;
         }
     }
     Ok(())
@@ -543,9 +588,7 @@ impl BlockJournalOverlay {
         let device = inner.entry(commit.device_id).or_default();
         device.writer_epoch = device.writer_epoch.max(commit.writer_epoch);
         device.visible_through = device.visible_through.max(commit.commit_seq);
-        let entries = commit.overlay_entries();
-        device.entries.extend(entries.iter().cloned());
-        for entry in entries {
+        for entry in commit.overlay_entries() {
             insert_block_journal_read_entry(&mut device.read_entries, entry)?;
         }
         Ok(())
@@ -578,28 +621,24 @@ impl BlockJournalOverlay {
         let Some(device) = inner.get(&device_id) else {
             return Ok(duration_nanos_u64(started.elapsed()));
         };
-        let first_overlap = device.read_entries.partition_point(|entry| {
-            entry.range.offset.saturating_add(entry.range.len) <= requested.offset
-        });
-        apply_block_journal_read_entries(
-            storage,
-            &device.read_entries[first_overlap..],
-            requested,
-            requested_end,
-            verification,
-            buf,
-            true,
-        )?;
+        if let Some((_, entry)) = device.read_entries.range(..requested.offset).next_back()
+            && entry.range.end_exclusive()? > requested.offset
+        {
+            apply_block_journal_read_entry(storage, entry, requested, verification, buf)?;
+        }
+        for (_, entry) in device.read_entries.range(requested.offset..requested_end) {
+            apply_block_journal_read_entry(storage, entry, requested, verification, buf)?;
+        }
         Ok(duration_nanos_u64(started.elapsed()))
     }
 
     #[cfg(test)]
-    fn entry_counts_for_test(&self, device_id: DeviceId) -> Result<(usize, usize)> {
+    fn read_entry_count_for_test(&self, device_id: DeviceId) -> Result<usize> {
         let inner = lock(&self.inner)?;
-        let Some(device) = inner.get(&device_id) else {
-            return Ok((0, 0));
-        };
-        Ok((device.entries.len(), device.read_entries.len()))
+        Ok(inner
+            .get(&device_id)
+            .map(|device| device.read_entries.len())
+            .unwrap_or(0))
     }
 }
 
@@ -629,7 +668,7 @@ mod block_journal_tests {
     }
 
     #[test]
-    fn block_journal_read_index_collapses_shadowed_ranges_without_pruning_history() {
+    fn block_journal_read_index_collapses_shadowed_ranges() {
         let overlay = BlockJournalOverlay::default();
         let device_id = DeviceId::from_raw(7);
         let block = 4096_usize;
@@ -644,9 +683,7 @@ mod block_journal_tests {
                 vec![2; block],
             ))
             .unwrap();
-        let (history_count, read_count) = overlay.entry_counts_for_test(device_id).unwrap();
-        assert_eq!(history_count, 2);
-        assert_eq!(read_count, 1);
+        assert_eq!(overlay.read_entry_count_for_test(device_id).unwrap(), 1);
 
         let mut read = vec![9; block * 4];
         overlay
@@ -679,9 +716,7 @@ mod block_journal_tests {
                 vec![2; block],
             ))
             .unwrap();
-        let (history_count, read_count) = overlay.entry_counts_for_test(device_id).unwrap();
-        assert_eq!(history_count, 2);
-        assert_eq!(read_count, 1);
+        assert_eq!(overlay.read_entry_count_for_test(device_id).unwrap(), 1);
 
         let mut read = vec![0; block * 2];
         overlay
@@ -721,9 +756,7 @@ mod block_journal_tests {
                 vec![3; block * 2],
             ))
             .unwrap();
-        let (history_count, read_count) = overlay.entry_counts_for_test(device_id).unwrap();
-        assert_eq!(history_count, 3);
-        assert_eq!(read_count, 1);
+        assert_eq!(overlay.read_entry_count_for_test(device_id).unwrap(), 1);
 
         let mut read = vec![0; block * 3];
         overlay
@@ -893,6 +926,9 @@ impl DurableSqliteStore {
                 BlockJournalRecord::Write(commit) => {
                     let info = local.metadata.device_info(commit.device_id)?;
                     commit.validate(&info.spec)?;
+                    local
+                        .metadata
+                        .observe_allocated_commit_seq(commit.commit_seq)?;
                     local.seed_block_writer_epoch(commit.device_id, commit.writer_epoch)?;
                     overlay.set_writer_epoch(commit.device_id, commit.writer_epoch)?;
                     latest_epoch
@@ -914,6 +950,9 @@ impl DurableSqliteStore {
                     writer_epoch,
                     durable_through: flushed_through,
                 } => {
+                    local
+                        .metadata
+                        .observe_allocated_commit_seq(flushed_through)?;
                     local.seed_block_writer_epoch(device_id, writer_epoch)?;
                     overlay.mark_durable(device_id, writer_epoch, flushed_through)?;
                     latest_epoch

@@ -3,8 +3,11 @@
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 const BLOCK_DELTA_PARALLEL_COMMIT_MIN_BYTES: u64 = 16 * 1024 * 1024;
-const BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES: u64 = BLOCK_JOURNAL_INLINE_MAX_BYTES;
-const BLOCK_JOURNAL_ACK_INLINE_MAX_BYTES: u64 = 1024 * 1024;
+/// Chunk size for segment-ref payload staging.
+///
+/// Large block writes split into multiple segments so placement spreads one
+/// write across storage nodes and their data disks.
+const BLOCK_SEGMENT_REF_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockJournalFastPathMode {
@@ -24,6 +27,8 @@ pub struct DurableCoordinator {
     pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     block_delta_staging_lock: Arc<Mutex<()>>,
     block_delta_prestage: Arc<BlockDeltaPrestageTracker>,
+    block_segment_ref_staging: Arc<BlockSegmentRefStagingGate>,
+    block_device_pending_payloads: Arc<BlockDevicePendingPayloads>,
     stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<StreamAppendLane>>>>,
     persist_lock: Arc<Mutex<()>>,
     metadata_persist_gate: Arc<RwLock<()>>,
@@ -31,6 +36,7 @@ pub struct DurableCoordinator {
     stream_prefix_persist_coordinator: Arc<StreamPrefixPersistCoordinator>,
     append_publish_persist_coordinator: Arc<AppendPublishPersistCoordinator>,
     append_publish_batch_policy: AppendPublishBatchPolicy,
+    block_journal_batch_policy: BlockJournalBatchPolicy,
     append_ingest_admission_policy: AppendIngestAdmissionPolicy,
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     append_auto_persist_policy: AppendAutoPersistPolicy,
@@ -57,6 +63,98 @@ struct AppendPublishLaneKey {
 enum PendingCompactDeltaRun {
     Block(Vec<BlockDeltaCommit>),
     NativeFile(Vec<NativeFileDeltaCommit>),
+}
+
+#[derive(Debug)]
+struct StagedBlockSegmentRefs {
+    entries: Vec<BlockJournalEntry>,
+    segment_ids: BTreeSet<SegmentId>,
+    committed_bytes: u64,
+    write_count: u64,
+    collapsed_range_count: u64,
+}
+
+/// Tracks in-flight block segment-ref payload staging.
+///
+/// Full persists wait for staging to drain before exporting local segments,
+/// so a segment being prestaged concurrently is never exported and appended
+/// to a data log twice.
+#[derive(Debug, Default)]
+struct BlockSegmentRefStagingGate {
+    inner: Mutex<u64>,
+    cvar: Condvar,
+}
+
+/// Segment-ref payloads acknowledged but not yet payload-durable, per device.
+///
+/// An acknowledged segment-ref write registers its prestaged placements here.
+/// Any flush boundary that would cover the write's sequence must first sync
+/// and catalog these payloads, so a durable Flush record never references
+/// segment bytes that could be lost in a crash.
+#[derive(Debug, Default)]
+struct BlockDevicePendingPayloads {
+    inner: Mutex<BTreeMap<DeviceId, BTreeMap<u64, PendingBlockPayload>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBlockPayload {
+    appended: PendingDataLogAppend,
+    segment_ids: BTreeSet<SegmentId>,
+}
+
+impl BlockDevicePendingPayloads {
+    fn register(
+        &self,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+        payload: PendingBlockPayload,
+    ) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        inner
+            .entry(device_id)
+            .or_default()
+            .insert(commit_seq.raw(), payload);
+        Ok(())
+    }
+
+    fn drain_through(
+        &self,
+        device_id: DeviceId,
+        through: CommitSeq,
+    ) -> Result<Vec<(u64, PendingBlockPayload)>> {
+        let mut inner = lock(&self.inner)?;
+        let Some(device) = inner.get_mut(&device_id) else {
+            return Ok(Vec::new());
+        };
+        let covered: Vec<u64> = device
+            .range(..=through.raw())
+            .map(|(seq, _)| *seq)
+            .collect();
+        let drained = covered
+            .into_iter()
+            .filter_map(|seq| device.remove(&seq).map(|payload| (seq, payload)))
+            .collect();
+        if device.is_empty() {
+            inner.remove(&device_id);
+        }
+        Ok(drained)
+    }
+
+    fn reinsert(
+        &self,
+        device_id: DeviceId,
+        entries: Vec<(u64, PendingBlockPayload)>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut inner = lock(&self.inner)?;
+        let device = inner.entry(device_id).or_default();
+        for (seq, payload) in entries {
+            device.insert(seq, payload);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -311,13 +409,14 @@ impl DurableCoordinator {
         policy: DurableDataLogPolicy,
         append_visible_publish_journal: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+        Self::open_with_policies(
             root,
             config,
             storage_nodes,
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
         )
     }
@@ -335,22 +434,25 @@ impl DurableCoordinator {
         append_visible_publish_journal: Option<PathBuf>,
         append_publish_batch_policy: AppendPublishBatchPolicy,
     ) -> Result<Self> {
-        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+        Self::open_with_policies(
             root,
             config,
             storage_nodes,
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             append_publish_batch_policy,
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
         )
     }
 
     /// Open a durable store with explicit storage nodes, split journal layout,
-    /// append publish batching, and append ingest policies.
+    /// append publish batching, block journal batching, and append ingest
+    /// policies.
     ///
     /// The policies change only local durable scheduling. They do not change the
     /// visible or restart-durable append publish contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
         root: impl AsRef<Path>,
         config: LocalStoreConfig,
@@ -358,15 +460,17 @@ impl DurableCoordinator {
         policy: DurableDataLogPolicy,
         append_visible_publish_journal: Option<PathBuf>,
         append_publish_batch_policy: AppendPublishBatchPolicy,
+        block_journal_batch_policy: BlockJournalBatchPolicy,
         append_ingest_policy: AppendIngestPolicy,
     ) -> Result<Self> {
-        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+        Self::open_with_policies(
             root,
             config,
             storage_nodes,
             MaintenancePolicy::manual(policy),
             append_visible_publish_journal,
             append_publish_batch_policy,
+            block_journal_batch_policy,
             append_ingest_policy,
         )
     }
@@ -400,13 +504,14 @@ impl DurableCoordinator {
         storage_nodes: Vec<StorageNodeId>,
         maintenance_policy: MaintenancePolicy,
     ) -> Result<Self> {
-        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+        Self::open_with_policies(
             root,
             config,
             storage_nodes,
             maintenance_policy,
             None,
             AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
         )
     }
@@ -420,29 +525,33 @@ impl DurableCoordinator {
         maintenance_policy: MaintenancePolicy,
         append_publish_batch_policy: AppendPublishBatchPolicy,
     ) -> Result<Self> {
-        Self::open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+        Self::open_with_policies(
             root,
             config,
             storage_nodes,
             maintenance_policy,
             None,
             append_publish_batch_policy,
+            BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
         )
     }
 
-    fn open_with_storage_nodes_maintenance_policy_and_append_visible_publish_journal(
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_policies(
         root: impl AsRef<Path>,
         config: LocalStoreConfig,
         storage_nodes: Vec<StorageNodeId>,
         maintenance_policy: MaintenancePolicy,
         append_visible_publish_journal: Option<PathBuf>,
         append_publish_batch_policy: AppendPublishBatchPolicy,
+        block_journal_batch_policy: BlockJournalBatchPolicy,
         append_ingest_policy: AppendIngestPolicy,
     ) -> Result<Self> {
         config.validate()?;
         maintenance_policy.validate()?;
         append_publish_batch_policy.validate()?;
+        block_journal_batch_policy.validate()?;
         append_ingest_policy.validate()?;
         let storage_nodes = normalize_storage_nodes(config.storage_node, storage_nodes);
         let paths = match append_visible_publish_journal {
@@ -482,6 +591,8 @@ impl DurableCoordinator {
             pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
             block_delta_staging_lock: Arc::new(Mutex::new(())),
             block_delta_prestage: Arc::new(BlockDeltaPrestageTracker::new()),
+            block_segment_ref_staging: Arc::new(BlockSegmentRefStagingGate::default()),
+            block_device_pending_payloads: Arc::new(BlockDevicePendingPayloads::default()),
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_lock: Arc::new(Mutex::new(())),
             metadata_persist_gate: Arc::new(RwLock::new(())),
@@ -489,6 +600,7 @@ impl DurableCoordinator {
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
             append_publish_persist_coordinator: Arc::new(AppendPublishPersistCoordinator::new()),
             append_publish_batch_policy,
+            block_journal_batch_policy,
             append_ingest_admission_policy: append_ingest_policy.admission,
             append_ingest_data_log_policy: append_ingest_policy.data_log,
             append_auto_persist_policy: append_ingest_policy.auto_persist,
@@ -1241,23 +1353,30 @@ impl DurableCoordinator {
     }
 
     fn prestage_block_delta_segments(&self, delta: &BlockDeltaCommit) -> Result<()> {
-        let segment_ids = delta.segment_ids();
-        let previous_segments = lock(&self.persisted_segments)?.clone();
-        let pending_base = lock(&self.pending_data_log_append)?.clone();
-        let pending_segments = pending_base.segment_ids();
-        let missing_segments: BTreeSet<_> = segment_ids
-            .iter()
-            .copied()
-            .filter(|segment_id| {
-                !previous_segments.contains(segment_id) && !pending_segments.contains(segment_id)
-            })
-            .collect();
-        if missing_segments.is_empty() {
-            return Ok(());
+        self.prestage_block_segments(&delta.segment_ids())?;
+        Ok(())
+    }
+
+    fn begin_block_segment_ref_staging(&self) -> Result<()> {
+        let mut count = lock(&self.block_segment_ref_staging.inner)?;
+        *count = count.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish_block_segment_ref_staging(&self) -> Result<()> {
+        let mut count = lock(&self.block_segment_ref_staging.inner)?;
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.block_segment_ref_staging.cvar.notify_all();
         }
-        let (_, payloads) = self.local.state_for_segment_ids(&missing_segments)?;
-        let appended = self.durable.prestage_segments(payloads, &pending_base)?;
-        lock(&self.pending_data_log_append)?.merge(appended);
+        Ok(())
+    }
+
+    fn wait_for_block_segment_ref_staging(&self) -> Result<()> {
+        let mut count = lock(&self.block_segment_ref_staging.inner)?;
+        while *count != 0 {
+            count = wait_on_cvar(&self.block_segment_ref_staging.cvar, count)?;
+        }
         Ok(())
     }
 
@@ -1839,6 +1958,7 @@ impl DurableCoordinator {
         let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
         self.flush_visible_block_journal_heads()?;
         let block_delta_prestage_wait_nanos = self.wait_for_all_block_delta_prestage()?;
+        self.wait_for_block_segment_ref_staging()?;
         let lock_started = Instant::now();
         let _persist_guard = lock(&self.persist_lock)?;
         let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
@@ -3067,6 +3187,13 @@ impl DurableCoordinator {
     }
 
     #[cfg(test)]
+    fn fail_next_block_journal_append_for_test(&self) {
+        self.durable
+            .fail_next_block_journal_append
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     fn fail_next_append_payload_sync_for_test(&self) {
         self.durable
             .fail_next_append_payload_sync
@@ -3200,23 +3327,14 @@ impl DurableCoordinator {
 
     pub fn acquire_block_writer(&self, device_id: DeviceId) -> Result<BlockWriterLease> {
         let lease = self.local.acquire_block_writer(device_id)?;
-        let profile = self.durable.append_block_journal_records(&[BlockJournalRecord::Lease {
-            device_id,
-            writer_epoch: lease.writer_epoch,
-        }])?;
+        let request_id =
+            self.enqueue_block_journal_request(BlockJournalLaneRequest::Lease {
+                device_id,
+                writer_epoch: lease.writer_epoch,
+            })?;
+        self.wait_for_block_journal_request(request_id)?;
         self.block_journal
             .set_writer_epoch(device_id, lease.writer_epoch)?;
-        self.record_persist_profile(DurablePersistProfile {
-            block_journal_encode_nanos: profile.encode_nanos,
-            block_journal_open_nanos: profile.open_nanos,
-            block_journal_write_nanos: profile.write_nanos,
-            block_journal_sync_nanos: profile.sync_nanos,
-            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
-            block_journal_record_count: profile.record_count,
-            block_journal_frame_bytes: profile.frame_bytes,
-            block_journal_created: profile.created,
-            ..DurablePersistProfile::default()
-        })?;
         Ok(lease)
     }
 
@@ -3227,14 +3345,7 @@ impl DurableCoordinator {
     fn block_journal_fast_path_mode(
         &self,
         writes: &[BlockBatchWrite],
-        durability: crate::api::WriteDurability,
-    ) -> Result<Option<BlockJournalFastPathMode>> {
-        if !matches!(
-            durability,
-            crate::api::WriteDurability::Acknowledged | crate::api::WriteDurability::Flushed
-        ) {
-            return Ok(None);
-        }
+    ) -> Result<BlockJournalFastPathMode> {
         let total_bytes = writes.iter().try_fold(0_u64, |total, write| {
             total
                 .checked_add(u64::try_from(write.bytes.len()).map_err(|_| {
@@ -3242,28 +3353,11 @@ impl DurableCoordinator {
                 })?)
                 .ok_or_else(|| StorageError::invalid_argument("block batch byte length overflows"))
         })?;
-        if total_bytes <= BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES {
-            return Ok(Some(BlockJournalFastPathMode::Inline));
+        if total_bytes <= self.block_journal_batch_policy.inline_max_total_bytes {
+            Ok(BlockJournalFastPathMode::Inline)
+        } else {
+            Ok(BlockJournalFastPathMode::SegmentRefs)
         }
-        if matches!(durability, crate::api::WriteDurability::Acknowledged)
-            && total_bytes <= BLOCK_JOURNAL_ACK_INLINE_MAX_BYTES
-        {
-            return Ok(Some(BlockJournalFastPathMode::Inline));
-        }
-        if matches!(durability, crate::api::WriteDurability::Flushed) {
-            return Ok(Some(BlockJournalFastPathMode::SegmentRefs));
-        }
-        Ok(None)
-    }
-
-    fn should_use_block_journal_fast_path(
-        &self,
-        writes: &[BlockBatchWrite],
-        durability: crate::api::WriteDurability,
-    ) -> Result<bool> {
-        Ok(self
-            .block_journal_fast_path_mode(writes, durability)?
-            .is_some())
     }
 
     fn block_journal_entries_from_collapsed(
@@ -3318,63 +3412,57 @@ impl DurableCoordinator {
         durable_commit_high_water: CommitSeq,
         flush_group_size: u64,
     ) -> Result<()> {
-        self.record_block_journal_profile_from_base(
-            DurablePersistProfile::default(),
-            total_started,
-            profile,
-            durable_commit_high_water,
-            flush_group_size,
-        )
+        self.record_persist_profile(DurablePersistProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            visible_metadata_write_bytes: profile.frame_bytes,
+            block_journal_encode_nanos: profile.encode_nanos,
+            block_journal_open_nanos: profile.open_nanos,
+            block_journal_write_nanos: profile.write_nanos,
+            block_journal_sync_nanos: profile.sync_nanos,
+            block_journal_dir_sync_nanos: profile.dir_sync_nanos,
+            block_journal_record_count: profile.record_count,
+            block_journal_frame_bytes: profile.frame_bytes,
+            block_journal_created: profile.created,
+            block_journal_flush_group_size: flush_group_size,
+            durable_commit_high_water: durable_commit_high_water.raw(),
+            ..DurablePersistProfile::default()
+        })
     }
 
-    fn record_block_journal_profile_from_base(
-        &self,
-        mut base: DurablePersistProfile,
-        total_started: Instant,
-        profile: AppendVisibleJournalProfile,
-        durable_commit_high_water: CommitSeq,
-        flush_group_size: u64,
-    ) -> Result<()> {
-        base.total_nanos = duration_nanos_u64(total_started.elapsed());
-        base.visible_metadata_write_bytes = profile.frame_bytes;
-        base.block_journal_encode_nanos = profile.encode_nanos;
-        base.block_journal_open_nanos = profile.open_nanos;
-        base.block_journal_write_nanos = profile.write_nanos;
-        base.block_journal_sync_nanos = profile.sync_nanos;
-        base.block_journal_dir_sync_nanos = profile.dir_sync_nanos;
-        base.block_journal_record_count = profile.record_count;
-        base.block_journal_frame_bytes = profile.frame_bytes;
-        base.block_journal_created = profile.created;
-        base.block_journal_flush_group_size = flush_group_size;
-        base.durable_commit_high_water = durable_commit_high_water.raw();
-        self.record_persist_profile(base)
-    }
-
-    fn enqueue_block_journal_commit(&self, commit: BlockJournalCommit) -> Result<()> {
+    fn enqueue_block_journal_request(&self, request: BlockJournalLaneRequest) -> Result<u64> {
         let mut state = lock(&self.block_journal_flush.inner)?;
-        if state
-            .pending
-            .insert(commit.commit_seq.raw(), commit)
-            .is_some()
-        {
-            return Err(StorageError::conflict(
-                "duplicate pending block journal commit sequence",
-            ));
-        }
-        Ok(())
+        let request_id = state.enqueue(request);
+        self.block_journal_flush.cvar.notify_all();
+        Ok(request_id)
     }
 
-    fn wait_for_block_journal_commit(&self, commit_seq: CommitSeq) -> Result<()> {
-        let commit_seq = commit_seq.raw();
+    /// Wait until the group-committed block journal lane completes a request.
+    ///
+    /// The first waiter that finds the lane idle becomes the batch owner: it
+    /// coalesces nearby requests per the batch policy, appends them as one
+    /// journal write with one data sync, and publishes the results. Other
+    /// waiters block until their request completes, so every waiter still
+    /// observes its own durability boundary.
+    fn wait_for_block_journal_request(&self, request_id: u64) -> Result<()> {
         loop {
             let mut state = lock(&self.block_journal_flush.inner)?;
-            if let Some(result) = state.completed.remove(&commit_seq) {
+            if let Some(result) = state.completed.remove(&request_id) {
                 return result;
             }
             if !state.in_flight {
                 state.in_flight = true;
-                drop(state);
-                let _ = self.persist_pending_block_journal_commits(Instant::now());
+                let batch = match self.coalesce_block_journal_requests(state) {
+                    Ok(mut state) => std::mem::take(&mut state.pending),
+                    Err(error) => {
+                        let mut state = lock(&self.block_journal_flush.inner)?;
+                        state.in_flight = false;
+                        state.generation = state.generation.saturating_add(1);
+                        self.block_journal_flush.cvar.notify_all();
+                        drop(state);
+                        return Err(error);
+                    }
+                };
+                let _ = self.persist_block_journal_lane_batch(Instant::now(), batch);
                 let mut state = lock(&self.block_journal_flush.inner)?;
                 state.in_flight = false;
                 state.generation = state.generation.saturating_add(1);
@@ -3389,20 +3477,91 @@ impl DurableCoordinator {
         }
     }
 
-    fn persist_pending_block_journal_commits(&self, total_started: Instant) -> Result<()> {
-        let commits = {
-            let mut state = lock(&self.block_journal_flush.inner)?;
-            if state.pending.is_empty() {
-                return Ok(());
+    /// Let nearby boundary requests join the owner's batch.
+    ///
+    /// A solo request proceeds immediately: the journal sync itself is the
+    /// natural batching window for later arrivals, so delaying an uncontended
+    /// boundary only adds latency. Once peers are present the owner waits in
+    /// short policy slices for the batch to reach the target size.
+    fn coalesce_block_journal_requests<'a>(
+        &self,
+        mut state: MutexGuard<'a, BlockJournalFlushState>,
+    ) -> Result<MutexGuard<'a, BlockJournalFlushState>> {
+        let policy = self.block_journal_batch_policy;
+        let started = Instant::now();
+        let mut demand = state.pending.len();
+        let saw_peer = demand > 1;
+        let mut hit_target = demand >= policy.target_requests;
+        loop {
+            if hit_target || !saw_peer {
+                break;
             }
-            std::mem::take(&mut state.pending)
-        };
-        let mut commits: Vec<_> = commits.into_values().collect();
-        commits.sort_by_key(|commit| commit.commit_seq.raw());
-        let mut records = Vec::with_capacity(commits.len().saturating_add(1));
+            let elapsed = started.elapsed();
+            if elapsed >= policy.max_coalesce_delay {
+                break;
+            }
+            let delay = policy
+                .idle_coalesce_delay
+                .min(policy.max_coalesce_delay.saturating_sub(elapsed));
+            if delay.is_zero() {
+                break;
+            }
+            let (next_state, timed_out) =
+                wait_timeout_on_cvar(&self.block_journal_flush.cvar, state, delay)?;
+            state = next_state;
+            let next_demand = state.pending.len();
+            if next_demand > demand {
+                demand = next_demand;
+                hit_target = demand >= policy.target_requests;
+                continue;
+            }
+            if timed_out {
+                break;
+            }
+        }
+        Ok(state)
+    }
+
+    fn persist_block_journal_lane_batch(
+        &self,
+        total_started: Instant,
+        batch: BTreeMap<u64, BlockJournalLaneRequest>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let request_ids: Vec<u64> = batch.keys().copied().collect();
+        let flush_group_size = usize_to_u64(batch.len());
+
+        let mut leases = Vec::new();
+        let mut commits = Vec::new();
         let mut flushes = BTreeMap::<DeviceId, (WriterEpoch, CommitSeq)>::new();
+        for request in batch.into_values() {
+            match request {
+                BlockJournalLaneRequest::Lease {
+                    device_id,
+                    writer_epoch,
+                } => leases.push((device_id, writer_epoch)),
+                BlockJournalLaneRequest::Write(commit) => commits.push(commit),
+                BlockJournalLaneRequest::Flush {
+                    device_id,
+                    writer_epoch,
+                    durable_through,
+                } => {
+                    flushes
+                        .entry(device_id)
+                        .and_modify(|(epoch, durable)| {
+                            *epoch = (*epoch).max(writer_epoch);
+                            *durable = (*durable).max(durable_through);
+                        })
+                        .or_insert((writer_epoch, durable_through));
+                }
+            }
+        }
+        commits.sort_by_key(|commit| commit.commit_seq.raw());
+        // Every lane write is a flushed boundary, so each device in the batch
+        // gets a Flush record covering its highest write in this batch.
         for commit in &commits {
-            records.push(BlockJournalRecord::Write(commit.clone()));
             flushes
                 .entry(commit.device_id)
                 .and_modify(|(epoch, durable)| {
@@ -3410,6 +3569,20 @@ impl DurableCoordinator {
                     *durable = (*durable).max(commit.commit_seq);
                 })
                 .or_insert((commit.writer_epoch, commit.commit_seq));
+        }
+
+        let mut records =
+            Vec::with_capacity(leases.len().saturating_add(commits.len()).saturating_add(
+                flushes.len(),
+            ));
+        for (device_id, writer_epoch) in &leases {
+            records.push(BlockJournalRecord::Lease {
+                device_id: *device_id,
+                writer_epoch: *writer_epoch,
+            });
+        }
+        for commit in &commits {
+            records.push(BlockJournalRecord::Write(commit.clone()));
         }
         for (device_id, (writer_epoch, durable_through)) in &flushes {
             records.push(BlockJournalRecord::Flush {
@@ -3420,8 +3593,24 @@ impl DurableCoordinator {
         }
 
         let result = (|| -> Result<AppendVisibleJournalProfile> {
-            let profile = self.durable.append_block_journal_records(&records)?;
+            // Every Flush this batch makes durable must not cover an
+            // acknowledged segment payload that is still volatile. Callers
+            // normally drained these already; this re-check closes the race
+            // where an acknowledged segment-ref write lands between a
+            // caller's drain and this batch.
+            for (device_id, (_, durable_through)) in &flushes {
+                self.make_device_payloads_durable(*device_id, *durable_through)?;
+            }
+            // The append holds the journal lock only for the file write; the
+            // data sync runs outside it so concurrent acknowledged appends
+            // are not serialized behind this batch's durability boundary.
+            let mut profile = self.durable.append_block_journal_records_unsynced(&records)?;
+            profile.sync_nanos = self.durable.sync_block_journal()?;
+            // Publish in commit-seq order after the shared sync: reserved
+            // sequences must publish in order per device, and a record may
+            // reference segments only after both are durable.
             for commit in &commits {
+                mark_block_journal_segment_refs_referenced(&self.local, commit)?;
                 self.local
                     .metadata
                     .publish_reserved_block_journal_commit(commit.device_id, commit.commit_seq)?;
@@ -3437,20 +3626,30 @@ impl DurableCoordinator {
             Ok(profile)
         })();
 
+        let mut applied_writes = BTreeMap::<DeviceId, u64>::new();
+        for commit in &commits {
+            *applied_writes.entry(commit.device_id).or_default() += 1;
+        }
         let profile = match result {
             Ok(profile) => {
                 let mut state = lock(&self.block_journal_flush.inner)?;
-                for commit in &commits {
-                    state.completed.insert(commit.commit_seq.raw(), Ok(()));
+                for (device_id, count) in applied_writes {
+                    state.release_unapplied_writes(device_id, count);
+                }
+                for request_id in &request_ids {
+                    state.completed.insert(*request_id, Ok(()));
                 }
                 profile
             }
             Err(error) => {
+                // Failed writes never published their reserved sequences, so
+                // later acknowledged writes may apply without waiting on them.
                 let mut state = lock(&self.block_journal_flush.inner)?;
-                for commit in &commits {
-                    state
-                        .completed
-                        .insert(commit.commit_seq.raw(), Err(error.clone()));
+                for (device_id, count) in applied_writes {
+                    state.release_unapplied_writes(device_id, count);
+                }
+                for request_id in &request_ids {
+                    state.completed.insert(*request_id, Err(error.clone()));
                 }
                 return Err(error);
             }
@@ -3461,9 +3660,10 @@ impl DurableCoordinator {
             commits
                 .iter()
                 .map(|commit| commit.commit_seq)
+                .chain(flushes.values().map(|(_, durable)| *durable))
                 .max()
                 .unwrap_or_else(|| CommitSeq::from_raw(0)),
-            usize_to_u64(commits.len()),
+            flush_group_size,
         )?;
         Ok(())
     }
@@ -3490,7 +3690,6 @@ impl DurableCoordinator {
 
     fn flush_block_journal_device_through(
         &self,
-        total_started: Instant,
         device_id: DeviceId,
         durable_through: CommitSeq,
     ) -> Result<bool> {
@@ -3500,135 +3699,263 @@ impl DurableCoordinator {
         if self.block_journal.visible_through(device_id)?.raw() < durable_through.raw() {
             return Ok(false);
         }
+        // Acknowledged segment payloads covered by this boundary sync here,
+        // outside the lane, so concurrent flushes fan payload syncs out
+        // across storage nodes. The lane leader re-checks as a safety net.
+        self.make_device_payloads_durable(device_id, durable_through)?;
         let writer_epoch = self.block_journal.writer_epoch(device_id)?;
-        let profile = self
-            .durable
-            .append_block_journal_records(&[BlockJournalRecord::Flush {
+        let request_id =
+            self.enqueue_block_journal_request(BlockJournalLaneRequest::Flush {
                 device_id,
                 writer_epoch,
                 durable_through,
-            }])?;
-        self.block_journal
-            .mark_durable(device_id, writer_epoch, durable_through)?;
-        self.record_block_journal_profile(total_started, profile, durable_through, 0)?;
+            })?;
+        self.wait_for_block_journal_request(request_id)?;
         Ok(true)
     }
 
     fn flush_visible_block_journal_heads(&self) -> Result<()> {
         for device_id in self.local.metadata.live_device_ids()? {
             let info = self.local.metadata.device_info(device_id)?;
-            self.flush_block_journal_device_through(Instant::now(), device_id, info.latest_commit)?;
+            self.flush_block_journal_device_through(device_id, info.latest_commit)?;
         }
         Ok(())
     }
 
-    fn block_journal_segment_ids(commits: &[BlockJournalCommit]) -> BTreeSet<SegmentId> {
-        commits
-            .iter()
-            .flat_map(|commit| commit.entries.iter().filter_map(BlockJournalEntry::segment_id))
-            .collect()
-    }
-
-    fn build_block_journal_segment_ref_commit_with_writer(
+    fn stage_block_journal_segment_ref_entries(
         &self,
         lease: &BlockWriterLease,
         writes: &[BlockBatchWrite],
-    ) -> Result<(BlockJournalCommit, BTreeSet<SegmentId>)> {
+    ) -> Result<StagedBlockSegmentRefs> {
         let info = self.local.metadata.device_info(lease.device_id)?;
         let collapsed =
             collapse_block_batch_writes(writes, &info.spec, DEFAULT_BLOCK_BATCH_MAX_BYTES)?;
-        let commit_seq = self
-            .local
-            .metadata
-            .reserve_block_journal_commit_seq(lease.device_id)?;
         let collapsed_range_count = usize_to_u64(collapsed.len());
         let write_intent = self.local.next_write_intent()?;
+        let chunk_bytes = usize::try_from(BLOCK_SEGMENT_REF_CHUNK_BYTES)
+            .map_err(|_| StorageError::invalid_argument("segment chunk size overflows usize"))?;
         let mut entries = Vec::with_capacity(collapsed.len());
         let mut segment_ids = BTreeSet::new();
         let mut committed_bytes = 0_u64;
 
         for write in collapsed {
-            let range = write.byte_range()?;
             let payload_integrity = write.payload_integrity;
-            committed_bytes = committed_bytes.checked_add(range.len).ok_or_else(|| {
-                StorageError::invalid_argument("block journal committed bytes overflow")
-            })?;
-            let receipt = self.local.write_segment_for_intent_with_id_owned_verified(
-                WriteGrantIntent::Internal {
-                    owner: MappingOwner::BlockDevice(lease.device_id),
-                },
-                write_intent,
-                write.bytes,
-                WriteDurability::Flushed,
-                payload_integrity,
-            )?;
-            if receipt.descriptor().bytes != range.len {
-                return Err(StorageError::corrupt(
-                    "block journal segment payload length disagrees with range",
-                ));
+            committed_bytes = committed_bytes
+                .checked_add(write.byte_range()?.len)
+                .ok_or_else(|| {
+                    StorageError::invalid_argument("block journal committed bytes overflow")
+                })?;
+            // Chunk large collapsed writes so placement spreads one write
+            // across storage nodes and their data disks.
+            let mut chunk_offset = write.offset;
+            for chunk in write.bytes.chunks(chunk_bytes) {
+                let len = u64::try_from(chunk.len()).map_err(|_| {
+                    StorageError::invalid_argument("block journal chunk length overflows u64")
+                })?;
+                let range = ByteRange::new(chunk_offset, len);
+                chunk_offset = chunk_offset.checked_add(len).ok_or_else(|| {
+                    StorageError::invalid_argument("block journal chunk offset overflows")
+                })?;
+                let receipt = self.local.write_segment_for_intent_with_id_owned_verified(
+                    WriteGrantIntent::Internal {
+                        owner: MappingOwner::BlockDevice(lease.device_id),
+                    },
+                    write_intent,
+                    chunk.to_vec(),
+                    WriteDurability::Flushed,
+                    payload_integrity,
+                )?;
+                if receipt.descriptor().bytes != range.len {
+                    return Err(StorageError::corrupt(
+                        "block journal segment payload length disagrees with range",
+                    ));
+                }
+                let segment_id = receipt.descriptor().segment_id;
+                segment_ids.insert(segment_id);
+                entries.push(BlockJournalEntry::Segment {
+                    range,
+                    storage_node: receipt.receipt().storage_node,
+                    segment_id,
+                    segment_offset: 0,
+                    integrity: receipt.descriptor().integrity,
+                });
             }
-            let segment_id = receipt.descriptor().segment_id;
-            segment_ids.insert(segment_id);
-            entries.push(BlockJournalEntry::Segment {
-                range,
-                storage_node: receipt.receipt().storage_node,
-                segment_id,
-                segment_offset: 0,
-                integrity: receipt.descriptor().integrity,
-            });
         }
 
-        let commit = BlockJournalCommit {
-            device_id: lease.device_id,
-            writer_epoch: lease.writer_epoch,
-            commit_seq,
+        Ok(StagedBlockSegmentRefs {
+            entries,
+            segment_ids,
+            committed_bytes,
             write_count: usize_to_u64(writes.len()),
             collapsed_range_count,
-            committed_bytes,
-            entries,
-        };
-        commit.validate(&info.spec)?;
-        Ok((commit, segment_ids))
+        })
     }
 
-    fn persist_block_journal_segment_ref_commits(
+    /// Append payloads for not-yet-durable segments to per-node data logs
+    /// without syncing, and merge the placements into the shared pending set.
+    ///
+    /// Returns the appended placements so callers that need a durability
+    /// boundary can sync exactly the files they touched.
+    fn prestage_block_segments(
         &self,
-        commits: &[BlockJournalCommit],
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<PendingDataLogAppend> {
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let pending_base = lock(&self.pending_data_log_append)?.clone();
+        let pending_segments = pending_base.segment_ids();
+        let missing_segments: BTreeSet<_> = segment_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| {
+                !previous_segments.contains(segment_id) && !pending_segments.contains(segment_id)
+            })
+            .collect();
+        if missing_segments.is_empty() {
+            return Ok(PendingDataLogAppend::default());
+        }
+        let (_, payloads) = self.local.state_for_segment_ids(&missing_segments)?;
+        let appended = self.durable.prestage_segments(payloads, &pending_base)?;
+        lock(&self.pending_data_log_append)?.merge(appended.clone());
+        Ok(appended)
+    }
+
+    /// Publish node catalog rows for already-durable segment payloads and
+    /// mark them persisted.
+    ///
+    /// Payload bytes must be appended and synced before this call; the
+    /// persist lock here only covers catalog rows and shared persist
+    /// bookkeeping, never payload-proportional I/O.
+    fn finalize_block_journal_segment_refs(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
     ) -> Result<Option<DurablePersistProfile>> {
-        let segment_ids = Self::block_journal_segment_ids(commits);
         if segment_ids.is_empty() {
             return Ok(None);
         }
         let lock_started = Instant::now();
-        let _persist_guard = lock(&self.persist_lock)?;
+        let persist_guard = lock(&self.persist_lock)?;
         let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let snapshot_started = Instant::now();
         let previous_segments = lock(&self.persisted_segments)?.clone();
         let mut pending_append = lock(&self.pending_data_log_append)?.clone();
-        pending_append.retain_current_placements(&segment_ids);
+        pending_append.retain_current_placements(segment_ids);
         let pending_segments = pending_append.segment_ids();
-        let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
-        let new_segments: Vec<_> = payloads
-            .into_iter()
-            .filter(|payload| {
-                !previous_segments.contains(&payload.segment_id)
-                    && !pending_segments.contains(&payload.segment_id)
+        // Payload bytes are cloned only for segments that missed prestaging
+        // (for example because a racing full persist consumed the pending
+        // set); the common case publishes catalog rows without holding the
+        // persist lock so finalizes on different nodes run in parallel.
+        let missing_segments: BTreeSet<_> = segment_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| {
+                !previous_segments.contains(segment_id) && !pending_segments.contains(segment_id)
             })
             .collect();
+        let nodes = self.local.selected_state_for_segment_ids(segment_ids)?;
+        let new_segments = if missing_segments.is_empty() {
+            drop(persist_guard);
+            Vec::new()
+        } else {
+            self.local.state_for_segment_ids(&missing_segments)?.1
+        };
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
         let mut base_profile = self.durable.persist_block_journal_segment_refs(
             &nodes,
-            &segment_ids,
+            segment_ids,
             new_segments,
             pending_append,
+            true,
         )?;
         lock(&self.persisted_segments)?.extend(segment_ids.iter().copied());
-        lock(&self.pending_data_log_append)?.remove_segments(&segment_ids);
+        lock(&self.pending_data_log_append)?.remove_segments(segment_ids);
 
         base_profile.lock_wait_nanos = lock_wait_nanos;
         base_profile.local_snapshot_nanos = local_snapshot_nanos;
         Ok(Some(base_profile))
+    }
+
+    /// Stage segment-ref payloads for a leased batch without global locks.
+    ///
+    /// The staging gate keeps full persists from exporting these segments
+    /// while their placements are still being recorded.
+    fn stage_block_journal_segment_refs(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+    ) -> Result<(StagedBlockSegmentRefs, PendingDataLogAppend)> {
+        self.begin_block_segment_ref_staging()?;
+        let staged = (|| -> Result<(StagedBlockSegmentRefs, PendingDataLogAppend)> {
+            let staged = self.stage_block_journal_segment_ref_entries(lease, writes)?;
+            let appended = self.prestage_block_segments(&staged.segment_ids)?;
+            Ok((staged, appended))
+        })();
+        self.finish_block_segment_ref_staging()?;
+        staged
+    }
+
+    /// Make staged payloads durable, then commit through the shared lane.
+    fn seal_staged_segment_refs_via_lane(
+        &self,
+        lease: &BlockWriterLease,
+        staged: StagedBlockSegmentRefs,
+        appended: PendingDataLogAppend,
+        durability: WriteDurability,
+        total_started: Instant,
+    ) -> Result<BlockBatchCommit> {
+        let payload_sync_profile = if appended.is_empty() {
+            DataLogAppendProfile::default()
+        } else {
+            self.durable.sync_pending_data_log_append(&appended)?
+        };
+        let mut base_profile = self
+            .finalize_block_journal_segment_refs(&staged.segment_ids)?
+            .unwrap_or_default();
+        base_profile.data_log_file_sync_nanos = base_profile
+            .data_log_file_sync_nanos
+            .saturating_add(payload_sync_profile.file_sync_nanos);
+        base_profile.data_log_write_nanos = base_profile
+            .data_log_write_nanos
+            .saturating_add(payload_sync_profile.write_nanos);
+
+        // Reserve the sequence immediately before enqueueing so per-device
+        // enqueue order equals commit-seq order, which the lane's ordered
+        // publish step requires.
+        let info = self.local.metadata.device_info(lease.device_id)?;
+        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
+        let commit_seq = self
+            .local
+            .metadata
+            .reserve_block_journal_commit_seq(lease.device_id)?;
+        let commit = BlockJournalCommit {
+            device_id: lease.device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq,
+            write_count: staged.write_count,
+            collapsed_range_count: staged.collapsed_range_count,
+            committed_bytes: staged.committed_bytes,
+            entries: staged.entries,
+        };
+        commit.validate(&info.spec)?;
+        let result = BlockBatchCommit {
+            device_id: lease.device_id,
+            commit_seq,
+            write_count: commit.write_count,
+            collapsed_range_count: commit.collapsed_range_count,
+            committed_bytes: commit.committed_bytes,
+            durability,
+        };
+        // The payload and its catalog receipts are durable above, so the
+        // referencing journal record may now enter the shared commit lane.
+        let request_id =
+            self.enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
+        drop(_enqueue_guard);
+        self.wait_for_block_journal_request(request_id)?;
+        base_profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        self.attach_metadata_publish_profile(&mut base_profile)?;
+        self.record_persist_profile(base_profile)?;
+
+        Ok(result)
     }
 
     fn commit_block_journal_segment_ref_batch_with_writer(
@@ -3638,47 +3965,129 @@ impl DurableCoordinator {
         durability: WriteDurability,
     ) -> Result<BlockBatchCommit> {
         let total_started = Instant::now();
-        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
-        let (commit, _segment_ids) =
-            self.build_block_journal_segment_ref_commit_with_writer(lease, writes)?;
         debug_assert!(matches!(durability, WriteDurability::Flushed));
+        let (staged, appended) = self.stage_block_journal_segment_refs(lease, writes)?;
+        self.seal_staged_segment_refs_via_lane(lease, staged, appended, durability, total_started)
+    }
 
-        let mut base_profile = self
-            .persist_block_journal_segment_ref_commits(std::slice::from_ref(&commit))?
-            .unwrap_or_default();
-        let records = [
-            BlockJournalRecord::Write(commit.clone()),
-            BlockJournalRecord::Flush {
-                device_id: lease.device_id,
-                writer_epoch: lease.writer_epoch,
-                durable_through: commit.commit_seq,
-            },
-        ];
-        let journal_profile = self.durable.append_block_journal_records(&records)?;
-        mark_block_journal_segment_refs_referenced(&self.local, &commit)?;
-        self.local
+    /// Commit an acknowledged segment-ref batch.
+    ///
+    /// The payload prestages to per-node data logs without a sync, the
+    /// journal record appends unsynced, and the write becomes visible
+    /// immediately. The prestaged placements register as device-pending
+    /// payloads so any later flush boundary covering this sequence first
+    /// makes the payload durable.
+    fn commit_block_journal_segment_ref_ack_with_writer(
+        &self,
+        lease: &BlockWriterLease,
+        writes: &[BlockBatchWrite],
+    ) -> Result<BlockBatchCommit> {
+        let total_started = Instant::now();
+        let (staged, appended) = self.stage_block_journal_segment_refs(lease, writes)?;
+        let info = self.local.metadata.device_info(lease.device_id)?;
+
+        let enqueue_guard = lock(&self.block_delta_staging_lock)?;
+        // Live overlay applies must follow commit-seq order per device, so
+        // the acknowledged write joins the lane (becoming flushed-strength,
+        // which acknowledged durability allows) whenever earlier lane writes
+        // for this device have not applied yet.
+        let lane_ordered =
+            lock(&self.block_journal_flush.inner)?.has_unapplied_writes(lease.device_id);
+        if lane_ordered {
+            drop(enqueue_guard);
+            return self.seal_staged_segment_refs_via_lane(
+                lease,
+                staged,
+                appended,
+                WriteDurability::Acknowledged,
+                total_started,
+            );
+        }
+        let commit_seq = self
+            .local
             .metadata
-            .publish_reserved_block_journal_commit(lease.device_id, commit.commit_seq)?;
-        self.block_journal.apply_commit(&commit)?;
-        self.block_journal
-            .mark_durable(lease.device_id, lease.writer_epoch, commit.commit_seq)?;
-        self.attach_metadata_publish_profile(&mut base_profile)?;
-        self.record_block_journal_profile_from_base(
-            base_profile,
-            total_started,
-            journal_profile,
-            commit.commit_seq,
-            1,
-        )?;
-
-        Ok(BlockBatchCommit {
+            .reserve_block_journal_commit_seq(lease.device_id)?;
+        let commit = BlockJournalCommit {
             device_id: lease.device_id,
-            commit_seq: commit.commit_seq,
+            writer_epoch: lease.writer_epoch,
+            commit_seq,
+            write_count: staged.write_count,
+            collapsed_range_count: staged.collapsed_range_count,
+            committed_bytes: staged.committed_bytes,
+            entries: staged.entries,
+        };
+        commit.validate(&info.spec)?;
+        let result = BlockBatchCommit {
+            device_id: lease.device_id,
+            commit_seq,
             write_count: commit.write_count,
             collapsed_range_count: commit.collapsed_range_count,
             committed_bytes: commit.committed_bytes,
-            durability,
-        })
+            durability: WriteDurability::Acknowledged,
+        };
+        let profile = self
+            .durable
+            .append_block_journal_records_unsynced(&[BlockJournalRecord::Write(commit.clone())])?;
+        // Register before publish so any flush boundary observing this
+        // sequence also observes the payload it must make durable first.
+        self.block_device_pending_payloads.register(
+            lease.device_id,
+            commit_seq,
+            PendingBlockPayload {
+                appended,
+                segment_ids: staged.segment_ids,
+            },
+        )?;
+        mark_block_journal_segment_refs_referenced(&self.local, &commit)?;
+        self.local
+            .metadata
+            .publish_reserved_block_journal_commit(lease.device_id, commit_seq)?;
+        self.block_journal.apply_commit(&commit)?;
+        drop(enqueue_guard);
+        self.record_block_journal_profile(
+            total_started,
+            profile,
+            self.block_journal.durable_through(lease.device_id)?,
+            0,
+        )?;
+        Ok(result)
+    }
+
+    /// Sync and catalog every device-pending acknowledged segment payload
+    /// covered by a flush boundary at `through`.
+    ///
+    /// This runs before any Flush record covering those sequences becomes
+    /// durable, preserving the rule that durable metadata never references
+    /// segment bytes that are not yet stable.
+    fn make_device_payloads_durable(
+        &self,
+        device_id: DeviceId,
+        through: CommitSeq,
+    ) -> Result<()> {
+        let drained = self
+            .block_device_pending_payloads
+            .drain_through(device_id, through)?;
+        if drained.is_empty() {
+            return Ok(());
+        }
+        let result = (|| -> Result<()> {
+            let mut merged = PendingDataLogAppend::default();
+            let mut segment_ids = BTreeSet::new();
+            for (_, payload) in &drained {
+                merged.merge(payload.appended.clone());
+                segment_ids.extend(payload.segment_ids.iter().copied());
+            }
+            if !merged.is_empty() {
+                self.durable.sync_pending_data_log_append(&merged)?;
+            }
+            self.finalize_block_journal_segment_refs(&segment_ids)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.block_device_pending_payloads
+                .reinsert(device_id, drained)?;
+        }
+        result
     }
 
     fn commit_block_journal_batch_with_writer(
@@ -3688,25 +4097,23 @@ impl DurableCoordinator {
         durability: crate::api::WriteDurability,
     ) -> Result<BlockBatchCommit> {
         self.local.validate_block_writer(lease)?;
-        let Some(mode) = self.block_journal_fast_path_mode(writes, durability)? else {
-            if self.block_journal.visible_through(lease.device_id)?.raw() > 0 {
-                return Err(StorageError::conflict(
-                    "block journal materialization is required before non-journal block writes",
-                ));
-            }
-            return self.commit_block_batch(lease.device_id, writes, durability);
-        };
-        if matches!(mode, BlockJournalFastPathMode::SegmentRefs) {
-            return self.commit_block_journal_segment_ref_batch_with_writer(
-                lease, writes, durability,
-            );
+        if matches!(
+            self.block_journal_fast_path_mode(writes)?,
+            BlockJournalFastPathMode::SegmentRefs
+        ) {
+            return match durability {
+                WriteDurability::Flushed => self
+                    .commit_block_journal_segment_ref_batch_with_writer(lease, writes, durability),
+                WriteDurability::Acknowledged => {
+                    self.commit_block_journal_segment_ref_ack_with_writer(lease, writes)
+                }
+            };
         }
         let info = self.local.metadata.device_info(lease.device_id)?;
-        let max_inline_bytes = if matches!(durability, WriteDurability::Acknowledged) {
-            BLOCK_JOURNAL_ACK_INLINE_MAX_BYTES
-        } else {
-            BLOCK_JOURNAL_BATCH_INLINE_MAX_BYTES
-        };
+        let max_inline_bytes = self
+            .block_journal_batch_policy
+            .inline_max_total_bytes
+            .max(u64::from(info.spec.block_size));
         let collapsed = collapse_block_batch_writes(writes, &info.spec, max_inline_bytes)?;
         let total_started = Instant::now();
         let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
@@ -3727,24 +4134,40 @@ impl DurableCoordinator {
             entries,
         };
         commit.validate(&info.spec)?;
-        match durability {
-            crate::api::WriteDurability::Flushed => {
-                self.enqueue_block_journal_commit(commit.clone())?;
-                drop(_enqueue_guard);
-                self.wait_for_block_journal_commit(commit_seq)?;
-            }
-            crate::api::WriteDurability::Acknowledged => {
-                self.append_acknowledged_block_journal_commit(total_started, &commit)?;
-            }
-        }
-        Ok(BlockBatchCommit {
+        let result = BlockBatchCommit {
             device_id: lease.device_id,
             commit_seq,
             write_count: commit.write_count,
             collapsed_range_count: commit.collapsed_range_count,
             committed_bytes,
             durability,
-        })
+        };
+        match durability {
+            crate::api::WriteDurability::Flushed => {
+                let request_id = self
+                    .enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
+                drop(_enqueue_guard);
+                self.wait_for_block_journal_request(request_id)?;
+            }
+            crate::api::WriteDurability::Acknowledged => {
+                // Live overlay applies must follow commit-seq order per
+                // device, so an acknowledged write joins the lane whenever an
+                // earlier lane write for this device has not applied yet.
+                // That path is stronger than acknowledged durability, which
+                // is allowed.
+                let lane_ordered =
+                    lock(&self.block_journal_flush.inner)?.has_unapplied_writes(lease.device_id);
+                if lane_ordered {
+                    let request_id = self
+                        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
+                    drop(_enqueue_guard);
+                    self.wait_for_block_journal_request(request_id)?;
+                } else {
+                    self.append_acknowledged_block_journal_commit(total_started, &commit)?;
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub fn write_device_with_writer(
@@ -3818,9 +4241,10 @@ impl DurableCoordinator {
             entries: vec![BlockJournalEntry::Sparse { range }],
         };
         commit.validate(&info.spec)?;
-        self.enqueue_block_journal_commit(commit)?;
+        let request_id =
+            self.enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
         drop(_enqueue_guard);
-        self.wait_for_block_journal_commit(commit_seq)?;
+        self.wait_for_block_journal_request(request_id)?;
         Ok(WriteCommit {
             device_id: lease.device_id,
             commit_seq,
@@ -3898,16 +4322,7 @@ impl DurableCoordinator {
         writes: &[BlockBatchWrite],
         durability: crate::api::WriteDurability,
     ) -> Result<BlockBatchCommit> {
-        self.local.validate_block_writer(lease)?;
-        if self.should_use_block_journal_fast_path(writes, durability)? {
-            return self.commit_block_journal_batch_with_writer(lease, writes, durability);
-        }
-        if self.block_journal.visible_through(lease.device_id)?.raw() > 0 {
-            return Err(StorageError::conflict(
-                "block journal materialization is required before non-journal block writes",
-            ));
-        }
-        self.commit_block_batch(lease.device_id, writes, durability)
+        self.commit_block_journal_batch_with_writer(lease, writes, durability)
     }
 
     pub fn read_device(&self, device_id: DeviceId, range: ByteRange, buf: &mut [u8]) -> Result<()> {
@@ -4758,7 +5173,7 @@ impl DurableCoordinator {
             let _staging_guard = lock(&self.block_delta_staging_lock)?;
             self.local.metadata.device_info(device_id)?
         };
-        if self.flush_block_journal_device_through(Instant::now(), device_id, info.latest_commit)? {
+        if self.flush_block_journal_device_through(device_id, info.latest_commit)? {
             return Ok(FlushResult {
                 device_id,
                 durable_through: info.latest_commit,

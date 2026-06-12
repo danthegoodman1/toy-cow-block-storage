@@ -33,6 +33,7 @@ struct Args {
     target_data_log_bytes: u64,
     data_log_file_sync_fanout: usize,
     append_publish_batch_policy: AppendPublishBatchPolicy,
+    block_journal_batch_policy: BlockJournalBatchPolicy,
     append_ingest_policy: AppendIngestPolicy,
     stream_publish_bytes: Option<u64>,
     stream_total_bytes: u64,
@@ -85,6 +86,7 @@ impl Args {
             target_data_log_bytes: 64 * 1024 * 1024,
             data_log_file_sync_fanout: 4,
             append_publish_batch_policy: AppendPublishBatchPolicy::default(),
+            block_journal_batch_policy: BlockJournalBatchPolicy::default(),
             append_ingest_policy: AppendIngestPolicy::default(),
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,
@@ -244,6 +246,30 @@ impl Args {
                     args.append_publish_batch_policy.max_coalesce_delay =
                         Duration::from_micros(micros);
                 }
+                "--block-journal-batch-target" => {
+                    args.block_journal_batch_policy.target_requests =
+                        parse_next(&mut raw, flag.as_str())?;
+                }
+                "--block-journal-idle-coalesce-us" => {
+                    let micros: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.block_journal_batch_policy.idle_coalesce_delay =
+                        Duration::from_micros(micros);
+                }
+                "--block-journal-max-coalesce-us" => {
+                    let micros: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.block_journal_batch_policy.max_coalesce_delay =
+                        Duration::from_micros(micros);
+                }
+                "--block-journal-inline-kib" => {
+                    let kib: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.block_journal_batch_policy.inline_max_total_bytes = kib
+                        .checked_mul(1024)
+                        .ok_or_else(|| {
+                            StorageError::invalid_argument(
+                                "block-journal-inline-kib overflows bytes",
+                            )
+                        })?;
+                }
                 "--append-ingest-max-in-flight-mib" => {
                     let mib: u64 = parse_next(&mut raw, flag.as_str())?;
                     args.append_ingest_policy.admission.max_in_flight_bytes =
@@ -398,6 +424,7 @@ impl Args {
             ));
         }
         args.append_publish_batch_policy.validate()?;
+        args.block_journal_batch_policy.validate()?;
         args.append_ingest_policy.validate()?;
         if args.device_blocks < args.shards as u64 {
             return Err(StorageError::invalid_argument(
@@ -540,6 +567,10 @@ options:\n\
   --append-publish-batch-target N          durable append publish batch target, default: 4\n\
   --append-publish-idle-coalesce-us N      durable append publish idle coalesce wait, default: 250\n\
   --append-publish-max-coalesce-us N       durable append publish max coalesce wait, default: 5000\n\
+  --block-journal-batch-target N           durable block journal batch target, default: 4\n\
+  --block-journal-idle-coalesce-us N       durable block journal idle coalesce wait, default: 0\n\
+  --block-journal-max-coalesce-us N        durable block journal max coalesce wait, default: 5000\n\
+  --block-journal-inline-kib N             durable block journal inline payload cap KiB, default: 64\n\
   --append-ingest-max-in-flight-mib N      durable append ingest global max in-flight MiB, default: disabled\n\
   --append-ingest-max-in-flight-per-storage-node-mib N durable append ingest per-storage-node max in-flight MiB\n\
   --append-ingest-active-log-lanes N       active append-run data logs per storage node, default: 1\n\

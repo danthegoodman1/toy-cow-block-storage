@@ -960,6 +960,22 @@ impl InMemoryMetadataPlane {
         Ok(())
     }
 
+    /// Advance the commit sequence allocator past an observed sequence.
+    ///
+    /// Reopen calls this for every block journal write record, including
+    /// records not covered by a durable flush boundary. Those records replay
+    /// nothing, but their sequences must never be handed out again: a reused
+    /// sequence would create duplicate write records in the journal.
+    fn observe_allocated_commit_seq(&self, commit_seq: CommitSeq) -> Result<()> {
+        let mut inner = lock(&self.inner)?;
+        if commit_seq.raw() >= inner.next_commit_seq {
+            inner.next_commit_seq = commit_seq.raw().checked_add(1).ok_or_else(|| {
+                StorageError::conflict("block journal commit sequence overflows")
+            })?;
+        }
+        Ok(())
+    }
+
     fn replay_block_journal_commit(&self, device_id: DeviceId, commit_seq: CommitSeq) -> Result<()> {
         let mut inner = lock(&self.inner)?;
         let current = inner

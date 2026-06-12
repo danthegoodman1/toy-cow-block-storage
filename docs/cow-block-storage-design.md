@@ -147,40 +147,59 @@ deterministic tests in the same change.
 Durable providers store checkpointed block heads as a stable device manifest
 plus one mutable row per shard head. Flushed block writes do not need to fold
 into those rows before returning: they may be recorded as ordered durable block
-delta rows that reference already-durable segment payloads. The durable provider
-also has a block-native journal fast path for small flushed writes, inline
-journal batches up to 256 KiB, data-log-backed journal segment references for
-larger flushed writes, and leased sparse zero/discard operations under an
-explicit whole-device writer lease. A journal batch contains lease, write,
-segment-reference or sparse-range, and flush-marker records in a framed
-append-only file. Large contiguous inline journal batches are split into
-block-sized inline entries so replay does not require a single oversized payload
-vector. A flushed inline journal write returns only after the inline payload
-bytes and the flush marker covering that commit sequence are durable; a flushed
-segment-reference journal write returns only after the segment payload data,
-node-catalog placement, journal segment references, and covering flush marker
-are durable. A journal sparse operation returns only after the sparse range and
-covering flush marker are durable. An acknowledged journal write appends its
-record and updates the in-process overlay without syncing a flush marker; for
-writeback/fsync windows it may use unsynced inline journal staging up to 1 MiB.
-It is visible to same-process reads, but reopen only replays it if a later
-durable flush marker covers its commit sequence. Reopen loads the
-compact shard roots, replays retained SQLite block deltas, then rebuilds the
-provider-private block overlay from journal writes and sparse ranges covered by
-durable flush markers. Reads resolve the compact tree and then apply the
-journal overlay, so read-after-write observes journal-backed writes without
-forcing immediate tree path-copy or node-catalog publication. The provider may
-keep a coalesced current-view read index for that overlay, but retained journal
-records remain the replay and future materialization history. Until journal
-materialization exists, a device with
-unmaterialized journal state must keep later journal-sized writes on the journal
-path, either inline or as data-log-backed journal references, instead of
-publishing a newer compact-tree root that older overlay entries could
-incorrectly cover. SQLite block-delta checkpointing and maintenance fold durable
-deltas into immutable CoW shard roots before pruning covered rows. Journal
-records remain retained replay roots until a
-materialization pass folds them into the CoW trees and proves no fork/PITR
-window needs the journal payloads.
+delta rows that reference already-durable segment payloads. Leased block writes
+use the block-native journal: a framed append-only file containing lease,
+write, segment-reference or sparse-range, and flush-marker records.
+
+Every durable block boundary is a request in one group-committed journal lane.
+Flushed writes, sparse zero/discard operations, `flush_device` boundaries, and
+lease fences enqueue lane requests; the first waiter that finds the lane idle
+becomes the batch owner, appends every pending record as framed batches, issues
+one data sync, then publishes the batch. A waiter returns only after the sync
+covering its request completes, so group commit changes scheduling, never the
+durability contract. Per device, write records append and publish in
+commit-sequence order, and a flush marker never covers a sequence whose write
+record is not yet appended.
+
+Writes whose total payload is at or below a provider-private inline cap
+(default 64 KiB) carry payload bytes inside the journal record, split into
+block-native inline entries. Larger writes place payload segments on per-node
+data logs, chunked so one large write spreads across storage nodes, and the
+journal records only small segment references. A flushed segment-reference
+write makes its segment payload and node-catalog receipts durable before its
+record enters the lane, preserving the rule that durable metadata never
+references volatile bytes.
+
+An acknowledged journal write appends its record without syncing, becomes
+visible to same-process reads, and replays after restart only if a later
+durable flush marker covers its commit sequence. An acknowledged
+segment-reference write additionally prestages its payload to per-node data
+logs unsynced and registers the placements as device-pending payloads. Any
+flush boundary that would cover such a sequence first syncs and catalogs those
+payloads: `flush_device` fans the payload syncs out before enqueueing its
+flush request, and the lane owner re-checks before making any flush marker
+durable. An acknowledged write joins the lane, gaining flushed-strength
+durability, whenever an earlier lane write for its device has not applied yet,
+so live overlay order always equals replay order.
+
+Reopen loads the compact shard roots, replays retained SQLite block deltas,
+then rebuilds the provider-private block overlay from journal writes and
+sparse ranges covered by durable flush markers. Every journal record's
+sequence advances the commit-sequence allocator on reopen, covered or not, so
+a sequence burned by an uncovered record is never reissued. Uncovered records
+replay nothing; their staged payloads are invisible orphans for custodian
+cleanup. Reads resolve the compact tree and then apply the journal overlay,
+so read-after-write observes journal-backed writes without forcing immediate
+tree path-copy or node-catalog publication. The overlay keeps only a
+coalesced current-view read index keyed by range start; shadowed history lives
+in the journal file, which remains the replay and future materialization
+history. Until journal materialization exists, a device with unmaterialized
+journal state keeps later writes on the journal path instead of publishing a
+newer compact-tree root that older overlay entries could incorrectly cover.
+SQLite block-delta checkpointing and maintenance fold durable deltas into
+immutable CoW shard roots before pruning covered rows. Journal records remain
+retained replay roots until a materialization pass folds them into the CoW
+trees and proves no fork/PITR window needs the journal payloads.
 This keeps `flush_device` as a replayable durability boundary while preserving
 CoW shard roots as the compact long-term representation for fork, PITR,
 validation, and GC. Durable metadata GC folds outstanding block deltas before

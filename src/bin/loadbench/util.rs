@@ -869,6 +869,7 @@ mod tests {
             target_data_log_bytes: 64 * 1024 * 1024,
             data_log_file_sync_fanout: 4,
             append_publish_batch_policy: AppendPublishBatchPolicy::default(),
+            block_journal_batch_policy: BlockJournalBatchPolicy::default(),
             append_ingest_policy: AppendIngestPolicy::default(),
             stream_publish_bytes: None,
             stream_total_bytes: 1024 * 1024 * 1024,

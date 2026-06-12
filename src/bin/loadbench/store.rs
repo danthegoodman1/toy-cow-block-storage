@@ -77,6 +77,7 @@ impl BenchStore {
                         },
                         append_visible_journal,
                         args.append_publish_batch_policy,
+                        args.block_journal_batch_policy,
                         args.append_ingest_policy,
                     )?,
                 );

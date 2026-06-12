@@ -97,6 +97,62 @@ impl AppendPublishBatchPolicy {
     }
 }
 
+/// Provider-private batching policy for durable block journal syncs.
+///
+/// Every durable block boundary (flushed writes, sparse commits, and
+/// `flush_device`) joins one group-committed journal lane. This policy only
+/// schedules how long a lane leader waits to coalesce peers into one journal
+/// append and sync; it does not change what a successful boundary makes
+/// durable or replayable.
+///
+/// The default adds no artificial coalesce wait: requests arriving while a
+/// batch sync is in flight form the next batch, so the sync duration itself
+/// is the batching window. Nonzero waits are an experiment knob for storage
+/// where syncs are much faster than request arrival gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockJournalBatchPolicy {
+    /// Pending requests needed to start a batch without an extra coalesce wait.
+    pub target_requests: usize,
+    /// Short wait used to let nearby boundary waiters join a batch.
+    pub idle_coalesce_delay: Duration,
+    /// Maximum time one batch owner may spend collecting peer requests.
+    pub max_coalesce_delay: Duration,
+    /// Largest batch payload carried inline in journal records.
+    ///
+    /// Larger writes place payload segments on per-node data logs and journal
+    /// only small segment references, so payload bandwidth uses every data
+    /// disk instead of the journal device.
+    pub inline_max_total_bytes: u64,
+}
+
+impl Default for BlockJournalBatchPolicy {
+    fn default() -> Self {
+        Self {
+            target_requests: 4,
+            idle_coalesce_delay: Duration::ZERO,
+            max_coalesce_delay: Duration::from_millis(5),
+            inline_max_total_bytes: 64 * 1024,
+        }
+    }
+}
+
+impl BlockJournalBatchPolicy {
+    /// Validate that block journal batching can make deterministic progress.
+    pub fn validate(self) -> Result<()> {
+        if self.target_requests == 0 {
+            return Err(StorageError::invalid_argument(
+                "block journal batch target_requests must be greater than zero",
+            ));
+        }
+        if self.idle_coalesce_delay > self.max_coalesce_delay {
+            return Err(StorageError::invalid_argument(
+                "block journal idle_coalesce_delay must be <= max_coalesce_delay",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Provider-private admission policy for durable append ingest.
 ///
 /// This is a queue-depth control below the public append-stream API. It may

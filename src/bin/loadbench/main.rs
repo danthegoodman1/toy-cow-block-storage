@@ -17,12 +17,12 @@ use toy_cow_block_storage::provider::{
 use toy_cow_block_storage::{
     AppendAutoPersistMode, AppendIngestPolicy, AppendIngestProfile, AppendPublishBatchPolicy,
     AppendPublishWaitProfile, AppendStream, AppendTicket, BlockBatchCommit, BlockBatchWrite,
-    BlockWriterLease, ByteRange, CreateDeviceRequest, CreateFileRequest, CreateKeyspaceRequest,
-    DeviceId, DeviceSpec, DurableCoordinator, DurableDataLogPolicy, DurablePersistProfile,
-    FileBatchWrite, FileId, FileSpec, FileWriteCommit, FlushResult, KeyspaceId, LocalCoordinator,
-    LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile, NativeFileBatchCommitProfile,
-    PayloadIntegrity, ReadProfile, ReadVerification, Result, StorageError, StorageNodeId,
-    TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
+    BlockJournalBatchPolicy, BlockWriterLease, ByteRange, CreateDeviceRequest, CreateFileRequest,
+    CreateKeyspaceRequest, DeviceId, DeviceSpec, DurableCoordinator, DurableDataLogPolicy,
+    DurablePersistProfile, FileBatchWrite, FileId, FileSpec, FileWriteCommit, FlushResult,
+    KeyspaceId, LocalCoordinator, LocalStoreConfig, MetadataTxnMode, MetadataTxnProfile,
+    NativeFileBatchCommitProfile, PayloadIntegrity, ReadProfile, ReadVerification, Result,
+    StorageError, StorageNodeId, TxnBlockCoordinator, TxnBlockWriteProfile, WriteDurability,
 };
 
 static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);

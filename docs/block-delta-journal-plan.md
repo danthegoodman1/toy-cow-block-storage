@@ -1,6 +1,7 @@
 # Block Delta Journal Architecture Plan
 
-Status: implemented through Stage 1 replayable deltas
+Status: implemented through replayable journal deltas with a group-committed
+boundary lane; checkpoint fold of journal records is the remaining stage
 
 ## Summary
 
@@ -15,16 +16,20 @@ every flush boundary" to a journal/checkpoint model:
 - **Read path:** reads consult the newest dirty/cache state, then the durable
   delta index, then checkpointed CoW roots.
 
-Current implementation note: flushed block writes persist durable segment
-payloads and compact `block_delta_commits` rows. Reopen loads checkpointed
-per-shard heads and replays retained delta rows into the in-memory CoW metadata
-view. Explicit checkpoint/full persist folds those deltas into row-native shard
-heads and prunes covered delta rows. Durable metadata GC folds outstanding block
-delta rows before sweeping so delta-only payload references cannot be reclaimed
-while replay still depends on them. The implementation still uses the existing
-segment data-log sync path, so benchmarks should be read as a measurement of
-whether removing root metadata export was enough or whether physical data-log
-sync remains dominant.
+Current implementation note: leased block writes run on the block journal.
+Every durable boundary (flushed writes, sparse operations, `flush_device`,
+lease fences) joins one group-committed lane that shares one journal append
+and one data sync per batch. Payloads at or below the inline cap (default
+64 KiB, `BlockJournalBatchPolicy::inline_max_total_bytes`) stay inline in
+journal records; larger writes stage chunked payload segments on per-node
+data logs in parallel, outside global locks, and journal only segment
+references. Acknowledged segment-reference writes prestage payloads unsynced
+and register device-pending placements; any flush boundary covering them
+syncs and catalogs those payloads first. Reopen replays journal records
+covered by durable flush markers and advances the commit-sequence allocator
+past every observed record. The journal file is not yet folded or pruned:
+checkpoint materialization into CoW shard roots (Stages 3-5 below) remains
+open, so reopen cost and journal size grow with retained journal history.
 
 This is the production-shaped block model for DB-on-filesystem-on-block. A
 filesystem already owns page-cache writeback and fsync policy. The block layer

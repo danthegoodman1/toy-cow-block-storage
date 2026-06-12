@@ -19,6 +19,8 @@ pub(super) struct DurableSqliteStore {
     fail_next_prestage: Arc<AtomicBool>,
     #[cfg(test)]
     fail_next_append_payload_sync: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_block_journal_append: Arc<AtomicBool>,
 }
 
 /// Process-local timing for one physical durable persist.
@@ -1822,15 +1824,6 @@ fn append_durable_journal_record<T: DurableCodec>(
     append_durable_journal_record_with_sync(path, record, magic, too_large_reason, true)
 }
 
-fn append_durable_journal_record_unsynced<T: DurableCodec>(
-    path: &Path,
-    record: &T,
-    magic: &[u8; 8],
-    too_large_reason: &'static str,
-) -> Result<AppendVisibleJournalProfile> {
-    append_durable_journal_record_with_sync(path, record, magic, too_large_reason, false)
-}
-
 fn append_durable_journal_record_with_sync<T: DurableCodec>(
     path: &Path,
     record: &T,
@@ -1841,6 +1834,17 @@ fn append_durable_journal_record_with_sync<T: DurableCodec>(
     let encode_started = Instant::now();
     let frame = durable_journal_frame(record, magic, too_large_reason)?;
     let encode_nanos = duration_nanos_u64(encode_started.elapsed());
+    let mut profile = append_durable_journal_bytes(path, &frame, sync_data)?;
+    profile.encode_nanos = encode_nanos;
+    profile.record_count = 1;
+    Ok(profile)
+}
+
+fn append_durable_journal_bytes(
+    path: &Path,
+    bytes: &[u8],
+    sync_data: bool,
+) -> Result<AppendVisibleJournalProfile> {
     let mut dir_sync_nanos = 0_u64;
     let parent = path
         .parent()
@@ -1865,7 +1869,7 @@ fn append_durable_journal_record_with_sync<T: DurableCodec>(
         preallocate_durable_journal_file(&file, DURABLE_JOURNAL_PREALLOC_BYTES)?;
     }
     let started = Instant::now();
-    file.write_all(&frame).map_err(fs_error)?;
+    file.write_all(bytes).map_err(fs_error)?;
     let write_nanos = duration_nanos_u64(started.elapsed());
     let sync_nanos = if sync_data {
         let sync_started = Instant::now();
@@ -1881,13 +1885,11 @@ fn append_durable_journal_record_with_sync<T: DurableCodec>(
             dir_sync_nanos.saturating_add(duration_nanos_u64(dir_sync_started.elapsed()));
     }
     Ok(AppendVisibleJournalProfile {
-        encode_nanos,
         open_nanos,
         write_nanos,
         sync_nanos,
         dir_sync_nanos,
-        record_count: 1,
-        frame_bytes: usize_to_u64(frame.len()),
+        frame_bytes: usize_to_u64(bytes.len()),
         created: if existed { 0 } else { 1 },
         ..AppendVisibleJournalProfile::default()
     })
@@ -1938,25 +1940,12 @@ fn load_native_publish_journal_commits_since(
     .collect())
 }
 
-pub(super) fn append_block_journal_records(
-    path: &Path,
-    records: &[BlockJournalRecord],
-) -> Result<AppendVisibleJournalProfile> {
-    if records.is_empty() {
-        return Err(StorageError::invalid_argument(
-            "block journal batch must include records",
-        ));
-    }
-    let records = records.to_vec();
-    let mut profile = append_durable_journal_record(
-        path,
-        &records,
-        &BLOCK_JOURNAL_MAGIC,
-        "block journal record exceeds durable payload limit",
-    )?;
-    profile.record_count = usize_to_u64(records.len());
-    Ok(profile)
-}
+/// Target encoded payload size for one block journal frame.
+///
+/// Group-committed batches can exceed the per-frame durable payload limit, so
+/// large batches split into multiple frames that still share one journal
+/// write; the lane owner issues one data sync for the whole batch.
+const BLOCK_JOURNAL_TARGET_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) fn append_block_journal_records_unsynced(
     path: &Path,
@@ -1967,13 +1956,46 @@ pub(super) fn append_block_journal_records_unsynced(
             "block journal batch must include records",
         ));
     }
-    let records = records.to_vec();
-    let mut profile = append_durable_journal_record_unsynced(
-        path,
-        &records,
-        &BLOCK_JOURNAL_MAGIC,
-        "block journal record exceeds durable payload limit",
-    )?;
+    let encode_started = Instant::now();
+    let mut bytes = Vec::new();
+    let mut frame_records: Vec<BlockJournalRecord> = Vec::new();
+    let mut frame_bytes = 0_u64;
+    for record in records {
+        let record_bytes = match record {
+            BlockJournalRecord::Write(commit) => commit
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    BlockJournalEntry::Write { bytes, .. } => usize_to_u64(bytes.len()),
+                    BlockJournalEntry::Segment { .. } | BlockJournalEntry::Sparse { .. } => 0,
+                })
+                .fold(128_u64, u64::saturating_add),
+            BlockJournalRecord::Lease { .. } | BlockJournalRecord::Flush { .. } => 128,
+        };
+        if !frame_records.is_empty()
+            && frame_bytes.saturating_add(record_bytes) > BLOCK_JOURNAL_TARGET_FRAME_BYTES
+        {
+            bytes.extend_from_slice(&durable_journal_frame(
+                &frame_records,
+                &BLOCK_JOURNAL_MAGIC,
+                "block journal record exceeds durable payload limit",
+            )?);
+            frame_records.clear();
+            frame_bytes = 0;
+        }
+        frame_records.push(record.clone());
+        frame_bytes = frame_bytes.saturating_add(record_bytes);
+    }
+    if !frame_records.is_empty() {
+        bytes.extend_from_slice(&durable_journal_frame(
+            &frame_records,
+            &BLOCK_JOURNAL_MAGIC,
+            "block journal record exceeds durable payload limit",
+        )?);
+    }
+    let encode_nanos = duration_nanos_u64(encode_started.elapsed());
+    let mut profile = append_durable_journal_bytes(path, &bytes, false)?;
+    profile.encode_nanos = encode_nanos;
     profile.record_count = usize_to_u64(records.len());
     Ok(profile)
 }
@@ -2376,6 +2398,8 @@ impl DurableSqliteStore {
             fail_next_prestage: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_append_payload_sync,
+            #[cfg(test)]
+            fail_next_block_journal_append: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -2752,20 +2776,34 @@ impl DurableSqliteStore {
         prune_native_publish_journal_through(&self.paths.native_publish_journal, commit_seq)
     }
 
-    fn append_block_journal_records(
-        &self,
-        records: &[BlockJournalRecord],
-    ) -> Result<AppendVisibleJournalProfile> {
-        let _journal_guard = lock(&self.block_journal_lock)?;
-        append_block_journal_records(&self.paths.block_journal, records)
-    }
-
     fn append_block_journal_records_unsynced(
         &self,
         records: &[BlockJournalRecord],
     ) -> Result<AppendVisibleJournalProfile> {
+        #[cfg(test)]
+        if self.fail_next_block_journal_append.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::unavailable(
+                "injected block journal append failure",
+            ));
+        }
         let _journal_guard = lock(&self.block_journal_lock)?;
         append_block_journal_records_unsynced(&self.paths.block_journal, records)
+    }
+
+    /// Make every block journal record written so far durable.
+    ///
+    /// The data sync deliberately runs outside `block_journal_lock` so
+    /// concurrent unsynced appends are not serialized behind device flushes.
+    /// Concurrent appends may be partially covered by the sync; they remain
+    /// unsynced records until a later boundary covers them.
+    fn sync_block_journal(&self) -> Result<u64> {
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.paths.block_journal)
+            .map_err(fs_error)?;
+        let sync_started = Instant::now();
+        file.sync_data().map_err(fs_error)?;
+        Ok(duration_nanos_u64(sync_started.elapsed()))
     }
 
     fn block_journal_records(&self) -> Result<Vec<BlockJournalRecord>> {
@@ -4062,6 +4100,7 @@ impl DurableSqliteStore {
         segment_ids: &BTreeSet<SegmentId>,
         segments: Vec<DurableSegmentPayload>,
         mut pending_append: PendingDataLogAppend,
+        payloads_synced: bool,
     ) -> Result<DurablePersistProfile> {
         let total_started = Instant::now();
         #[cfg(test)]
@@ -4087,13 +4126,22 @@ impl DurableSqliteStore {
         let sync_only_bytes = prestaged_segment_bytes;
         let flush_write_bytes = new_segment_bytes;
 
-        let prepared = self.prepare_durable_bundle_payload(
+        // Callers that already synced every prestaged payload skip the
+        // sync-only pass, keeping payload-proportional I/O out of this
+        // persist-lock-covered section.
+        let payload = if payloads_synced && segments.is_empty() {
+            DurableBundlePayload::PreingestedSynced {
+                appended: pending_append,
+                sync_profile: DataLogAppendProfile::default(),
+                sync_nanos: 0,
+            }
+        } else {
             DurableBundlePayload::PrestagedBlockDelta {
                 pending_append,
                 segments,
-            },
-            segment_ids,
-        )?;
+            }
+        };
+        let prepared = self.prepare_durable_bundle_payload(payload, segment_ids)?;
 
         let started = Instant::now();
         let catalog_profile = self.persist_durable_bundle_catalog(
