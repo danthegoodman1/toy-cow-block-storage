@@ -2882,7 +2882,7 @@ fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
     let _ = store.drain_persist_profiles(16).unwrap();
 
     // At or below the inline cap, payload stays in the journal frame.
-    let inline_write = repeated_blocks(16, 12);
+    let inline_write = repeated_blocks(4, 12);
     let commit = store
         .write_device_with_writer(
             &lease,
@@ -2892,12 +2892,12 @@ fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
             PayloadIntegrity::Verified,
         )
         .unwrap();
-    assert_eq!(commit.range, ByteRange::new(0, 64 * 1024));
+    assert_eq!(commit.range, ByteRange::new(0, 16 * 1024));
 
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(profiles.iter().any(|profile| {
         profile.block_journal_record_count == 2
-            && profile.block_journal_frame_bytes > 64 * 1024
+            && profile.block_journal_frame_bytes > 16 * 1024
             && profile.data_log_write_bytes == 0
             && profile.root_sqlite_commit_nanos == 0
     }));
@@ -3484,6 +3484,279 @@ fn durable_block_journal_lane_sync_failure_fails_waiters_without_durability() {
         .unwrap();
     assert_eq!(&replayed[0..4096], repeated_blocks(1, 81).as_slice());
     assert_eq!(&replayed[4096..], vec![0; 4096].as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+// Two segment-ref boundaries queued into one finalize-lane batch must share
+// one catalog persist: a single injected persist failure fails both waiters,
+// nothing becomes visible or replayable, and the lane recovers for the next
+// boundary.
+#[test]
+fn durable_block_segment_finalize_lane_failure_fails_every_batched_waiter() {
+    let root = durable_temp_dir("block-segref-finalize-lane-failure");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("segref-finalize-lane-failure".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    // Hold the finalize lane busy so both writes queue into the same batch.
+    lock(&store.block_segment_finalize.inner).unwrap().in_flight = true;
+
+    let (first, second) = thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            store.write_device_with_writer(
+                &lease,
+                0,
+                &repeated_blocks(256, 51),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let second = scope.spawn(|| {
+            store.write_device_with_writer(
+                &lease,
+                512 * 4096,
+                &repeated_blocks(256, 52),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let queued = lock(&store.block_segment_finalize.inner)
+                .unwrap()
+                .pending
+                .len();
+            if queued == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both finalizes should queue while the lane is held"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // One injected failure for the one shared persist call.
+        store.fail_next_persist_for_test();
+        {
+            let mut state = lock(&store.block_segment_finalize.inner).unwrap();
+            state.in_flight = false;
+            state.generation = state.generation.wrapping_add(1);
+        }
+        store.block_segment_finalize.cvar.notify_all();
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert!(matches!(first, Err(StorageError::Unavailable { .. })));
+    assert!(matches!(second, Err(StorageError::Unavailable { .. })));
+
+    let info = store.local.metadata.device_info(device_id).unwrap();
+    assert_eq!(info.latest_commit.raw(), 0);
+    let mut live = vec![9; 1024 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 1024 * 4096), &mut live)
+        .unwrap();
+    assert_eq!(live, vec![0; 1024 * 4096]);
+
+    // The lane must keep serving boundaries after a failed batch.
+    let recovered = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 53),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert!(recovered.commit_seq.raw() > 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![9; 1024 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 1024 * 4096), &mut replayed)
+        .unwrap();
+    assert_eq!(
+        &replayed[0..256 * 4096],
+        repeated_blocks(256, 53).as_slice()
+    );
+    assert_eq!(
+        &replayed[256 * 4096..],
+        vec![0; 768 * 4096].as_slice(),
+        "failed batch writes must not replay"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+// A payload sync failure on the node-sync lane must fail the flushed
+// segment-ref boundary before any journal record exists: nothing visible,
+// nothing replayable, and the next boundary succeeds.
+#[test]
+fn durable_block_journal_payload_sync_failure_exposes_nothing() {
+    let root = durable_temp_dir("block-segref-payload-sync-failure");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("segref-payload-sync-failure".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    store.fail_next_append_payload_sync_for_test();
+    assert!(matches!(
+        store.write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 61),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Unavailable { .. })
+    ));
+    let info = store.local.metadata.device_info(device_id).unwrap();
+    assert_eq!(info.latest_commit.raw(), 0);
+    let mut live = vec![9; 256 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 256 * 4096), &mut live)
+        .unwrap();
+    assert_eq!(live, vec![0; 256 * 4096]);
+
+    let recovered = store
+        .write_device_with_writer(
+            &lease,
+            512 * 4096,
+            &repeated_blocks(256, 62),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert!(recovered.commit_seq.raw() > 0);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![9; 1024 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 1024 * 4096), &mut replayed)
+        .unwrap();
+    assert_eq!(
+        &replayed[0..256 * 4096],
+        vec![0; 256 * 4096].as_slice(),
+        "the failed boundary must not replay"
+    );
+    assert_eq!(
+        &replayed[512 * 4096..768 * 4096],
+        repeated_blocks(256, 62).as_slice()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+// One large flushed write stripes its policy-sized chunks round-robin across
+// every storage node and still reads and replays as one atomic commit.
+#[test]
+fn durable_block_journal_stripes_large_write_across_storage_nodes() {
+    let root = durable_temp_dir("block-segref-striping");
+    let cfg = config();
+    let nodes = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+        StorageNodeId::from_raw(80),
+    ];
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            nodes.clone(),
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy {
+                segment_chunk_bytes: 2 * 1024 * 1024,
+                ..BlockJournalBatchPolicy::default()
+            },
+            AppendIngestPolicy::default(),
+        )
+        .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("segref-striping".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    // 8 MiB at a 2 MiB chunk policy stripes one chunk onto each of the four
+    // nodes.
+    let payload = repeated_blocks(2048, 71);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &payload,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    let mut segment_nodes = BTreeSet::new();
+    let mut segment_count = 0;
+    for record in store.durable.block_journal_records().unwrap() {
+        let BlockJournalRecord::Write(commit) = record else {
+            continue;
+        };
+        for entry in &commit.entries {
+            if let BlockJournalEntry::Segment { storage_node, .. } = entry {
+                segment_nodes.insert(*storage_node);
+                segment_count += 1;
+            }
+        }
+    }
+    assert_eq!(
+        segment_count, 4,
+        "8 MiB write should stage four 2 MiB chunks"
+    );
+    assert_eq!(
+        segment_nodes.len(),
+        nodes.len(),
+        "chunks should round-robin across every storage node"
+    );
+
+    let mut live = vec![9; payload.len()];
+    store
+        .read_device(device_id, ByteRange::new(0, 2048 * 4096), &mut live)
+        .unwrap();
+    assert_eq!(live, payload);
+
+    drop(store);
+    let reopened = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        nodes,
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let mut replayed = vec![9; payload.len()];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 2048 * 4096), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, payload);
     let _ = fs::remove_dir_all(root);
 }
 

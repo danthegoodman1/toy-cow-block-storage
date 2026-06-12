@@ -889,6 +889,7 @@ struct StorageNodeAppendLogService {
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     lanes: Mutex<BTreeMap<StorageNodeId, Arc<StorageNodeAppendLogLane>>>,
+    sync_lanes: Mutex<BTreeMap<StorageNodeId, Arc<DataLogSyncLane>>>,
     synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
     dir_synced_logs: Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
     synced_log_cvar: Arc<Condvar>,
@@ -900,6 +901,28 @@ struct StorageNodeAppendLogService {
 #[derive(Debug)]
 struct StorageNodeAppendLogLane {
     active: Mutex<BTreeMap<String, Arc<Mutex<ActiveAppendRunLog>>>>,
+}
+
+/// Group-commit lane for one storage node's data-log syncs.
+///
+/// Concurrent durability boundaries on the same node merge their sync targets
+/// into one pending high-water set; the first settler that finds the lane
+/// idle syncs the merged set with one fdatasync per file, and every covered
+/// waiter observes durability through `synced_logs`. A waiter whose targets
+/// stay uncovered after a leader pass re-merges and eventually leads its own
+/// sync, so a sync failure surfaces to every affected boundary instead of
+/// silently claiming durability.
+#[derive(Debug, Default)]
+struct DataLogSyncLane {
+    inner: Mutex<DataLogSyncLaneState>,
+    cvar: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct DataLogSyncLaneState {
+    in_flight: bool,
+    generation: u64,
+    pending: BTreeMap<DurableDataLogRef, AppendLogPayloadSyncRequest>,
 }
 
 #[derive(Debug)]
@@ -1292,14 +1315,125 @@ impl StorageNodeAppendLogService {
             ));
         }
 
-        sync_append_run_log_requests(
-            &self.paths,
-            self.policy,
-            &self.synced_logs,
-            &self.dir_synced_logs,
-            &self.synced_log_cvar,
-            self.pending_sync_requests(appended)?,
-        )
+        let requests = self.pending_sync_requests(appended)?;
+        let mut by_node: BTreeMap<StorageNodeId, Vec<AppendLogPayloadSyncRequest>> =
+            BTreeMap::new();
+        for request in requests {
+            by_node
+                .entry(request.log_ref.storage_node)
+                .or_default()
+                .push(request);
+        }
+        if by_node.len() <= 1 {
+            let mut profile = DataLogAppendProfile::default();
+            for (storage_node, node_requests) in by_node {
+                profile.merge(self.settle_node_sync_lane(storage_node, node_requests)?);
+            }
+            return Ok(profile);
+        }
+        // A boundary spanning several nodes settles each node lane on its own
+        // thread, so one slow node sync does not serialize the rest.
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (storage_node, node_requests) in by_node {
+                handles.push(
+                    scope.spawn(move || self.settle_node_sync_lane(storage_node, node_requests)),
+                );
+            }
+            let mut profile = DataLogAppendProfile::default();
+            for handle in handles {
+                let node_profile = handle
+                    .join()
+                    .map_err(|_| StorageError::unavailable("data-log sync worker panicked"))??;
+                profile.merge(node_profile);
+            }
+            Ok(profile)
+        })
+    }
+
+    fn sync_lane_for_node(&self, storage_node: StorageNodeId) -> Result<Arc<DataLogSyncLane>> {
+        let mut lanes = lock(&self.sync_lanes)?;
+        Ok(Arc::clone(
+            lanes
+                .entry(storage_node)
+                .or_insert_with(|| Arc::new(DataLogSyncLane::default())),
+        ))
+    }
+
+    /// True once every request's bytes (and dir entry, when required) are
+    /// recorded durable.
+    fn sync_requests_covered(&self, requests: &[AppendLogPayloadSyncRequest]) -> Result<bool> {
+        {
+            let synced = lock(&self.synced_logs)?;
+            for request in requests {
+                if synced.get(&request.log_ref).copied().unwrap_or_default() < request.bytes {
+                    return Ok(false);
+                }
+            }
+        }
+        let dir_synced = lock(&self.dir_synced_logs)?;
+        for request in requests {
+            if request.sync_dir && !dir_synced.contains(&request.log_ref) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Settle one node's sync targets through its group-commit lane.
+    ///
+    /// Merges the targets into the lane, then either leads a sync covering
+    /// every pending target or waits for the in-flight leader and re-checks
+    /// coverage. Returns only after this call's targets are durable, or with
+    /// the error from this call's own failed sync attempt.
+    fn settle_node_sync_lane(
+        &self,
+        storage_node: StorageNodeId,
+        requests: Vec<AppendLogPayloadSyncRequest>,
+    ) -> Result<DataLogAppendProfile> {
+        if requests.is_empty() {
+            return Ok(DataLogAppendProfile::default());
+        }
+        let lane = self.sync_lane_for_node(storage_node)?;
+        loop {
+            if self.sync_requests_covered(&requests)? {
+                return Ok(DataLogAppendProfile::default());
+            }
+            let mut state = lock(&lane.inner)?;
+            for request in &requests {
+                state
+                    .pending
+                    .entry(request.log_ref)
+                    .and_modify(|existing| {
+                        existing.bytes = existing.bytes.max(request.bytes);
+                        existing.sync_dir |= request.sync_dir;
+                    })
+                    .or_insert(*request);
+            }
+            if !state.in_flight {
+                state.in_flight = true;
+                let batch: Vec<_> = std::mem::take(&mut state.pending).into_values().collect();
+                drop(state);
+                let result = sync_append_run_log_requests(
+                    &self.paths,
+                    self.policy,
+                    &self.synced_logs,
+                    &self.dir_synced_logs,
+                    &self.synced_log_cvar,
+                    batch,
+                );
+                let mut state = lock(&lane.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.wrapping_add(1);
+                lane.cvar.notify_all();
+                drop(state);
+                return result;
+            }
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&lane.cvar, state)?;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1740,7 +1874,29 @@ fn durable_journal_frame<T: DurableCodec>(
     magic: &[u8; 8],
     too_large_reason: &'static str,
 ) -> Result<Vec<u8>> {
-    let payload = encode_row(record)?;
+    durable_journal_frame_from_payload(encode_row(record)?, magic, too_large_reason)
+}
+
+/// Frame a slice of records with the same wire format as a `Vec<T>` row, so
+/// batch writers can frame without first cloning records into a `Vec`.
+fn durable_journal_slice_frame<T: DurableCodec>(
+    records: &[T],
+    magic: &[u8; 8],
+    too_large_reason: &'static str,
+) -> Result<Vec<u8>> {
+    let mut encoder = DurableEncoder::default();
+    usize_to_u64(records.len()).encode(&mut encoder)?;
+    for record in records {
+        record.encode(&mut encoder)?;
+    }
+    durable_journal_frame_from_payload(encoder.finish(), magic, too_large_reason)
+}
+
+fn durable_journal_frame_from_payload(
+    payload: Vec<u8>,
+    magic: &[u8; 8],
+    too_large_reason: &'static str,
+) -> Result<Vec<u8>> {
     let payload_len = usize_to_u64(payload.len());
     if payload_len > MAX_DURABLE_JOURNAL_PAYLOAD_BYTES {
         return Err(StorageError::conflict(too_large_reason));
@@ -1958,9 +2114,9 @@ pub(super) fn append_block_journal_records_unsynced(
     }
     let encode_started = Instant::now();
     let mut bytes = Vec::new();
-    let mut frame_records: Vec<BlockJournalRecord> = Vec::new();
+    let mut frame_start = 0_usize;
     let mut frame_bytes = 0_u64;
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let record_bytes = match record {
             BlockJournalRecord::Write(commit) => commit
                 .entries
@@ -1972,27 +2128,24 @@ pub(super) fn append_block_journal_records_unsynced(
                 .fold(128_u64, u64::saturating_add),
             BlockJournalRecord::Lease { .. } | BlockJournalRecord::Flush { .. } => 128,
         };
-        if !frame_records.is_empty()
+        if index > frame_start
             && frame_bytes.saturating_add(record_bytes) > BLOCK_JOURNAL_TARGET_FRAME_BYTES
         {
-            bytes.extend_from_slice(&durable_journal_frame(
-                &frame_records,
+            bytes.extend_from_slice(&durable_journal_slice_frame(
+                &records[frame_start..index],
                 &BLOCK_JOURNAL_MAGIC,
                 "block journal record exceeds durable payload limit",
             )?);
-            frame_records.clear();
+            frame_start = index;
             frame_bytes = 0;
         }
-        frame_records.push(record.clone());
         frame_bytes = frame_bytes.saturating_add(record_bytes);
     }
-    if !frame_records.is_empty() {
-        bytes.extend_from_slice(&durable_journal_frame(
-            &frame_records,
-            &BLOCK_JOURNAL_MAGIC,
-            "block journal record exceeds durable payload limit",
-        )?);
-    }
+    bytes.extend_from_slice(&durable_journal_slice_frame(
+        &records[frame_start..],
+        &BLOCK_JOURNAL_MAGIC,
+        "block journal record exceeds durable payload limit",
+    )?);
     let encode_nanos = duration_nanos_u64(encode_started.elapsed());
     let mut profile = append_durable_journal_bytes(path, &bytes, false)?;
     profile.encode_nanos = encode_nanos;
@@ -2364,6 +2517,7 @@ impl DurableSqliteStore {
             append_ingest_data_log_policy,
             allocation_locks: Arc::clone(&data_log_allocation_locks),
             lanes: Mutex::new(BTreeMap::new()),
+            sync_lanes: Mutex::new(BTreeMap::new()),
             synced_logs: synced_append_logs,
             dir_synced_logs: dir_synced_append_logs,
             synced_log_cvar: synced_append_log_cvar,
@@ -4666,6 +4820,20 @@ impl DurableSqliteStore {
                     payload_bytes,
                     integrity,
                 });
+                // Unsynced appends request a background sync immediately, so
+                // one chunk's fdatasync overlaps the next chunk's write and a
+                // later durability boundary usually finds the bytes already
+                // covered. Durability is still claimed only by boundaries
+                // that observe the covering sync.
+                if sync_mode == DataLogSyncMode::NoSync {
+                    self.append_log_service.payload_sync_worker.request(
+                        AppendLogPayloadSyncRequest {
+                            log_ref,
+                            bytes: new_total,
+                            sync_dir: *needs_dir_sync,
+                        },
+                    );
+                }
             }
             if let Some((_, file, bytes, _)) = open_log.take()
                 && sync_mode == DataLogSyncMode::Sync

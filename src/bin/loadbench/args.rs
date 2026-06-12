@@ -270,6 +270,11 @@ impl Args {
                             )
                         })?;
                 }
+                "--block-journal-chunk-mib" => {
+                    let mib: u64 = parse_next(&mut raw, flag.as_str())?;
+                    args.block_journal_batch_policy.segment_chunk_bytes =
+                        mib_to_bytes(mib, flag.as_str())?;
+                }
                 "--append-ingest-max-in-flight-mib" => {
                     let mib: u64 = parse_next(&mut raw, flag.as_str())?;
                     args.append_ingest_policy.admission.max_in_flight_bytes =
@@ -570,7 +575,8 @@ options:\n\
   --block-journal-batch-target N           durable block journal batch target, default: 4\n\
   --block-journal-idle-coalesce-us N       durable block journal idle coalesce wait, default: 0\n\
   --block-journal-max-coalesce-us N        durable block journal max coalesce wait, default: 5000\n\
-  --block-journal-inline-kib N             durable block journal inline payload cap KiB, default: 64\n\
+  --block-journal-inline-kib N             durable block journal inline payload cap KiB, default: 16\n\
+  --block-journal-chunk-mib N              durable block segment-ref stripe chunk MiB, default: 8\n\
   --append-ingest-max-in-flight-mib N      durable append ingest global max in-flight MiB, default: disabled\n\
   --append-ingest-max-in-flight-per-storage-node-mib N durable append ingest per-storage-node max in-flight MiB\n\
   --append-ingest-active-log-lanes N       active append-run data logs per storage node, default: 1\n\

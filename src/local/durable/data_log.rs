@@ -144,6 +144,57 @@ impl PendingDataLogAppend {
         self.prune_unreferenced_logs();
     }
 
+    /// Copy restricted to placements for the requested segments plus the log
+    /// manifests those placements reference.
+    ///
+    /// Equivalent to cloning the whole pending set and then calling
+    /// `retain_current_placements`, without copying unrelated placements.
+    fn for_segments(&self, segment_ids: &BTreeSet<SegmentId>) -> Self {
+        let placements: Vec<_> = self
+            .placements
+            .iter()
+            .filter(|placement| segment_ids.contains(&placement.segment_id))
+            .cloned()
+            .collect();
+        let retained_refs: BTreeSet<_> = placements
+            .iter()
+            .map(|placement| DurableDataLogRef {
+                storage_node: placement.storage_node,
+                log_id: placement.data_log_id,
+            })
+            .collect();
+        let logs = self
+            .logs
+            .iter()
+            .filter(|(log_ref, _)| retained_refs.contains(log_ref))
+            .map(|(log_ref, manifest)| (*log_ref, manifest.clone()))
+            .collect();
+        let sealed_logs = self
+            .sealed_logs
+            .iter()
+            .copied()
+            .filter(|log_ref| retained_refs.contains(log_ref))
+            .collect();
+        Self {
+            placements,
+            logs,
+            sealed_logs,
+        }
+    }
+
+    /// Copy of just the log manifests, without placements.
+    ///
+    /// Staging only needs active-log positions to continue appending, so this
+    /// keeps prestage snapshot cost independent of how many placements are
+    /// waiting to finalize.
+    fn manifests_only(&self) -> Self {
+        Self {
+            placements: Vec::new(),
+            logs: self.logs.clone(),
+            sealed_logs: self.sealed_logs.clone(),
+        }
+    }
+
     fn remove_segments(&mut self, segment_ids: &BTreeSet<SegmentId>) {
         self.placements
             .retain(|placement| !segment_ids.contains(&placement.segment_id));

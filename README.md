@@ -307,6 +307,58 @@ measures bytes that became visible and restart-durable inside the timed window.
 | Local FS, fsync at end | `fio`, buffered writes plus `--end_fsync=1`, same shape | about 3.49 GB/s write-phase bandwidth |
 | Local FS, direct with fsync at end | `fio`, direct writes plus `--end_fsync=1`, same shape | about 3.82 GB/s write-phase bandwidth |
 
+Segment-ref lane results from June 12, 2026. Concurrent segment-ref finalizes
+now coalesce into one node-catalog transaction per batch through a finalize
+lane, payload syncs group-commit through per-node sync lanes with eager
+chunk-level sync requests, large writes stripe policy-sized chunks round-robin
+across storage nodes, and the default inline cap dropped to 16 KiB so 64k and
+larger writes ride the data disks. Local Docker A/B against `bf6da8d`,
+`block-batch` with one random durable `flushed` write per op, `--rtt-us 0`,
+4 storage nodes, 5-second windows, medians of two repeats. One shared disk
+backs every role on this host, so segment-ref gains are bounded by disk
+sharing and the 64k inline-to-segref default flip is slower here by design;
+the GCP layout with one journal disk plus four data disks is the reference
+deployment shape:
+
+| Shape | Before | After |
+| --- | --- | --- |
+| 4k c1/c32 | 2.0k / 16.3k IOPS | 1.9k / 15.2k IOPS |
+| 64k c1/c32 | 156 / 559 MB/s | 47 / 314 MB/s (now segment-refs by default) |
+| 256k c1/c32 | 164 / 349 MB/s | 232 / 939 MB/s, c32 p99 53 ms to 24 ms |
+| 1m c1/c32 | 543 / 1326 MB/s | 639 / 1634 MB/s, c32 p99 62 ms to 42 ms |
+| 32m c1/c32 | 1118 / 2144 MB/s | 1233 / 2087 MB/s |
+
+GCP block-vs-RBD rerun from June 12, 2026, same harness and matrix as the
+June 11 run below (five local NVMe SSDs, microceph RBD `pool size 1` via fio
+librbd randwrite against `loadbench block-batch` with 4 storage nodes plus a
+journal disk; medians of two repeats at `--rtt-us 0`; ratios are toy/Ceph
+throughput from the same-day Ceph pass). Fully durable toy rows:
+
+| Shape | Ceph RBD | Toy `flushed` | Ratio | p99 toy vs Ceph |
+| --- | --- | --- | --- | --- |
+| 4k c1 | 9 MB/s | 33 MB/s | 3.61x | 0.2 / 0.5 ms |
+| 4k c16 | 118 MB/s | 155 MB/s | 1.31x | 0.5 / 1.2 ms |
+| 4k c32 | 219 MB/s | 167 MB/s | 0.76x | 1.5 / 0.8 ms |
+| 64k c32 | 1509 MB/s | 929 MB/s | 0.62x | 3.4 / 5.5 ms |
+| 256k c16 | 1497 MB/s | 1211 MB/s | 0.81x | 6.0 / 12.5 ms |
+| 256k c32 | 1545 MB/s | 1272 MB/s | 0.82x | 10.6 / 24.8 ms |
+| 1m c4 | 1195 MB/s | 1338 MB/s | 1.12x | 5.8 / 13.2 ms |
+| 1m c32 | 1494 MB/s | 1377 MB/s | 0.92x | 37.7 / 95.9 ms |
+| 32m c4 | 1095 MB/s | 1174 MB/s | 1.07x | 172 / 173 ms |
+| 32m c32 | 1606 MB/s | 1184 MB/s | 0.74x | 1688 / 1284 ms |
+
+Against the June 11 toy results on the same matrix, 64k c32 went from 348 to
+929 MB/s and 256k c32 from 335 to 1272 MB/s (the two cells the segment-ref
+lanes targeted), 1m c32 from 1320 to 1377 MB/s, and 32m c32 from 1099 to
+1184 MB/s, with no cell regressing. Fully durable writes now win at 4k up to
+c16 and at 1m/32m mid-concurrency, and durable p99 beats Ceph at most
+high-concurrency shapes from 64k up. Ceph keeps the raw-throughput lead at
+64k (toy is ops-bound near 14.5k segment-ref boundaries/s there) and at the
+largest sizes at c32, where Ceph stripes data over all five disks while the
+toy layout reserves one disk for the journal; folding the journal disk into
+the data layout is the next obvious lever. Raw artifacts live in
+`infra/gcp-local-nvme-bench/results/gbvr-beat-0612/`.
+
 Block journal group-commit results from June 11, 2026. Every durable block
 boundary now joins one group-committed journal lane, payloads above the inline
 cap stage on per-node data logs in parallel, and acknowledged segment-ref
@@ -720,9 +772,12 @@ for visible durability claims.
 lane that every durable block boundary joins. The default adds no artificial
 coalesce wait: the in-flight batch sync is the batching window for the next
 batch. `--block-journal-inline-kib` sets the largest batch payload carried
-inline in journal records (default 64); larger writes stage chunked payload
-segments on per-node data logs and journal only segment references, so payload
-bandwidth uses the data disks instead of the journal device.
+inline in journal records (default 16); larger writes stripe payload segments
+across per-node data logs in `--block-journal-chunk-mib` chunks (default 8)
+and journal only segment references, so payload bandwidth uses the data disks
+instead of the journal device. Payload syncs share one group-commit sync lane
+per storage node, and segment-ref catalog finalizes share a finalize lane
+that publishes one catalog transaction per batch.
 
 `--stream-auto-persist-mib` is an internal
 durable-provider policy knob for append-stream latency experiments: it asks the

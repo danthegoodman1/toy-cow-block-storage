@@ -519,26 +519,15 @@ impl StorageNodeRegistry {
         }
         for (ordinal, node_id) in self.node_order.iter().enumerate() {
             let node = self.node(*node_id)?;
-            let catalog = node.segment_catalog.state_inner()?;
-            let selected: Vec<_> = segment_ids
-                .iter()
-                .copied()
-                .filter(|segment_id| catalog.entries.contains_key(segment_id))
-                .collect();
-            if selected.is_empty() {
+            let Some(catalog) = node.segment_catalog.selected_state_inner(segment_ids)? else {
                 continue;
-            }
-            let selected: BTreeSet<_> = selected.into_iter().collect();
-            for segment_id in &selected {
+            };
+            for segment_id in catalog.entries.keys() {
                 payloads.push(
                     node.segment_store
                         .payload_for_segment(*node_id, *segment_id)?,
                 );
             }
-            let mut catalog = catalog;
-            catalog
-                .entries
-                .retain(|segment_id, _| selected.contains(segment_id));
             nodes.insert(
                 *node_id,
                 (
@@ -629,20 +618,10 @@ impl StorageNodeRegistry {
         let mut found = BTreeSet::new();
         for (ordinal, node_id) in self.node_order.iter().enumerate() {
             let node = self.node(*node_id)?;
-            let catalog = node.segment_catalog.state_inner()?;
-            let selected: BTreeSet<_> = segment_ids
-                .iter()
-                .copied()
-                .filter(|segment_id| catalog.entries.contains_key(segment_id))
-                .collect();
-            if selected.is_empty() {
+            let Some(catalog) = node.segment_catalog.selected_state_inner(segment_ids)? else {
                 continue;
-            }
-            found.extend(selected.iter().copied());
-            let mut catalog = catalog;
-            catalog
-                .entries
-                .retain(|segment_id, _| selected.contains(segment_id));
+            };
+            found.extend(catalog.entries.keys().copied());
             nodes.insert(
                 *node_id,
                 (

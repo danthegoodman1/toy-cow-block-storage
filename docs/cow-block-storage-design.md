@@ -162,13 +162,29 @@ commit-sequence order, and a flush marker never covers a sequence whose write
 record is not yet appended.
 
 Writes whose total payload is at or below a provider-private inline cap
-(default 64 KiB) carry payload bytes inside the journal record, split into
-block-native inline entries. Larger writes place payload segments on per-node
-data logs, chunked so one large write spreads across storage nodes, and the
-journal records only small segment references. A flushed segment-reference
-write makes its segment payload and node-catalog receipts durable before its
-record enters the lane, preserving the rule that durable metadata never
-references volatile bytes.
+(default 16 KiB) carry payload bytes inside the journal record, split into
+block-native inline entries, so a small write costs one lane append on the
+journal device. Larger writes place payload segments on per-node data logs,
+striped in provider-private chunks round-robin across storage nodes so one
+large write spreads payload bandwidth and payload syncs over every data disk,
+and the journal records only small segment references. A flushed
+segment-reference write makes its segment payload and node-catalog receipts
+durable before its record enters the lane, preserving the rule that durable
+metadata never references volatile bytes.
+
+Segment-reference staging shares two more group-commit lanes shaped like the
+journal lane. Payload syncs route through one sync lane per storage node:
+staging records each chunk's high-water append position eagerly while later
+chunks are still being written, one in-flight data sync per node covers the
+batch high-water, and a staging waiter completes only when the synced
+high-water covers its bytes, so syncs on different nodes run in parallel and
+syncs on one node amortize across writers. Catalog publication routes through
+a finalize lane: concurrent segment-reference finalizes coalesce into one
+node-catalog transaction per batch, the batch commit is every member's
+durability boundary, and a failed batch fails every member with nothing
+published. Both lanes reschedule work without weakening the boundary
+contract: a flushed acknowledgment still requires the covering payload sync
+and the durable journal record.
 
 An acknowledged journal write appends its record without syncing, becomes
 visible to same-process reads, and replays after restart only if a later

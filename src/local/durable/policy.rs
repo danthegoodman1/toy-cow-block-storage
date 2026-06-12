@@ -121,8 +121,18 @@ pub struct BlockJournalBatchPolicy {
     ///
     /// Larger writes place payload segments on per-node data logs and journal
     /// only small segment references, so payload bandwidth uses every data
-    /// disk instead of the journal device.
+    /// disk instead of the journal device. The default keeps small writes on
+    /// the journal lane and routes everything else to the data disks, which
+    /// favors layouts with one journal device beside several data devices;
+    /// single-disk layouts can raise the cap so mid-size writes skip the
+    /// segment-ref staging round trip.
     pub inline_max_total_bytes: u64,
+    /// Chunk size for striping one segment-ref write across storage nodes.
+    ///
+    /// A write larger than this splits into chunks placed round-robin on the
+    /// storage nodes, so one op's payload bandwidth and payload syncs spread
+    /// across every data disk.
+    pub segment_chunk_bytes: u64,
 }
 
 impl Default for BlockJournalBatchPolicy {
@@ -131,7 +141,8 @@ impl Default for BlockJournalBatchPolicy {
             target_requests: 4,
             idle_coalesce_delay: Duration::ZERO,
             max_coalesce_delay: Duration::from_millis(5),
-            inline_max_total_bytes: 64 * 1024,
+            inline_max_total_bytes: 16 * 1024,
+            segment_chunk_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -147,6 +158,11 @@ impl BlockJournalBatchPolicy {
         if self.idle_coalesce_delay > self.max_coalesce_delay {
             return Err(StorageError::invalid_argument(
                 "block journal idle_coalesce_delay must be <= max_coalesce_delay",
+            ));
+        }
+        if self.segment_chunk_bytes == 0 {
+            return Err(StorageError::invalid_argument(
+                "block journal segment_chunk_bytes must be greater than zero",
             ));
         }
         Ok(())

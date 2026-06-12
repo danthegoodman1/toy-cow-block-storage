@@ -20,16 +20,19 @@ Current implementation note: leased block writes run on the block journal.
 Every durable boundary (flushed writes, sparse operations, `flush_device`,
 lease fences) joins one group-committed lane that shares one journal append
 and one data sync per batch. Payloads at or below the inline cap (default
-64 KiB, `BlockJournalBatchPolicy::inline_max_total_bytes`) stay inline in
-journal records; larger writes stage chunked payload segments on per-node
-data logs in parallel, outside global locks, and journal only segment
-references. Acknowledged segment-reference writes prestage payloads unsynced
-and register device-pending placements; any flush boundary covering them
-syncs and catalogs those payloads first. Reopen replays journal records
-covered by durable flush markers and advances the commit-sequence allocator
-past every observed record. The journal file is not yet folded or pruned:
-checkpoint materialization into CoW shard roots (Stages 3-5 below) remains
-open, so reopen cost and journal size grow with retained journal history.
+16 KiB, `BlockJournalBatchPolicy::inline_max_total_bytes`) stay inline in
+journal records; larger writes stripe policy-sized chunks round-robin across
+storage-node data logs in parallel, outside global locks, and journal only
+segment references. Payload syncs group-commit through one sync lane per
+storage node, and catalog finalizes group-commit through a finalize lane that
+publishes one node-catalog transaction per batch. Acknowledged
+segment-reference writes prestage payloads unsynced and register
+device-pending placements; any flush boundary covering them syncs and
+catalogs those payloads first. Reopen replays journal records covered by
+durable flush markers and advances the commit-sequence allocator past every
+observed record. The journal file is not yet folded or pruned: checkpoint
+materialization into CoW shard roots (Stages 3-5 below) remains open, so
+reopen cost and journal size grow with retained journal history.
 
 This is the production-shaped block model for DB-on-filesystem-on-block. A
 filesystem already owns page-cache writeback and fsync policy. The block layer

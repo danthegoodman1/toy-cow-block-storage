@@ -64,6 +64,31 @@ impl InMemoryLocalSegmentCatalog {
         Ok(lock(&self.inner)?.clone())
     }
 
+    /// Copy of the catalog restricted to the requested segment ids.
+    ///
+    /// Hot per-write paths use this instead of `state_inner` so snapshot cost
+    /// scales with the request, not with every segment the node has ever
+    /// cataloged. Returns `None` when none of the ids live on this node.
+    fn selected_state_inner(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<Option<CatalogInner>> {
+        let inner = lock(&self.inner)?;
+        let mut entries = BTreeMap::new();
+        for segment_id in segment_ids {
+            if let Some(entry) = inner.entries.get(segment_id) {
+                entries.insert(*segment_id, entry.clone());
+            }
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CatalogInner {
+            next_segment_id: inner.next_segment_id,
+            entries,
+        }))
+    }
+
     fn reserve_segment_with_id(
         &self,
         segment_id: SegmentId,

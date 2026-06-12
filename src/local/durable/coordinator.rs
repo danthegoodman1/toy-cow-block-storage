@@ -3,11 +3,6 @@
 const APPEND_STREAM_BACKGROUND_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const APPEND_STREAM_BACKGROUND_SYNC_MAX_STEP_BYTES: u64 = 32 * 1024 * 1024;
 const BLOCK_DELTA_PARALLEL_COMMIT_MIN_BYTES: u64 = 16 * 1024 * 1024;
-/// Chunk size for segment-ref payload staging.
-///
-/// Large block writes split into multiple segments so placement spreads one
-/// write across storage nodes and their data disks.
-const BLOCK_SEGMENT_REF_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockJournalFastPathMode {
@@ -28,6 +23,7 @@ pub struct DurableCoordinator {
     block_delta_staging_lock: Arc<Mutex<()>>,
     block_delta_prestage: Arc<BlockDeltaPrestageTracker>,
     block_segment_ref_staging: Arc<BlockSegmentRefStagingGate>,
+    block_segment_finalize: Arc<BlockSegmentFinalizeCoordinator>,
     block_device_pending_payloads: Arc<BlockDevicePendingPayloads>,
     stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<StreamAppendLane>>>>,
     persist_lock: Arc<Mutex<()>>,
@@ -83,6 +79,29 @@ struct StagedBlockSegmentRefs {
 struct BlockSegmentRefStagingGate {
     inner: Mutex<u64>,
     cvar: Condvar,
+}
+
+/// Coalesces concurrent segment-ref finalizes into shared catalog batches.
+///
+/// Finalize cost is dominated by the per-node catalog SQLite commit, which
+/// fsyncs under `synchronous=FULL`. The first waiter that finds the lane idle
+/// drains every queued request and publishes the union of their segments in
+/// one transaction per node, so concurrent writers share one catalog fsync
+/// instead of queueing one commit each. A waiter only observes success after
+/// the batch that contains its segments commits.
+#[derive(Debug, Default)]
+struct BlockSegmentFinalizeCoordinator {
+    inner: Mutex<BlockSegmentFinalizeState>,
+    cvar: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct BlockSegmentFinalizeState {
+    in_flight: bool,
+    generation: u64,
+    next_request_id: u64,
+    pending: BTreeMap<u64, BTreeSet<SegmentId>>,
+    completed: BTreeMap<u64, Result<Option<DurablePersistProfile>>>,
 }
 
 /// Segment-ref payloads acknowledged but not yet payload-durable, per device.
@@ -592,6 +611,7 @@ impl DurableCoordinator {
             block_delta_staging_lock: Arc::new(Mutex::new(())),
             block_delta_prestage: Arc::new(BlockDeltaPrestageTracker::new()),
             block_segment_ref_staging: Arc::new(BlockSegmentRefStagingGate::default()),
+            block_segment_finalize: Arc::new(BlockSegmentFinalizeCoordinator::default()),
             block_device_pending_payloads: Arc::new(BlockDevicePendingPayloads::default()),
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
             persist_lock: Arc::new(Mutex::new(())),
@@ -3571,6 +3591,16 @@ impl DurableCoordinator {
                 .or_insert((commit.writer_epoch, commit.commit_seq));
         }
 
+        let mut applied_writes = BTreeMap::<DeviceId, u64>::new();
+        let mut max_commit_seq = CommitSeq::from_raw(0);
+        for commit in &commits {
+            *applied_writes.entry(commit.device_id).or_default() += 1;
+            max_commit_seq = max_commit_seq.max(commit.commit_seq);
+        }
+
+        // Commits move into their records so inline payload bytes are never
+        // copied on the lane hot path; the publish step reads them back out
+        // of the record list.
         let mut records =
             Vec::with_capacity(leases.len().saturating_add(commits.len()).saturating_add(
                 flushes.len(),
@@ -3581,8 +3611,8 @@ impl DurableCoordinator {
                 writer_epoch: *writer_epoch,
             });
         }
-        for commit in &commits {
-            records.push(BlockJournalRecord::Write(commit.clone()));
+        for commit in commits {
+            records.push(BlockJournalRecord::Write(commit));
         }
         for (device_id, (writer_epoch, durable_through)) in &flushes {
             records.push(BlockJournalRecord::Flush {
@@ -3608,8 +3638,13 @@ impl DurableCoordinator {
             profile.sync_nanos = self.durable.sync_block_journal()?;
             // Publish in commit-seq order after the shared sync: reserved
             // sequences must publish in order per device, and a record may
-            // reference segments only after both are durable.
-            for commit in &commits {
+            // reference segments only after both are durable. Write records
+            // were appended in commit-seq order, so iterating them in record
+            // order preserves the publish order.
+            for record in &records {
+                let BlockJournalRecord::Write(commit) = record else {
+                    continue;
+                };
                 mark_block_journal_segment_refs_referenced(&self.local, commit)?;
                 self.local
                     .metadata
@@ -3625,11 +3660,6 @@ impl DurableCoordinator {
             }
             Ok(profile)
         })();
-
-        let mut applied_writes = BTreeMap::<DeviceId, u64>::new();
-        for commit in &commits {
-            *applied_writes.entry(commit.device_id).or_default() += 1;
-        }
         let profile = match result {
             Ok(profile) => {
                 let mut state = lock(&self.block_journal_flush.inner)?;
@@ -3657,12 +3687,12 @@ impl DurableCoordinator {
         self.record_block_journal_profile(
             total_started,
             profile,
-            commits
-                .iter()
-                .map(|commit| commit.commit_seq)
-                .chain(flushes.values().map(|(_, durable)| *durable))
+            flushes
+                .values()
+                .map(|(_, durable)| *durable)
                 .max()
-                .unwrap_or_else(|| CommitSeq::from_raw(0)),
+                .unwrap_or_else(|| CommitSeq::from_raw(0))
+                .max(max_commit_seq),
             flush_group_size,
         )?;
         Ok(())
@@ -3732,7 +3762,7 @@ impl DurableCoordinator {
             collapse_block_batch_writes(writes, &info.spec, DEFAULT_BLOCK_BATCH_MAX_BYTES)?;
         let collapsed_range_count = usize_to_u64(collapsed.len());
         let write_intent = self.local.next_write_intent()?;
-        let chunk_bytes = usize::try_from(BLOCK_SEGMENT_REF_CHUNK_BYTES)
+        let chunk_bytes = usize::try_from(self.block_journal_batch_policy.segment_chunk_bytes)
             .map_err(|_| StorageError::invalid_argument("segment chunk size overflows usize"))?;
         let mut entries = Vec::with_capacity(collapsed.len());
         let mut segment_ids = BTreeSet::new();
@@ -3800,21 +3830,25 @@ impl DurableCoordinator {
         &self,
         segment_ids: &BTreeSet<SegmentId>,
     ) -> Result<PendingDataLogAppend> {
-        let previous_segments = lock(&self.persisted_segments)?.clone();
-        let pending_base = lock(&self.pending_data_log_append)?.clone();
-        let pending_segments = pending_base.segment_ids();
-        let missing_segments: BTreeSet<_> = segment_ids
-            .iter()
-            .copied()
-            .filter(|segment_id| {
-                !previous_segments.contains(segment_id) && !pending_segments.contains(segment_id)
-            })
-            .collect();
+        let (pending_segments, active_logs) = {
+            let pending = lock(&self.pending_data_log_append)?;
+            (pending.segment_ids(), pending.manifests_only())
+        };
+        let missing_segments: BTreeSet<_> = {
+            let persisted = lock(&self.persisted_segments)?;
+            segment_ids
+                .iter()
+                .copied()
+                .filter(|segment_id| {
+                    !persisted.contains(segment_id) && !pending_segments.contains(segment_id)
+                })
+                .collect()
+        };
         if missing_segments.is_empty() {
             return Ok(PendingDataLogAppend::default());
         }
         let (_, payloads) = self.local.state_for_segment_ids(&missing_segments)?;
-        let appended = self.durable.prestage_segments(payloads, &pending_base)?;
+        let appended = self.durable.prestage_segments(payloads, &active_logs)?;
         lock(&self.pending_data_log_append)?.merge(appended.clone());
         Ok(appended)
     }
@@ -3822,9 +3856,12 @@ impl DurableCoordinator {
     /// Publish node catalog rows for already-durable segment payloads and
     /// mark them persisted.
     ///
-    /// Payload bytes must be appended and synced before this call; the
-    /// persist lock here only covers catalog rows and shared persist
-    /// bookkeeping, never payload-proportional I/O.
+    /// Concurrent finalizes coalesce through the finalize lane: the first
+    /// waiter that finds the lane idle publishes the union of every queued
+    /// request in one catalog transaction per node, and every member of the
+    /// batch shares that commit as its durability boundary. Waiters receive
+    /// the batch profile, so per-op profile rows attribute shared batch work
+    /// to each member.
     fn finalize_block_journal_segment_refs(
         &self,
         segment_ids: &BTreeSet<SegmentId>,
@@ -3832,25 +3869,72 @@ impl DurableCoordinator {
         if segment_ids.is_empty() {
             return Ok(None);
         }
+        let request_id = {
+            let mut state = lock(&self.block_segment_finalize.inner)?;
+            let request_id = state.next_request_id;
+            state.next_request_id = state.next_request_id.wrapping_add(1);
+            state.pending.insert(request_id, segment_ids.clone());
+            request_id
+        };
+        loop {
+            let mut state = lock(&self.block_segment_finalize.inner)?;
+            if let Some(result) = state.completed.remove(&request_id) {
+                return result;
+            }
+            if !state.in_flight {
+                state.in_flight = true;
+                let batch = std::mem::take(&mut state.pending);
+                drop(state);
+                let mut batch_segment_ids = BTreeSet::new();
+                for ids in batch.values() {
+                    batch_segment_ids.extend(ids.iter().copied());
+                }
+                let result = self.finalize_block_segment_refs_batch(&batch_segment_ids);
+                let mut state = lock(&self.block_segment_finalize.inner)?;
+                state.in_flight = false;
+                state.generation = state.generation.wrapping_add(1);
+                for batch_request_id in batch.keys() {
+                    state.completed.insert(*batch_request_id, result.clone());
+                }
+                self.block_segment_finalize.cvar.notify_all();
+                continue;
+            }
+            let generation = state.generation;
+            while state.in_flight && state.generation == generation {
+                state = wait_on_cvar(&self.block_segment_finalize.cvar, state)?;
+            }
+        }
+    }
+
+    /// Publish one finalize batch.
+    ///
+    /// Payload bytes must be appended and synced before this call; the
+    /// persist lock here only covers catalog rows and shared persist
+    /// bookkeeping, never payload-proportional I/O.
+    fn finalize_block_segment_refs_batch(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<Option<DurablePersistProfile>> {
         let lock_started = Instant::now();
         let persist_guard = lock(&self.persist_lock)?;
         let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         let snapshot_started = Instant::now();
-        let previous_segments = lock(&self.persisted_segments)?.clone();
-        let mut pending_append = lock(&self.pending_data_log_append)?.clone();
-        pending_append.retain_current_placements(segment_ids);
+        let pending_append = lock(&self.pending_data_log_append)?.for_segments(segment_ids);
         let pending_segments = pending_append.segment_ids();
         // Payload bytes are cloned only for segments that missed prestaging
         // (for example because a racing full persist consumed the pending
         // set); the common case publishes catalog rows without holding the
         // persist lock so finalizes on different nodes run in parallel.
-        let missing_segments: BTreeSet<_> = segment_ids
-            .iter()
-            .copied()
-            .filter(|segment_id| {
-                !previous_segments.contains(segment_id) && !pending_segments.contains(segment_id)
-            })
-            .collect();
+        let missing_segments: BTreeSet<_> = {
+            let persisted = lock(&self.persisted_segments)?;
+            segment_ids
+                .iter()
+                .copied()
+                .filter(|segment_id| {
+                    !persisted.contains(segment_id) && !pending_segments.contains(segment_id)
+                })
+                .collect()
+        };
         let nodes = self.local.selected_state_for_segment_ids(segment_ids)?;
         let new_segments = if missing_segments.is_empty() {
             drop(persist_guard);
