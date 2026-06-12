@@ -318,7 +318,10 @@ wait_for_osds() {
 
 wait_for_pool_clean() {
   for _ in $(seq 1 180); do
-    if ceph_cmd pg stat 2>/dev/null | grep -q "active+clean"; then
+    local status
+    status="$(ceph_cmd status 2>/dev/null || true)"
+    if grep -q "active+clean" <<<"${status}" \
+      && ! grep -Eq "not active|peering|creating|recover|remapped|misplaced|premerge|backfill|degraded" <<<"${status}"; then
       return 0
     fi
     sleep 2
@@ -349,14 +352,18 @@ setup_ceph_rbd() {
     || true
   ceph_cmd config set global osd_pool_default_size "${CEPH_POOL_SIZE}" || true
   ceph_cmd config set global osd_pool_default_min_size 1 || true
+  ceph_cmd config set global osd_pool_default_pg_autoscale_mode off || true
   ceph_cmd osd pool create bench 128
+  ceph_cmd osd pool set bench pg_autoscale_mode off || true
   ceph_cmd osd pool set bench size "${CEPH_POOL_SIZE}" --yes-i-really-mean-it \
     || ceph_cmd osd pool set bench size "${CEPH_POOL_SIZE}"
   ceph_cmd osd pool set bench min_size 1
   ceph_cmd osd pool application enable bench rbd
+  wait_for_pool_clean
   rbd_cmd pool init -p bench
   wait_for_pool_clean
   rbd_cmd create bench/image --size "${RBD_SIZE_MIB}" --image-feature layering
+  wait_for_pool_clean
   printf '%s\n' "bench/image" > "${RESULT_ROOT}/ceph/rbd-device.txt"
   ceph_cmd status | tee "${RESULT_ROOT}/ceph/ceph-status-before-fio.txt" || true
 }
