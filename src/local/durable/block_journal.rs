@@ -967,6 +967,44 @@ impl DurableSqliteStore {
             }
         }
 
+        // Catalog rows publish asynchronously behind flushed acks, so a crash
+        // can leave durable journal records referencing segments that have no
+        // SQLite rows yet. Rebuild those segments from the self-describing
+        // data logs before replay resolves their receipts.
+        let mut missing_segments: BTreeMap<
+            StorageNodeId,
+            BTreeMap<SegmentId, (SegmentPayloadIntegrity, DeviceId)>,
+        > = BTreeMap::new();
+        for (device_id, durable) in &durable_through {
+            let Some(device_writes) = writes.get(device_id) else {
+                continue;
+            };
+            for commit in device_writes.values() {
+                if commit.commit_seq.raw() > durable.raw() {
+                    continue;
+                }
+                for entry in &commit.entries {
+                    let BlockJournalEntry::Segment {
+                        storage_node,
+                        segment_id,
+                        integrity,
+                        ..
+                    } = entry
+                    else {
+                        continue;
+                    };
+                    if local.storage_nodes.segment_exists(*segment_id)? {
+                        continue;
+                    }
+                    missing_segments
+                        .entry(*storage_node)
+                        .or_default()
+                        .insert(*segment_id, (*integrity, *device_id));
+                }
+            }
+        }
+        self.recover_block_segment_rows(local, missing_segments)?;
+
         for (device_id, durable) in durable_through {
             let Some(device_writes) = writes.get(&device_id) else {
                 continue;
@@ -996,5 +1034,72 @@ impl DurableSqliteStore {
         }
 
         Ok(overlay)
+    }
+
+    /// Rebuild in-memory state and catalog rows for journal-referenced
+    /// segments whose asynchronous row publication did not survive a crash.
+    ///
+    /// Every such segment's payload was synced on its node before the
+    /// referencing journal record became durable, so a header walk of that
+    /// node's data logs must find it; failing to is corruption. Rows publish
+    /// before this returns, so a recovered reopen is row-for-row equivalent
+    /// to one where the publisher had drained.
+    fn recover_block_segment_rows(
+        &self,
+        local: &LocalCoordinator,
+        missing: BTreeMap<StorageNodeId, BTreeMap<SegmentId, (SegmentPayloadIntegrity, DeviceId)>>,
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut pending = PendingDataLogAppend::default();
+        let mut adopted = BTreeSet::new();
+        for (storage_node, wanted) in missing {
+            let wanted_ids: BTreeSet<SegmentId> = wanted.keys().copied().collect();
+            let mut records =
+                scan_node_data_logs_for_segments(&self.paths.data_dir, storage_node, &wanted_ids)?;
+            for (segment_id, (integrity, device_id)) in wanted {
+                let Some(record) = records.remove(&segment_id) else {
+                    return Err(StorageError::corrupt(
+                        "durable journal references a segment with no durable data-log record",
+                    ));
+                };
+                if record.placement.integrity != integrity {
+                    return Err(StorageError::corrupt(
+                        "recovered segment integrity disagrees with journal entry",
+                    ));
+                }
+                let log_ref = DurableDataLogRef {
+                    storage_node,
+                    log_id: record.placement.data_log_id,
+                };
+                let record_end = record
+                    .placement
+                    .record_offset
+                    .saturating_add(record.placement.record_bytes);
+                let manifest = pending.logs.entry(log_ref).or_insert(PendingDataLogManifest {
+                    storage_node,
+                    log_id: log_ref.log_id,
+                    state: self
+                        .node_data_log_state(log_ref)?
+                        .unwrap_or_else(|| GENERIC_DATA_LOG_STATE_ACTIVE.to_string()),
+                    total_bytes: 0,
+                    needs_dir_sync: false,
+                });
+                manifest.total_bytes = manifest.total_bytes.max(record_end);
+                local.adopt_recovered_segment(
+                    MappingOwner::BlockDevice(device_id),
+                    storage_node,
+                    segment_id,
+                    record.bytes,
+                    integrity,
+                )?;
+                pending.placements.push(record.placement);
+                adopted.insert(segment_id);
+            }
+        }
+        let nodes = local.selected_state_for_segment_ids(&adopted)?;
+        self.persist_block_journal_segment_refs(&nodes, &adopted, Vec::new(), pending, true)?;
+        Ok(())
     }
 }

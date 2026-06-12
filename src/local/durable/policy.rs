@@ -131,7 +131,10 @@ pub struct BlockJournalBatchPolicy {
     ///
     /// A write larger than this splits into chunks placed round-robin on the
     /// storage nodes, so one op's payload bandwidth and payload syncs spread
-    /// across every data disk.
+    /// across every data disk. The 2 MiB default came from a 5-disk GCP sweep
+    /// over 2/4/8 MiB: smaller chunks engage every node sooner for one large
+    /// op (best 32 MiB c1 latency) without measurable cost at high
+    /// concurrency.
     pub segment_chunk_bytes: u64,
 }
 
@@ -142,7 +145,7 @@ impl Default for BlockJournalBatchPolicy {
             idle_coalesce_delay: Duration::ZERO,
             max_coalesce_delay: Duration::from_millis(5),
             inline_max_total_bytes: 16 * 1024,
-            segment_chunk_bytes: 8 * 1024 * 1024,
+            segment_chunk_bytes: 2 * 1024 * 1024,
         }
     }
 }

@@ -677,6 +677,24 @@ impl StorageNodeRegistry {
         self.node_order.as_ref().clone()
     }
 
+    fn segment_exists(&self, segment_id: SegmentId) -> Result<bool> {
+        for node in self.nodes.values() {
+            if node.segment_catalog.contains_segment(segment_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Keep the segment-id allocator above an id recovered from durable state,
+    /// so adopted segments never collide with future allocations.
+    fn ensure_segment_id_floor(&self, segment_id: SegmentId) -> Result<()> {
+        let floor = u64::try_from(segment_id.raw().saturating_add(1))
+            .map_err(|_| StorageError::corrupt("recovered segment id exceeds local limit"))?;
+        self.next_segment_id.fetch_max(floor, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn owner_node_for_segment(&self, segment_id: SegmentId) -> Result<&LocalStorageNode> {
         let mut found = None;
         for (node_id, node) in self.nodes.iter() {

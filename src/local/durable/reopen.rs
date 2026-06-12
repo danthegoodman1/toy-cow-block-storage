@@ -1249,6 +1249,126 @@ pub(super) fn delete_data_log(data_dir: &Path, log_ref: DurableDataLogRef) -> Re
     }
 }
 
+pub(super) fn list_node_data_log_ids(
+    data_dir: &Path,
+    storage_node: StorageNodeId,
+) -> Result<Vec<u64>> {
+    let dir = node_data_log_dir(data_dir, storage_node);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(fs_error(error)),
+    };
+    let mut log_ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(fs_error)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(digits) = name.strip_prefix("data-").and_then(|rest| rest.strip_suffix(".log"))
+            && let Ok(log_id) = digits.parse::<u64>()
+        {
+            log_ids.push(log_id);
+        }
+    }
+    log_ids.sort_unstable();
+    Ok(log_ids)
+}
+
+/// One self-describing data-log record recovered by scanning, with the
+/// durable placement that a catalog row publication would have recorded.
+#[derive(Debug)]
+pub(super) struct RecoveredSegmentRecord {
+    pub placement: SegmentPlacementRow,
+    pub bytes: Vec<u8>,
+}
+
+/// Find durable payload records for `wanted` segments by walking a node's
+/// data logs header-by-header.
+///
+/// Reopen uses this for journal-referenced segments whose catalog rows were
+/// still queued for asynchronous publication at crash. Scanning stops at the
+/// first torn or truncated record in a log: payload syncs cover whole-file
+/// prefixes, so anything beyond a torn record was never covered by a payload
+/// sync and therefore cannot be referenced by a durable journal record.
+pub(super) fn scan_node_data_logs_for_segments(
+    data_dir: &Path,
+    storage_node: StorageNodeId,
+    wanted: &BTreeSet<SegmentId>,
+) -> Result<BTreeMap<SegmentId, RecoveredSegmentRecord>> {
+    let mut found = BTreeMap::new();
+    if wanted.is_empty() {
+        return Ok(found);
+    }
+    // Newer logs hold the most recently staged segments, so scanning from the
+    // highest log id finds crash-window segments fastest.
+    for log_id in list_node_data_log_ids(data_dir, storage_node)?
+        .into_iter()
+        .rev()
+    {
+        if found.len() == wanted.len() {
+            break;
+        }
+        let path = data_log_path(data_dir, storage_node, log_id);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(fs_error(error)),
+        };
+        let file_len = file.metadata().map_err(fs_error)?.len();
+        let mut offset = 0_u64;
+        let mut header = vec![0_u8; DATA_LOG_HEADER_LEN];
+        while offset.saturating_add(DATA_LOG_HEADER_LEN as u64) <= file_len {
+            file.seek(SeekFrom::Start(offset)).map_err(fs_error)?;
+            if file.read_exact(&mut header).is_err() {
+                break;
+            }
+            let Ok(parsed) = parse_data_log_record_header(&header) else {
+                break;
+            };
+            let record_bytes = (DATA_LOG_HEADER_LEN as u64).saturating_add(parsed.payload_len);
+            let record_end = offset.saturating_add(record_bytes);
+            if record_end > file_len {
+                break;
+            }
+            if parsed.kind == DATA_LOG_KIND_SEGMENT {
+                let segment_id = SegmentId::from_raw(parsed.identity);
+                if wanted.contains(&segment_id) && !found.contains_key(&segment_id) {
+                    let payload_len = usize::try_from(parsed.payload_len).map_err(|_| {
+                        StorageError::corrupt("data-log payload length overflows usize")
+                    })?;
+                    let mut bytes = vec![0_u8; payload_len];
+                    file.read_exact(&mut bytes).map_err(fs_error)?;
+                    verify_segment_payload_integrity(parsed.integrity, &bytes)?;
+                    found.insert(
+                        segment_id,
+                        RecoveredSegmentRecord {
+                            placement: SegmentPlacementRow {
+                                segment_id,
+                                storage_node,
+                                data_log_id: log_id,
+                                record_offset: offset,
+                                record_bytes,
+                                payload_offset: offset
+                                    .saturating_add(DATA_LOG_HEADER_LEN as u64),
+                                payload_bytes: parsed.payload_len,
+                                integrity: parsed.integrity,
+                            },
+                            bytes,
+                        },
+                    );
+                    if found.len() == wanted.len() {
+                        break;
+                    }
+                }
+            }
+            offset = record_end;
+        }
+    }
+    Ok(found)
+}
+
 pub(super) fn sync_data_log_files(
     files: Vec<DataLogFileToSync>,
 ) -> Result<DataLogFileSyncProfile> {
@@ -1432,16 +1552,25 @@ pub(super) fn encode_typed_data_log_header(
     Ok(out)
 }
 
-pub(super) fn decode_data_log_record(record: &[u8]) -> Result<DataLogRecordData> {
-    if record.len() < DATA_LOG_HEADER_LEN {
+/// Parsed fixed-size data-log record header.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DataLogRecordHeader {
+    pub kind: u8,
+    pub identity: u128,
+    pub payload_len: u64,
+    pub integrity: SegmentPayloadIntegrity,
+}
+
+pub(super) fn parse_data_log_record_header(header: &[u8]) -> Result<DataLogRecordHeader> {
+    if header.len() < DATA_LOG_HEADER_LEN {
         return Err(StorageError::corrupt("data-log record is truncated"));
     }
-    if &record[..DATA_LOG_MAGIC.len()] != DATA_LOG_MAGIC {
+    if &header[..DATA_LOG_MAGIC.len()] != DATA_LOG_MAGIC {
         return Err(StorageError::corrupt("bad data-log magic"));
     }
     let version_offset = DATA_LOG_MAGIC.len();
     let version = u16::from_be_bytes(
-        record[version_offset..version_offset + 2]
+        header[version_offset..version_offset + 2]
             .try_into()
             .map_err(|_| StorageError::corrupt("bad data-log version"))?,
     );
@@ -1449,36 +1578,29 @@ pub(super) fn decode_data_log_record(record: &[u8]) -> Result<DataLogRecordData>
         return Err(StorageError::corrupt("unsupported data-log version"));
     }
     let kind_offset = version_offset + 2;
-    let kind = record[kind_offset];
+    let kind = header[kind_offset];
+    if !matches!(kind, DATA_LOG_KIND_SEGMENT | DATA_LOG_KIND_APPEND_RUN) {
+        return Err(StorageError::corrupt("invalid data-log record kind"));
+    }
     let identity_start = kind_offset + 1;
     let identity = u128::from_be_bytes(
-        record[identity_start..identity_start + 16]
+        header[identity_start..identity_start + 16]
             .try_into()
             .map_err(|_| StorageError::corrupt("bad data-log identity"))?,
     );
     let payload_len_start = identity_start + 16;
     let payload_len = u64::from_be_bytes(
-        record[payload_len_start..payload_len_start + 8]
+        header[payload_len_start..payload_len_start + 8]
             .try_into()
             .map_err(|_| StorageError::corrupt("bad data-log payload length"))?,
     );
     let integrity_start = payload_len_start + 8;
-    let integrity_tag = record[integrity_start];
-    let checksum_start = DATA_LOG_CHECKSUM_OFFSET;
+    let integrity_tag = header[integrity_start];
     let expected_checksum = u64::from_be_bytes(
-        record[checksum_start..checksum_start + 8]
+        header[DATA_LOG_CHECKSUM_OFFSET..DATA_LOG_CHECKSUM_OFFSET + 8]
             .try_into()
             .map_err(|_| StorageError::corrupt("bad data-log checksum"))?,
     );
-    let payload_len_usize = usize::try_from(payload_len)
-        .map_err(|_| StorageError::corrupt("data-log payload length overflows usize"))?;
-    let expected_record_len = DATA_LOG_HEADER_LEN
-        .checked_add(payload_len_usize)
-        .ok_or_else(|| StorageError::corrupt("data-log record length overflow"))?;
-    if record.len() != expected_record_len {
-        return Err(StorageError::corrupt("data-log record length mismatch"));
-    }
-    let bytes = record[DATA_LOG_HEADER_LEN..].to_vec();
     let integrity = match integrity_tag {
         1 => SegmentPayloadIntegrity::Crc32c(expected_checksum),
         2 if expected_checksum == 0 => SegmentPayloadIntegrity::Unchecked,
@@ -1489,7 +1611,29 @@ pub(super) fn decode_data_log_record(record: &[u8]) -> Result<DataLogRecordData>
         }
         _ => return Err(StorageError::corrupt("invalid data-log integrity tag")),
     };
+    Ok(DataLogRecordHeader {
+        kind,
+        identity,
+        payload_len,
+        integrity,
+    })
+}
+
+pub(super) fn decode_data_log_record(record: &[u8]) -> Result<DataLogRecordData> {
+    let header = parse_data_log_record_header(record)?;
+    let payload_len_usize = usize::try_from(header.payload_len)
+        .map_err(|_| StorageError::corrupt("data-log payload length overflows usize"))?;
+    let expected_record_len = DATA_LOG_HEADER_LEN
+        .checked_add(payload_len_usize)
+        .ok_or_else(|| StorageError::corrupt("data-log record length overflow"))?;
+    if record.len() != expected_record_len {
+        return Err(StorageError::corrupt("data-log record length mismatch"));
+    }
+    let bytes = record[DATA_LOG_HEADER_LEN..].to_vec();
+    let integrity = header.integrity;
     verify_segment_payload_integrity(integrity, &bytes)?;
+    let kind = header.kind;
+    let identity = header.identity;
     match kind {
         DATA_LOG_KIND_SEGMENT => Ok(DataLogRecordData::Segment(DataLogSegmentData {
             segment_id: SegmentId::from_raw(identity),

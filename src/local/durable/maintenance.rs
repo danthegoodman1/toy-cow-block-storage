@@ -3,6 +3,7 @@ pub(super) struct DurableMaintenanceParts {
     local: LocalCoordinator,
     durable: DurableSqliteStore,
     persist_lock: Arc<Mutex<()>>,
+    pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_policy: MaintenancePolicy,
 }
@@ -153,12 +154,25 @@ pub(super) fn run_maintenance_tick_parts(
     let mut compaction = empty_compaction_report();
     if !plan.commands.is_empty() {
         let _persist_guard = lock(&parts.persist_lock)?;
+        // Logs that still carry unpublished placements (catalog rows queued
+        // behind a flushed ack or an acknowledged write) hold durable payload
+        // bytes the catalog cannot see yet; compacting them would delete
+        // those bytes. Their placements publish shortly, so skip them this
+        // tick. Reading the pending set after taking the persist lock is
+        // race-free: placements leave the set only after their rows commit.
+        let pending_log_refs: BTreeSet<DurableDataLogRef> =
+            lock(&parts.pending_data_log_append)?.log_refs();
         for command in &plan.commands {
             match command {
                 MaintenanceCommand::CompactDataLogs { logs } => {
+                    let logs: Vec<DurableDataLogRef> = logs
+                        .iter()
+                        .copied()
+                        .filter(|log_ref| !pending_log_refs.contains(log_ref))
+                        .collect();
                     let report = parts.durable.compact_data_log_refs(
                         maintenance_tick_data_log_policy(parts.maintenance_policy),
-                        logs,
+                        &logs,
                     )?;
                     compaction.deleted_logs.extend(report.deleted_logs);
                     compaction.relocated_logs.extend(report.relocated_logs);

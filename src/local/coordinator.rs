@@ -3458,6 +3458,51 @@ impl LocalCoordinator {
             .receipt)
     }
 
+    /// Re-register one durable data-log segment in the in-memory registry.
+    ///
+    /// Reopen recovery uses this for segments whose payload bytes are durable
+    /// and journal-referenced but whose catalog rows were still queued for
+    /// asynchronous publication at crash. The segment keeps its original id;
+    /// the grant, write intent, and receipt are process-local and freshly
+    /// issued, exactly as a live staging write would produce them.
+    fn adopt_recovered_segment(
+        &self,
+        owner: MappingOwner,
+        storage_node: StorageNodeId,
+        segment_id: SegmentId,
+        bytes: Vec<u8>,
+        integrity: SegmentPayloadIntegrity,
+    ) -> Result<SegmentWriteReceipt> {
+        let max_bytes = u64::try_from(bytes.len()).map_err(|_| {
+            StorageError::invalid_argument("recovered segment byte length overflows u64")
+        })?;
+        let payload_integrity = match integrity {
+            SegmentPayloadIntegrity::Crc32c(_) => PayloadIntegrity::Verified,
+            SegmentPayloadIntegrity::Unchecked => PayloadIntegrity::Unchecked,
+        };
+        self.storage_nodes.ensure_segment_id_floor(segment_id)?;
+        let write_intent = self.next_write_intent()?;
+        let grant = self.issue_write_grant(WriteGrantRequest {
+            tenant: LOCAL_TENANT_ID,
+            principal: LOCAL_PRINCIPAL_ID,
+            intent: WriteGrantIntent::Internal { owner },
+            write_intent,
+            segment_id,
+            storage_node,
+            max_bytes,
+            payload_integrity,
+            durability: WriteDurability::Flushed,
+            expires_at: LOCAL_GRANT_EXPIRATION,
+        })?;
+        let receipt = self.write_granted_segment_verified(&grant, bytes)?.receipt;
+        if receipt.integrity != integrity {
+            return Err(StorageError::corrupt(
+                "recovered segment integrity disagrees with data-log record",
+            ));
+        }
+        Ok(receipt)
+    }
+
     fn write_segment_for_intent_with_id_owned_verified(
         &self,
         intent: WriteGrantIntent,

@@ -23,7 +23,7 @@ pub struct DurableCoordinator {
     block_delta_staging_lock: Arc<Mutex<()>>,
     block_delta_prestage: Arc<BlockDeltaPrestageTracker>,
     block_segment_ref_staging: Arc<BlockSegmentRefStagingGate>,
-    block_segment_finalize: Arc<BlockSegmentFinalizeCoordinator>,
+    block_segment_rows: Arc<BlockSegmentRowPublisher>,
     block_device_pending_payloads: Arc<BlockDevicePendingPayloads>,
     stream_append_lanes: Arc<Mutex<BTreeMap<AppendStreamId, Arc<StreamAppendLane>>>>,
     persist_lock: Arc<Mutex<()>>,
@@ -81,27 +81,255 @@ struct BlockSegmentRefStagingGate {
     cvar: Condvar,
 }
 
-/// Coalesces concurrent segment-ref finalizes into shared catalog batches.
+/// Publishes per-segment catalog rows from a background thread.
 ///
-/// Finalize cost is dominated by the per-node catalog SQLite commit, which
-/// fsyncs under `synchronous=FULL`. The first waiter that finds the lane idle
-/// drains every queued request and publishes the union of their segments in
-/// one transaction per node, so concurrent writers share one catalog fsync
-/// instead of queueing one commit each. A waiter only observes success after
-/// the batch that contains its segments commits.
-#[derive(Debug, Default)]
-struct BlockSegmentFinalizeCoordinator {
-    inner: Mutex<BlockSegmentFinalizeState>,
-    cvar: Condvar,
+/// A flushed segment-ref ack requires the payload bytes synced on their node
+/// and a durable journal record. The per-segment catalog rows are bookkeeping
+/// that live reads never consult, so sealing enqueues row publication here
+/// instead of paying the per-node SQLite commit on the hot path. The worker
+/// drains the queue in one catalog transaction per node, and a clean shutdown
+/// drains whatever is still queued. If rows are queued at a crash, reopen
+/// rebuilds them by scanning the self-describing data logs
+/// (`recover_block_segment_rows`), so a publish failure parks the queue until
+/// the next enqueue without affecting durability.
+struct BlockSegmentRowPublisher {
+    state: Arc<(Mutex<BlockSegmentRowPublisherState>, Condvar)>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[derive(Debug, Default)]
-struct BlockSegmentFinalizeState {
-    in_flight: bool,
-    generation: u64,
-    next_request_id: u64,
-    pending: BTreeMap<u64, BTreeSet<SegmentId>>,
-    completed: BTreeMap<u64, Result<Option<DurablePersistProfile>>>,
+impl std::fmt::Debug for BlockSegmentRowPublisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockSegmentRowPublisher").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct BlockSegmentRowPublisherState {
+    shutdown: bool,
+    queued: BTreeSet<SegmentId>,
+    publishing: bool,
+    // After a failed publish the queue parks until the next enqueue instead
+    // of hot-looping on a persistently failing catalog.
+    retry_parked: bool,
+    last_error: Option<StorageError>,
+    // Test-only crash simulation: a paused publisher never drains, including
+    // the shutdown drain, so a drop-and-reopen behaves like a crash with rows
+    // unpublished.
+    paused: bool,
+}
+
+#[derive(Clone)]
+struct BlockSegmentRowPublisherParts {
+    local: LocalCoordinator,
+    durable: DurableSqliteStore,
+    persist_lock: Arc<Mutex<()>>,
+    pending_data_log_append: Arc<Mutex<PendingDataLogAppend>>,
+    persisted_segments: Arc<Mutex<BTreeSet<SegmentId>>>,
+}
+
+impl BlockSegmentRowPublisher {
+    fn start(parts: BlockSegmentRowPublisherParts) -> Result<Arc<Self>> {
+        let state = Arc::new((
+            Mutex::new(BlockSegmentRowPublisherState {
+                shutdown: false,
+                queued: BTreeSet::new(),
+                publishing: false,
+                retry_parked: false,
+                last_error: None,
+                paused: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let handle = thread::Builder::new()
+            .name("toy-cow-segment-rows".to_string())
+            .spawn(move || block_segment_row_publisher_loop(parts, worker_state))
+            .map_err(|error| {
+                StorageError::unavailable(format!(
+                    "failed to start segment row publisher: {error}"
+                ))
+            })?;
+        Ok(Arc::new(Self {
+            state,
+            handle: Mutex::new(Some(handle)),
+        }))
+    }
+
+    fn enqueue(&self, segment_ids: &BTreeSet<SegmentId>) -> Result<()> {
+        if segment_ids.is_empty() {
+            return Ok(());
+        }
+        let (lock_state, cvar) = &*self.state;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("segment row publisher lock poisoned"))?;
+        state.queued.extend(segment_ids.iter().copied());
+        state.retry_parked = false;
+        // A new enqueue starts a fresh drain attempt; the prior failure was
+        // already surfaced to anyone waiting on it.
+        state.last_error = None;
+        cvar.notify_one();
+        Ok(())
+    }
+
+    /// Block until every queued row has published, surfacing a parked
+    /// publish failure instead of waiting forever on it.
+    #[cfg(test)]
+    fn wait_drained(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.state;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("segment row publisher lock poisoned"))?;
+        loop {
+            if let Some(error) = &state.last_error {
+                return Err(error.clone());
+            }
+            if state.queued.is_empty() && !state.publishing {
+                return Ok(());
+            }
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("segment row publisher lock poisoned"))?;
+        }
+    }
+
+    fn shutdown(&self) {
+        let (lock_state, cvar) = &*self.state;
+        if let Ok(mut state) = lock_state.lock() {
+            state.shutdown = true;
+            cvar.notify_all();
+        }
+        if let Ok(mut handle) = self.handle.lock()
+            && let Some(handle) = handle.take()
+        {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_paused(&self, paused: bool) {
+        let (lock_state, cvar) = &*self.state;
+        if let Ok(mut state) = lock_state.lock() {
+            state.paused = paused;
+            cvar.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn queued_len(&self) -> usize {
+        let (lock_state, _) = &*self.state;
+        lock_state.lock().map(|state| state.queued.len()).unwrap_or(0)
+    }
+}
+
+impl Drop for BlockSegmentRowPublisher {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn block_segment_row_publisher_loop(
+    parts: BlockSegmentRowPublisherParts,
+    state: Arc<(Mutex<BlockSegmentRowPublisherState>, Condvar)>,
+) {
+    let (lock_state, cvar) = &*state;
+    loop {
+        let mut guard = match lock_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        while !guard.shutdown && (guard.queued.is_empty() || guard.paused || guard.retry_parked) {
+            guard = match cvar.wait(guard) {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+        }
+        if guard.shutdown {
+            // Drain on clean shutdown so a normal close leaves the same rows
+            // an eager publish would have; a paused publisher is simulating
+            // a crash and leaves the queue for reopen recovery.
+            if !guard.paused && !guard.queued.is_empty() {
+                let batch = std::mem::take(&mut guard.queued);
+                drop(guard);
+                let _ = publish_block_segment_rows(&parts, &batch);
+            }
+            return;
+        }
+        let batch = std::mem::take(&mut guard.queued);
+        guard.publishing = true;
+        drop(guard);
+        let result = publish_block_segment_rows(&parts, &batch);
+        let mut guard = match lock_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        guard.publishing = false;
+        match result {
+            Ok(()) => guard.last_error = None,
+            Err(error) => {
+                guard.queued.extend(batch);
+                guard.retry_parked = true;
+                guard.last_error = Some(error);
+            }
+        }
+        cvar.notify_all();
+    }
+}
+
+/// Publish catalog rows for one drained batch.
+///
+/// Payload bytes are appended and synced before their ids are enqueued; this
+/// only writes catalog rows and shared persist bookkeeping. Segments that
+/// vanished between enqueue and drain were published and freed by a full
+/// persist in the meantime, so they are skipped rather than treated as
+/// missing.
+fn publish_block_segment_rows(
+    parts: &BlockSegmentRowPublisherParts,
+    segment_ids: &BTreeSet<SegmentId>,
+) -> Result<()> {
+    let persist_guard = lock(&parts.persist_lock)?;
+    let mut live_ids = BTreeSet::new();
+    for segment_id in segment_ids {
+        if parts.local.storage_nodes.segment_exists(*segment_id)? {
+            live_ids.insert(*segment_id);
+        }
+    }
+    if live_ids.is_empty() {
+        return Ok(());
+    }
+    let pending_append = lock(&parts.pending_data_log_append)?.for_segments(&live_ids);
+    let pending_segments = pending_append.segment_ids();
+    // Payload bytes are cloned only for segments that missed prestaging
+    // (for example because a racing full persist consumed the pending set);
+    // the common case publishes catalog rows without holding the persist
+    // lock so publishes on different nodes run in parallel.
+    let missing_segments: BTreeSet<_> = {
+        let persisted = lock(&parts.persisted_segments)?;
+        live_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| {
+                !persisted.contains(segment_id) && !pending_segments.contains(segment_id)
+            })
+            .collect()
+    };
+    let nodes = parts.local.selected_state_for_segment_ids(&live_ids)?;
+    let new_segments = if missing_segments.is_empty() {
+        drop(persist_guard);
+        Vec::new()
+    } else {
+        parts.local.state_for_segment_ids(&missing_segments)?.1
+    };
+    parts.durable.persist_block_journal_segment_refs(
+        &nodes,
+        &live_ids,
+        new_segments,
+        pending_append,
+        true,
+    )?;
+    lock(&parts.persisted_segments)?.extend(live_ids.iter().copied());
+    lock(&parts.pending_data_log_append)?.remove_segments(&live_ids);
+    Ok(())
 }
 
 /// Segment-ref payloads acknowledged but not yet payload-durable, per device.
@@ -595,26 +823,35 @@ impl DurableCoordinator {
         local
             .metadata
             .use_append_stream_incarnation(append_stream_incarnation)?;
-        let persisted_segments = local.segment_ids()?;
+        let persisted_segments = Arc::new(Mutex::new(local.segment_ids()?));
         let durable_through = durable_commit_high_water_from_local(&local)?;
         let maintenance_cursor = Arc::new(Mutex::new(durable.load_maintenance_cursor()?));
+        let pending_data_log_append = Arc::new(Mutex::new(PendingDataLogAppend::default()));
+        let persist_lock = Arc::new(Mutex::new(()));
+        let block_segment_rows = BlockSegmentRowPublisher::start(BlockSegmentRowPublisherParts {
+            local: local.clone(),
+            durable: durable.clone(),
+            persist_lock: Arc::clone(&persist_lock),
+            pending_data_log_append: Arc::clone(&pending_data_log_append),
+            persisted_segments: Arc::clone(&persisted_segments),
+        })?;
 
         let mut store = Self {
             local,
             durable,
             block_journal,
             block_journal_flush: Arc::new(BlockJournalFlushCoordinator::new()),
-            persisted_segments: Arc::new(Mutex::new(persisted_segments)),
+            persisted_segments,
             pending_block_deltas: Arc::new(Mutex::new(Vec::new())),
             pending_native_file_deltas: Arc::new(Mutex::new(Vec::new())),
-            pending_data_log_append: Arc::new(Mutex::new(PendingDataLogAppend::default())),
+            pending_data_log_append,
             block_delta_staging_lock: Arc::new(Mutex::new(())),
             block_delta_prestage: Arc::new(BlockDeltaPrestageTracker::new()),
             block_segment_ref_staging: Arc::new(BlockSegmentRefStagingGate::default()),
-            block_segment_finalize: Arc::new(BlockSegmentFinalizeCoordinator::default()),
+            block_segment_rows,
             block_device_pending_payloads: Arc::new(BlockDevicePendingPayloads::default()),
             stream_append_lanes: Arc::new(Mutex::new(BTreeMap::new())),
-            persist_lock: Arc::new(Mutex::new(())),
+            persist_lock,
             metadata_persist_gate: Arc::new(RwLock::new(())),
             persist_coordinator: Arc::new(PersistCoordinator::new(durable_through)),
             stream_prefix_persist_coordinator: Arc::new(StreamPrefixPersistCoordinator::new()),
@@ -641,13 +878,7 @@ impl DurableCoordinator {
 
     fn start_maintenance_worker_if_needed(&mut self) -> Result<()> {
         if matches!(self.maintenance_policy.mode, MaintenanceMode::AlwaysOn) {
-            let worker = MaintenanceWorker::start(DurableMaintenanceParts {
-                local: self.local.clone(),
-                durable: self.durable.clone(),
-                persist_lock: Arc::clone(&self.persist_lock),
-                maintenance_cursor: Arc::clone(&self.maintenance_cursor),
-                maintenance_policy: self.maintenance_policy,
-            })?;
+            let worker = MaintenanceWorker::start(self.maintenance_parts())?;
             if self.startup_maintenance_has_work()? {
                 worker.notify();
             }
@@ -677,6 +908,7 @@ impl DurableCoordinator {
             local: self.local.clone(),
             durable: self.durable.clone(),
             persist_lock: Arc::clone(&self.persist_lock),
+            pending_data_log_append: Arc::clone(&self.pending_data_log_append),
             maintenance_cursor: Arc::clone(&self.maintenance_cursor),
             maintenance_policy: self.maintenance_policy,
         }
@@ -3207,10 +3439,39 @@ impl DurableCoordinator {
     }
 
     #[cfg(test)]
+    fn fail_node_segment_append_for_test(&self, storage_node: StorageNodeId) {
+        *lock(&self.durable.fail_node_segment_append).expect("fail-node lock poisoned") =
+            Some(storage_node);
+    }
+
+    #[cfg(test)]
     fn fail_next_block_journal_append_for_test(&self) {
         self.durable
             .fail_next_block_journal_append
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Park the row publisher so queued catalog rows never publish, including
+    /// the drain a clean drop would run; dropping the store while paused
+    /// models a crash with rows unpublished.
+    #[cfg(test)]
+    fn pause_block_segment_row_publication_for_test(&self) {
+        self.block_segment_rows.set_paused(true);
+    }
+
+    #[cfg(test)]
+    fn resume_block_segment_row_publication_for_test(&self) {
+        self.block_segment_rows.set_paused(false);
+    }
+
+    #[cfg(test)]
+    fn wait_block_segment_rows_published_for_test(&self) -> Result<()> {
+        self.block_segment_rows.wait_drained()
+    }
+
+    #[cfg(test)]
+    fn block_segment_rows_queued_for_test(&self) -> usize {
+        self.block_segment_rows.queued_len()
     }
 
     #[cfg(test)]
@@ -3853,112 +4114,6 @@ impl DurableCoordinator {
         Ok(appended)
     }
 
-    /// Publish node catalog rows for already-durable segment payloads and
-    /// mark them persisted.
-    ///
-    /// Concurrent finalizes coalesce through the finalize lane: the first
-    /// waiter that finds the lane idle publishes the union of every queued
-    /// request in one catalog transaction per node, and every member of the
-    /// batch shares that commit as its durability boundary. Waiters receive
-    /// the batch profile, so per-op profile rows attribute shared batch work
-    /// to each member.
-    fn finalize_block_journal_segment_refs(
-        &self,
-        segment_ids: &BTreeSet<SegmentId>,
-    ) -> Result<Option<DurablePersistProfile>> {
-        if segment_ids.is_empty() {
-            return Ok(None);
-        }
-        let request_id = {
-            let mut state = lock(&self.block_segment_finalize.inner)?;
-            let request_id = state.next_request_id;
-            state.next_request_id = state.next_request_id.wrapping_add(1);
-            state.pending.insert(request_id, segment_ids.clone());
-            request_id
-        };
-        loop {
-            let mut state = lock(&self.block_segment_finalize.inner)?;
-            if let Some(result) = state.completed.remove(&request_id) {
-                return result;
-            }
-            if !state.in_flight {
-                state.in_flight = true;
-                let batch = std::mem::take(&mut state.pending);
-                drop(state);
-                let mut batch_segment_ids = BTreeSet::new();
-                for ids in batch.values() {
-                    batch_segment_ids.extend(ids.iter().copied());
-                }
-                let result = self.finalize_block_segment_refs_batch(&batch_segment_ids);
-                let mut state = lock(&self.block_segment_finalize.inner)?;
-                state.in_flight = false;
-                state.generation = state.generation.wrapping_add(1);
-                for batch_request_id in batch.keys() {
-                    state.completed.insert(*batch_request_id, result.clone());
-                }
-                self.block_segment_finalize.cvar.notify_all();
-                continue;
-            }
-            let generation = state.generation;
-            while state.in_flight && state.generation == generation {
-                state = wait_on_cvar(&self.block_segment_finalize.cvar, state)?;
-            }
-        }
-    }
-
-    /// Publish one finalize batch.
-    ///
-    /// Payload bytes must be appended and synced before this call; the
-    /// persist lock here only covers catalog rows and shared persist
-    /// bookkeeping, never payload-proportional I/O.
-    fn finalize_block_segment_refs_batch(
-        &self,
-        segment_ids: &BTreeSet<SegmentId>,
-    ) -> Result<Option<DurablePersistProfile>> {
-        let lock_started = Instant::now();
-        let persist_guard = lock(&self.persist_lock)?;
-        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
-        let snapshot_started = Instant::now();
-        let pending_append = lock(&self.pending_data_log_append)?.for_segments(segment_ids);
-        let pending_segments = pending_append.segment_ids();
-        // Payload bytes are cloned only for segments that missed prestaging
-        // (for example because a racing full persist consumed the pending
-        // set); the common case publishes catalog rows without holding the
-        // persist lock so finalizes on different nodes run in parallel.
-        let missing_segments: BTreeSet<_> = {
-            let persisted = lock(&self.persisted_segments)?;
-            segment_ids
-                .iter()
-                .copied()
-                .filter(|segment_id| {
-                    !persisted.contains(segment_id) && !pending_segments.contains(segment_id)
-                })
-                .collect()
-        };
-        let nodes = self.local.selected_state_for_segment_ids(segment_ids)?;
-        let new_segments = if missing_segments.is_empty() {
-            drop(persist_guard);
-            Vec::new()
-        } else {
-            self.local.state_for_segment_ids(&missing_segments)?.1
-        };
-        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
-
-        let mut base_profile = self.durable.persist_block_journal_segment_refs(
-            &nodes,
-            segment_ids,
-            new_segments,
-            pending_append,
-            true,
-        )?;
-        lock(&self.persisted_segments)?.extend(segment_ids.iter().copied());
-        lock(&self.pending_data_log_append)?.remove_segments(segment_ids);
-
-        base_profile.lock_wait_nanos = lock_wait_nanos;
-        base_profile.local_snapshot_nanos = local_snapshot_nanos;
-        Ok(Some(base_profile))
-    }
-
     /// Stage segment-ref payloads for a leased batch without global locks.
     ///
     /// The staging gate keeps full persists from exporting these segments
@@ -3992,15 +4147,28 @@ impl DurableCoordinator {
         } else {
             self.durable.sync_pending_data_log_append(&appended)?
         };
-        let mut base_profile = self
-            .finalize_block_journal_segment_refs(&staged.segment_ids)?
-            .unwrap_or_default();
-        base_profile.data_log_file_sync_nanos = base_profile
-            .data_log_file_sync_nanos
-            .saturating_add(payload_sync_profile.file_sync_nanos);
-        base_profile.data_log_write_nanos = base_profile
-            .data_log_write_nanos
-            .saturating_add(payload_sync_profile.write_nanos);
+        // The payload is durable, so the catalog rows are bookkeeping that
+        // publishes from the background row publisher; the ack only awaits
+        // the journal record below. The profile row attributes payload
+        // staging and sync to this op, with catalog publish fields zero.
+        self.block_segment_rows.enqueue(&staged.segment_ids)?;
+        let mut base_profile = DurablePersistProfile {
+            data_log_encode_nanos: payload_sync_profile.encode_nanos,
+            data_log_write_nanos: payload_sync_profile.write_nanos,
+            data_log_file_sync_nanos: payload_sync_profile.file_sync_nanos,
+            data_log_file_sync_sum_nanos: payload_sync_profile.file_sync_sum_nanos,
+            data_log_file_sync_max_nanos: payload_sync_profile.file_sync_max_nanos,
+            data_log_dir_sync_nanos: payload_sync_profile.dir_sync_nanos,
+            data_log_files_synced: payload_sync_profile.files_synced,
+            data_log_sync_bytes: payload_sync_profile.sync_bytes,
+            data_log_records_written: payload_sync_profile.records_written,
+            data_log_write_bytes: payload_sync_profile.write_bytes,
+            data_log_prestaged_segment_count: appended.placement_count(),
+            data_log_prestaged_segment_bytes: appended.placement_payload_bytes(),
+            data_log_sync_only_bytes: appended.placement_payload_bytes(),
+            data_log_sync_storage_node_count: appended.storage_node_count(),
+            ..DurablePersistProfile::default()
+        };
 
         // Reserve the sequence immediately before enqueueing so per-device
         // enqueue order equals commit-seq order, which the lane's ordered
@@ -4164,7 +4332,7 @@ impl DurableCoordinator {
             if !merged.is_empty() {
                 self.durable.sync_pending_data_log_append(&merged)?;
             }
-            self.finalize_block_journal_segment_refs(&segment_ids)?;
+            self.block_segment_rows.enqueue(&segment_ids)?;
             Ok(())
         })();
         if result.is_err() {

@@ -9,12 +9,16 @@ SRC_DIR="/opt/src"
 LOADBENCH="${SRC_DIR}/target/release/loadbench"
 
 MIN_LOCAL_SSDS="${MIN_LOCAL_SSDS:-5}"
-STORAGE_NODES="${STORAGE_NODES:-4}"
+STORAGE_NODES="${STORAGE_NODES:-5}"
 CONCURRENCY="${CONCURRENCY:-1,4,16,32}"
 IO_SIZES="${IO_SIZES:-4k,64k,256k,1m,32m}"
 TOY_RTTS="${TOY_RTTS:-0,200}"
 TOY_DURABILITIES="${TOY_DURABILITIES:-ack-flush:1,flushed}"
 TOY_REPEATS="${TOY_REPEATS:-2}"
+TOY_CHUNK_MIB="${TOY_CHUNK_MIB:-2}"
+TOY_CHUNK_SWEEP="${TOY_CHUNK_SWEEP:-2,4,8}"
+TOY_CHUNK_SWEEP_SIZES="${TOY_CHUNK_SWEEP_SIZES:-1m,32m}"
+TOY_CHUNK_SWEEP_CONCURRENCY="${TOY_CHUNK_SWEEP_CONCURRENCY:-1,32}"
 SKIP_TOY="${SKIP_TOY:-0}"
 DELAY_MODE="${DELAY_MODE:-spin}"
 DURATION_MS="${DURATION_MS:-5000}"
@@ -101,9 +105,15 @@ if (( ${#DISKS[@]} < MIN_LOCAL_SSDS )); then
   lsblk -o NAME,TYPE,TRAN,SIZE,MODEL,MOUNTPOINT | tee "${RESULT_ROOT}/environment-lsblk-failure.txt"
   exit 1
 fi
-if (( ${#DISKS[@]} <= STORAGE_NODES )); then
-  printf 'toy layout needs one journal disk plus %s storage-node disks, found %s\n' \
-    "${STORAGE_NODES}" "${#DISKS[@]}" >&2
+# Disk 0 is the journal disk. Nodes get dedicated disks when there are
+# enough; when there is exactly one disk fewer than nodes, the last node
+# colocates with the journal so every spindle carries data.
+COLOCATED_NODE=0
+if (( ${#DISKS[@]} == STORAGE_NODES )); then
+  COLOCATED_NODE="${STORAGE_NODES}"
+elif (( ${#DISKS[@]} < STORAGE_NODES )); then
+  printf 'toy layout needs at least %s disks for %s storage nodes, found %s\n' \
+    "${STORAGE_NODES}" "${STORAGE_NODES}" "${#DISKS[@]}" >&2
   exit 1
 fi
 
@@ -119,6 +129,11 @@ fi
   echo "toy_rtts=${TOY_RTTS}"
   echo "toy_durabilities=${TOY_DURABILITIES}"
   echo "toy_repeats=${TOY_REPEATS}"
+  echo "toy_chunk_mib=${TOY_CHUNK_MIB}"
+  echo "toy_chunk_sweep=${TOY_CHUNK_SWEEP}"
+  echo "toy_chunk_sweep_sizes=${TOY_CHUNK_SWEEP_SIZES}"
+  echo "toy_chunk_sweep_concurrency=${TOY_CHUNK_SWEEP_CONCURRENCY}"
+  echo "colocated_node=${COLOCATED_NODE}"
   echo "skip_toy=${SKIP_TOY}"
   echo "delay_mode=${DELAY_MODE}"
   echo "duration_ms=${DURATION_MS}"
@@ -210,11 +225,21 @@ mount_xfs() {
   mount -o noatime,nodiratime "${device}" "${mountpoint}"
 }
 
+toy_node_mount() {
+  local index="$1"
+  if (( index == COLOCATED_NODE )); then
+    printf '%s' /mnt/toy-journal
+  else
+    printf '%s' "/mnt/toy-node-${index}"
+  fi
+}
+
 toy_node_dirs_for_run() {
   local run_key="$1"
   local out=""
   for index in $(seq 1 "${STORAGE_NODES}"); do
-    local path="/mnt/toy-node-${index}/loadbench/${run_key}/node-${index}"
+    local path
+    path="$(toy_node_mount "${index}")/loadbench/${run_key}/node-${index}"
     mkdir -p "${path}"
     if [[ -n "${out}" ]]; then
       out+=","
@@ -228,6 +253,9 @@ setup_toy_storage() {
   wipe_disks
   mount_xfs "${DISKS[0]}" /mnt/toy-journal
   for index in $(seq 1 "${STORAGE_NODES}"); do
+    if (( index == COLOCATED_NODE )); then
+      continue
+    fi
     mount_xfs "${DISKS[$index]}" "/mnt/toy-node-${index}"
   done
 }
@@ -237,12 +265,14 @@ run_toy_case() {
   local bytes="$2"
   local rtt="$3"
   local durability="$4"
-  local out="${RESULT_ROOT}/toy/${run_key}"
+  local out_root="${5:-toy}"
+  local chunk_mib="${6:-${TOY_CHUNK_MIB}}"
+  local out="${RESULT_ROOT}/${out_root}/${run_key}"
   local root="/mnt/toy-journal/loadbench/${run_key}/root"
   local node_dirs
   node_dirs="$(toy_node_dirs_for_run "${run_key}")"
   mkdir -p "${out}" "$(dirname "${root}")"
-  log "running toy block ${run_key} bytes=${bytes}"
+  log "running toy block ${run_key} bytes=${bytes} chunk_mib=${chunk_mib}"
   "${LOADBENCH}" \
     --provider durable \
     --durability "${durability}" \
@@ -261,6 +291,7 @@ run_toy_case() {
     --payload-integrity verified \
     --target-data-log-mib 64 \
     --data-log-file-sync-fanout 16 \
+    --block-journal-chunk-mib "${chunk_mib}" \
     --root "${root}" \
     --storage-node-data-dirs "${node_dirs}" \
     --matrix-csv "${out}/matrix.csv" \
@@ -269,7 +300,7 @@ run_toy_case() {
     | tee "${out}/stdout.csv"
   rm -rf "/mnt/toy-journal/loadbench/${run_key}"
   for index in $(seq 1 "${STORAGE_NODES}"); do
-    rm -rf "/mnt/toy-node-${index}/loadbench/${run_key}"
+    rm -rf "$(toy_node_mount "${index}")/loadbench/${run_key}"
   done
 }
 
@@ -301,7 +332,31 @@ run_toy_matrix() {
       run_toy_case "${case_key}-rep-${repeat}" "${bytes}" "${rtt}" "${durability}"
     done < <(printf '%s\n' "${cases[@]}" | shuf)
   done
+  run_toy_chunk_sweep
   teardown_storage
+}
+
+# Toy-only stripe-chunk sweep. Results land in toy-sweep/, which the
+# summarizer ignores, so the sweep informs the chunk default without
+# polluting the toy-vs-ceph comparison.
+run_toy_chunk_sweep() {
+  if [[ -z "${TOY_CHUNK_SWEEP}" || "${TOY_CHUNK_SWEEP}" == "0" ]]; then
+    return 0
+  fi
+  local saved_concurrency="${CONCURRENCY}"
+  CONCURRENCY="${TOY_CHUNK_SWEEP_CONCURRENCY}"
+  IFS=',' read -r -a chunks <<<"${TOY_CHUNK_SWEEP}"
+  IFS=',' read -r -a sweep_sizes <<<"${TOY_CHUNK_SWEEP_SIZES}"
+  for chunk in "${chunks[@]}"; do
+    for raw_size in "${sweep_sizes[@]}"; do
+      local label
+      label="$(normalize_size_label "${raw_size}")"
+      local bytes
+      bytes="$(size_bytes "${raw_size}")"
+      run_toy_case "size-${label}-chunk-${chunk}" "${bytes}" 0 flushed toy-sweep "${chunk}"
+    done
+  done
+  CONCURRENCY="${saved_concurrency}"
 }
 
 install_microceph() {

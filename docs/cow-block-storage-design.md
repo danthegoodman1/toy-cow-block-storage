@@ -165,42 +165,55 @@ Writes whose total payload is at or below a provider-private inline cap
 (default 16 KiB) carry payload bytes inside the journal record, split into
 block-native inline entries, so a small write costs one lane append on the
 journal device. Larger writes place payload segments on per-node data logs,
-striped in provider-private chunks round-robin across storage nodes so one
-large write spreads payload bandwidth and payload syncs over every data disk,
-and the journal records only small segment references. A flushed
-segment-reference write makes its segment payload and node-catalog receipts
-durable before its record enters the lane, preserving the rule that durable
+striped in provider-private chunks (default 2 MiB) round-robin across storage
+nodes so one large write spreads payload bandwidth and payload syncs over
+every data disk, and the journal records only small segment references. A
+flushed segment-reference write makes its segment payload durable on its
+nodes before its record enters the lane, preserving the rule that durable
 metadata never references volatile bytes.
 
-Segment-reference staging shares two more group-commit lanes shaped like the
-journal lane. Payload syncs route through one sync lane per storage node:
+Payload syncs route through one group-commit sync lane per storage node:
 staging records each chunk's high-water append position eagerly while later
 chunks are still being written, one in-flight data sync per node covers the
 batch high-water, and a staging waiter completes only when the synced
 high-water covers its bytes, so syncs on different nodes run in parallel and
-syncs on one node amortize across writers. Catalog publication routes through
-a finalize lane: concurrent segment-reference finalizes coalesce into one
-node-catalog transaction per batch, the batch commit is every member's
-durability boundary, and a failed batch fails every member with nothing
-published. Both lanes reschedule work without weakening the boundary
-contract: a flushed acknowledgment still requires the covering payload sync
-and the durable journal record.
+syncs on one node amortize across writers. The lane reschedules work without
+weakening the boundary contract: a flushed acknowledgment still requires the
+covering payload sync and the durable journal record.
+
+The per-segment node-catalog rows are not part of that boundary. Data-log
+records are self-describing (kind, identity, integrity, length), so the rows
+are derivable bookkeeping that live reads never consult: reads resolve
+journal-referenced segments through the in-memory registry populated at
+staging. A flushed acknowledgment therefore enqueues row publication to a
+single background publisher thread, which drains queued segments in one
+catalog transaction per node. A clean shutdown drains the queue; a publish
+failure parks the queue for the next boundary to retry without failing any
+acknowledged write. Data-log compaction skips logs whose placements are still
+queued, so unpublished rows never expose payload bytes to reclamation.
 
 An acknowledged journal write appends its record without syncing, becomes
 visible to same-process reads, and replays after restart only if a later
 durable flush marker covers its commit sequence. An acknowledged
 segment-reference write additionally prestages its payload to per-node data
 logs unsynced and registers the placements as device-pending payloads. Any
-flush boundary that would cover such a sequence first syncs and catalogs those
-payloads: `flush_device` fans the payload syncs out before enqueueing its
-flush request, and the lane owner re-checks before making any flush marker
-durable. An acknowledged write joins the lane, gaining flushed-strength
-durability, whenever an earlier lane write for its device has not applied yet,
-so live overlay order always equals replay order.
+flush boundary that would cover such a sequence first syncs those payloads
+and queues their catalog rows: `flush_device` fans the payload syncs out
+before enqueueing its flush request, and the lane owner re-checks before
+making any flush marker durable. An acknowledged write joins the lane,
+gaining flushed-strength durability, whenever an earlier lane write for its
+device has not applied yet, so live overlay order always equals replay order.
 
 Reopen loads the compact shard roots, replays retained SQLite block deltas,
 then rebuilds the provider-private block overlay from journal writes and
-sparse ranges covered by durable flush markers. Every journal record's
+sparse ranges covered by durable flush markers. Covered journal records may
+reference segments whose catalog rows were still queued at a crash; reopen
+rebuilds those by scanning the owning node's self-describing data logs for
+the referenced segment ids, validating each recovered payload against the
+journal entry's integrity, re-registering the segment in the in-memory
+registry, and publishing the recovered rows before replay resolves reads. A
+referenced segment with no durable data-log record is corruption, because the
+payload sync always precedes the record's durability. Every journal record's
 sequence advances the commit-sequence allocator on reopen, covered or not, so
 a sequence burned by an uncovered record is never reissued. Uncovered records
 replay nothing; their staged payloads are invisible orphans for custodian

@@ -307,8 +307,62 @@ measures bytes that became visible and restart-durable inside the timed window.
 | Local FS, fsync at end | `fio`, buffered writes plus `--end_fsync=1`, same shape | about 3.49 GB/s write-phase bandwidth |
 | Local FS, direct with fsync at end | `fio`, direct writes plus `--end_fsync=1`, same shape | about 3.82 GB/s write-phase bandwidth |
 
+Lazy catalog rows and five-disk striping results from June 12, 2026. One
+op's stripe chunks now stage on their storage nodes in parallel (default
+chunk 2 MiB, picked by an on-instance sweep over 2/4/8 MiB), the bench layout
+uses all five disks by colocating a fifth storage node on the journal disk,
+and per-segment catalog rows moved off the flushed segment-ref ack: an ack
+requires the payload synced on its nodes plus the durable journal record,
+rows drain through a background publisher, and reopen rebuilds rows that
+were still queued at a crash by scanning the self-describing data logs.
+Local Docker A/B against `e01141c` (one random durable `flushed` write per
+op, `--rtt-us 0`, 4 storage nodes, medians of three interleaved repeats;
+4k and 1m c32 re-checked with run order flipped and landed at parity):
+
+| Shape | Before | After |
+| --- | --- | --- |
+| 64k c1/c16/c32 | 58 / 182 / 288 MB/s | 92 / 275 / 347 MB/s |
+| 256k c1/c16/c32 | 170 / 610 / 933 MB/s | 289 / 891 / 1043 MB/s |
+| 1m c1 | 301 MB/s | 636 MB/s |
+| 32m c1/c16/c32 | 1109 / 2247 / 2224 MB/s | 1300 / 2657 / 2569 MB/s |
+
+GCP block-vs-RBD rerun from June 12, 2026 (`gbvr-gap2-0612`), same harness as
+the runs below but with the five-node layout; medians of two repeats at
+`--rtt-us 0`; ratios are toy/Ceph throughput from the same-day Ceph pass.
+Fully durable toy rows:
+
+| Shape | Ceph RBD | Toy `flushed` | Ratio | p99 toy vs Ceph |
+| --- | --- | --- | --- | --- |
+| 4k c1 | 9 MB/s | 32 MB/s | 3.58x | 0.2 / 0.5 ms |
+| 4k c16 | 123 MB/s | 154 MB/s | 1.25x | 0.6 / 0.7 ms |
+| 4k c32 | 219 MB/s | 164 MB/s | 0.75x | 1.5 / 0.8 ms |
+| 64k c1 | 121 MB/s | 169 MB/s | 1.40x | 0.5 / 0.6 ms |
+| 64k c4 | 464 MB/s | 534 MB/s | 1.15x | 0.7 / 0.7 ms |
+| 64k c16 | 1448 MB/s | 1132 MB/s | 0.78x | 1.7 / 2.1 ms |
+| 64k c32 | 1513 MB/s | 1263 MB/s | 0.83x | 3.7 / 5.5 ms |
+| 256k c1 | 348 MB/s | 414 MB/s | 1.19x | 0.9 / 0.8 ms |
+| 256k c16 | 1499 MB/s | 1501 MB/s | 1.00x | 6.3 / 12.4 ms |
+| 256k c32 | 1531 MB/s | 1587 MB/s | 1.04x | 10.6 / 25.3 ms |
+| 1m c1 | 667 MB/s | 679 MB/s | 1.02x | 2.0 / 2.7 ms |
+| 1m c4 | 1183 MB/s | 1634 MB/s | 1.38x | 3.6 / 13.0 ms |
+| 1m c32 | 1482 MB/s | 1714 MB/s | 1.16x | 32.7 / 97.0 ms |
+| 32m c1 | 657 MB/s | 532 MB/s | 0.81x | 68 / 69 ms |
+| 32m c4 | 1179 MB/s | 1573 MB/s | 1.33x | 129 / 179 ms |
+| 32m c32 | 1592 MB/s | 1651 MB/s | 1.04x | 1070 / 1053 ms |
+
+Against the June 12 morning run below on the same Ceph harness, 64k c32 went
+from 929 to 1263 MB/s, 256k c32 from 1272 to 1587 MB/s, 1m c1 from 589 to
+679 MB/s, 1m c32 from 1377 to 1714 MB/s, 32m c1 from 459 to 532 MB/s, and
+32m c32 from 1184 to 1651 MB/s, with 4k cells flat. Fully durable writes now
+beat or tie Ceph RBD at every measured 256k, 1m, and 32m shape except 32m
+c1, plus 64k and 4k through c4, and durable p99 stays ahead at most
+high-concurrency shapes. Ceph keeps 64k c16-c32 (toy 0.78-0.83x), 4k c32,
+and 32m c1, where one op's chunk syncs cannot yet fill five disks; deeper
+staging pipelining is the remaining lever there. Raw artifacts live in
+`infra/gcp-local-nvme-bench/results/gbvr-gap2-0612/`.
+
 Segment-ref lane results from June 12, 2026. Concurrent segment-ref finalizes
-now coalesce into one node-catalog transaction per batch through a finalize
+coalesced into one node-catalog transaction per batch through a finalize
 lane, payload syncs group-commit through per-node sync lanes with eager
 chunk-level sync requests, large writes stripe policy-sized chunks round-robin
 across storage nodes, and the default inline cap dropped to 16 KiB so 64k and
