@@ -293,22 +293,44 @@ fn insert_block_journal_read_entry(
     entry: BlockJournalOverlayEntry,
 ) -> Result<()> {
     let entry_end = entry.range.end_exclusive()?;
-    let mut next = Vec::with_capacity(entries.len().saturating_add(2));
-    for current in entries.drain(..) {
+    let left = entries.partition_point(|current| {
+        current
+            .range
+            .end_exclusive()
+            .is_ok_and(|current_end| current_end <= entry.range.offset)
+    });
+    let right = entries.partition_point(|current| current.range.offset < entry_end);
+    let mut replace_start = left;
+    if replace_start > 0
+        && entries[replace_start - 1].range.end_exclusive()? == entry.range.offset
+    {
+        replace_start -= 1;
+    }
+    let mut replace_end = right;
+    if replace_end < entries.len() && entries[replace_end].range.offset == entry_end {
+        replace_end += 1;
+    }
+
+    let mut next = Vec::with_capacity(
+        replace_end
+            .saturating_sub(replace_start)
+            .saturating_add(2),
+    );
+    for current in &entries[replace_start..replace_end] {
         let current_end = current.range.end_exclusive()?;
         if current_end <= entry.range.offset || current.range.offset >= entry_end {
-            next.push(current);
+            next.push(current.clone());
             continue;
         }
         if current.range.offset < entry.range.offset {
             next.push(block_journal_overlay_slice(
-                &current,
+                current,
                 ByteRange::new(current.range.offset, entry.range.offset - current.range.offset),
             )?);
         }
         if current_end > entry_end {
             next.push(block_journal_overlay_slice(
-                &current,
+                current,
                 ByteRange::new(entry_end, current_end - entry_end),
             )?);
         }
@@ -316,7 +338,7 @@ fn insert_block_journal_read_entry(
     next.push(entry);
     next.sort_by_key(|entry| entry.range.offset);
     coalesce_block_journal_read_entries(&mut next)?;
-    *entries = next;
+    entries.splice(replace_start..replace_end, next);
     Ok(())
 }
 
@@ -673,6 +695,48 @@ mod block_journal_tests {
             .unwrap();
         assert_eq!(&read[..block], vec![1; block]);
         assert_eq!(&read[block..], vec![2; block]);
+    }
+
+    #[test]
+    fn block_journal_read_index_preserves_disjoint_ranges_around_overlap() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(9);
+        let block = 4096_usize;
+        overlay
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]))
+            .unwrap();
+        overlay
+            .apply_commit(&journal_commit(
+                device_id,
+                2,
+                (block * 2) as u64,
+                vec![2; block],
+            ))
+            .unwrap();
+        overlay
+            .apply_commit(&journal_commit(
+                device_id,
+                3,
+                block as u64,
+                vec![3; block * 2],
+            ))
+            .unwrap();
+        let (history_count, read_count) = overlay.entry_counts_for_test(device_id).unwrap();
+        assert_eq!(history_count, 3);
+        assert_eq!(read_count, 1);
+
+        let mut read = vec![0; block * 3];
+        overlay
+            .apply_read_overlay(
+                &LocalCoordinator::new(),
+                device_id,
+                ByteRange::new(0, (block * 3) as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        assert_eq!(&read[..block], vec![1; block]);
+        assert_eq!(&read[block..], vec![3; block * 2]);
     }
 }
 
