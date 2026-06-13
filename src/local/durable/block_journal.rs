@@ -120,6 +120,23 @@ pub(super) struct BlockJournalFlushCoordinator {
     cvar: Condvar,
 }
 
+/// Leader-side timing for one journal lane batch, attributing time spent
+/// outside the journal append/sync I/O itself.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct BlockJournalLaneBatchTiming {
+    pub(super) payload_recheck_nanos: u64,
+    pub(super) publish_nanos: u64,
+    pub(super) publish_mark_nanos: u64,
+    pub(super) publish_reserve_nanos: u64,
+    pub(super) publish_apply_nanos: u64,
+    pub(super) publish_receipt_nanos: u64,
+    pub(super) publish_evidence_nanos: u64,
+    pub(super) publish_dispatch_nanos: u64,
+    pub(super) publish_verify_nanos: u64,
+    pub(super) publish_mark_catalog_nanos: u64,
+    pub(super) publish_mark_lock_wait_nanos: u64,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct BlockJournalFlushState {
     in_flight: bool,
@@ -538,18 +555,38 @@ fn apply_block_journal_read_entry(
 fn mark_block_journal_segment_refs_referenced(
     local: &LocalCoordinator,
     commit: &BlockJournalCommit,
+    timing: &mut BlockJournalLaneBatchTiming,
 ) -> Result<()> {
     for segment_id in commit
         .entries
         .iter()
         .filter_map(BlockJournalEntry::segment_id)
     {
+        let receipt_started = Instant::now();
         let receipt = local.storage_nodes.receipt_for_segment(segment_id)?;
-        local.storage_nodes.mark_segment_referenced(
+        timing.publish_receipt_nanos = timing
+            .publish_receipt_nanos
+            .saturating_add(duration_nanos_u64(receipt_started.elapsed()));
+        let mark_profile = local.storage_nodes.mark_segment_referenced_profiled(
             &receipt,
             commit.commit_seq,
             local.authority.as_ref(),
         )?;
+        timing.publish_evidence_nanos = timing
+            .publish_evidence_nanos
+            .saturating_add(mark_profile.evidence_create_nanos);
+        timing.publish_dispatch_nanos = timing
+            .publish_dispatch_nanos
+            .saturating_add(mark_profile.transport_dispatch_nanos);
+        timing.publish_verify_nanos = timing
+            .publish_verify_nanos
+            .saturating_add(mark_profile.verify_nanos);
+        timing.publish_mark_catalog_nanos = timing
+            .publish_mark_catalog_nanos
+            .saturating_add(mark_profile.catalog_mark_nanos);
+        timing.publish_mark_lock_wait_nanos = timing
+            .publish_mark_lock_wait_nanos
+            .saturating_add(mark_profile.catalog_mark_lock_wait_nanos);
     }
     Ok(())
 }
@@ -1020,7 +1057,11 @@ impl DurableSqliteStore {
                         "block journal write uses epoch above durable lease high-water",
                     ));
                 }
-                mark_block_journal_segment_refs_referenced(local, commit)?;
+                mark_block_journal_segment_refs_referenced(
+                    local,
+                    commit,
+                    &mut BlockJournalLaneBatchTiming::default(),
+                )?;
                 local
                     .metadata
                     .replay_block_journal_commit(device_id, commit.commit_seq)?;

@@ -1492,6 +1492,7 @@ pub(super) fn sync_dir(path: &Path) -> Result<()> {
         .map_err(fs_error)
 }
 
+#[cfg(test)]
 pub(super) fn encode_data_log_record(
     segment_id: SegmentId,
     integrity: SegmentPayloadIntegrity,
@@ -1509,6 +1510,7 @@ pub(super) fn encode_append_run_data_log_record(
     encode_typed_data_log_record(DATA_LOG_KIND_APPEND_RUN, run_id.raw(), integrity, bytes)
 }
 
+#[cfg(test)]
 pub(super) fn encode_typed_data_log_record(
     kind: u8,
     identity: u128,

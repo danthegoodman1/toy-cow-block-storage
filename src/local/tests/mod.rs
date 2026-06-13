@@ -3133,6 +3133,7 @@ fn durable_block_journal_chunks_very_large_writes_across_segments() {
     assert!(profiles.iter().any(|profile| {
         profile.data_log_prestaged_segment_count == 6
             && profile.data_log_prestaged_segment_bytes == 12 * 1024 * 1024
+            && profile.block_journal_lane_wait_nanos > 0
     }));
 
     drop(store);
@@ -3146,6 +3147,153 @@ fn durable_block_journal_chunks_very_large_writes_across_segments() {
         )
         .unwrap();
     assert_eq!(replayed, large);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Chunked large writes stage shared windows into one collapsed payload
+// buffer. Reads that straddle chunk (segment) boundaries must splice bytes
+// from adjacent windows, both live from the in-memory store and after reopen
+// when payloads are recovered from data-log records whose header and payload
+// are written separately. The non-uniform byte pattern would expose any
+// window offset error that a repeated block fill could mask.
+#[test]
+fn durable_block_journal_shared_chunk_windows_read_across_chunk_boundaries() {
+    let root = durable_temp_dir("block-journal-shared-chunk-reads");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("journal-shared-chunk-reads".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    // 5 MiB splits into three segments under the default 2 MiB chunk size;
+    // writing at a one-block device offset keeps device ranges and buffer
+    // windows from being trivially aligned.
+    let payload_len = 5 * 1024 * 1024;
+    let device_offset = 4096_u64;
+    let payload: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+    store.enable_persist_profiling(16).unwrap();
+    store
+        .commit_block_batch_with_writer(
+            &lease,
+            &[BlockBatchWrite {
+                offset: device_offset,
+                bytes: payload.clone(),
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.data_log_prestaged_segment_count == 3),
+        "write must stage three chunk segments"
+    );
+
+    let chunk_bytes = 2 * 1024 * 1024_u64;
+    let reads = [
+        // 8 KiB straddling the first and second chunk boundaries.
+        ByteRange::new(device_offset + chunk_bytes - 4096, 8192),
+        ByteRange::new(device_offset + 2 * chunk_bytes - 4096, 8192),
+        // The full write, spliced from all three windows.
+        ByteRange::new(device_offset, payload_len as u64),
+    ];
+    for range in &reads {
+        let expected_start = usize::try_from(range.offset - device_offset).unwrap();
+        let expected =
+            &payload[expected_start..expected_start + usize::try_from(range.len).unwrap()];
+        let mut actual = vec![0; usize::try_from(range.len).unwrap()];
+        store.read_device(device_id, *range, &mut actual).unwrap();
+        assert_eq!(actual, expected, "live read at offset {}", range.offset);
+    }
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    for range in &reads {
+        let expected_start = usize::try_from(range.offset - device_offset).unwrap();
+        let expected =
+            &payload[expected_start..expected_start + usize::try_from(range.len).unwrap()];
+        let mut actual = vec![0; usize::try_from(range.len).unwrap()];
+        reopened
+            .read_device(device_id, *range, &mut actual)
+            .unwrap();
+        assert_eq!(actual, expected, "replayed read at offset {}", range.offset);
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+// An acknowledged chunked write stages shared-window segment payloads with
+// only background sync requests outstanding. The next flushed boundary on
+// the device must make those earlier shared payloads durable, and both
+// writes must replay after crash-reopen.
+#[test]
+fn durable_block_journal_acknowledged_shared_chunks_become_durable_at_flush_boundary() {
+    let root = durable_temp_dir("block-journal-ack-shared-chunks");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("journal-ack-shared-chunks".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let payload_len = 6 * 1024 * 1024;
+    let acknowledged: Vec<u8> = (0..payload_len).map(|index| (index % 249) as u8).collect();
+    store
+        .commit_block_batch_with_writer(
+            &lease,
+            &[BlockBatchWrite {
+                offset: 0,
+                bytes: acknowledged.clone(),
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            WriteDurability::Acknowledged,
+        )
+        .unwrap();
+    let flushed = repeated_blocks(1, 73);
+    store
+        .write_device_with_writer(
+            &lease,
+            payload_len as u64,
+            &flushed,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; payload_len];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(0, payload_len as u64),
+            &mut replayed,
+        )
+        .unwrap();
+    assert_eq!(replayed, acknowledged);
+    let mut tail = vec![0; 4096];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(payload_len as u64, 4096),
+            &mut tail,
+        )
+        .unwrap();
+    assert_eq!(tail, flushed);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3173,7 +3321,7 @@ fn durable_block_journal_ignores_incomplete_tail_after_reopen() {
             PayloadIntegrity::Verified,
         )
         .unwrap();
-    let journal = store.durable.block_journal_path();
+    let journal = store.durable.block_journal_shard_path_for_device(device_id);
     let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
     file.write_all(b"incomplete").unwrap();
     file.sync_data().unwrap();
@@ -3186,6 +3334,309 @@ fn durable_block_journal_ignores_incomplete_tail_after_reopen() {
         .read_device(device_id, ByteRange::new(0, 4096), &mut actual)
         .unwrap();
     assert_eq!(actual, repeated_blocks(1, 31));
+    let _ = fs::remove_dir_all(root);
+}
+
+// Devices route round-robin onto per-node journal shard files, inline and
+// segment-ref records replay from every shard on reopen, and routing stays
+// pinned to the same shard file across reopens.
+#[test]
+fn durable_block_journal_shards_route_devices_and_replay_across_reopen() {
+    let root = durable_temp_dir("block-journal-shards");
+    let cfg = config();
+    let node_ids = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+    ];
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        node_ids.clone(),
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let mut devices = Vec::new();
+    for index in 0..3_u8 {
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 32,
+                    block_size: 4096,
+                },
+                name: Some(format!("shard-routing-{index}")),
+            })
+            .unwrap();
+        let lease = store.acquire_block_writer(device_id).unwrap();
+        // One inline write and one segment-ref write per device, so both
+        // record shapes land in and replay from every shard.
+        store
+            .write_device_with_writer(
+                &lease,
+                0,
+                &repeated_blocks(1, index + 1),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+        store
+            .write_device_with_writer(
+                &lease,
+                4096,
+                &repeated_blocks(16, index + 101),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+        devices.push(device_id);
+    }
+    let expected_paths: Vec<PathBuf> = devices
+        .iter()
+        .map(|device_id| {
+            store
+                .durable
+                .block_journal_shard_path_for_device(*device_id)
+        })
+        .collect();
+    // Sequential device ids round-robin across the three shards, so the
+    // devices land on three distinct shard files, one per node directory.
+    let distinct_paths: BTreeSet<&PathBuf> = expected_paths.iter().collect();
+    assert_eq!(distinct_paths.len(), 3);
+    for path in &expected_paths {
+        assert!(path.exists());
+    }
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    for (index, device_id) in devices.iter().enumerate() {
+        let marker = index as u8;
+        let mut head = vec![0; 4096];
+        reopened
+            .read_device(*device_id, ByteRange::new(0, 4096), &mut head)
+            .unwrap();
+        assert_eq!(head, repeated_blocks(1, marker + 1));
+        let mut tail = vec![0; 16 * 4096];
+        reopened
+            .read_device(*device_id, ByteRange::new(4096, 16 * 4096), &mut tail)
+            .unwrap();
+        assert_eq!(tail, repeated_blocks(16, marker + 101));
+        assert_eq!(
+            reopened
+                .durable
+                .block_journal_shard_path_for_device(*device_id),
+            expected_paths[index]
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+// A torn tail in one journal shard is that shard's problem alone: reopen
+// ignores the incomplete frame and devices on other shards replay untouched.
+#[test]
+fn durable_block_journal_shard_torn_tail_leaves_other_shards_replaying() {
+    let root = durable_temp_dir("block-journal-shard-torn-tail");
+    let cfg = config();
+    let node_ids = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+    ];
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        node_ids,
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let mut devices = Vec::new();
+    for index in 0..2_u8 {
+        let device_id = store
+            .create_device(CreateDeviceRequest {
+                spec: DeviceSpec {
+                    logical_blocks: 16,
+                    block_size: 4096,
+                },
+                name: Some(format!("shard-tail-{index}")),
+            })
+            .unwrap();
+        let lease = store.acquire_block_writer(device_id).unwrap();
+        store
+            .write_device_with_writer(
+                &lease,
+                0,
+                &repeated_blocks(1, index + 41),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+        devices.push(device_id);
+    }
+    let torn_path = store
+        .durable
+        .block_journal_shard_path_for_device(devices[0]);
+    assert_ne!(
+        torn_path,
+        store
+            .durable
+            .block_journal_shard_path_for_device(devices[1])
+    );
+    let mut file = OpenOptions::new().append(true).open(&torn_path).unwrap();
+    file.write_all(b"torn-shard-tail").unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    for (index, device_id) in devices.iter().enumerate() {
+        let mut actual = vec![0; 4096];
+        reopened
+            .read_device(*device_id, ByteRange::new(0, 4096), &mut actual)
+            .unwrap();
+        assert_eq!(actual, repeated_blocks(1, index as u8 + 41));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+// Growing the storage-node set would reroute devices onto different journal
+// shard files, so reopen refuses a node count that disagrees with the
+// persisted layout instead of silently splitting per-device history.
+#[test]
+fn durable_block_journal_shard_count_change_fails_reopen() {
+    let root = durable_temp_dir("block-journal-shard-count");
+    let cfg = config();
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        vec![cfg.storage_node, StorageNodeId::from_raw(78)],
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("shard-count".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 9),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    drop(store);
+
+    let error = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        vec![
+            cfg.storage_node,
+            StorageNodeId::from_raw(78),
+            StorageNodeId::from_raw(79),
+        ],
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        StorageError::corrupt("durable SQLite layout disagrees with block journal shard count")
+    );
+
+    // The original node set still reopens and replays.
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut actual = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut actual)
+        .unwrap();
+    assert_eq!(actual, repeated_blocks(1, 9));
+    let _ = fs::remove_dir_all(root);
+}
+
+// A failed append on one shard's lane fails only that shard's waiters;
+// devices on other shards keep committing durably, and reopen replays
+// exactly the writes that succeeded.
+#[test]
+fn durable_block_journal_shard_append_failure_leaves_other_shards_writable() {
+    let root = durable_temp_dir("block-journal-shard-fail");
+    let cfg = config();
+    let node_ids = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+    ];
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        node_ids,
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let mut devices = Vec::new();
+    for index in 0..2_u8 {
+        devices.push(
+            store
+                .create_device(CreateDeviceRequest {
+                    spec: DeviceSpec {
+                        logical_blocks: 16,
+                        block_size: 4096,
+                    },
+                    name: Some(format!("shard-fail-{index}")),
+                })
+                .unwrap(),
+        );
+    }
+    assert_ne!(
+        store
+            .durable
+            .block_journal_shard_path_for_device(devices[0]),
+        store
+            .durable
+            .block_journal_shard_path_for_device(devices[1])
+    );
+    let failed_lease = store.acquire_block_writer(devices[0]).unwrap();
+    let surviving_lease = store.acquire_block_writer(devices[1]).unwrap();
+
+    store.fail_next_block_journal_append_for_test();
+    assert!(matches!(
+        store.write_device_with_writer(
+            &failed_lease,
+            0,
+            &repeated_blocks(1, 51),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Unavailable { .. })
+    ));
+    store
+        .write_device_with_writer(
+            &surviving_lease,
+            0,
+            &repeated_blocks(1, 52),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    // The failed shard-0 write never became durable, so its device reads
+    // back zeroes while the other shard's write replays.
+    let mut failed = vec![0xff; 4096];
+    reopened
+        .read_device(devices[0], ByteRange::new(0, 4096), &mut failed)
+        .unwrap();
+    assert_eq!(failed, vec![0; 4096]);
+    let mut survived = vec![0; 4096];
+    reopened
+        .read_device(devices[1], ByteRange::new(0, 4096), &mut survived)
+        .unwrap();
+    assert_eq!(survived, repeated_blocks(1, 52));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3242,17 +3693,19 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
             bytes: repeated_blocks(1, 42),
         }],
     };
-    let first_request = store
+    let (shard, first_request) = store
         .enqueue_block_journal_request(BlockJournalLaneRequest::Write(first))
         .unwrap();
-    let second_request = store
+    let (_, second_request) = store
         .enqueue_block_journal_request(BlockJournalLaneRequest::Write(second))
         .unwrap();
 
     store
-        .wait_for_block_journal_request(second_request)
+        .wait_for_block_journal_request(shard, second_request)
         .unwrap();
-    store.wait_for_block_journal_request(first_request).unwrap();
+    store
+        .wait_for_block_journal_request(shard, first_request)
+        .unwrap();
 
     let profiles = store.drain_persist_profiles(16).unwrap();
     assert!(profiles.iter().any(|profile| {
@@ -3328,8 +3781,10 @@ fn durable_block_journal_lane_merges_concurrent_flush_boundaries() {
             })
             .unwrap(),
     );
-    for request_id in request_ids {
-        store.wait_for_block_journal_request(request_id).unwrap();
+    for (shard, request_id) in request_ids {
+        store
+            .wait_for_block_journal_request(shard, request_id)
+            .unwrap();
     }
 
     // Two writes plus the explicit flush make one batch of three requests,
@@ -3371,7 +3826,7 @@ fn durable_block_journal_lane_orders_acknowledged_writes_behind_pending_lane_wri
         .metadata
         .reserve_block_journal_commit_seq(device_id)
         .unwrap();
-    let first_request = store
+    let (first_shard, first_request) = store
         .enqueue_block_journal_request(BlockJournalLaneRequest::Write(BlockJournalCommit {
             device_id,
             writer_epoch: lease.writer_epoch,
@@ -3397,7 +3852,9 @@ fn durable_block_journal_lane_orders_acknowledged_writes_behind_pending_lane_wri
         )
         .unwrap();
     assert!(ack.commit_seq.raw() > first_seq.raw());
-    store.wait_for_block_journal_request(first_request).unwrap();
+    store
+        .wait_for_block_journal_request(first_shard, first_request)
+        .unwrap();
 
     // The later sequence wins the overlapping range in live reads.
     let mut live = vec![0; 4096];
@@ -18072,7 +18529,7 @@ fn storage_node_duplicate_retry_compares_stored_bytes_not_only_receipt_checksum(
     {
         let mut inner = lock(&node.segment_store.inner).unwrap();
         let record = inner.segments.get_mut(&segment_id).unwrap();
-        record.bytes = Arc::from(repeated_blocks(1, 8));
+        record.bytes = SharedSegmentPayload::from_vec(repeated_blocks(1, 8));
     }
 
     assert!(
@@ -18832,7 +19289,9 @@ fn corrupt_in_memory_segment_payload(
         .unwrap();
     let mut inner = lock(&segment_store.inner).unwrap();
     let record = inner.segments.get_mut(&segment_id).unwrap();
-    Arc::make_mut(&mut record.bytes)[0] ^= 0xff;
+    let mut corrupted = record.bytes.as_slice().to_vec();
+    corrupted[0] ^= 0xff;
+    record.bytes = SharedSegmentPayload::from_vec(corrupted);
 }
 
 fn node_catalog_conn(root: &Path, storage_node: StorageNodeId) -> Connection {

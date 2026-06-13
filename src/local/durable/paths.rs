@@ -2,7 +2,6 @@
 pub(super) struct DurableStorePaths {
     metadata: PathBuf,
     data_dir: PathBuf,
-    block_journal: PathBuf,
     native_publish_journal: PathBuf,
     append_visible_publish_journal: PathBuf,
 }
@@ -24,12 +23,17 @@ impl DurableStorePaths {
         Ok(Self {
             metadata: root.join("metadata.sqlite"),
             data_dir,
-            block_journal: root.join("block.journal"),
             native_publish_journal: root.join("native-publish.journal"),
             append_visible_publish_journal: append_visible_publish_journal
                 .unwrap_or_else(|| root.join("append-visible-publish.journal")),
         })
     }
+}
+
+/// Block journal shard file inside one storage node's data directory, so each
+/// shard's group-commit fsync stream lands on that node's disk.
+pub(super) fn block_journal_shard_path(data_dir: &Path, storage_node: StorageNodeId) -> PathBuf {
+    node_data_log_dir(data_dir, storage_node).join("block.journal")
 }
 
 fn ensure_dir_exists(path: &Path) -> Result<bool> {

@@ -17,25 +17,34 @@ every flush boundary" to a journal/checkpoint model:
   delta index, then checkpointed CoW roots.
 
 Current implementation note: leased block writes run on the block journal.
-Every durable boundary (flushed writes, sparse operations, `flush_device`,
-lease fences) joins one group-committed lane that shares one journal append
-and one data sync per batch. Payloads at or below the inline cap (default
+The journal is sharded one file per storage node directory; each device
+routes to one shard by a stable hash of its device ID over the sorted node
+list, and the shard count is persisted in `store_layout` and validated on
+reopen. Every durable boundary (flushed writes, sparse operations,
+`flush_device`, lease fences) joins its shard's group-committed lane, which
+shares one journal append and one data sync per batch; lanes on different
+shards sync in parallel. Payloads at or below the inline cap (default
 16 KiB, `BlockJournalBatchPolicy::inline_max_total_bytes`) stay inline in
 journal records; larger writes stripe policy-sized chunks (default 2 MiB)
 round-robin across storage-node data logs in parallel, outside global locks,
-and journal only segment references. Payload syncs group-commit through one
-sync lane per storage node. Per-segment catalog rows are off the boundary: a
-flushed ack requires the payload synced on its nodes plus the durable journal
-record, and row publication drains through a background publisher thread.
-Reopen rebuilds rows that were still queued at a crash by scanning the
-self-describing data logs for journal-referenced segments. Acknowledged
-segment-reference writes prestage payloads unsynced and register
-device-pending placements; any flush boundary covering them syncs those
-payloads first and queues their rows. Reopen replays journal records covered
-by durable flush markers and advances the commit-sequence allocator past
-every observed record. The journal file is not yet folded or pruned:
-checkpoint materialization into CoW shard roots (Stages 3-5 below) remains
-open, so reopen cost and journal size grow with retained journal history.
+and journal only segment references. Chunks are shared windows into the one
+collapsed write buffer: the same allocation backs the in-memory segment and
+the payload of its data-log record (header and payload written separately),
+so staging copies payload bytes once at the API boundary. Payload syncs
+group-commit through one sync lane per storage node, requested as one
+covering sync per touched log when a node's writes for the operation finish.
+Per-segment catalog rows are off the boundary: a flushed ack requires the
+payload synced on its nodes plus the durable journal record, and row
+publication drains through a background publisher thread. Reopen rebuilds
+rows that were still queued at a crash by scanning the self-describing data
+logs for journal-referenced segments. Acknowledged segment-reference writes
+prestage payloads unsynced and register device-pending placements; any flush
+boundary covering them syncs those payloads first and queues their rows.
+Reopen scans every shard file, replays journal records covered by durable
+flush markers, and advances the commit-sequence allocator past every
+observed record. Journal shards are not yet folded or pruned: checkpoint
+materialization into CoW shard roots (Stages 3-5 below) remains open, so
+reopen cost and journal size grow with retained journal history.
 
 This is the production-shaped block model for DB-on-filesystem-on-block. A
 filesystem already owns page-cache writeback and fsync policy. The block layer

@@ -3532,6 +3532,50 @@ impl LocalCoordinator {
         self.write_granted_segment_verified(&grant, data)
     }
 
+    /// Verified segment write that shares the payload buffer with the caller.
+    ///
+    /// Chunked staging passes windows into one collapsed write buffer, so the
+    /// write path must not copy payload bytes again. Dispatches to the local
+    /// node directly, which is identical to the in-process transport route.
+    fn write_segment_for_intent_shared_verified(
+        &self,
+        intent: WriteGrantIntent,
+        write_intent: WriteIntentId,
+        data: SharedSegmentPayload,
+        durability: WriteDurability,
+        payload_integrity: PayloadIntegrity,
+    ) -> Result<VerifiedSegmentReceipt> {
+        let max_bytes = u64::try_from(data.len()).map_err(|_| {
+            StorageError::invalid_argument("segment reservation byte length overflows u64")
+        })?;
+        let candidates = self.storage_nodes.storage_node_ids()?;
+        let storage_node = PlacementPolicy::choose_storage_node(&self.storage_nodes, &candidates)?;
+        let segment_id = self.storage_nodes.allocate_segment_id()?;
+        let grant = self.issue_write_grant(WriteGrantRequest {
+            tenant: LOCAL_TENANT_ID,
+            principal: LOCAL_PRINCIPAL_ID,
+            intent,
+            write_intent,
+            segment_id,
+            storage_node,
+            max_bytes,
+            payload_integrity,
+            durability,
+            expires_at: LOCAL_GRANT_EXPIRATION,
+        })?;
+        let expected_segment = grant.segment_id;
+        let (receipt, _) = self
+            .storage_nodes
+            .node(storage_node)?
+            .write_segment_shared_profiled(grant.clone(), data)?;
+        if receipt.segment_id != expected_segment {
+            return Err(StorageError::corrupt(
+                "storage node write receipt disagrees with requested segment ID",
+            ));
+        }
+        self.verify_receipt_matches_grant_observed(&grant, &receipt)
+    }
+
     fn write_segment_for_intent_with_id_owned_verified_profiled(
         &self,
         intent: WriteGrantIntent,

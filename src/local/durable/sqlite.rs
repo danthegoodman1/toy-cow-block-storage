@@ -7,7 +7,10 @@ pub(super) struct DurableSqliteStore {
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
     data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     append_log_service: Arc<StorageNodeAppendLogService>,
-    block_journal_lock: Arc<Mutex<()>>,
+    // Sorted at open and validated against the persisted shard count, so
+    // device-to-shard routing is stable across reopens.
+    block_journal_shard_nodes: Arc<Vec<StorageNodeId>>,
+    block_journal_shard_locks: Arc<Vec<Mutex<()>>>,
     native_publish_journal_lock: Arc<Mutex<()>>,
     append_visible_publish_journal_lock: Arc<Mutex<()>>,
     append_visible_publish_journal_lane_locks: Arc<Vec<Mutex<()>>>,
@@ -98,6 +101,18 @@ pub struct DurablePersistProfile {
     pub block_journal_frame_bytes: u64,
     pub block_journal_created: u64,
     pub block_journal_flush_group_size: u64,
+    pub block_journal_lane_wait_nanos: u64,
+    pub block_journal_payload_recheck_nanos: u64,
+    pub block_journal_publish_nanos: u64,
+    pub block_journal_publish_mark_nanos: u64,
+    pub block_journal_publish_reserve_nanos: u64,
+    pub block_journal_publish_apply_nanos: u64,
+    pub block_journal_publish_receipt_nanos: u64,
+    pub block_journal_publish_evidence_nanos: u64,
+    pub block_journal_publish_dispatch_nanos: u64,
+    pub block_journal_publish_verify_nanos: u64,
+    pub block_journal_publish_mark_catalog_nanos: u64,
+    pub block_journal_publish_mark_lock_wait_nanos: u64,
     pub block_journal_overlay_read_nanos: u64,
     pub new_segment_count: u64,
     pub new_segment_bytes: u64,
@@ -2505,11 +2520,24 @@ impl DurableSqliteStore {
         reject_root_storage_catalog_tables_if_present(&conn)?;
         reject_legacy_device_head_tables_if_present(&conn)?;
         reject_legacy_keyspace_head_tables_if_present(&conn)?;
+        // Validate the shard layout against the prospective node set before
+        // opening catalogs: opening creates missing node directories, and a
+        // refused open must not leave new directories behind for discovery
+        // to fold into every later open.
+        let prospective_nodes: BTreeSet<StorageNodeId> = configured_storage_nodes
+            .iter()
+            .copied()
+            .chain(discover_node_catalogs(&paths.data_dir)?)
+            .collect();
+        Self::validate_block_journal_shard_layout(&conn, prospective_nodes.len())?;
         let node_catalogs = Arc::new(NodeCatalogs::open(&paths, configured_storage_nodes)?);
+        let block_journal_shard_nodes: Vec<StorageNodeId> =
+            node_catalogs.storage_nodes().collect();
         Self::validate_or_initialize_store_layout(
             &conn,
             node_catalogs.as_ref(),
             append_ingest_data_log_policy,
+            block_journal_shard_nodes.len(),
         )?;
         let data_log_allocation_locks =
             Arc::new(StorageNodeDataLogAllocationLocks::default());
@@ -2552,7 +2580,12 @@ impl DurableSqliteStore {
             append_ingest_data_log_policy,
             data_log_allocation_locks,
             append_log_service,
-            block_journal_lock: Arc::new(Mutex::new(())),
+            block_journal_shard_locks: Arc::new(
+                (0..block_journal_shard_nodes.len())
+                    .map(|_| Mutex::new(()))
+                    .collect(),
+            ),
+            block_journal_shard_nodes: Arc::new(block_journal_shard_nodes),
             native_publish_journal_lock: Arc::new(Mutex::new(())),
             append_visible_publish_journal_lock: Arc::new(Mutex::new(())),
             append_visible_publish_journal_lane_locks: Arc::new(
@@ -2599,7 +2632,9 @@ impl DurableSqliteStore {
             CREATE TABLE IF NOT EXISTS store_layout (
               id INTEGER PRIMARY KEY CHECK (id = 1),
               append_ingest_active_log_lanes INTEGER NOT NULL
-                CHECK (append_ingest_active_log_lanes > 0)
+                CHECK (append_ingest_active_log_lanes > 0),
+              block_journal_shards INTEGER NOT NULL
+                CHECK (block_journal_shards > 0)
             );
             CREATE TABLE IF NOT EXISTS maintenance_state (
               id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -2948,8 +2983,34 @@ impl DurableSqliteStore {
         prune_native_publish_journal_through(&self.paths.native_publish_journal, commit_seq)
     }
 
+    fn block_journal_shard_count(&self) -> usize {
+        self.block_journal_shard_nodes.len()
+    }
+
+    /// Stable device-to-shard routing.
+    ///
+    /// Device ids allocate sequentially, so the modulus round-robins devices
+    /// across shards. The shard count is validated against the persisted
+    /// layout at open, so a device's records always live in one shard file.
+    fn block_journal_shard_for_device(&self, device_id: DeviceId) -> usize {
+        let shards = self.block_journal_shard_nodes.len();
+        if shards <= 1 {
+            0
+        } else {
+            (device_id.raw() % shards as u128) as usize
+        }
+    }
+
+    fn block_journal_shard_path(&self, shard: usize) -> Result<PathBuf> {
+        let storage_node = self.block_journal_shard_nodes.get(shard).ok_or_else(|| {
+            StorageError::invalid_argument("block journal shard index out of range")
+        })?;
+        Ok(block_journal_shard_path(&self.paths.data_dir, *storage_node))
+    }
+
     fn append_block_journal_records_unsynced(
         &self,
+        shard: usize,
         records: &[BlockJournalRecord],
     ) -> Result<AppendVisibleJournalProfile> {
         #[cfg(test)]
@@ -2958,34 +3019,52 @@ impl DurableSqliteStore {
                 "injected block journal append failure",
             ));
         }
-        let _journal_guard = lock(&self.block_journal_lock)?;
-        append_block_journal_records_unsynced(&self.paths.block_journal, records)
+        let path = self.block_journal_shard_path(shard)?;
+        let shard_lock = self.block_journal_shard_locks.get(shard).ok_or_else(|| {
+            StorageError::invalid_argument("block journal shard index out of range")
+        })?;
+        let _journal_guard = lock(shard_lock)?;
+        append_block_journal_records_unsynced(&path, records)
     }
 
-    /// Make every block journal record written so far durable.
+    /// Make every record written to one block journal shard so far durable.
     ///
-    /// The data sync deliberately runs outside `block_journal_lock` so
-    /// concurrent unsynced appends are not serialized behind device flushes.
-    /// Concurrent appends may be partially covered by the sync; they remain
-    /// unsynced records until a later boundary covers them.
-    fn sync_block_journal(&self) -> Result<u64> {
+    /// The data sync deliberately runs outside the shard lock so concurrent
+    /// unsynced appends are not serialized behind device flushes. Concurrent
+    /// appends may be partially covered by the sync; they remain unsynced
+    /// records until a later boundary covers them.
+    fn sync_block_journal(&self, shard: usize) -> Result<u64> {
         let file = OpenOptions::new()
             .append(true)
-            .open(&self.paths.block_journal)
+            .open(self.block_journal_shard_path(shard)?)
             .map_err(fs_error)?;
         let sync_started = Instant::now();
         file.sync_data().map_err(fs_error)?;
         Ok(duration_nanos_u64(sync_started.elapsed()))
     }
 
+    /// Load every shard's records as one list.
+    ///
+    /// Cross-shard order is meaningless: replay is gated per device, and a
+    /// device's records always live in one shard, so concatenating whole
+    /// shard files preserves every per-device order.
     fn block_journal_records(&self) -> Result<Vec<BlockJournalRecord>> {
-        let _journal_guard = lock(&self.block_journal_lock)?;
-        load_block_journal_records(&self.paths.block_journal)
+        let mut records = Vec::new();
+        for shard in 0..self.block_journal_shard_nodes.len() {
+            let path = self.block_journal_shard_path(shard)?;
+            let shard_lock = self.block_journal_shard_locks.get(shard).ok_or_else(|| {
+                StorageError::invalid_argument("block journal shard index out of range")
+            })?;
+            let _journal_guard = lock(shard_lock)?;
+            records.extend(load_block_journal_records(&path)?);
+        }
+        Ok(records)
     }
 
     #[cfg(test)]
-    pub(super) fn block_journal_path(&self) -> PathBuf {
-        self.paths.block_journal.clone()
+    pub(super) fn block_journal_shard_path_for_device(&self, device_id: DeviceId) -> PathBuf {
+        self.block_journal_shard_path(self.block_journal_shard_for_device(device_id))
+            .expect("device shard path")
     }
 
     #[cfg(test)]
@@ -3084,30 +3163,79 @@ impl DurableSqliteStore {
         Ok(())
     }
 
-    fn validate_or_initialize_store_layout(
+    /// Refuse an open whose storage-node set disagrees with the persisted
+    /// block journal shard count.
+    ///
+    /// This runs against the prospective node set before node catalogs open,
+    /// because opening creates missing node directories that discovery would
+    /// fold into every later open even after this open is refused.
+    fn validate_block_journal_shard_layout(
         conn: &Connection,
-        node_catalogs: &NodeCatalogs,
-        append_ingest_data_log_policy: AppendIngestDataLogPolicy,
+        prospective_nodes: usize,
     ) -> Result<()> {
-        let expected_lanes = append_ingest_data_log_policy.active_log_lanes;
-        let existing_lanes = conn
+        let existing_shards = conn
             .query_row(
-                "SELECT append_ingest_active_log_lanes FROM store_layout WHERE id = 1",
+                "SELECT block_journal_shards FROM store_layout WHERE id = 1",
                 [],
                 |row| i64_to_u64(row.get::<_, i64>(0)?),
             )
             .optional()
+            .map_err(sqlite_error)?;
+        let Some(existing_shards) = existing_shards else {
+            return Ok(());
+        };
+        let existing_shards = usize::try_from(existing_shards)
+            .map_err(|_| StorageError::corrupt("block journal shard count overflows usize"))?;
+        if existing_shards != prospective_nodes {
+            return Err(StorageError::corrupt(
+                "durable SQLite layout disagrees with block journal shard count",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_or_initialize_store_layout(
+        conn: &Connection,
+        node_catalogs: &NodeCatalogs,
+        append_ingest_data_log_policy: AppendIngestDataLogPolicy,
+        block_journal_shards: usize,
+    ) -> Result<()> {
+        let expected_lanes = append_ingest_data_log_policy.active_log_lanes;
+        let existing_layout = conn
+            .query_row(
+                "SELECT append_ingest_active_log_lanes, block_journal_shards
+                 FROM store_layout WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        i64_to_u64(row.get::<_, i64>(0)?)?,
+                        i64_to_u64(row.get::<_, i64>(1)?)?,
+                    ))
+                },
+            )
+            .optional()
             .map_err(sqlite_error)?
-            .map(|lanes| {
-                usize::try_from(lanes).map_err(|_| {
+            .map(|(lanes, shards)| {
+                let lanes = usize::try_from(lanes).map_err(|_| {
                     StorageError::corrupt("append ingest active log lane count overflows usize")
-                })
+                })?;
+                let shards = usize::try_from(shards).map_err(|_| {
+                    StorageError::corrupt("block journal shard count overflows usize")
+                })?;
+                Ok::<_, StorageError>((lanes, shards))
             })
             .transpose()?;
-        if let Some(existing_lanes) = existing_lanes {
+        if let Some((existing_lanes, existing_shards)) = existing_layout {
             if existing_lanes != expected_lanes {
                 return Err(StorageError::corrupt(
                     "durable SQLite layout disagrees with append ingest data-log lane policy",
+                ));
+            }
+            // A changed storage-node set would reroute devices onto different
+            // journal shard files, so reopen refuses it outright.
+            if existing_shards != block_journal_shards {
+                return Err(StorageError::corrupt(
+                    "durable SQLite layout disagrees with block journal shard count",
                 ));
             }
             return Ok(());
@@ -3123,9 +3251,12 @@ impl DurableSqliteStore {
         }
 
         conn.execute(
-            "INSERT INTO store_layout(id, append_ingest_active_log_lanes)
-             VALUES (1, ?1)",
-            params![u64_to_i64(usize_to_u64(expected_lanes))?],
+            "INSERT INTO store_layout(id, append_ingest_active_log_lanes, block_journal_shards)
+             VALUES (1, ?1, ?2)",
+            params![
+                u64_to_i64(usize_to_u64(expected_lanes))?,
+                u64_to_i64(usize_to_u64(block_journal_shards))?
+            ],
         )
         .map_err(sqlite_error)?;
         Ok(())
@@ -3207,7 +3338,7 @@ impl DurableSqliteStore {
                 records.insert(
                     *segment_id,
                     SegmentRecord {
-                        bytes: Arc::from(bytes),
+                        bytes: SharedSegmentPayload::from_vec(bytes),
                         synced: record.synced,
                         commit: record.commit,
                     },
@@ -4948,13 +5079,21 @@ impl DurableSqliteStore {
                 return Err(StorageError::conflict("data-log writer was not opened"));
             };
             let started = Instant::now();
-            let record = encode_data_log_record(segment_id, integrity, bytes.as_ref())?;
+            // Header and payload are written separately so the payload slice
+            // goes straight to the page cache without a record-sized copy.
+            let header = encode_typed_data_log_header(
+                DATA_LOG_KIND_SEGMENT,
+                segment_id.raw(),
+                integrity,
+                payload_bytes,
+            )?;
             outcome.profile.encode_nanos = outcome
                 .profile
                 .encode_nanos
                 .saturating_add(duration_nanos_u64(started.elapsed()));
             let started = Instant::now();
-            file.write_all(&record).map_err(fs_error)?;
+            file.write_all(&header).map_err(fs_error)?;
+            file.write_all(bytes.as_slice()).map_err(fs_error)?;
             outcome.profile.write_nanos = outcome
                 .profile
                 .write_nanos
@@ -4992,25 +5131,28 @@ impl DurableSqliteStore {
                     integrity,
                 },
             ));
-            // Unsynced appends request a background sync immediately, so
-            // one chunk's fdatasync overlaps the next chunk's write and a
-            // later durability boundary usually finds the bytes already
-            // covered. Durability is still claimed only by boundaries
-            // that observe the covering sync.
-            if sync_mode == DataLogSyncMode::NoSync {
-                self.append_log_service.payload_sync_worker.request(
-                    AppendLogPayloadSyncRequest {
-                        log_ref,
-                        bytes: new_total,
-                        sync_dir: *needs_dir_sync,
-                    },
-                );
-            }
         }
         if let Some((_, file, bytes, _)) = open_log.take()
             && sync_mode == DataLogSyncMode::Sync
         {
             outcome.files_to_sync.push(data_log_file_to_sync(file, bytes));
+        }
+        // Unsynced appends request one covering background sync per touched
+        // log once the node's writes finish, so this node's fdatasync
+        // overlaps other nodes' staging instead of queueing a sync round
+        // behind every chunk. Durability is still claimed only by
+        // boundaries that observe the covering sync.
+        if sync_mode == DataLogSyncMode::NoSync && !outcome.logs.is_empty() {
+            let requests: Vec<_> = outcome
+                .logs
+                .iter()
+                .map(|(log_ref, manifest)| AppendLogPayloadSyncRequest {
+                    log_ref: *log_ref,
+                    bytes: manifest.total_bytes,
+                    sync_dir: manifest.needs_dir_sync,
+                })
+                .collect();
+            self.append_log_service.payload_sync_worker.request_many(requests);
         }
         Ok(outcome)
     }
@@ -5380,7 +5522,7 @@ impl DurableSqliteStore {
                     segment_id: placement.segment_id,
                     storage_node: placement.storage_node,
                     integrity: placement.integrity,
-                    bytes: Arc::from(self.read_segment_payload(placement)?),
+                    bytes: SharedSegmentPayload::from_vec(self.read_segment_payload(placement)?),
                 });
             }
             let appended = self.append_segments(payloads, DataLogSyncMode::Sync, None)?;

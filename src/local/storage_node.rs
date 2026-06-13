@@ -53,6 +53,14 @@ impl LocalStorageNode {
         grant: WriteGrant,
         bytes: Vec<u8>,
     ) -> Result<(SegmentWriteReceipt, LocalSegmentWriteProfile)> {
+        self.write_segment_shared_profiled(grant, SharedSegmentPayload::from_vec(bytes))
+    }
+
+    fn write_segment_shared_profiled(
+        &self,
+        grant: WriteGrant,
+        bytes: SharedSegmentPayload,
+    ) -> Result<(SegmentWriteReceipt, LocalSegmentWriteProfile)> {
         let mut profile = LocalSegmentWriteProfile::default();
         let bytes_len = u64::try_from(bytes.len())
             .map_err(|_| StorageError::invalid_argument("segment write length overflows u64"))?;
@@ -93,7 +101,8 @@ impl LocalStorageNode {
             if receipt.grant_id == grant.grant_id
                 && receipt.grant_hash == grant_hash
                 && receipt.bytes == bytes_len
-                && receipt.integrity == segment_payload_integrity(grant.payload_integrity, &bytes)
+                && receipt.integrity
+                    == segment_payload_integrity(grant.payload_integrity, bytes.as_slice())
             {
                 let existing_len = usize::try_from(bytes_len).map_err(|_| {
                     StorageError::invalid_argument("duplicate segment length overflows usize")
@@ -104,7 +113,7 @@ impl LocalStorageNode {
                     ByteRange::new(0, bytes_len),
                     &mut existing,
                 )?;
-                if existing == bytes {
+                if existing.as_slice() == bytes.as_slice() {
                     self.observability.record_with_update(
                         StorageEventKind::StorageSegmentWriteRetried,
                         Some(self.storage_node),
@@ -142,7 +151,7 @@ impl LocalStorageNode {
         profile.catalog_begin_nanos = begin_profile.total_nanos;
         profile.catalog_begin_lock_wait_nanos = begin_profile.lock_wait_nanos;
 
-        let (commit, write_profile) = self.segment_store.write_segment_owned_profiled(
+        let (commit, write_profile) = self.segment_store.write_segment_shared_profiled(
             &reservation,
             bytes,
             grant.payload_integrity,

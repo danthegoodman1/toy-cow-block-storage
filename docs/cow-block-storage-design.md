@@ -148,38 +148,52 @@ Durable providers store checkpointed block heads as a stable device manifest
 plus one mutable row per shard head. Flushed block writes do not need to fold
 into those rows before returning: they may be recorded as ordered durable block
 delta rows that reference already-durable segment payloads. Leased block writes
-use the block-native journal: a framed append-only file containing lease,
-write, segment-reference or sparse-range, and flush-marker records.
+use the block-native journal: framed append-only files containing lease,
+write, segment-reference or sparse-range, and flush-marker records. The
+journal is sharded one file per storage node, placed in that node's data
+directory so shards land on separate data disks. Each device routes to one
+shard by a stable hash of its device ID over the sorted storage-node list;
+all records for a device live in one shard, so per-device record order is a
+single-file append order. The shard count is persisted in the store layout
+and validated on reopen, because a changed node set would silently reroute
+devices away from their journal history.
 
-Every durable block boundary is a request in one group-committed journal lane.
-Flushed writes, sparse zero/discard operations, `flush_device` boundaries, and
-lease fences enqueue lane requests; the first waiter that finds the lane idle
-becomes the batch owner, appends every pending record as framed batches, issues
-one data sync, then publishes the batch. A waiter returns only after the sync
-covering its request completes, so group commit changes scheduling, never the
-durability contract. Per device, write records append and publish in
-commit-sequence order, and a flush marker never covers a sequence whose write
-record is not yet appended.
+Every durable block boundary is a request in its shard's group-committed
+journal lane. Flushed writes, sparse zero/discard operations, `flush_device`
+boundaries, and lease fences enqueue lane requests; the first waiter that
+finds the lane idle becomes the batch owner, appends every pending record as
+framed batches, issues one data sync, then publishes the batch. A waiter
+returns only after the sync covering its request completes, so group commit
+changes scheduling, never the durability contract. Lanes on different shards
+append and sync in parallel because no record orders across devices. Per
+device, write records append and publish in commit-sequence order, and a
+flush marker never covers a sequence whose write record is not yet appended.
 
 Writes whose total payload is at or below a provider-private inline cap
 (default 16 KiB) carry payload bytes inside the journal record, split into
-block-native inline entries, so a small write costs one lane append on the
-journal device. Larger writes place payload segments on per-node data logs,
-striped in provider-private chunks (default 2 MiB) round-robin across storage
-nodes so one large write spreads payload bandwidth and payload syncs over
-every data disk, and the journal records only small segment references. A
-flushed segment-reference write makes its segment payload durable on its
-nodes before its record enters the lane, preserving the rule that durable
-metadata never references volatile bytes.
+block-native inline entries, so a small write costs one lane append on its
+shard's journal file. Larger writes place payload segments on per-node data
+logs, striped in provider-private chunks (default 2 MiB) round-robin across
+storage nodes so one large write spreads payload bandwidth and payload syncs
+over every data disk, and the journal records only small segment references.
+Chunks are shared windows into the one collapsed write buffer rather than
+per-chunk copies: the same allocation backs the staged segment in the
+in-memory store and the payload portion of its data-log record, whose header
+and payload are written separately, so a large write's payload bytes are
+copied once at the API boundary plus the page-cache write. A flushed
+segment-reference write makes its segment payload durable on its nodes
+before its record enters the lane, preserving the rule that durable metadata
+never references volatile bytes.
 
 Payload syncs route through one group-commit sync lane per storage node:
-staging records each chunk's high-water append position eagerly while later
-chunks are still being written, one in-flight data sync per node covers the
-batch high-water, and a staging waiter completes only when the synced
-high-water covers its bytes, so syncs on different nodes run in parallel and
-syncs on one node amortize across writers. The lane reschedules work without
-weakening the boundary contract: a flushed acknowledgment still requires the
-covering payload sync and the durable journal record.
+staging requests one covering sync per touched data log when a node's writes
+for the operation finish, one in-flight data sync per node covers the batch
+high-water, and a staging waiter completes only when the synced high-water
+covers its bytes, so syncs on different nodes run in parallel, syncs on one
+node amortize across writers, and a durability boundary never queues behind
+stale incremental sync rounds. The lane reschedules work without weakening
+the boundary contract: a flushed acknowledgment still requires the covering
+payload sync and the durable journal record.
 
 The per-segment node-catalog rows are not part of that boundary. Data-log
 records are self-describing (kind, identity, integrity, length), so the rows
@@ -206,7 +220,11 @@ device has not applied yet, so live overlay order always equals replay order.
 
 Reopen loads the compact shard roots, replays retained SQLite block deltas,
 then rebuilds the provider-private block overlay from journal writes and
-sparse ranges covered by durable flush markers. Covered journal records may
+sparse ranges covered by durable flush markers. Every journal shard file is
+scanned and the records concatenated; no order holds across shards, and none
+is needed, because replay gates each device on its own flush markers and a
+device's records live in one shard. A torn tail truncates only its own
+shard's replay. Covered journal records may
 reference segments whose catalog rows were still queued at a crash; reopen
 rebuilds those by scanning the owning node's self-describing data logs for
 the referenced segment ids, validating each recovered payload against the
@@ -221,8 +239,8 @@ cleanup. Reads resolve the compact tree and then apply the journal overlay,
 so read-after-write observes journal-backed writes without forcing immediate
 tree path-copy or node-catalog publication. The overlay keeps only a
 coalesced current-view read index keyed by range start; shadowed history lives
-in the journal file, which remains the replay and future materialization
-history. Until journal materialization exists, a device with unmaterialized
+in the journal shard files, which remain the replay and future
+materialization history. Until journal materialization exists, a device with unmaterialized
 journal state keeps later writes on the journal path instead of publishing a
 newer compact-tree root that older overlay entries could incorrectly cover.
 SQLite block-delta checkpointing and maintenance fold durable deltas into

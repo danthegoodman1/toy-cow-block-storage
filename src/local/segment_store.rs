@@ -1,6 +1,86 @@
+/// Shared immutable payload bytes with a window.
+///
+/// Chunked staging clones the Arc and narrows the window instead of copying
+/// payload bytes per chunk, so one collapsed write's buffer backs every chunk
+/// segment along the write path, in the in-memory store, and in the data-log
+/// writer.
+#[derive(Debug, Clone)]
+pub(super) struct SharedSegmentPayload {
+    buf: Arc<Vec<u8>>,
+    start: usize,
+    end: usize,
+}
+
+impl SharedSegmentPayload {
+    pub(super) fn from_vec(buf: Vec<u8>) -> Self {
+        let end = buf.len();
+        Self {
+            buf: Arc::new(buf),
+            start: 0,
+            end,
+        }
+    }
+
+    /// Narrow to a window given relative to this payload's window.
+    pub(super) fn window(&self, start: usize, end: usize) -> Result<Self> {
+        let absolute_start = self
+            .start
+            .checked_add(start)
+            .ok_or_else(|| StorageError::invalid_argument("payload window start overflows"))?;
+        let absolute_end = self
+            .start
+            .checked_add(end)
+            .ok_or_else(|| StorageError::invalid_argument("payload window end overflows"))?;
+        if start > end || absolute_end > self.end {
+            return Err(StorageError::invalid_argument(
+                "payload window exceeds payload bytes",
+            ));
+        }
+        Ok(Self {
+            buf: Arc::clone(&self.buf),
+            start: absolute_start,
+            end: absolute_end,
+        })
+    }
+
+    pub(super) fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+impl PartialEq for SharedSegmentPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for SharedSegmentPayload {}
+
+impl serde::Serialize for SharedSegmentPayload {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.as_slice())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SharedSegmentPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self::from_vec(Vec::<u8>::deserialize(deserializer)?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct SegmentRecord {
-    bytes: Arc<[u8]>,
+    bytes: SharedSegmentPayload,
     synced: bool,
     commit: SegmentReplicaCommit,
 }
@@ -10,7 +90,7 @@ pub(super) struct DurableSegmentPayload {
     segment_id: SegmentId,
     storage_node: StorageNodeId,
     integrity: SegmentPayloadIntegrity,
-    bytes: Arc<[u8]>,
+    bytes: SharedSegmentPayload,
 }
 
 #[derive(Debug)]
@@ -79,7 +159,7 @@ impl InMemorySegmentStore {
                     segment_id: *segment_id,
                     storage_node,
                     integrity: record.commit.descriptor.integrity,
-                    bytes: Arc::clone(&record.bytes),
+                    bytes: record.bytes.clone(),
                 });
             }
         }
@@ -107,7 +187,7 @@ impl InMemorySegmentStore {
             segment_id,
             storage_node,
             integrity: record.commit.descriptor.integrity,
-            bytes: Arc::clone(&record.bytes),
+            bytes: record.bytes.clone(),
         })
     }
 
@@ -131,7 +211,7 @@ impl InMemorySegmentStore {
                 segment_id: *segment_id,
                 storage_node,
                 integrity: record.commit.descriptor.integrity,
-                bytes: Arc::clone(&record.bytes),
+                bytes: record.bytes.clone(),
             });
         }
         Ok((inner.next_offset, payloads))
@@ -165,7 +245,7 @@ impl InMemorySegmentStore {
             .get(&segment_id)
             .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
         let integrity = record.commit.descriptor.integrity;
-        let bytes = Arc::clone(&record.bytes);
+        let bytes = record.bytes.clone();
         drop(inner);
         match integrity {
             SegmentPayloadIntegrity::Unchecked => {
@@ -180,7 +260,7 @@ impl InMemorySegmentStore {
             }
             integrity @ SegmentPayloadIntegrity::Crc32c(_) => {
                 let checksum_started = Instant::now();
-                verify_segment_payload_integrity(integrity, bytes.as_ref())?;
+                verify_segment_payload_integrity(integrity, bytes.as_slice())?;
                 profile.checksum_nanos = duration_nanos_u64(checksum_started.elapsed());
                 profile.total_nanos = duration_nanos_u64(total_started.elapsed());
                 Ok(profile)
@@ -215,14 +295,18 @@ impl InMemorySegmentStore {
         bytes: Vec<u8>,
         payload_integrity: PayloadIntegrity,
     ) -> Result<SegmentReplicaCommit> {
-        self.write_segment_owned_profiled(reservation, bytes, payload_integrity)
-            .map(|(commit, _)| commit)
+        self.write_segment_shared_profiled(
+            reservation,
+            SharedSegmentPayload::from_vec(bytes),
+            payload_integrity,
+        )
+        .map(|(commit, _)| commit)
     }
 
-    fn write_segment_owned_profiled(
+    fn write_segment_shared_profiled(
         &self,
         reservation: &SegmentReservation,
-        bytes: Vec<u8>,
+        bytes: SharedSegmentPayload,
         payload_integrity: PayloadIntegrity,
     ) -> Result<(SegmentReplicaCommit, LocalSegmentStoreWriteProfile)> {
         let total_started = Instant::now();
@@ -250,15 +334,14 @@ impl InMemorySegmentStore {
         }
 
         let checksum_started = Instant::now();
-        let integrity = segment_payload_integrity(payload_integrity, &bytes);
+        let integrity = segment_payload_integrity(payload_integrity, bytes.as_slice());
         profile.checksum_integrity_nanos = duration_nanos_u64(checksum_started.elapsed());
-        let bytes: Arc<[u8]> = Arc::from(bytes);
 
         let lock_started = Instant::now();
         let mut inner = lock(&self.inner)?;
         profile.lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
         if let Some(existing) = inner.segments.get(&reservation.segment_id) {
-            if existing.bytes.as_ref() == bytes.as_ref() {
+            if existing.bytes == bytes {
                 profile.total_nanos = duration_nanos_u64(total_started.elapsed());
                 return Ok((existing.commit.clone(), profile));
             }
@@ -337,7 +420,7 @@ impl InMemorySegmentStore {
             return Err(StorageError::unavailable("segment is not synced"));
         }
         let end = range.end_exclusive()?;
-        let bytes = Arc::clone(&record.bytes);
+        let bytes = record.bytes.clone();
         let record_len = u64::try_from(bytes.len())
             .map_err(|_| StorageError::invalid_argument("segment byte length overflows u64"))?;
         if end > record_len {
@@ -359,7 +442,7 @@ impl InMemorySegmentStore {
             .map_err(|_| StorageError::invalid_argument("segment read end overflows usize"))?;
         drop(inner);
         let source = bytes
-            .as_ref()
+            .as_slice()
             .get(start..end)
             .ok_or_else(|| StorageError::corrupt("segment read range exceeds segment bytes"))?;
         let copy_started = Instant::now();
