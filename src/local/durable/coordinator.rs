@@ -3488,6 +3488,12 @@ impl DurableCoordinator {
             .store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn set_append_payload_sync_delay_for_test(&self, delay: Option<Duration>) -> Result<()> {
+        *lock(&self.durable.append_payload_sync_delay)? = delay;
+        Ok(())
+    }
+
     pub fn create_device(&self, request: CreateDeviceRequest) -> Result<DeviceId> {
         self.run_and_persist(|local| {
             local

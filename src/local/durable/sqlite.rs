@@ -23,6 +23,8 @@ pub(super) struct DurableSqliteStore {
     #[cfg(test)]
     fail_next_append_payload_sync: Arc<AtomicBool>,
     #[cfg(test)]
+    append_payload_sync_delay: Arc<Mutex<Option<Duration>>>,
+    #[cfg(test)]
     fail_next_block_journal_append: Arc<AtomicBool>,
     #[cfg(test)]
     fail_node_segment_append: Arc<Mutex<Option<StorageNodeId>>>,
@@ -928,6 +930,8 @@ struct StorageNodeAppendLogService {
     payload_sync_worker: AppendLogPayloadSyncWorker,
     #[cfg(test)]
     fail_next_payload_sync: Arc<AtomicBool>,
+    #[cfg(test)]
+    payload_sync_delay: Arc<Mutex<Option<Duration>>>,
 }
 
 #[derive(Debug)]
@@ -953,8 +957,15 @@ struct DataLogSyncLane {
 #[derive(Debug, Default)]
 struct DataLogSyncLaneState {
     in_flight: bool,
-    generation: u64,
+    next_waiter_id: u64,
     pending: BTreeMap<DurableDataLogRef, AppendLogPayloadSyncRequest>,
+    waiters: BTreeMap<u64, DataLogSyncWaiter>,
+}
+
+#[derive(Debug)]
+struct DataLogSyncWaiter {
+    requests: Vec<AppendLogPayloadSyncRequest>,
+    completion: Option<Result<()>>,
 }
 
 #[derive(Debug)]
@@ -1340,12 +1351,6 @@ impl StorageNodeAppendLogService {
         if appended.logs.is_empty() && appended.sealed_logs.is_empty() {
             return Ok(DataLogAppendProfile::default());
         }
-        #[cfg(test)]
-        if self.fail_next_payload_sync.swap(false, Ordering::SeqCst) {
-            return Err(StorageError::unavailable(
-                "injected append payload sync failure",
-            ));
-        }
 
         let requests = self.pending_sync_requests(appended)?;
         let mut by_node: BTreeMap<StorageNodeId, Vec<AppendLogPayloadSyncRequest>> =
@@ -1412,6 +1417,19 @@ impl StorageNodeAppendLogService {
         Ok(true)
     }
 
+    fn sync_batch_covers(
+        batch: &[AppendLogPayloadSyncRequest],
+        requests: &[AppendLogPayloadSyncRequest],
+    ) -> bool {
+        requests.iter().all(|request| {
+            batch.iter().any(|covered| {
+                covered.log_ref == request.log_ref
+                    && covered.bytes >= request.bytes
+                    && (!request.sync_dir || covered.sync_dir)
+            })
+        })
+    }
+
     /// Settle one node's sync targets through its group-commit lane.
     ///
     /// Merges the targets into the lane, then either leads a sync covering
@@ -1427,11 +1445,39 @@ impl StorageNodeAppendLogService {
             return Ok(DataLogAppendProfile::default());
         }
         let lane = self.sync_lane_for_node(storage_node)?;
+        let mut waiter_id = None;
         loop {
+            if let Some(waiter_id) = waiter_id {
+                let mut state = lock(&lane.inner)?;
+                if let Some(completion) = state
+                    .waiters
+                    .get(&waiter_id)
+                    .and_then(|waiter| waiter.completion.clone())
+                {
+                    state.waiters.remove(&waiter_id);
+                    return completion.map(|()| DataLogAppendProfile::default());
+                }
+                drop(state);
+            }
             if self.sync_requests_covered(&requests)? {
+                if let Some(waiter_id) = waiter_id {
+                    lock(&lane.inner)?.waiters.remove(&waiter_id);
+                }
                 return Ok(DataLogAppendProfile::default());
             }
             let mut state = lock(&lane.inner)?;
+            let waiter_id = *waiter_id.get_or_insert_with(|| {
+                let waiter_id = state.next_waiter_id;
+                state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
+                state.waiters.insert(
+                    waiter_id,
+                    DataLogSyncWaiter {
+                        requests: requests.clone(),
+                        completion: None,
+                    },
+                );
+                waiter_id
+            });
             for request in &requests {
                 state
                     .pending
@@ -1446,23 +1492,59 @@ impl StorageNodeAppendLogService {
                 state.in_flight = true;
                 let batch: Vec<_> = std::mem::take(&mut state.pending).into_values().collect();
                 drop(state);
+                #[cfg(test)]
+                let result = if self.fail_next_payload_sync.swap(false, Ordering::SeqCst) {
+                    if let Some(delay) = *lock(&self.payload_sync_delay)? {
+                        thread::sleep(delay);
+                    }
+                    Err(StorageError::unavailable(
+                        "injected append payload sync failure",
+                    ))
+                } else {
+                    if let Some(delay) = *lock(&self.payload_sync_delay)? {
+                        thread::sleep(delay);
+                    }
+                    sync_append_run_log_requests(
+                        &self.paths,
+                        self.policy,
+                        &self.synced_logs,
+                        &self.dir_synced_logs,
+                        &self.synced_log_cvar,
+                        batch.clone(),
+                    )
+                };
+                #[cfg(not(test))]
                 let result = sync_append_run_log_requests(
                     &self.paths,
                     self.policy,
                     &self.synced_logs,
                     &self.dir_synced_logs,
                     &self.synced_log_cvar,
-                    batch,
+                    batch.clone(),
                 );
                 let mut state = lock(&lane.inner)?;
                 state.in_flight = false;
-                state.generation = state.generation.wrapping_add(1);
+                let completion = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| error.clone());
+                for waiter in state.waiters.values_mut() {
+                    if waiter.completion.is_none()
+                        && Self::sync_batch_covers(&batch, &waiter.requests)
+                    {
+                        waiter.completion = Some(completion.clone());
+                    }
+                }
                 lane.cvar.notify_all();
-                drop(state);
+                state.waiters.remove(&waiter_id);
                 return result;
             }
-            let generation = state.generation;
-            while state.in_flight && state.generation == generation {
+            while state.in_flight
+                && state
+                    .waiters
+                    .get(&waiter_id)
+                    .is_some_and(|waiter| waiter.completion.is_none())
+            {
                 state = wait_on_cvar(&lane.cvar, state)?;
             }
         }
@@ -2524,6 +2606,8 @@ impl DurableSqliteStore {
             Arc::new(StorageNodeDataLogAllocationLocks::default());
         #[cfg(test)]
         let fail_next_append_payload_sync = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let append_payload_sync_delay = Arc::new(Mutex::new(None));
         let synced_append_logs = Arc::new(Mutex::new(BTreeMap::new()));
         let dir_synced_append_logs = Arc::new(Mutex::new(BTreeSet::new()));
         let synced_append_log_cvar = Arc::new(Condvar::new());
@@ -2549,6 +2633,8 @@ impl DurableSqliteStore {
             payload_sync_worker,
             #[cfg(test)]
             fail_next_payload_sync: Arc::clone(&fail_next_append_payload_sync),
+            #[cfg(test)]
+            payload_sync_delay: Arc::clone(&append_payload_sync_delay),
         });
         if !metadata_existed {
             sync_parent_dir(&paths.metadata)?;
@@ -2582,6 +2668,8 @@ impl DurableSqliteStore {
             fail_next_prestage: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_append_payload_sync,
+            #[cfg(test)]
+            append_payload_sync_delay,
             #[cfg(test)]
             fail_next_block_journal_append: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]

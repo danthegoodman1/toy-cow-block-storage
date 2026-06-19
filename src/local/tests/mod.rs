@@ -4487,6 +4487,73 @@ fn durable_block_journal_payload_sync_failure_exposes_nothing() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn durable_block_journal_payload_sync_failure_fails_covered_waiters() {
+    let root = durable_temp_dir("block-segref-payload-sync-covered-waiters");
+    let cfg = config();
+    let store = Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let log_ref = DurableDataLogRef {
+        storage_node: cfg.storage_node,
+        log_id: 991,
+    };
+    let data_dir = root.join("data");
+    fs::create_dir_all(node_data_log_dir(&data_dir, cfg.storage_node)).unwrap();
+    let payload = repeated_blocks(1, 71);
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(data_log_path(&data_dir, cfg.storage_node, log_ref.log_id))
+        .unwrap()
+        .write_all(&payload)
+        .unwrap();
+    let appended = PendingDataLogAppend {
+        placements: Vec::new(),
+        logs: std::collections::BTreeMap::from([(
+            log_ref,
+            PendingDataLogManifest {
+                storage_node: cfg.storage_node,
+                log_id: log_ref.log_id,
+                state: GENERIC_DATA_LOG_STATE_ACTIVE.to_string(),
+                total_bytes: usize_to_u64(payload.len()),
+                needs_dir_sync: false,
+            },
+        )]),
+        sealed_logs: Vec::new(),
+    };
+
+    store
+        .set_append_payload_sync_delay_for_test(Some(Duration::from_millis(100)))
+        .unwrap();
+    store.fail_next_append_payload_sync_for_test();
+
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let store = Arc::clone(&store);
+        let appended = appended.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            store.durable.sync_pending_data_log_append(&appended)
+        }));
+    }
+    barrier.wait();
+
+    for handle in handles {
+        assert!(matches!(
+            handle.join().unwrap(),
+            Err(StorageError::Unavailable { .. })
+        ));
+    }
+    store.set_append_payload_sync_delay_for_test(None).unwrap();
+    store
+        .durable
+        .sync_pending_data_log_append(&appended)
+        .unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
 // One large flushed write stripes its policy-sized chunks round-robin across
 // every storage node and still reads and replays as one atomic commit.
 #[test]
