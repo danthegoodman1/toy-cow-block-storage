@@ -222,7 +222,12 @@ impl DirectIoFileBackend {
             copied += chunk.len();
         }
         file.scratch.as_mut_slice()[logical_len..physical_len].fill(0);
-        write_all_at(&file.file, &file.scratch.as_slice()[..physical_len], offset)?;
+        write_all_at(
+            &file.file,
+            &file.scratch.as_slice()[..physical_len],
+            offset,
+            self.alignment,
+        )?;
         file.len = file
             .len
             .checked_add(usize_to_u64(physical_len))
@@ -236,7 +241,8 @@ impl DirectIoFileBackend {
     }
 
     fn file(&self, path: &Path) -> Result<(Arc<Mutex<DirectIoFile>>, u64, bool)> {
-        if let Some(file) = lock(&self.files)?.get(path).cloned() {
+        let mut files = lock(&self.files)?;
+        if let Some(file) = files.get(path).cloned() {
             return Ok((file, 0, false));
         }
         let started = Instant::now();
@@ -254,7 +260,7 @@ impl DirectIoFileBackend {
             len,
             scratch: DirectIoScratch::new(self.alignment)?,
         }));
-        lock(&self.files)?.insert(path.to_path_buf(), Arc::clone(&opened));
+        files.insert(path.to_path_buf(), Arc::clone(&opened));
         Ok((
             opened,
             duration_nanos_u64(started.elapsed()),
@@ -333,26 +339,63 @@ fn open_direct_io_file(_path: &Path) -> Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> Result<()> {
+fn write_all_at(file: &File, bytes: &[u8], offset: u64, alignment: usize) -> Result<()> {
     use std::os::unix::fs::FileExt;
 
-    while !bytes.is_empty() {
-        let written = file.write_at(bytes, offset).map_err(fs_error)?;
+    write_all_at_with(bytes, offset, alignment, |chunk, chunk_offset| {
+        file.write_at(chunk, chunk_offset).map_err(fs_error)
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn write_all_at_with<F>(
+    bytes: &[u8],
+    offset: u64,
+    alignment: usize,
+    mut write_at: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8], u64) -> Result<usize>,
+{
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(StorageError::invalid_argument(
+            "direct I/O alignment must be a nonzero power of two",
+        ));
+    }
+    let mut completed = 0_usize;
+    let mut unaligned_short_retries = 0_u8;
+    while completed < bytes.len() {
+        let chunk_offset = offset
+            .checked_add(usize_to_u64(completed))
+            .ok_or_else(|| StorageError::invalid_argument("direct I/O offset overflows"))?;
+        let written = write_at(&bytes[completed..], chunk_offset)?;
         if written == 0 {
             return Err(StorageError::unavailable(
                 "direct I/O write made no progress",
             ));
         }
-        offset = offset
-            .checked_add(usize_to_u64(written))
-            .ok_or_else(|| StorageError::invalid_argument("direct I/O offset overflows"))?;
-        bytes = &bytes[written..];
+        if written > bytes.len() - completed {
+            return Err(StorageError::unavailable(
+                "direct I/O write reported too many bytes",
+            ));
+        }
+        if written.is_multiple_of(alignment) {
+            completed += written;
+            unaligned_short_retries = 0;
+            continue;
+        }
+        unaligned_short_retries = unaligned_short_retries.saturating_add(1);
+        if unaligned_short_retries >= 16 {
+            return Err(StorageError::unavailable(
+                "direct I/O write repeatedly returned unaligned short writes",
+            ));
+        }
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn write_all_at(_file: &File, _bytes: &[u8], _offset: u64) -> Result<()> {
+fn write_all_at(_file: &File, _bytes: &[u8], _offset: u64, _alignment: usize) -> Result<()> {
     Err(StorageError::unsupported(
         "direct I/O backend requires Linux O_DIRECT support",
     ))
@@ -376,4 +419,85 @@ fn pad_file_to_alignment(path: &Path, alignment: usize) -> Result<()> {
     let mut file = OpenOptions::new().append(true).open(path).map_err(fs_error)?;
     file.write_all(&zeros).map_err(fs_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod io_backend_tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn direct_write_retries_unaligned_short_write_from_aligned_boundary() {
+        let bytes = vec![7_u8; 4096];
+        let mut calls = Vec::new();
+        write_all_at_with(&bytes, 8192, 4096, |chunk, offset| {
+            calls.push((offset, chunk.len()));
+            Ok(if calls.len() == 1 { 512 } else { chunk.len() })
+        })
+        .unwrap();
+
+        assert_eq!(calls, vec![(8192, 4096), (8192, 4096)]);
+    }
+
+    #[test]
+    fn direct_write_advances_on_aligned_short_write() {
+        let bytes = vec![9_u8; 8192];
+        let mut calls = Vec::new();
+        write_all_at_with(&bytes, 4096, 4096, |chunk, offset| {
+            calls.push((offset, chunk.len()));
+            Ok(if calls.len() == 1 { 4096 } else { chunk.len() })
+        })
+        .unwrap();
+
+        assert_eq!(calls, vec![(4096, 8192), (8192, 4096)]);
+    }
+
+    #[test]
+    fn direct_write_fails_repeated_unaligned_short_writes() {
+        let bytes = vec![11_u8; 4096];
+        let error = write_all_at_with(&bytes, 0, 4096, |_chunk, _offset| Ok(512)).unwrap_err();
+
+        assert!(matches!(error, StorageError::Unavailable { .. }));
+    }
+
+    #[test]
+    fn direct_io_concurrent_first_appends_share_one_path_length_when_supported() {
+        let root = std::env::temp_dir().join(format!(
+            "toy-cow-direct-io-concurrent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let backend = match DirectIoFileBackend::new(DIRECT_IO_DEFAULT_ALIGNMENT)
+            .and_then(|backend| backend.probe(&root).map(|()| backend))
+        {
+            Ok(backend) => backend,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let path = root.join("append.bin");
+        let workers = 8_usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        thread::scope(|scope| {
+            for worker in 0..workers {
+                let backend = Arc::clone(&backend);
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                scope.spawn(move || {
+                    let bytes = vec![worker as u8; DIRECT_IO_DEFAULT_ALIGNMENT];
+                    barrier.wait();
+                    backend.append(&path, &[&bytes]).unwrap();
+                });
+            }
+        });
+
+        assert_eq!(
+            path.metadata().unwrap().len(),
+            (workers * DIRECT_IO_DEFAULT_ALIGNMENT) as u64
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
