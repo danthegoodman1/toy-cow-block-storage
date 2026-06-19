@@ -405,6 +405,10 @@ Stage 5 local checkpoint, 2026-06-19, macOS Docker dev container, baseline
   `latest_commit` is not compact coverage. Reopen and journal pruning skip only
   records covered by this materialized high-water; if a durable snapshot records
   a visible head beyond compact roots, retained journal records still replay.
+- Materialization holds the block-delta staging lock while waiting for all
+  block-journal lane batches to finish their sync-and-publish boundary and
+  while scanning/folding raw journal files, so unsynced or unpublished
+  write/flush records cannot be appended and folded into CoW roots.
 - Durable root-copy operations hold the block-delta staging lock while draining
   block-journal lanes, flushing visible heads, materializing compact roots, and
   copying checkpoint/fork/restore roots. A concurrent writer can publish only

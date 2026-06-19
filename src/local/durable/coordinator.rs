@@ -51,6 +51,9 @@ pub struct DurableCoordinator {
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
     #[cfg(test)]
     root_copy_pause: Arc<(Mutex<RootCopyPauseState>, Condvar)>,
+    #[cfg(test)]
+    block_journal_materialization_pause:
+        Arc<(Mutex<BlockJournalMaterializationPauseState>, Condvar)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,6 +83,20 @@ struct RootCopyPauseState {
     enabled: bool,
     paused: bool,
     resume: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct BlockJournalMaterializationPauseState {
+    pause_after_append_before_sync: bool,
+    paused_after_append_before_sync: bool,
+    resume_after_append: bool,
+    pause_after_lane_wait_before_scan: bool,
+    paused_after_lane_wait_before_scan: bool,
+    resume_after_lane_wait: bool,
+    materialization_waiting_for_lane: bool,
+    materialization_scanned_while_unsynced_append_paused: bool,
+    writer_reached_staging_after_lane_wait: bool,
 }
 
 /// Tracks in-flight block segment-ref payload staging.
@@ -891,6 +908,11 @@ impl DurableCoordinator {
             #[cfg(test)]
             root_copy_pause: Arc::new((
                 Mutex::new(RootCopyPauseState::default()),
+                Condvar::new(),
+            )),
+            #[cfg(test)]
+            block_journal_materialization_pause: Arc::new((
+                Mutex::new(BlockJournalMaterializationPauseState::default()),
                 Condvar::new(),
             )),
         };
@@ -3558,6 +3580,133 @@ impl DurableCoordinator {
     }
 
     #[cfg(test)]
+    fn pause_block_journal_after_unsynced_append_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        state.pause_after_append_before_sync = true;
+        state.paused_after_append_before_sync = false;
+        state.resume_after_append = false;
+        state.materialization_waiting_for_lane = false;
+        state.materialization_scanned_while_unsynced_append_paused = false;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_block_journal_after_lane_wait_before_scan_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        state.pause_after_lane_wait_before_scan = true;
+        state.paused_after_lane_wait_before_scan = false;
+        state.resume_after_lane_wait = false;
+        state.writer_reached_staging_after_lane_wait = false;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_until_block_journal_lane_wait_before_scan_paused_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        while !state.paused_after_lane_wait_before_scan {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_until_block_journal_writer_reached_staging_after_lane_wait_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        while !state.writer_reached_staging_after_lane_wait {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn resume_block_journal_lane_wait_before_scan_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        state.resume_after_lane_wait = true;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn note_block_journal_writer_reached_staging_after_lane_wait_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        if state.paused_after_lane_wait_before_scan {
+            state.writer_reached_staging_after_lane_wait = true;
+            cvar.notify_all();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_until_block_journal_append_paused_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        while !state.paused_after_append_before_sync {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_until_block_journal_materialization_waited_or_scanned_for_test(
+        &self,
+    ) -> Result<(bool, bool)> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        while !state.materialization_waiting_for_lane
+            && !state.materialization_scanned_while_unsynced_append_paused
+        {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        }
+        Ok((
+            state.materialization_waiting_for_lane,
+            state.materialization_scanned_while_unsynced_append_paused,
+        ))
+    }
+
+    #[cfg(test)]
+    fn resume_block_journal_append_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        state.resume_after_append = true;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn persist_without_block_journal_materialization_for_test(&self) -> Result<()> {
         let total_started = Instant::now();
         let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
@@ -3933,6 +4082,10 @@ impl DurableCoordinator {
                 {
                     break;
                 }
+                #[cfg(test)]
+                if state.in_flight {
+                    self.note_block_journal_materialization_waiting_for_lane_for_test()?;
+                }
                 if !state.in_flight && !state.pending.is_empty() {
                     state.in_flight = true;
                     let batch = std::mem::take(&mut state.pending);
@@ -4105,6 +4258,8 @@ impl DurableCoordinator {
             let mut profile = self
                 .durable
                 .append_block_journal_records_unsynced(shard, &records)?;
+            #[cfg(test)]
+            self.pause_after_block_journal_append_before_sync_if_requested_for_test()?;
             profile.sync_nanos = self.durable.sync_block_journal(shard)?;
             // Publish in commit-seq order after the shared sync: reserved
             // sequences must publish in order per device, and a record may
@@ -4483,6 +4638,8 @@ impl DurableCoordinator {
     }
 
     fn materializable_block_journal_commits(&self) -> Result<Vec<BlockJournalCommit>> {
+        #[cfg(test)]
+        self.note_block_journal_materialization_scan_for_test()?;
         let records = self.durable.block_journal_records()?;
         let materialized = self.local.metadata.block_materialized_high_water()?;
         let mut durable_through = BTreeMap::<DeviceId, CommitSeq>::new();
@@ -4533,7 +4690,10 @@ impl DurableCoordinator {
         Ok(selected)
     }
 
-    fn materialize_durable_block_journal(&self) -> Result<bool> {
+    fn materialize_durable_block_journal_locked(&self) -> Result<bool> {
+        self.wait_for_block_journal_lanes_idle()?;
+        #[cfg(test)]
+        self.pause_after_block_journal_lane_wait_before_scan_if_requested_for_test()?;
         let commits = self.materializable_block_journal_commits()?;
         let mut materialized = false;
         for commit in commits {
@@ -4543,11 +4703,88 @@ impl DurableCoordinator {
         Ok(materialized)
     }
 
+    fn materialize_durable_block_journal(&self) -> Result<bool> {
+        let _staging_guard = lock(&self.block_delta_staging_lock)?;
+        self.materialize_durable_block_journal_locked()
+    }
+
     fn materialize_block_journal_for_root_copy(&self) -> Result<()> {
         self.wait_for_block_journal_lanes_idle()?;
         self.flush_visible_block_journal_heads()?;
         self.wait_for_block_journal_lanes_idle()?;
-        self.materialize_durable_block_journal()?;
+        self.materialize_durable_block_journal_locked()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_after_block_journal_append_before_sync_if_requested_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        if !state.pause_after_append_before_sync {
+            return Ok(());
+        }
+        state.paused_after_append_before_sync = true;
+        cvar.notify_all();
+        while !state.resume_after_append {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        }
+        state.pause_after_append_before_sync = false;
+        state.paused_after_append_before_sync = false;
+        state.resume_after_append = false;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_after_block_journal_lane_wait_before_scan_if_requested_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        if !state.pause_after_lane_wait_before_scan {
+            return Ok(());
+        }
+        state.paused_after_lane_wait_before_scan = true;
+        cvar.notify_all();
+        while !state.resume_after_lane_wait {
+            state = cvar.wait(state).map_err(|_| {
+                StorageError::conflict("block-journal materialization pause poisoned")
+            })?;
+        }
+        state.pause_after_lane_wait_before_scan = false;
+        state.paused_after_lane_wait_before_scan = false;
+        state.resume_after_lane_wait = false;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn note_block_journal_materialization_waiting_for_lane_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        if state.pause_after_append_before_sync {
+            state.materialization_waiting_for_lane = true;
+            cvar.notify_all();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn note_block_journal_materialization_scan_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        if state.paused_after_append_before_sync && !state.resume_after_append {
+            state.materialization_scanned_while_unsynced_append_paused = true;
+            cvar.notify_all();
+        }
         Ok(())
     }
 
@@ -4742,6 +4979,8 @@ impl DurableCoordinator {
         // enqueue order equals commit-seq order, which the lane's ordered
         // publish step requires.
         let info = self.local.metadata.device_info(lease.device_id)?;
+        #[cfg(test)]
+        self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
         let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
         let commit_seq = self
             .local
@@ -4809,6 +5048,8 @@ impl DurableCoordinator {
         let (staged, appended) = self.stage_block_journal_segment_refs(lease, writes)?;
         let info = self.local.metadata.device_info(lease.device_id)?;
 
+        #[cfg(test)]
+        self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
         let enqueue_guard = lock(&self.block_delta_staging_lock)?;
         // Live overlay applies must follow commit-seq order per device, so
         // the acknowledged write joins the lane (becoming flushed-strength,
@@ -4951,6 +5192,8 @@ impl DurableCoordinator {
             .max(u64::from(info.spec.block_size));
         let collapsed = collapse_block_batch_writes(writes, &info.spec, max_inline_bytes)?;
         let total_started = Instant::now();
+        #[cfg(test)]
+        self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
         let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
         let commit_seq = self
             .local
@@ -5062,6 +5305,8 @@ impl DurableCoordinator {
             });
         }
 
+        #[cfg(test)]
+        self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
         let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
         let commit_seq = self
             .local

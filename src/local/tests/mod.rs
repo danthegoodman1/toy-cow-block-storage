@@ -2883,6 +2883,161 @@ fn durable_block_journal_reopen_replays_retained_journal_when_latest_exceeds_mat
 }
 
 #[test]
+fn durable_block_journal_materialization_waits_for_in_flight_flush_lane_before_scan() {
+    let root = durable_temp_dir("block-journal-materialize-waits-for-lane");
+    let cfg = config();
+    let store = std::sync::Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-materialize-lane-boundary".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    store
+        .pause_block_journal_after_unsynced_append_for_test()
+        .unwrap();
+    let writer_store = std::sync::Arc::clone(&store);
+    let writer = std::thread::spawn(move || {
+        writer_store.write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 15),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+    });
+    store
+        .wait_until_block_journal_append_paused_for_test()
+        .unwrap();
+
+    let materialize_store = std::sync::Arc::clone(&store);
+    let materializer = std::thread::spawn(move || materialize_store.materialize_block_journal());
+    let (waited_for_lane, scanned_paused_records) = store
+        .wait_until_block_journal_materialization_waited_or_scanned_for_test()
+        .unwrap();
+    store.resume_block_journal_append_for_test().unwrap();
+
+    let commit = writer.join().unwrap().unwrap();
+    materializer.join().unwrap().unwrap();
+    assert!(waited_for_lane);
+    assert!(!scanned_paused_records);
+    assert!(
+        store
+            .metadata()
+            .block_materialized_high_water()
+            .unwrap()
+            .get(&device_id)
+            .is_some_and(|high| *high >= commit.commit_seq)
+    );
+
+    let mut live = vec![0; 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 4096), &mut live)
+        .unwrap();
+    assert_eq!(live, repeated_blocks(1, 15));
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut reopened_bytes = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut reopened_bytes)
+        .unwrap();
+    assert_eq!(reopened_bytes, repeated_blocks(1, 15));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_materialization_blocks_new_lane_after_idle_wait_before_scan() {
+    let root = durable_temp_dir("block-journal-materialize-blocks-after-wait");
+    let cfg = config();
+    let store = std::sync::Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-materialize-after-wait".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    store
+        .pause_block_journal_after_lane_wait_before_scan_for_test()
+        .unwrap();
+    let materialize_store = std::sync::Arc::clone(&store);
+    let materializer = std::thread::spawn(move || materialize_store.materialize_block_journal());
+    store
+        .wait_until_block_journal_lane_wait_before_scan_paused_for_test()
+        .unwrap();
+
+    let writer_store = std::sync::Arc::clone(&store);
+    let writer = std::thread::spawn(move || {
+        writer_store.write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 16),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+    });
+    store
+        .wait_until_block_journal_writer_reached_staging_after_lane_wait_for_test()
+        .unwrap();
+    assert!(
+        !store
+            .metadata()
+            .block_materialized_high_water()
+            .unwrap()
+            .contains_key(&device_id)
+    );
+
+    store
+        .resume_block_journal_lane_wait_before_scan_for_test()
+        .unwrap();
+    materializer.join().unwrap().unwrap();
+    let commit = writer.join().unwrap().unwrap();
+    assert!(
+        store
+            .metadata()
+            .block_materialized_high_water()
+            .unwrap()
+            .get(&device_id)
+            .is_none_or(|high| *high < commit.commit_seq)
+    );
+
+    let mut live = vec![0; 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 4096), &mut live)
+        .unwrap();
+    assert_eq!(live, repeated_blocks(1, 16));
+
+    store.materialize_block_journal().unwrap();
+    assert!(
+        store
+            .metadata()
+            .block_materialized_high_water()
+            .unwrap()
+            .get(&device_id)
+            .is_some_and(|high| *high >= commit.commit_seq)
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut reopened_bytes = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut reopened_bytes)
+        .unwrap();
+    assert_eq!(reopened_bytes, repeated_blocks(1, 16));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_block_journal_root_copy_excludes_concurrent_writes_after_materialization() {
     let root = durable_temp_dir("block-journal-root-copy-serialization");
     let cfg = config();
