@@ -15,11 +15,13 @@ IO_SIZES="${IO_SIZES:-4k,64k,256k,1m,32m}"
 TOY_RTTS="${TOY_RTTS:-0,200}"
 TOY_DURABILITIES="${TOY_DURABILITIES:-ack-flush:1,flushed}"
 TOY_REPEATS="${TOY_REPEATS:-2}"
+TOY_DURABLE_IO_BACKEND="${TOY_DURABLE_IO_BACKEND:-filesystem}"
 TOY_CHUNK_MIB="${TOY_CHUNK_MIB:-2}"
 TOY_CHUNK_SWEEP="${TOY_CHUNK_SWEEP:-2,4,8}"
 TOY_CHUNK_SWEEP_SIZES="${TOY_CHUNK_SWEEP_SIZES:-1m,32m}"
 TOY_CHUNK_SWEEP_CONCURRENCY="${TOY_CHUNK_SWEEP_CONCURRENCY:-1,32}"
 SKIP_TOY="${SKIP_TOY:-0}"
+SKIP_CEPH="${SKIP_CEPH:-0}"
 DELAY_MODE="${DELAY_MODE:-spin}"
 DURATION_MS="${DURATION_MS:-5000}"
 WARMUP_MS="${WARMUP_MS:-1000}"
@@ -62,6 +64,23 @@ normalize_size_label() {
   case "$1" in
     265k) printf '%s\n' 256k ;;
     *) printf '%s\n' "$1" ;;
+  esac
+}
+
+toy_resolved_durable_io_backend() {
+  case "${TOY_DURABLE_IO_BACKEND}" in
+    filesystem|fs|buffered)
+      printf '%s\n' filesystem
+      ;;
+    direct-io|direct|odirect)
+      printf '%s\n' direct-io
+      ;;
+    direct-io-or-filesystem|direct-or-fs|auto)
+      printf '%s\n' auto-probed-by-loadbench
+      ;;
+    *)
+      printf '%s\n' unknown
+      ;;
   esac
 }
 
@@ -129,12 +148,15 @@ fi
   echo "toy_rtts=${TOY_RTTS}"
   echo "toy_durabilities=${TOY_DURABILITIES}"
   echo "toy_repeats=${TOY_REPEATS}"
+  echo "toy_durable_io_backend=${TOY_DURABLE_IO_BACKEND}"
+  echo "toy_resolved_durable_io_backend=$(toy_resolved_durable_io_backend)"
   echo "toy_chunk_mib=${TOY_CHUNK_MIB}"
   echo "toy_chunk_sweep=${TOY_CHUNK_SWEEP}"
   echo "toy_chunk_sweep_sizes=${TOY_CHUNK_SWEEP_SIZES}"
   echo "toy_chunk_sweep_concurrency=${TOY_CHUNK_SWEEP_CONCURRENCY}"
   echo "colocated_node=${COLOCATED_NODE}"
   echo "skip_toy=${SKIP_TOY}"
+  echo "skip_ceph=${SKIP_CEPH}"
   echo "delay_mode=${DELAY_MODE}"
   echo "duration_ms=${DURATION_MS}"
   echo "warmup_ms=${WARMUP_MS}"
@@ -276,6 +298,7 @@ run_toy_case() {
   "${LOADBENCH}" \
     --provider durable \
     --durability "${durability}" \
+    --durable-io-backend "${TOY_DURABLE_IO_BACKEND}" \
     --workloads block-batch-4k-16ops \
     --block-batch-ops 1 \
     --block-batch-bytes "${bytes}" \
@@ -501,11 +524,17 @@ summarize_results() {
 import csv
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+toy_backend = os.environ.get("TOY_DURABLE_IO_BACKEND", "filesystem")
+toy_resolved_backend = os.environ.get(
+    "TOY_RESOLVED_DURABLE_IO_BACKEND",
+    "unknown",
+)
 
 def parse_size_label(label):
     table = {
@@ -544,7 +573,7 @@ for path in sorted((root / "toy").glob("size-*/matrix.csv")):
     with path.open(newline="") as f:
         for row in csv.DictReader(f):
             raw_rows.append({
-                "system": f"toy-block-{durability}",
+                "system": f"toy-block-{durability}-{toy_backend}",
                 "io_size": io_size,
                 "size_bytes": parse_size_label(io_size),
                 "rtt_us": rtt_us,
@@ -559,8 +588,11 @@ for path in sorted((root / "toy").glob("size-*/matrix.csv")):
                 "max_us": as_float(row["max_us"]),
                 "errors": row["errors"],
                 "source": str(path.relative_to(root)),
+                "toy_durable_io_backend": toy_backend,
+                "toy_resolved_durable_io_backend": toy_resolved_backend,
                 "semantics": (
-                    f"loadbench durable {durability}, "
+                    f"loadbench durable {durability}, backend "
+                    f"{toy_backend}, "
                     "one random block-batch write per op"
                 ),
             })
@@ -614,6 +646,8 @@ for path in sorted((root / "ceph").glob("size-*/fio.json")):
         "max_us": as_float(write.get("clat_ns", {}).get("max", 0)) / 1000.0,
         "errors": job.get("error", 0),
         "source": str(path.relative_to(root)),
+        "toy_durable_io_backend": "",
+        "toy_resolved_durable_io_backend": "",
         "semantics": "fio randwrite direct=1 through librbd, pool size 1",
     })
 
@@ -632,6 +666,8 @@ fields = [
     "max_us",
     "errors",
     "source",
+    "toy_durable_io_backend",
+    "toy_resolved_durable_io_backend",
     "semantics",
 ]
 with (root / "comparison-summary.csv").open("w", newline="") as f:
@@ -700,9 +736,15 @@ PY
 if [[ "${SKIP_TOY}" == "1" ]]; then
   log "skipping toy matrix"
 else
+  export TOY_RESOLVED_DURABLE_IO_BACKEND
+  TOY_RESOLVED_DURABLE_IO_BACKEND="$(toy_resolved_durable_io_backend)"
   run_toy_matrix
 fi
-run_ceph_matrix
+if [[ "${SKIP_CEPH}" == "1" ]]; then
+  log "skipping ceph matrix"
+else
+  run_ceph_matrix
+fi
 summarize_results
 teardown_storage
 log "complete"

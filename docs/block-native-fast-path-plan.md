@@ -487,6 +487,43 @@ Stage 6 implementation checkpoint, 2026-06-19:
 - No Stage 6 performance win is claimed until GCP direct-I/O measurements show
   improvement over the filesystem backend.
 
+Stage 6 GCP measurement note, 2026-06-19:
+
+- Provenance: branch `codex/block-direct-io-gcp-measurement`, based on
+  `codex/block-direct-io-phase-6`; commit under test `6484f10` plus the
+  uncommitted two-file harness diff in
+  `infra/gcp-local-nvme-bench/run_block_vs_rbd.sh` and
+  `infra/gcp-local-nvme-bench/remote_block_vs_rbd.sh` that added
+  `TOY_DURABLE_IO_BACKEND` propagation and backend result labels.
+- GCP runs on `c4-standard-32-lssd` in `us-east1-b`, local SSD, pool-size-1
+  Ceph RBD, RTT 0, flushed durability, concurrency `1,4,16,32`, sizes
+  `4k,64k,256k`:
+  - filesystem backend: `stage6-filesystem-20260619-001`, artifacts in
+    `infra/gcp-local-nvme-bench/results/stage6-filesystem-20260619-001/` and
+    `infra/gcp-local-nvme-bench/results/stage6-filesystem-20260619-001-results.tgz`;
+  - direct-I/O backend: `stage6-direct-io-20260619-001`, artifacts in
+    `infra/gcp-local-nvme-bench/results/stage6-direct-io-20260619-001/` and
+    `infra/gcp-local-nvme-bench/results/stage6-direct-io-20260619-001-results.tgz`.
+- Reviewer correction: do not use the "best clean rows" ratio table as an
+  apples-to-apples backend comparison, because the 64K and 256K rows compare
+  direct-I/O at concurrency 4 against filesystem/Ceph at concurrency 32.
+- Same-concurrency direct-I/O versus filesystem facts:
+  - 64K: `0.960x` throughput / `1.090x` p99 at concurrency 1; `0.974x`
+    throughput / `0.930x` p99 at concurrency 4; direct-I/O had errors at
+    concurrency 16 and 32.
+  - 256K: `1.038x` throughput / `0.874x` p99 at concurrency 1; `0.893x`
+    throughput / `1.175x` p99 at concurrency 4; direct-I/O had errors at
+    concurrency 16 and 32.
+- Direct-I/O high-concurrency error rows:
+  - 64K concurrency 16: 58,737 errors.
+  - 64K concurrency 32: 238,573 errors.
+  - 256K concurrency 16: 238,899 errors.
+  - 256K concurrency 32: 409,418 errors.
+- Conclusion: direct-I/O resolved successfully on GCP local SSD, but it does
+  not justify keeping as a performance path until high-concurrency errors are
+  root-caused. Throughput tuning should wait until that correctness issue is
+  understood.
+
 ### Stage 7: SPDK / NVMe-oF Evaluation
 
 Evaluate a separate SPDK-style backend only after the Rust/filesystem/direct-I/O
