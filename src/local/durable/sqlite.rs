@@ -1909,21 +1909,6 @@ fn durable_journal_frame<T: DurableCodec>(
     durable_journal_frame_from_payload(encode_row(record)?, magic, too_large_reason)
 }
 
-/// Frame a slice of records with the same wire format as a `Vec<T>` row, so
-/// batch writers can frame without first cloning records into a `Vec`.
-fn durable_journal_slice_frame<T: DurableCodec>(
-    records: &[T],
-    magic: &[u8; 8],
-    too_large_reason: &'static str,
-) -> Result<Vec<u8>> {
-    let mut encoder = DurableEncoder::default();
-    usize_to_u64(records.len()).encode(&mut encoder)?;
-    for record in records {
-        record.encode(&mut encoder)?;
-    }
-    durable_journal_frame_from_payload(encoder.finish(), magic, too_large_reason)
-}
-
 fn durable_journal_frame_from_payload(
     payload: Vec<u8>,
     magic: &[u8; 8],
@@ -2158,26 +2143,21 @@ pub(super) fn append_block_journal_records_unsynced(
                     BlockJournalEntry::Segment { .. } | BlockJournalEntry::Sparse { .. } => 0,
                 })
                 .fold(128_u64, u64::saturating_add),
+            BlockJournalRecord::PackedWrites(packed) => {
+                usize_to_u64(packed.payload_slab.len()).saturating_add(128)
+            }
             BlockJournalRecord::Lease { .. } | BlockJournalRecord::Flush { .. } => 128,
         };
         if index > frame_start
             && frame_bytes.saturating_add(record_bytes) > BLOCK_JOURNAL_TARGET_FRAME_BYTES
         {
-            bytes.extend_from_slice(&durable_journal_slice_frame(
-                &records[frame_start..index],
-                &BLOCK_JOURNAL_MAGIC,
-                "block journal record exceeds durable payload limit",
-            )?);
+            bytes.extend_from_slice(&block_journal_records_frame(&records[frame_start..index])?);
             frame_start = index;
             frame_bytes = 0;
         }
         frame_bytes = frame_bytes.saturating_add(record_bytes);
     }
-    bytes.extend_from_slice(&durable_journal_slice_frame(
-        &records[frame_start..],
-        &BLOCK_JOURNAL_MAGIC,
-        "block journal record exceeds durable payload limit",
-    )?);
+    bytes.extend_from_slice(&block_journal_records_frame(&records[frame_start..])?);
     let encode_nanos = duration_nanos_u64(encode_started.elapsed());
     let mut profile = append_durable_journal_bytes(path, &bytes, false)?;
     profile.encode_nanos = encode_nanos;

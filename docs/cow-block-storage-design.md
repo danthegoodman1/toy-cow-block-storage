@@ -170,11 +170,17 @@ device, write records append and publish in commit-sequence order, and a
 flush marker never covers a sequence whose write record is not yet appended.
 
 Writes whose total payload is at or below a provider-private inline cap
-(default 16 KiB) carry payload bytes inside the journal record, split into
-block-native inline entries, so a small write costs one lane append on its
-shard's journal file. Larger writes place payload segments on per-node data
-logs, striped in provider-private chunks (default 2 MiB) round-robin across
-storage nodes so one large write spreads payload bandwidth and payload syncs
+(default 16 KiB) carry payload bytes inside the journal. A singleton inline
+write may remain a normal write record, while a lane batch with multiple
+eligible inline writes for one device and writer epoch encodes them as one
+versioned packed record with commit-sequence deltas, block-aligned LBA
+entries, a contiguous payload slab, and a CRC32C over that slab. Replay
+expands packed entries into equivalent single-entry commit-sequence writes
+before applying flush high-water rules, so packing changes durable bytes and
+encode cost but not visibility, fencing, or flush semantics. Larger writes place
+payload segments on per-node data logs, striped in provider-private chunks
+(default 2 MiB) round-robin across storage nodes so one large write spreads
+payload bandwidth and payload syncs
 over every data disk, and the journal records only small segment references.
 Chunks are shared windows into the one collapsed write buffer rather than
 per-chunk copies: the same allocation backs the staged segment in the

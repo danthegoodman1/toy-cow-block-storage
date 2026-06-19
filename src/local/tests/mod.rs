@@ -3788,6 +3788,182 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn durable_block_journal_packed_inline_writes_replay_mixed_records_and_ignore_torn_tail() {
+    let root = durable_temp_dir("block-journal-packed-inline");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    store.enable_persist_profiling(16).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("journal-packed-inline".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let _ = store.drain_persist_profiles(16).unwrap();
+
+    let acknowledged = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 40),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let _ = store.drain_persist_profiles(16).unwrap();
+
+    let first_seq = store
+        .local
+        .metadata
+        .reserve_block_journal_commit_seq(device_id)
+        .unwrap();
+    let first = BlockJournalCommit {
+        device_id,
+        writer_epoch: lease.writer_epoch,
+        commit_seq: first_seq,
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: 4096,
+        entries: vec![BlockJournalEntry::Write {
+            range: ByteRange::new(0, 4096),
+            payload_integrity: PayloadIntegrity::Verified,
+            bytes: repeated_blocks(1, 41),
+        }],
+    };
+    let second_seq = store
+        .local
+        .metadata
+        .reserve_block_journal_commit_seq(device_id)
+        .unwrap();
+    let second = BlockJournalCommit {
+        device_id,
+        writer_epoch: lease.writer_epoch,
+        commit_seq: second_seq,
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: 4096,
+        entries: vec![BlockJournalEntry::Write {
+            range: ByteRange::new(4096, 4096),
+            payload_integrity: PayloadIntegrity::Verified,
+            bytes: repeated_blocks(1, 42),
+        }],
+    };
+    let (shard, first_request) = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(first))
+        .unwrap();
+    let (_, second_request) = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(second))
+        .unwrap();
+    store
+        .wait_for_block_journal_request(shard, second_request)
+        .unwrap();
+    store
+        .wait_for_block_journal_request(shard, first_request)
+        .unwrap();
+
+    let profiles = store.drain_persist_profiles(16).unwrap();
+    assert!(profiles.iter().any(|profile| {
+        profile.block_journal_flush_group_size == 2
+            && profile.block_journal_record_count == 3
+            && profile.block_journal_sync_nanos > 0
+            && profile.durable_commit_high_water == second_seq.raw()
+    }));
+    assert_eq!(
+        store.block_journal.durable_through(device_id).unwrap(),
+        second_seq
+    );
+
+    let records = store.durable.block_journal_records().unwrap();
+    let packed = records
+        .iter()
+        .find_map(|record| match record {
+            BlockJournalRecord::PackedWrites(packed) => Some(packed),
+            _ => None,
+        })
+        .expect("two eligible lane writes should encode as one packed record");
+    assert_eq!(packed.device_id, device_id);
+    assert_eq!(packed.writer_epoch, lease.writer_epoch);
+    assert_eq!(packed.expand_commits().unwrap().len(), 2);
+    assert!(records.iter().any(|record| matches!(record, BlockJournalRecord::Write(commit) if commit.commit_seq == acknowledged.commit_seq)));
+
+    let mut live = vec![9; 3 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut live)
+        .unwrap();
+    assert_eq!(&live[0..4096], repeated_blocks(1, 41).as_slice());
+    assert_eq!(&live[4096..2 * 4096], repeated_blocks(1, 42).as_slice());
+    assert_eq!(&live[2 * 4096..3 * 4096], vec![0; 4096].as_slice());
+
+    let fresh = store.acquire_block_writer(device_id).unwrap();
+    let tail_first = BlockJournalCommit {
+        device_id,
+        writer_epoch: fresh.writer_epoch,
+        commit_seq: CommitSeq::from_raw(second_seq.raw() + 1),
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: 4096,
+        entries: vec![BlockJournalEntry::Write {
+            range: ByteRange::new(2 * 4096, 4096),
+            payload_integrity: PayloadIntegrity::Verified,
+            bytes: repeated_blocks(1, 43),
+        }],
+    };
+    let tail_second = BlockJournalCommit {
+        device_id,
+        writer_epoch: fresh.writer_epoch,
+        commit_seq: CommitSeq::from_raw(second_seq.raw() + 2),
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: 4096,
+        entries: vec![BlockJournalEntry::Write {
+            range: ByteRange::new(3 * 4096, 4096),
+            payload_integrity: PayloadIntegrity::Verified,
+            bytes: repeated_blocks(1, 44),
+        }],
+    };
+    let tail = block_journal_records_frame(&[
+        BlockJournalRecord::Write(tail_first),
+        BlockJournalRecord::Write(tail_second),
+        BlockJournalRecord::Flush {
+            device_id,
+            writer_epoch: fresh.writer_epoch,
+            durable_through: CommitSeq::from_raw(second_seq.raw() + 2),
+        },
+    ])
+    .unwrap();
+    let journal = store.durable.block_journal_shard_path_for_device(device_id);
+    let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+    file.write_all(&tail[..tail.len() - 1]).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert!(matches!(
+        reopened.write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 99),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Conflict { .. })
+    ));
+    let mut replayed = vec![9; 4 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4 * 4096), &mut replayed)
+        .unwrap();
+    assert_eq!(&replayed[0..4096], repeated_blocks(1, 41).as_slice());
+    assert_eq!(&replayed[4096..2 * 4096], repeated_blocks(1, 42).as_slice());
+    assert_eq!(&replayed[2 * 4096..4 * 4096], vec![0; 2 * 4096].as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
 // One lane batch must share one journal append and one sync across write and
 // flush boundaries, and per-device Flush records must merge.
 #[test]

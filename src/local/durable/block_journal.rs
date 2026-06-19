@@ -32,12 +32,33 @@ pub(super) struct BlockJournalCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PackedBlockJournalEntry {
+    commit_seq_delta: u64,
+    lba: u64,
+    block_count: u64,
+    payload_offset: u64,
+    payload_integrity: PayloadIntegrity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PackedBlockJournalWrites {
+    device_id: DeviceId,
+    writer_epoch: WriterEpoch,
+    block_size: u64,
+    first_commit_seq: CommitSeq,
+    entries: Vec<PackedBlockJournalEntry>,
+    payload_checksum: u64,
+    payload_slab: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum BlockJournalRecord {
     Lease {
         device_id: DeviceId,
         writer_epoch: WriterEpoch,
     },
     Write(BlockJournalCommit),
+    PackedWrites(PackedBlockJournalWrites),
     Flush {
         device_id: DeviceId,
         writer_epoch: WriterEpoch,
@@ -311,6 +332,129 @@ impl BlockJournalCommit {
             )?;
         }
         Ok(entries)
+    }
+}
+
+impl PackedBlockJournalWrites {
+    fn commit_seq_for_entry(&self, entry: &PackedBlockJournalEntry) -> Result<CommitSeq> {
+        let raw = self
+            .first_commit_seq
+            .raw()
+            .checked_add(entry.commit_seq_delta)
+            .ok_or_else(|| StorageError::corrupt("packed block journal commit sequence overflows"))?;
+        Ok(CommitSeq::from_raw(raw))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.block_size == 0 {
+            return Err(StorageError::corrupt(
+                "packed block journal block size must be nonzero",
+            ));
+        }
+        if self.entries.is_empty() {
+            return Err(StorageError::corrupt(
+                "packed block journal record has no entries",
+            ));
+        }
+        if data_log_checksum(&self.payload_slab) != self.payload_checksum {
+            return Err(StorageError::corrupt(
+                "packed block journal payload checksum mismatch",
+            ));
+        }
+
+        let mut expected_payload_offset = 0_u64;
+        let payload_len = usize_to_u64(self.payload_slab.len());
+        let mut previous_commit_seq = None;
+        for (entry_index, entry) in self.entries.iter().enumerate() {
+            if entry_index == 0 && entry.commit_seq_delta != 0 {
+                return Err(StorageError::corrupt(
+                    "packed block journal first commit sequence disagrees with base",
+                ));
+            }
+            let commit_seq = self.commit_seq_for_entry(entry)?;
+            if previous_commit_seq.is_some_and(|previous| commit_seq.raw() <= previous) {
+                return Err(StorageError::corrupt(
+                    "packed block journal commit sequences are not monotonic",
+                ));
+            }
+            previous_commit_seq = Some(commit_seq.raw());
+
+            if entry.block_count == 0 {
+                return Err(StorageError::corrupt(
+                    "packed block journal entry has zero block count",
+                ));
+            }
+            let len = entry.block_count.checked_mul(self.block_size).ok_or_else(|| {
+                StorageError::corrupt("packed block journal entry length overflows")
+            })?;
+            let _offset = entry.lba.checked_mul(self.block_size).ok_or_else(|| {
+                StorageError::corrupt("packed block journal entry offset overflows")
+            })?;
+            if entry.payload_offset != expected_payload_offset {
+                return Err(StorageError::corrupt(
+                    "packed block journal payload offsets are not contiguous",
+                ));
+            }
+            expected_payload_offset =
+                entry.payload_offset.checked_add(len).ok_or_else(|| {
+                    StorageError::corrupt("packed block journal payload range overflows")
+                })?;
+            if expected_payload_offset > payload_len {
+                return Err(StorageError::corrupt(
+                    "packed block journal payload range out of bounds",
+                ));
+            }
+        }
+        if expected_payload_offset != payload_len {
+            return Err(StorageError::corrupt(
+                "packed block journal payload slab has trailing bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn expand_commits(&self) -> Result<Vec<BlockJournalCommit>> {
+        self.validate()?;
+        let mut out = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let commit_seq = self.commit_seq_for_entry(entry)?;
+            let offset = entry.lba.checked_mul(self.block_size).ok_or_else(|| {
+                StorageError::corrupt("packed block journal entry offset overflows")
+            })?;
+            let len = entry.block_count.checked_mul(self.block_size).ok_or_else(|| {
+                StorageError::corrupt("packed block journal entry length overflows")
+            })?;
+            let payload_end = entry.payload_offset.checked_add(len).ok_or_else(|| {
+                StorageError::corrupt("packed block journal payload range overflows")
+            })?;
+            let payload_start = usize::try_from(entry.payload_offset).map_err(|_| {
+                StorageError::corrupt("packed block journal payload offset overflows usize")
+            })?;
+            let payload_end = usize::try_from(payload_end).map_err(|_| {
+                StorageError::corrupt("packed block journal payload end overflows usize")
+            })?;
+            let bytes = self
+                .payload_slab
+                .get(payload_start..payload_end)
+                .ok_or_else(|| {
+                    StorageError::corrupt("packed block journal payload range out of bounds")
+                })?
+                .to_vec();
+            out.push(BlockJournalCommit {
+                device_id: self.device_id,
+                writer_epoch: self.writer_epoch,
+                commit_seq,
+                write_count: 1,
+                collapsed_range_count: 1,
+                committed_bytes: len,
+                entries: vec![BlockJournalEntry::Write {
+                    range: ByteRange::new(offset, len),
+                    payload_integrity: entry.payload_integrity,
+                    bytes,
+                }],
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -1726,6 +1870,98 @@ mod block_journal_tests {
             vec![ByteRange::new(0, read_len as u64)]
         );
     }
+
+    #[test]
+    fn block_journal_packed_write_record_round_trips_and_expands() {
+        let device_id = DeviceId::from_raw(18);
+        let first = journal_commit(device_id, 7, 0, repeated_block(41, 4096));
+        let second = journal_commit(device_id, 9, 4096, repeated_block(42, 4096));
+        let records = vec![
+            BlockJournalRecord::Write(first.clone()),
+            BlockJournalRecord::Write(second.clone()),
+        ];
+
+        let mut encoder = DurableEncoder::default();
+        encode_block_journal_record_sequence(&records, &mut encoder).unwrap();
+        let decoded = decode_row::<Vec<BlockJournalRecord>>(&encoder.finish()).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        let BlockJournalRecord::PackedWrites(packed) = &decoded[0] else {
+            panic!("eligible inline writes should encode as one packed record");
+        };
+        assert_eq!(packed.device_id, device_id);
+        assert_eq!(packed.writer_epoch, WriterEpoch::from_raw(1));
+        assert_eq!(packed.first_commit_seq, CommitSeq::from_raw(7));
+        assert_eq!(packed.block_size, 4096);
+        assert_eq!(packed.entries.len(), 2);
+        assert_eq!(packed.entries[0].commit_seq_delta, 0);
+        assert_eq!(packed.entries[1].commit_seq_delta, 2);
+        assert_eq!(packed.expand_commits().unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn block_journal_packed_write_record_rejects_bad_checksum() {
+        let payload = [repeated_block(51, 4096), repeated_block(52, 4096)].concat();
+        let packed = PackedBlockJournalWrites {
+            device_id: DeviceId::from_raw(19),
+            writer_epoch: WriterEpoch::from_raw(3),
+            block_size: 4096,
+            first_commit_seq: CommitSeq::from_raw(11),
+            entries: vec![
+                PackedBlockJournalEntry {
+                    commit_seq_delta: 0,
+                    lba: 0,
+                    block_count: 1,
+                    payload_offset: 0,
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+                PackedBlockJournalEntry {
+                    commit_seq_delta: 1,
+                    lba: 1,
+                    block_count: 1,
+                    payload_offset: 4096,
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+            ],
+            payload_checksum: 0,
+            payload_slab: payload,
+        };
+
+        let bytes = encode_row(&BlockJournalRecord::PackedWrites(packed)).unwrap();
+        assert!(decode_row::<BlockJournalRecord>(&bytes).is_err());
+    }
+
+    #[test]
+    fn block_journal_packed_write_record_rejects_nonmonotonic_sequences() {
+        let payload = [repeated_block(61, 4096), repeated_block(62, 4096)].concat();
+        let packed = PackedBlockJournalWrites {
+            device_id: DeviceId::from_raw(20),
+            writer_epoch: WriterEpoch::from_raw(3),
+            block_size: 4096,
+            first_commit_seq: CommitSeq::from_raw(11),
+            entries: vec![
+                PackedBlockJournalEntry {
+                    commit_seq_delta: 0,
+                    lba: 0,
+                    block_count: 1,
+                    payload_offset: 0,
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+                PackedBlockJournalEntry {
+                    commit_seq_delta: 0,
+                    lba: 1,
+                    block_count: 1,
+                    payload_offset: 4096,
+                    payload_integrity: PayloadIntegrity::Verified,
+                },
+            ],
+            payload_checksum: data_log_checksum(&payload),
+            payload_slab: payload,
+        };
+
+        let bytes = encode_row(&BlockJournalRecord::PackedWrites(packed)).unwrap();
+        assert!(decode_row::<BlockJournalRecord>(&bytes).is_err());
+    }
 }
 
 impl DurableCodec for BlockJournalEntry {
@@ -1812,6 +2048,73 @@ impl DurableCodec for BlockJournalCommit {
     }
 }
 
+impl DurableCodec for PackedBlockJournalEntry {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        self.commit_seq_delta.encode(out)?;
+        self.lba.encode(out)?;
+        self.block_count.encode(out)?;
+        self.payload_offset.encode(out)?;
+        self.payload_integrity.encode(out)
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        Ok(Self {
+            commit_seq_delta: u64::decode(input)?,
+            lba: u64::decode(input)?,
+            block_count: u64::decode(input)?,
+            payload_offset: u64::decode(input)?,
+            payload_integrity: PayloadIntegrity::decode(input)?,
+        })
+    }
+}
+
+impl DurableCodec for PackedBlockJournalWrites {
+    fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
+        1u8.encode(out)?;
+        self.device_id.encode(out)?;
+        self.writer_epoch.encode(out)?;
+        self.block_size.encode(out)?;
+        self.first_commit_seq.encode(out)?;
+        self.entries.encode(out)?;
+        usize_to_u64(self.payload_slab.len()).encode(out)?;
+        self.payload_checksum.encode(out)?;
+        out.bytes.extend_from_slice(&self.payload_slab);
+        Ok(())
+    }
+
+    fn decode(input: &mut DurableDecoder<'_>) -> Result<Self> {
+        match u8::decode(input)? {
+            1 => {
+                let device_id = DeviceId::decode(input)?;
+                let writer_epoch = WriterEpoch::decode(input)?;
+                let block_size = u64::decode(input)?;
+                let first_commit_seq = CommitSeq::decode(input)?;
+                let entries = Vec::<PackedBlockJournalEntry>::decode(input)?;
+                let payload_len = u64::decode(input)?;
+                let payload_checksum = u64::decode(input)?;
+                let payload_len = usize::try_from(payload_len).map_err(|_| {
+                    durable_codec_error("packed block journal payload length overflows usize")
+                })?;
+                let payload_slab = input.take(payload_len)?.to_vec();
+                let packed = Self {
+                    device_id,
+                    writer_epoch,
+                    block_size,
+                    first_commit_seq,
+                    entries,
+                    payload_checksum,
+                    payload_slab,
+                };
+                packed.validate()?;
+                Ok(packed)
+            }
+            _ => Err(durable_codec_error(
+                "invalid packed block journal write version",
+            )),
+        }
+    }
+}
+
 impl DurableCodec for BlockJournalRecord {
     fn encode(&self, out: &mut DurableEncoder) -> Result<()> {
         match self {
@@ -1826,6 +2129,10 @@ impl DurableCodec for BlockJournalRecord {
             Self::Write(commit) => {
                 2u8.encode(out)?;
                 commit.encode(out)
+            }
+            Self::PackedWrites(packed) => {
+                4u8.encode(out)?;
+                packed.encode(out)
             }
             Self::Flush {
                 device_id,
@@ -1852,9 +2159,256 @@ impl DurableCodec for BlockJournalRecord {
                 writer_epoch: WriterEpoch::decode(input)?,
                 durable_through: CommitSeq::decode(input)?,
             }),
+            4 => Ok(Self::PackedWrites(PackedBlockJournalWrites::decode(input)?)),
             _ => Err(durable_codec_error("invalid block journal record kind")),
         }
     }
+}
+
+fn block_journal_gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn block_journal_packing_unit_add(unit: u64, value: u64) -> u64 {
+    if value == 0 {
+        unit
+    } else if unit == 0 {
+        value
+    } else {
+        block_journal_gcd(unit, value)
+    }
+}
+
+fn block_journal_commit_packing_entry(
+    commit: &BlockJournalCommit,
+) -> Option<(&ByteRange, PayloadIntegrity, &[u8])> {
+    if commit.write_count != 1 || commit.collapsed_range_count != 1 || commit.entries.len() != 1 {
+        return None;
+    }
+    let BlockJournalEntry::Write {
+        range,
+        payload_integrity,
+        bytes,
+    } = &commit.entries[0]
+    else {
+        return None;
+    };
+    if range.len == 0 {
+        return None;
+    }
+    let bytes_len = u64::try_from(bytes.len()).ok()?;
+    if bytes_len != range.len || commit.committed_bytes != range.len {
+        return None;
+    }
+    Some((range, *payload_integrity, bytes))
+}
+
+fn block_journal_packed_group_len(
+    records: &[BlockJournalRecord],
+    start: usize,
+) -> Option<usize> {
+    let BlockJournalRecord::Write(first) = records.get(start)? else {
+        return None;
+    };
+    let mut group_len = 0_usize;
+    let mut previous_seq = None;
+    for record in &records[start..] {
+        let BlockJournalRecord::Write(commit) = record else {
+            break;
+        };
+        if commit.device_id != first.device_id || commit.writer_epoch != first.writer_epoch {
+            break;
+        }
+        if previous_seq.is_some_and(|seq| commit.commit_seq.raw() <= seq) {
+            break;
+        }
+        block_journal_commit_packing_entry(commit)?;
+        group_len = group_len.saturating_add(1);
+        previous_seq = Some(commit.commit_seq.raw());
+    }
+    if group_len > 1 {
+        Some(group_len)
+    } else {
+        None
+    }
+}
+
+fn block_journal_packed_group_unit(records: &[BlockJournalRecord]) -> Result<u64> {
+    let mut unit = 0_u64;
+    for record in records {
+        let BlockJournalRecord::Write(commit) = record else {
+            return Err(StorageError::corrupt(
+                "packed block journal group includes non-write record",
+            ));
+        };
+        let (range, _, _) = block_journal_commit_packing_entry(commit).ok_or_else(|| {
+            StorageError::corrupt("packed block journal group includes ineligible write")
+        })?;
+        unit = block_journal_packing_unit_add(unit, range.offset);
+        unit = block_journal_packing_unit_add(unit, range.len);
+    }
+    if unit == 0 {
+        return Err(StorageError::corrupt(
+            "packed block journal group has no range unit",
+        ));
+    }
+    Ok(unit)
+}
+
+fn block_journal_encoded_record_count(records: &[BlockJournalRecord]) -> Result<u64> {
+    let mut count = 0_u64;
+    let mut index = 0_usize;
+    while index < records.len() {
+        if let Some(group_len) = block_journal_packed_group_len(records, index) {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("block journal record count overflows"))?;
+            index = index.saturating_add(group_len);
+        } else {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| StorageError::conflict("block journal record count overflows"))?;
+            index = index.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn encode_packed_block_journal_writes_from_records(
+    records: &[BlockJournalRecord],
+    out: &mut DurableEncoder,
+) -> Result<()> {
+    let Some(BlockJournalRecord::Write(first)) = records.first() else {
+        return Err(StorageError::invalid_argument(
+            "packed block journal group must start with a write",
+        ));
+    };
+    4u8.encode(out)?;
+    1u8.encode(out)?;
+    first.device_id.encode(out)?;
+    first.writer_epoch.encode(out)?;
+    let block_size = block_journal_packed_group_unit(records)?;
+    block_size.encode(out)?;
+    first.commit_seq.encode(out)?;
+    usize_to_u64(records.len()).encode(out)?;
+    let mut payload_offset = 0_u64;
+    let mut payload_chunks = Vec::new();
+    for record in records {
+        let BlockJournalRecord::Write(commit) = record else {
+            return Err(StorageError::corrupt(
+                "packed block journal group includes non-write record",
+            ));
+        };
+        let (range, payload_integrity, bytes) = block_journal_commit_packing_entry(commit)
+            .ok_or_else(|| {
+                StorageError::corrupt("packed block journal group includes ineligible write")
+            })?;
+        let commit_seq_delta = commit
+            .commit_seq
+            .raw()
+            .checked_sub(first.commit_seq.raw())
+            .ok_or_else(|| StorageError::corrupt("packed block journal sequence underflows"))?;
+        commit_seq_delta.encode(out)?;
+        if !range.offset.is_multiple_of(block_size) || !range.len.is_multiple_of(block_size) {
+            return Err(StorageError::corrupt(
+                "packed block journal range is not aligned to packing unit",
+            ));
+        }
+        let lba = range.offset / block_size;
+        let block_count = range.len / block_size;
+        lba.encode(out)?;
+        block_count.encode(out)?;
+        payload_offset.encode(out)?;
+        payload_integrity.encode(out)?;
+        payload_offset = payload_offset.checked_add(range.len).ok_or_else(|| {
+            StorageError::conflict("packed block journal payload offset overflows")
+        })?;
+        payload_chunks.push(bytes);
+    }
+
+    payload_offset.encode(out)?;
+    data_log_checksum_chunks(&payload_chunks).encode(out)?;
+    for chunk in payload_chunks {
+        out.bytes.extend_from_slice(chunk);
+    }
+    Ok(())
+}
+
+fn encode_block_journal_record_sequence(
+    records: &[BlockJournalRecord],
+    out: &mut DurableEncoder,
+) -> Result<()> {
+    block_journal_encoded_record_count(records)?.encode(out)?;
+    let mut index = 0_usize;
+    while index < records.len() {
+        if let Some(group_len) = block_journal_packed_group_len(records, index) {
+            encode_packed_block_journal_writes_from_records(
+                &records[index..index + group_len],
+                out,
+            )?;
+            index += group_len;
+        } else {
+            records[index].encode(out)?;
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn block_journal_records_frame(records: &[BlockJournalRecord]) -> Result<Vec<u8>> {
+    let mut encoder = DurableEncoder::default();
+    encode_block_journal_record_sequence(records, &mut encoder)?;
+    durable_journal_frame_from_payload(
+        encoder.finish(),
+        &BLOCK_JOURNAL_MAGIC,
+        "block journal record exceeds durable payload limit",
+    )
+}
+
+fn observe_block_journal_replay_write(
+    local: &LocalCoordinator,
+    overlay: &BlockJournalOverlay,
+    latest_epoch: &mut BTreeMap<DeviceId, WriterEpoch>,
+    writes: &mut BTreeMap<DeviceId, BTreeMap<u64, BlockJournalCommit>>,
+    last_write_seq: &mut BTreeMap<DeviceId, u64>,
+    commit: BlockJournalCommit,
+) -> Result<()> {
+    if last_write_seq
+        .get(&commit.device_id)
+        .is_some_and(|previous| commit.commit_seq.raw() <= *previous)
+    {
+        return Err(StorageError::corrupt(
+            "block journal write commit sequences are not monotonic",
+        ));
+    }
+    last_write_seq.insert(commit.device_id, commit.commit_seq.raw());
+
+    let info = local.metadata.device_info(commit.device_id)?;
+    commit.validate(&info.spec)?;
+    local
+        .metadata
+        .observe_allocated_commit_seq(commit.commit_seq)?;
+    local.seed_block_writer_epoch(commit.device_id, commit.writer_epoch)?;
+    overlay.set_writer_epoch(commit.device_id, commit.writer_epoch)?;
+    latest_epoch
+        .entry(commit.device_id)
+        .and_modify(|epoch| *epoch = (*epoch).max(commit.writer_epoch))
+        .or_insert(commit.writer_epoch);
+    let device_writes = writes.entry(commit.device_id).or_default();
+    if device_writes
+        .insert(commit.commit_seq.raw(), commit)
+        .is_some()
+    {
+        return Err(StorageError::corrupt(
+            "block journal contains duplicate write commit sequence",
+        ));
+    }
+    Ok(())
 }
 
 impl DurableSqliteStore {
@@ -1864,6 +2418,7 @@ impl DurableSqliteStore {
         let mut latest_epoch = BTreeMap::<DeviceId, WriterEpoch>::new();
         let mut durable_through = BTreeMap::<DeviceId, CommitSeq>::new();
         let mut writes = BTreeMap::<DeviceId, BTreeMap<u64, BlockJournalCommit>>::new();
+        let mut last_write_seq = BTreeMap::<DeviceId, u64>::new();
 
         for record in records {
             match record {
@@ -1879,25 +2434,25 @@ impl DurableSqliteStore {
                         .or_insert(writer_epoch);
                 }
                 BlockJournalRecord::Write(commit) => {
-                    let info = local.metadata.device_info(commit.device_id)?;
-                    commit.validate(&info.spec)?;
-                    local
-                        .metadata
-                        .observe_allocated_commit_seq(commit.commit_seq)?;
-                    local.seed_block_writer_epoch(commit.device_id, commit.writer_epoch)?;
-                    overlay.set_writer_epoch(commit.device_id, commit.writer_epoch)?;
-                    latest_epoch
-                        .entry(commit.device_id)
-                        .and_modify(|epoch| *epoch = (*epoch).max(commit.writer_epoch))
-                        .or_insert(commit.writer_epoch);
-                    let device_writes = writes.entry(commit.device_id).or_default();
-                    if device_writes
-                        .insert(commit.commit_seq.raw(), commit)
-                        .is_some()
-                    {
-                        return Err(StorageError::corrupt(
-                            "block journal contains duplicate write commit sequence",
-                        ));
+                    observe_block_journal_replay_write(
+                        local,
+                        &overlay,
+                        &mut latest_epoch,
+                        &mut writes,
+                        &mut last_write_seq,
+                        commit,
+                    )?;
+                }
+                BlockJournalRecord::PackedWrites(packed) => {
+                    for commit in packed.expand_commits()? {
+                        observe_block_journal_replay_write(
+                            local,
+                            &overlay,
+                            &mut latest_epoch,
+                            &mut writes,
+                            &mut last_write_seq,
+                            commit,
+                        )?;
                     }
                 }
                 BlockJournalRecord::Flush {

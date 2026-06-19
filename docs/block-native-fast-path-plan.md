@@ -291,6 +291,51 @@ Exit gate:
 - Encode nanos per 4K commit drop materially.
 - No p99 regression from larger frames.
 
+Stage 2 local checkpoint, 2026-06-19, macOS Docker dev container, baseline
+`b874093`, artifacts under ignored Docker `target/loadbench/block-packed-stage2-*`
+and extracted summaries under `/private/tmp/block-packed-stage2-*-extract`:
+
+- Added a versioned packed block-journal record for same-device, same-epoch
+  groups of eligible single-entry inline writes. The packed record stores one
+  compact entry per write (`commit_seq_delta`, LBA, block count, payload offset,
+  integrity), a contiguous payload slab, and a CRC32C over the slab. The outer
+  durable journal frame still covers the full record with its existing checksum.
+- Replay validates checksum, contiguous payload offsets, monotonic commit
+  sequences, and expands packed entries before applying flush high-water marks.
+- Mixed sparse, segment-ref, multi-entry, cross-device, cross-epoch, and
+  singleton writes fall back to the existing record shape.
+- Focused tests cover packed round-trip, bad checksum rejection, non-monotonic
+  sequence rejection, torn packed tail, mixed packed/non-packed replay order,
+  flush high-water preservation, stale-writer fencing, and read-after-write
+  before/after reopen.
+- Key 5s local c16 deltas, with focused reruns used for the noisy 4K lane rows:
+  - `block-batch-4k-16ops`: `3647 -> 5395 IOPS`, p99 `16762 -> 13557 us`.
+  - `block-batch-4k-256ops`: `1285 -> 1662 IOPS`, p99 `40449 -> 38794 us`.
+  - `block-write-4k-shard-lanes`: `16440 -> 16429 IOPS`, p99
+    `1771 -> 1629 us`.
+  - `block-write-4k-device-lanes`: `13112 -> 17348 IOPS`, p99
+    `2533 -> 1492 us`.
+  - `block-writeback-fsync-1m`: `1545 -> 1495 IOPS`, p99
+    `34074 -> 28506 us`.
+  - `block-writeback-prestaged-fsync-1m`: `1580 -> 1686 IOPS`, p99
+    `29487 -> 15419 us`.
+  - `block-read-4k`: `80638 -> 88281 IOPS`, p99 `3349 -> 1050 us`.
+  - `block-read-1m`: `37888 -> 36640 IOPS`, p99 `1809 -> 1909 us`.
+- Profile evidence for `block-write-4k-shard-lanes` c16:
+  frame bytes per write boundary `4196 -> 4145` (-1.2%), encode nanos per
+  boundary `3460 -> 2467` (-28.7%). Because 4096 payload bytes dominate total
+  frame size, the non-payload framing estimate dropped from about 100 bytes to
+  about 49 bytes per write.
+- Profile evidence for `block-write-4k-device-lanes` c16:
+  encode nanos per boundary `4291 -> 3463` (-19.3%); frame bytes were flat
+  because those writes route across devices and do not form same-device packed
+  groups in this run.
+- Residual watch items: `block-writeback-fsync-1m` throughput was -3.2% with
+  better p99, and `block-read-1m` was -3.3% with p99 +5.5%; both are within the
+  local noise/tolerance band but should be watched on the GCP comparator. Total
+  frame-byte reduction should be interpreted against non-payload overhead, not
+  against payload-dominated 4K frame bytes.
+
 ### Stage 3: Real Lane Group Commit
 
 Make each block journal lane a first-class submit queue instead of relying on
