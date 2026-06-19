@@ -460,6 +460,33 @@ Exit gate:
 - Durable latency claims are tied to hardware capabilities and measured flush
   semantics.
 
+Stage 6 implementation checkpoint, 2026-06-19:
+
+- Added an explicitly selected provider-private low-level I/O backend for block
+  journal files and segment data-log files. The default remains buffered
+  filesystem I/O. `direct-io` requires Linux `O_DIRECT` and probes the data
+  directory during open so unsupported configurations fail before the store is
+  usable; `direct-io-or-filesystem` performs the same probe once and falls back
+  deterministically when direct I/O is unsupported.
+- Direct writes reuse per-file aligned anonymous mmap buffers and pad physical
+  appends with zero bytes to the direct-I/O alignment. Logical journal frames,
+  data-log record headers, CRCs, placement offsets, and public API semantics are
+  unchanged. Replay skips zero padding between journal frames or data-log
+  records and still treats nonzero malformed tails as corruption/torn tails per
+  the existing rules. Recovery of missing node-catalog rows uses the physical
+  padded record end for data-log manifest `total_bytes` while preserving logical
+  bytes for placement and CRC validation.
+- Loadbench selection uses `--durable-io-backend filesystem|direct-io|direct-io-or-filesystem`.
+  The selector is intentionally exposed only through a hidden provider benchmark
+  opener, not the crate-root public API. The GCP comparison should run the same
+  durable block workloads twice, changing only that flag. Minimum commands:
+  `cargo run --release --bin loadbench -- --provider durable --durability flushed --durable-io-backend filesystem --workloads block-write-4k-shard-lanes,block-write-4k-device-lanes,block-batch-4k-16ops,block-batch-4k-256ops --block-batch-bytes 4096 --duration-ms 30000 --warmup-ms 5000 --concurrency 1,4,16,32 --storage-nodes <local-nvme-count> --root <filesystem-root> --matrix-csv <filesystem.csv> --durable-profile-csv <filesystem-profiles.csv>`
+  and the same command with `--durable-io-backend direct-io` and direct output
+  paths. Repeat with `--block-batch-bytes 65536` and `--block-batch-bytes
+  262144` for the 64K and 256K block-batch rows.
+- No Stage 6 performance win is claimed until GCP direct-I/O measurements show
+  improvement over the filesystem backend.
+
 ### Stage 7: SPDK / NVMe-oF Evaluation
 
 Evaluate a separate SPDK-style backend only after the Rust/filesystem/direct-I/O

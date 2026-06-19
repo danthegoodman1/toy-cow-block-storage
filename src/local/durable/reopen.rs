@@ -1281,6 +1281,7 @@ pub(super) fn list_node_data_log_ids(
 #[derive(Debug)]
 pub(super) struct RecoveredSegmentRecord {
     pub placement: SegmentPlacementRow,
+    pub physical_record_end: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -1324,14 +1325,21 @@ pub(super) fn scan_node_data_logs_for_segments(
             if file.read_exact(&mut header).is_err() {
                 break;
             }
-            let Ok(parsed) = parse_data_log_record_header(&header) else {
-                break;
+            let parsed = match parse_data_log_record_header(&header) {
+                Ok(parsed) => parsed,
+                Err(_) if header[0] == 0 => {
+                    offset = offset.saturating_add(1);
+                    continue;
+                }
+                Err(_) => break,
             };
             let record_bytes = (DATA_LOG_HEADER_LEN as u64).saturating_add(parsed.payload_len);
             let record_end = offset.saturating_add(record_bytes);
             if record_end > file_len {
                 break;
             }
+            let physical_record_end =
+                skip_zero_padding_after_data_log_record(&mut file, record_end, file_len)?;
             if parsed.kind == DATA_LOG_KIND_SEGMENT {
                 let segment_id = SegmentId::from_raw(parsed.identity);
                 if wanted.contains(&segment_id) && !found.contains_key(&segment_id) {
@@ -1339,6 +1347,10 @@ pub(super) fn scan_node_data_logs_for_segments(
                         StorageError::corrupt("data-log payload length overflows usize")
                     })?;
                     let mut bytes = vec![0_u8; payload_len];
+                    file.seek(SeekFrom::Start(
+                        offset.saturating_add(DATA_LOG_HEADER_LEN as u64),
+                    ))
+                    .map_err(fs_error)?;
                     file.read_exact(&mut bytes).map_err(fs_error)?;
                     verify_segment_payload_integrity(parsed.integrity, &bytes)?;
                     found.insert(
@@ -1355,6 +1367,7 @@ pub(super) fn scan_node_data_logs_for_segments(
                                 payload_bytes: parsed.payload_len,
                                 integrity: parsed.integrity,
                             },
+                            physical_record_end,
                             bytes,
                         },
                     );
@@ -1363,21 +1376,45 @@ pub(super) fn scan_node_data_logs_for_segments(
                     }
                 }
             }
-            offset = record_end;
+            offset = physical_record_end;
         }
     }
     Ok(found)
 }
 
+fn skip_zero_padding_after_data_log_record(
+    file: &mut File,
+    mut offset: u64,
+    file_len: u64,
+) -> Result<u64> {
+    let mut buf = [0_u8; 4096];
+    while offset < file_len {
+        let to_read = usize::try_from((file_len - offset).min(buf.len() as u64))
+            .map_err(|_| StorageError::corrupt("data-log padding span overflows usize"))?;
+        file.seek(SeekFrom::Start(offset)).map_err(fs_error)?;
+        let read = file.read(&mut buf[..to_read]).map_err(fs_error)?;
+        if read == 0 {
+            break;
+        }
+        if let Some(nonzero) = buf[..read].iter().position(|byte| *byte != 0) {
+            return Ok(offset.saturating_add(nonzero as u64));
+        }
+        offset = offset.saturating_add(read as u64);
+    }
+    Ok(offset)
+}
+
 pub(super) fn sync_data_log_files(
     files: Vec<DataLogFileToSync>,
+    low_level_io: &ResolvedDurableLowLevelIoBackend,
 ) -> Result<DataLogFileSyncProfile> {
-    sync_data_log_files_with_fanout(files, 4)
+    sync_data_log_files_with_fanout(files, 4, low_level_io)
 }
 
 pub(super) fn sync_data_log_files_with_fanout(
     files: Vec<DataLogFileToSync>,
     fanout: usize,
+    low_level_io: &ResolvedDurableLowLevelIoBackend,
 ) -> Result<DataLogFileSyncProfile> {
     if fanout == 0 {
         return Err(StorageError::invalid_argument(
@@ -1387,7 +1424,7 @@ pub(super) fn sync_data_log_files_with_fanout(
     let mut profile = DataLogFileSyncProfile::default();
     if files.len() <= 1 {
         if let Some(file) = files.into_iter().next() {
-            let (bytes, nanos) = sync_data_log_file(file)?;
+            let (bytes, nanos) = low_level_io.sync_file(file)?;
             profile.record_file(bytes, nanos);
         }
         return Ok(profile);
@@ -1400,7 +1437,8 @@ pub(super) fn sync_data_log_files_with_fanout(
             let Some(file) = files.next() else {
                 break;
             };
-            handles.push(thread::spawn(move || sync_data_log_file(file)));
+            let low_level_io = low_level_io.clone();
+            handles.push(thread::spawn(move || low_level_io.sync_file(file)));
         }
         if handles.is_empty() {
             break;
@@ -1415,15 +1453,10 @@ pub(super) fn sync_data_log_files_with_fanout(
     Ok(profile)
 }
 
-fn sync_data_log_file(file: DataLogFileToSync) -> Result<(u64, u64)> {
-    let started = Instant::now();
-    file.file.sync_data().map_err(fs_error)?;
-    Ok((file.bytes, duration_nanos_u64(started.elapsed())))
-}
-
 pub(super) fn sync_pending_data_logs(
     data_dir: &Path,
     pending: &PendingDataLogAppend,
+    low_level_io: &ResolvedDurableLowLevelIoBackend,
 ) -> Result<DataLogAppendProfile> {
     if pending.is_empty() {
         return Ok(DataLogAppendProfile::default());
@@ -1443,7 +1476,7 @@ pub(super) fn sync_pending_data_logs(
         )?);
     }
     let started = Instant::now();
-    let sync_profile = sync_data_log_files(files)?;
+    let sync_profile = sync_data_log_files(files, low_level_io)?;
     profile.file_sync_nanos = duration_nanos_u64(started.elapsed());
     profile.file_sync_sum_nanos = sync_profile.sync_sum_nanos;
     profile.file_sync_max_nanos = sync_profile.sync_max_nanos;

@@ -201,6 +201,28 @@ stale incremental sync rounds. The lane reschedules work without weakening
 the boundary contract: a flushed acknowledgment still requires the covering
 payload sync and the durable journal record.
 
+The durable provider may route block journal files and segment data-log files
+through a provider-private Linux `O_DIRECT` backend when explicitly selected.
+Required direct mode probes the data directory during open and fails before the
+store is usable if direct I/O is unsupported; fallback mode performs the same
+probe once and resolves to buffered filesystem I/O deterministically on failure.
+That backend does not change any public block or native contract. It writes the
+same logical journal frames and data-log record headers, then pads the physical
+file append with zero bytes to the direct-I/O alignment. Journal replay scans
+past zero padding between frames and still validates the frame checksum before
+decoding records. Data-log recovery scans past zero padding between records;
+placement `record_offset`, `payload_offset`, and `record_bytes` continue to
+describe the logical self-describing record, while data-log manifest
+`total_bytes` advances by the padded physical append length. If crash recovery
+rebuilds missing node-catalog rows from a padded data log, it uses the physical
+zero-padded record end for manifest accounting and preserves the logical length
+for CRC and placement replay. A store previously written by the buffered
+backend may be opened with the direct backend: the provider pads any unaligned
+tail with zeros before the next direct append, and replay treats that padding
+as non-record bytes. Successful flushed writes still require payload sync before
+the durable journal record, and the journal sync covering the flush marker
+remains the durable visibility boundary.
+
 The per-segment node-catalog rows are not part of that boundary. Data-log
 records are self-describing (kind, identity, integrity, length), so the rows
 are derivable bookkeeping that live reads never consult: reads resolve

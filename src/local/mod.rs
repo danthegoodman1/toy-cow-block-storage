@@ -80,6 +80,7 @@ pub use txn_metadata::{
 
 include!("durable/paths.rs");
 include!("durable/policy.rs");
+include!("durable/io_backend.rs");
 include!("durable/block_delta.rs");
 include!("durable/block_journal.rs");
 include!("durable/native_file_delta.rs");

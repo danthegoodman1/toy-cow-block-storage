@@ -694,6 +694,7 @@ impl DurableCoordinator {
             AppendPublishBatchPolicy::default(),
             BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
+            DurableLowLevelIoBackend::default(),
         )
     }
 
@@ -719,6 +720,7 @@ impl DurableCoordinator {
             append_publish_batch_policy,
             BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
+            DurableLowLevelIoBackend::default(),
         )
     }
 
@@ -748,6 +750,67 @@ impl DurableCoordinator {
             append_publish_batch_policy,
             block_journal_batch_policy,
             append_ingest_policy,
+            DurableLowLevelIoBackend::default(),
+        )
+    }
+
+    /// Benchmark-only provider hook for selecting the low-level block
+    /// journal/data-log backend.
+    ///
+    /// This is intentionally hidden from the crate root API. It exists so the
+    /// loadbench binary can compare provider-private filesystem and direct-I/O
+    /// mechanics without making the backend selector part of the stable block
+    /// or native file contracts.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        policy: DurableDataLogPolicy,
+        append_visible_publish_journal: Option<PathBuf>,
+        append_publish_batch_policy: AppendPublishBatchPolicy,
+        block_journal_batch_policy: BlockJournalBatchPolicy,
+        append_ingest_policy: AppendIngestPolicy,
+        low_level_io_backend: impl AsRef<str>,
+    ) -> Result<Self> {
+        let low_level_io_backend = low_level_io_backend.as_ref().parse()?;
+        Self::open_with_policies(
+            root,
+            config,
+            storage_nodes,
+            MaintenancePolicy::manual(policy),
+            append_visible_publish_journal,
+            append_publish_batch_policy,
+            block_journal_batch_policy,
+            append_ingest_policy,
+            low_level_io_backend,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+        root: impl AsRef<Path>,
+        config: LocalStoreConfig,
+        storage_nodes: Vec<StorageNodeId>,
+        policy: DurableDataLogPolicy,
+        append_visible_publish_journal: Option<PathBuf>,
+        append_publish_batch_policy: AppendPublishBatchPolicy,
+        block_journal_batch_policy: BlockJournalBatchPolicy,
+        append_ingest_policy: AppendIngestPolicy,
+        low_level_io_backend: DurableLowLevelIoBackend,
+    ) -> Result<Self> {
+        Self::open_with_policies(
+            root,
+            config,
+            storage_nodes,
+            MaintenancePolicy::manual(policy),
+            append_visible_publish_journal,
+            append_publish_batch_policy,
+            block_journal_batch_policy,
+            append_ingest_policy,
+            low_level_io_backend,
         )
     }
 
@@ -789,6 +852,7 @@ impl DurableCoordinator {
             AppendPublishBatchPolicy::default(),
             BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
+            DurableLowLevelIoBackend::default(),
         )
     }
 
@@ -810,6 +874,7 @@ impl DurableCoordinator {
             append_publish_batch_policy,
             BlockJournalBatchPolicy::default(),
             AppendIngestPolicy::default(),
+            DurableLowLevelIoBackend::default(),
         )
     }
 
@@ -823,6 +888,7 @@ impl DurableCoordinator {
         append_publish_batch_policy: AppendPublishBatchPolicy,
         block_journal_batch_policy: BlockJournalBatchPolicy,
         append_ingest_policy: AppendIngestPolicy,
+        low_level_io_backend: DurableLowLevelIoBackend,
     ) -> Result<Self> {
         config.validate()?;
         maintenance_policy.validate()?;
@@ -842,6 +908,7 @@ impl DurableCoordinator {
             maintenance_policy.data_log_policy,
             append_ingest_policy.data_log,
             storage_nodes.clone(),
+            low_level_io_backend,
         )?;
 
         let local = durable
@@ -1089,6 +1156,11 @@ impl DurableCoordinator {
 
     pub fn append_ingest_data_log_policy(&self) -> AppendIngestDataLogPolicy {
         self.append_ingest_data_log_policy
+    }
+
+    #[cfg(test)]
+    fn resolved_low_level_io_backend_for_test(&self) -> DurableResolvedLowLevelIoBackend {
+        self.durable.resolved_low_level_io_backend()
     }
 
     fn maybe_auto_persist_append_stream(

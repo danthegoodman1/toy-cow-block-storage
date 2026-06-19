@@ -32,6 +32,7 @@ struct Args {
     read_profile_csv: Option<PathBuf>,
     target_data_log_bytes: u64,
     data_log_file_sync_fanout: usize,
+    durable_io_backend: String,
     append_publish_batch_policy: AppendPublishBatchPolicy,
     block_journal_batch_policy: BlockJournalBatchPolicy,
     append_ingest_policy: AppendIngestPolicy,
@@ -85,6 +86,7 @@ impl Args {
             read_profile_csv: None,
             target_data_log_bytes: 64 * 1024 * 1024,
             data_log_file_sync_fanout: 4,
+            durable_io_backend: "filesystem".to_string(),
             append_publish_batch_policy: AppendPublishBatchPolicy::default(),
             block_journal_batch_policy: BlockJournalBatchPolicy::default(),
             append_ingest_policy: AppendIngestPolicy::default(),
@@ -231,6 +233,10 @@ impl Args {
                 }
                 "--data-log-file-sync-fanout" => {
                     args.data_log_file_sync_fanout = parse_next(&mut raw, flag.as_str())?;
+                }
+                "--durable-io-backend" => {
+                    let value: String = parse_next(&mut raw, flag.as_str())?;
+                    args.durable_io_backend = parse_durable_io_backend(&value)?;
                 }
                 "--append-publish-batch-target" => {
                     args.append_publish_batch_policy.target_tickets =
@@ -569,6 +575,8 @@ options:\n\
   --read-profile-csv PATH                  append block/native read profiles to CSV\n\
   --target-data-log-mib N                  durable data-log roll target, default: 64\n\
   --data-log-file-sync-fanout N            concurrent durable data-log file syncs, default: 4\n\
+  --durable-io-backend filesystem|direct-io|direct-io-or-filesystem\n\
+                                           low-level block journal/data-log backend, default: filesystem\n\
   --append-publish-batch-target N          durable append publish batch target, default: 4\n\
   --append-publish-idle-coalesce-us N      durable append publish idle coalesce wait, default: 250\n\
   --append-publish-max-coalesce-us N       durable append publish max coalesce wait, default: 5000\n\
@@ -639,6 +647,16 @@ fn parse_path_list(value: &str) -> Vec<PathBuf> {
         .filter(|part| !part.is_empty())
         .map(PathBuf::from)
         .collect()
+}
+
+fn parse_durable_io_backend(value: &str) -> Result<String> {
+    match value {
+        "filesystem" | "fs" | "buffered" | "direct-io" | "direct" | "odirect"
+        | "direct-io-or-filesystem" | "direct-or-fs" | "auto" => Ok(value.to_string()),
+        _ => Err(StorageError::invalid_argument(format!(
+            "unknown durable low-level I/O backend {value}"
+        ))),
+    }
 }
 
 fn mib_to_bytes(mib: u64, flag: &str) -> Result<u64> {

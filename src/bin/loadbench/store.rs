@@ -66,7 +66,7 @@ impl BenchStore {
             }
             ProviderKind::Durable => {
                 let store = Arc::new(
-                    DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+                    DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend(
                         root,
                         args.config(),
                         args.storage_node_ids(),
@@ -79,6 +79,7 @@ impl BenchStore {
                         args.append_publish_batch_policy,
                         args.block_journal_batch_policy,
                         args.append_ingest_policy,
+                        args.durable_io_backend.as_str(),
                     )?,
                 );
                 if args.durable_profile_csv.is_some() {

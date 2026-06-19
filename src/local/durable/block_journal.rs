@@ -2605,10 +2605,6 @@ impl DurableSqliteStore {
                     storage_node,
                     log_id: record.placement.data_log_id,
                 };
-                let record_end = record
-                    .placement
-                    .record_offset
-                    .saturating_add(record.placement.record_bytes);
                 let manifest = pending.logs.entry(log_ref).or_insert(PendingDataLogManifest {
                     storage_node,
                     log_id: log_ref.log_id,
@@ -2618,7 +2614,7 @@ impl DurableSqliteStore {
                     total_bytes: 0,
                     needs_dir_sync: false,
                 });
-                manifest.total_bytes = manifest.total_bytes.max(record_end);
+                manifest.total_bytes = manifest.total_bytes.max(record.physical_record_end);
                 local.adopt_recovered_segment(
                     MappingOwner::BlockDevice(device_id),
                     storage_node,

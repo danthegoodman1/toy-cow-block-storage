@@ -5,6 +5,7 @@ pub(super) struct DurableSqliteStore {
     node_catalogs: Arc<NodeCatalogs>,
     policy: DurableDataLogPolicy,
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
+    low_level_io: ResolvedDurableLowLevelIoBackend,
     data_log_allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     append_log_service: Arc<StorageNodeAppendLogService>,
     // Sorted at open and validated against the persisted shard count, so
@@ -667,6 +668,7 @@ impl AppendLogPayloadSyncWorker {
     fn start(
         paths: DurableStorePaths,
         policy: DurableDataLogPolicy,
+        low_level_io: ResolvedDurableLowLevelIoBackend,
         worker_count: usize,
         synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
         dir_synced_logs: Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
@@ -687,6 +689,7 @@ impl AppendLogPayloadSyncWorker {
         let mut handles = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let paths = paths.clone();
+            let low_level_io = low_level_io.clone();
             let worker_state = Arc::clone(&state);
             let synced_logs = Arc::clone(&synced_logs);
             let dir_synced_logs = Arc::clone(&dir_synced_logs);
@@ -698,6 +701,7 @@ impl AppendLogPayloadSyncWorker {
                         append_log_payload_sync_worker_loop(
                             paths,
                             policy,
+                            low_level_io,
                             synced_logs,
                             dir_synced_logs,
                             synced_log_cvar,
@@ -772,6 +776,7 @@ impl Drop for AppendLogPayloadSyncWorker {
 fn append_log_payload_sync_worker_loop(
     paths: DurableStorePaths,
     policy: DurableDataLogPolicy,
+    low_level_io: ResolvedDurableLowLevelIoBackend,
     synced_logs: Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
     dir_synced_logs: Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
     synced_log_cvar: Arc<Condvar>,
@@ -800,6 +805,7 @@ fn append_log_payload_sync_worker_loop(
         let _ = sync_append_run_log_requests(
             &paths,
             policy,
+            &low_level_io,
             &synced_logs,
             &dir_synced_logs,
             &synced_log_cvar,
@@ -811,6 +817,7 @@ fn append_log_payload_sync_worker_loop(
 fn sync_append_run_log_requests(
     paths: &DurableStorePaths,
     policy: DurableDataLogPolicy,
+    low_level_io: &ResolvedDurableLowLevelIoBackend,
     synced_logs: &Arc<Mutex<BTreeMap<DurableDataLogRef, u64>>>,
     dir_synced_logs: &Arc<Mutex<BTreeSet<DurableDataLogRef>>>,
     synced_log_cvar: &Arc<Condvar>,
@@ -879,7 +886,7 @@ fn sync_append_run_log_requests(
     };
 
     let started = Instant::now();
-    let sync_result = sync_data_log_files_with_fanout(files, policy.file_sync_fanout);
+    let sync_result = sync_data_log_files_with_fanout(files, policy.file_sync_fanout, low_level_io);
     let file_sync_nanos = duration_nanos_u64(started.elapsed());
     let dir_sync_result = match dir_sync_handle {
         Some(handle) => handle
@@ -921,6 +928,7 @@ struct StorageNodeAppendLogService {
     node_catalogs: Arc<NodeCatalogs>,
     policy: DurableDataLogPolicy,
     append_ingest_data_log_policy: AppendIngestDataLogPolicy,
+    low_level_io: ResolvedDurableLowLevelIoBackend,
     allocation_locks: Arc<StorageNodeDataLogAllocationLocks>,
     lanes: Mutex<BTreeMap<StorageNodeId, Arc<StorageNodeAppendLogLane>>>,
     sync_lanes: Mutex<BTreeMap<StorageNodeId, Arc<DataLogSyncLane>>>,
@@ -1507,6 +1515,7 @@ impl StorageNodeAppendLogService {
                     sync_append_run_log_requests(
                         &self.paths,
                         self.policy,
+                        &self.low_level_io,
                         &self.synced_logs,
                         &self.dir_synced_logs,
                         &self.synced_log_cvar,
@@ -1517,6 +1526,7 @@ impl StorageNodeAppendLogService {
                 let result = sync_append_run_log_requests(
                     &self.paths,
                     self.policy,
+                    &self.low_level_io,
                     &self.synced_logs,
                     &self.dir_synced_logs,
                     &self.synced_log_cvar,
@@ -2039,15 +2049,26 @@ fn load_durable_journal_records<T: DurableCodec>(
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let mut file = File::open(path).map_err(fs_error)?;
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(fs_error)?
+        .read_to_end(&mut bytes)
+        .map_err(fs_error)?;
     let mut records = Vec::new();
-    loop {
-        let mut header = [0_u8; DURABLE_JOURNAL_HEADER_BYTES];
-        match file.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(fs_error(error)),
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        if bytes.len().saturating_sub(offset) < DURABLE_JOURNAL_HEADER_BYTES {
+            break;
         }
+        if bytes[offset..offset + 8] != *magic {
+            if bytes[offset] == 0 {
+                offset += 1;
+                continue;
+            }
+            return Err(StorageError::corrupt(invalid_magic_reason));
+        }
+        let mut header = [0_u8; DURABLE_JOURNAL_HEADER_BYTES];
+        header.copy_from_slice(&bytes[offset..offset + DURABLE_JOURNAL_HEADER_BYTES]);
         let (payload_len, expected_checksum) = decode_durable_journal_header(
             &header,
             magic,
@@ -2056,16 +2077,19 @@ fn load_durable_journal_records<T: DurableCodec>(
         )?;
         let payload_len = usize::try_from(payload_len)
             .map_err(|_| StorageError::corrupt(length_overflow_reason))?;
-        let mut payload = vec![0_u8; payload_len];
-        match file.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(fs_error(error)),
+        let payload_start = offset + DURABLE_JOURNAL_HEADER_BYTES;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or_else(|| StorageError::corrupt(length_overflow_reason))?;
+        if payload_end > bytes.len() {
+            break;
         }
-        if data_log_checksum(&payload) != expected_checksum {
+        let payload = &bytes[payload_start..payload_end];
+        if data_log_checksum(payload) != expected_checksum {
             return Err(StorageError::corrupt(checksum_mismatch_reason));
         }
-        records.push(decode_row(&payload)?);
+        records.push(decode_row(payload)?);
+        offset = payload_end;
     }
     Ok(records)
 }
@@ -2100,6 +2124,20 @@ fn append_durable_journal_bytes(
     bytes: &[u8],
     sync_data: bool,
 ) -> Result<AppendVisibleJournalProfile> {
+    append_durable_journal_bytes_with_backend(
+        path,
+        bytes,
+        sync_data,
+        &ResolvedDurableLowLevelIoBackend::Filesystem,
+    )
+}
+
+fn append_durable_journal_bytes_with_backend(
+    path: &Path,
+    bytes: &[u8],
+    sync_data: bool,
+    low_level_io: &ResolvedDurableLowLevelIoBackend,
+) -> Result<AppendVisibleJournalProfile> {
     let mut dir_sync_nanos = 0_u64;
     let parent = path
         .parent()
@@ -2113,20 +2151,19 @@ fn append_durable_journal_bytes(
             dir_sync_nanos.saturating_add(duration_nanos_u64(dir_sync_started.elapsed()));
     }
     let existed = path.exists();
-    let open_started = Instant::now();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(fs_error)?;
-    let open_nanos = duration_nanos_u64(open_started.elapsed());
+    let append = low_level_io.append_bytes(path, &[bytes])?;
     if !existed {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(fs_error)?;
         preallocate_durable_journal_file(&file, DURABLE_JOURNAL_PREALLOC_BYTES)?;
     }
-    let started = Instant::now();
-    file.write_all(bytes).map_err(fs_error)?;
-    let write_nanos = duration_nanos_u64(started.elapsed());
     let sync_nanos = if sync_data {
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(fs_error)?;
         let sync_started = Instant::now();
         file.sync_data().map_err(fs_error)?;
         duration_nanos_u64(sync_started.elapsed())
@@ -2140,12 +2177,12 @@ fn append_durable_journal_bytes(
             dir_sync_nanos.saturating_add(duration_nanos_u64(dir_sync_started.elapsed()));
     }
     Ok(AppendVisibleJournalProfile {
-        open_nanos,
-        write_nanos,
+        open_nanos: append.open_nanos,
+        write_nanos: append.write_nanos,
         sync_nanos,
         dir_sync_nanos,
-        frame_bytes: usize_to_u64(bytes.len()),
-        created: if existed { 0 } else { 1 },
+        frame_bytes: append.physical_bytes,
+        created: if append.created { 1 } else { 0 },
         ..AppendVisibleJournalProfile::default()
     })
 }
@@ -2205,6 +2242,7 @@ const BLOCK_JOURNAL_TARGET_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) fn append_block_journal_records_unsynced(
     path: &Path,
     records: &[BlockJournalRecord],
+    low_level_io: &ResolvedDurableLowLevelIoBackend,
 ) -> Result<AppendVisibleJournalProfile> {
     if records.is_empty() {
         return Err(StorageError::invalid_argument(
@@ -2241,7 +2279,7 @@ pub(super) fn append_block_journal_records_unsynced(
     }
     bytes.extend_from_slice(&block_journal_records_frame(&records[frame_start..])?);
     let encode_nanos = duration_nanos_u64(encode_started.elapsed());
-    let mut profile = append_durable_journal_bytes(path, &bytes, false)?;
+    let mut profile = append_durable_journal_bytes_with_backend(path, &bytes, false, low_level_io)?;
     profile.encode_nanos = encode_nanos;
     profile.record_count = usize_to_u64(records.len());
     Ok(profile)
@@ -2661,9 +2699,11 @@ impl DurableSqliteStore {
         policy: DurableDataLogPolicy,
         append_ingest_data_log_policy: AppendIngestDataLogPolicy,
         configured_storage_nodes: Vec<StorageNodeId>,
+        low_level_io_backend: DurableLowLevelIoBackend,
     ) -> Result<Self> {
         policy.validate()?;
         append_ingest_data_log_policy.validate()?;
+        let low_level_io = low_level_io_backend.resolve(&paths)?;
         let metadata_existed = paths.metadata.exists();
         let conn = Connection::open(&paths.metadata).map_err(sqlite_error)?;
         configure_sqlite_connection(&conn)?;
@@ -2702,6 +2742,7 @@ impl DurableSqliteStore {
         let payload_sync_worker = AppendLogPayloadSyncWorker::start(
             paths.clone(),
             policy,
+            low_level_io.clone(),
             append_ingest_data_log_policy.background_sync_workers,
             Arc::clone(&synced_append_logs),
             Arc::clone(&dir_synced_append_logs),
@@ -2712,6 +2753,7 @@ impl DurableSqliteStore {
             node_catalogs: Arc::clone(&node_catalogs),
             policy,
             append_ingest_data_log_policy,
+            low_level_io: low_level_io.clone(),
             allocation_locks: Arc::clone(&data_log_allocation_locks),
             lanes: Mutex::new(BTreeMap::new()),
             sync_lanes: Mutex::new(BTreeMap::new()),
@@ -2733,6 +2775,7 @@ impl DurableSqliteStore {
             node_catalogs,
             policy,
             append_ingest_data_log_policy,
+            low_level_io,
             data_log_allocation_locks,
             append_log_service,
             block_journal_shard_locks: Arc::new(
@@ -3181,7 +3224,7 @@ impl DurableSqliteStore {
             StorageError::invalid_argument("block journal shard index out of range")
         })?;
         let _journal_guard = lock(shard_lock)?;
-        append_block_journal_records_unsynced(&path, records)
+        append_block_journal_records_unsynced(&path, records, &self.low_level_io)
     }
 
     /// Make every record written to one block journal shard so far durable.
@@ -3232,6 +3275,7 @@ impl DurableSqliteStore {
             })?;
             let _journal_guard = lock(shard_lock)?;
             prune_block_journal_records_through(&path, materialized)?;
+            self.low_level_io.forget_path(&path)?;
         }
         Ok(())
     }
@@ -3245,6 +3289,11 @@ impl DurableSqliteStore {
     #[cfg(test)]
     pub(super) fn append_visible_publish_journal_path(&self) -> PathBuf {
         self.paths.append_visible_publish_journal.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn resolved_low_level_io_backend(&self) -> DurableResolvedLowLevelIoBackend {
+        self.low_level_io.selected()
     }
 
     #[cfg(test)]
@@ -3577,6 +3626,7 @@ impl DurableSqliteStore {
         data_log_profile.merge(sync_pending_data_logs(
             &self.paths.data_dir,
             &pending_append,
+            &self.low_level_io,
         )?);
         pending_append.merge(new_append);
         let data_log_append_sync_nanos = duration_nanos_u64(started.elapsed());
@@ -5097,7 +5147,11 @@ impl DurableSqliteStore {
             }
             let started = Instant::now();
             let sync_profile =
-                sync_data_log_files_with_fanout(files_to_sync, self.policy.file_sync_fanout)?;
+                sync_data_log_files_with_fanout(
+                    files_to_sync,
+                    self.policy.file_sync_fanout,
+                    &self.low_level_io,
+                )?;
             profile.file_sync_nanos = profile
                 .file_sync_nanos
                 .saturating_add(duration_nanos_u64(started.elapsed()));
@@ -5160,7 +5214,7 @@ impl DurableSqliteStore {
         };
         let data_dir = node_data_log_dir(&self.paths.data_dir, storage_node);
         let mut active_log: Option<DataLogRow> = None;
-        let mut open_log: Option<(DurableDataLogRef, File, u64, bool)> = None;
+        let mut open_log: Option<(DurableDataLogRef, PathBuf, File, u64, bool)> = None;
         for (index, segment) in segments {
             let segment_id = segment.segment_id;
             let integrity = segment.integrity;
@@ -5197,10 +5251,11 @@ impl DurableSqliteStore {
                 .ok_or_else(|| {
                     StorageError::invalid_argument("data-log record length overflows")
                 })?;
+            let physical_record_len = self.low_level_io.physical_append_len(record_len)?;
             if active.total_bytes != 0
                 && active
                     .total_bytes
-                    .checked_add(record_len)
+                    .checked_add(physical_record_len)
                     .ok_or_else(|| StorageError::conflict("data-log size overflow"))?
                     > self.policy.target_data_log_bytes
             {
@@ -5221,8 +5276,8 @@ impl DurableSqliteStore {
                 storage_node,
                 log_id: active.log_id,
             };
-            if open_log.as_ref().map(|(log_ref, _, _, _)| *log_ref) != Some(log_ref) {
-                if let Some((_, file, bytes, _)) = open_log.take()
+            if open_log.as_ref().map(|(log_ref, _, _, _, _)| *log_ref) != Some(log_ref) {
+                if let Some((_, _, file, bytes, _)) = open_log.take()
                     && sync_mode == DataLogSyncMode::Sync
                 {
                     outcome.files_to_sync.push(data_log_file_to_sync(file, bytes));
@@ -5240,17 +5295,17 @@ impl DurableSqliteStore {
                     .read(true)
                     .open(&path)
                     .map_err(fs_error)?;
-                let file_len = file.metadata().map_err(fs_error)?.len();
+                let file_len = self.low_level_io.file_len_after_alignment_padding(&path)?;
                 active.total_bytes = active.total_bytes.max(file_len);
                 if !existed {
                     outcome.created_log_file = true;
                 }
                 let needs_dir_sync = sync_mode == DataLogSyncMode::NoSync && !existed;
-                open_log = Some((log_ref, file, active.total_bytes, needs_dir_sync));
+                open_log = Some((log_ref, path, file, active.total_bytes, needs_dir_sync));
             }
 
             let offset = active.total_bytes;
-            let Some((_, file, open_log_bytes, needs_dir_sync)) = open_log.as_mut() else {
+            let Some((_, path, file, open_log_bytes, needs_dir_sync)) = open_log.as_mut() else {
                 return Err(StorageError::conflict("data-log writer was not opened"));
             };
             let started = Instant::now();
@@ -5267,19 +5322,30 @@ impl DurableSqliteStore {
                 .encode_nanos
                 .saturating_add(duration_nanos_u64(started.elapsed()));
             let started = Instant::now();
-            file.write_all(&header).map_err(fs_error)?;
-            file.write_all(bytes.as_slice()).map_err(fs_error)?;
+            match &self.low_level_io {
+                ResolvedDurableLowLevelIoBackend::Filesystem => {
+                    file.write_all(&header).map_err(fs_error)?;
+                    file.write_all(bytes.as_slice()).map_err(fs_error)?;
+                }
+                ResolvedDurableLowLevelIoBackend::DirectIo(_) => {
+                    self.low_level_io
+                        .append_bytes(path, &[&header, bytes.as_slice()])?;
+                }
+            }
             outcome.profile.write_nanos = outcome
                 .profile
                 .write_nanos
                 .saturating_add(duration_nanos_u64(started.elapsed()));
             outcome.profile.records_written = outcome.profile.records_written.saturating_add(1);
-            outcome.profile.write_bytes = outcome.profile.write_bytes.saturating_add(record_len);
+            outcome.profile.write_bytes = outcome
+                .profile
+                .write_bytes
+                .saturating_add(physical_record_len);
             let payload_offset = offset
                 .checked_add(DATA_LOG_HEADER_LEN as u64)
                 .ok_or_else(|| StorageError::conflict("data-log payload offset overflow"))?;
             let new_total = offset
-                .checked_add(record_len)
+                .checked_add(physical_record_len)
                 .ok_or_else(|| StorageError::conflict("data-log size overflow"))?;
             active.total_bytes = new_total;
             *open_log_bytes = new_total;
@@ -5307,7 +5373,7 @@ impl DurableSqliteStore {
                 },
             ));
         }
-        if let Some((_, file, bytes, _)) = open_log.take()
+        if let Some((_, _, file, bytes, _)) = open_log.take()
             && sync_mode == DataLogSyncMode::Sync
         {
             outcome.files_to_sync.push(data_log_file_to_sync(file, bytes));
@@ -5780,5 +5846,19 @@ impl DurableSqliteStore {
     #[cfg(test)]
     fn placement_for_test(&self, segment_id: SegmentId) -> Result<SegmentPlacementRow> {
         self.placement_for_segment(segment_id)
+    }
+
+    #[cfg(test)]
+    fn data_log_total_bytes_for_test(&self, log_ref: DurableDataLogRef) -> Result<u64> {
+        let node_conn = self.node_catalogs.lock(log_ref.storage_node)?;
+        let data_logs = node_catalog_table(log_ref.storage_node, "data_logs")?;
+        let total_bytes = node_conn
+            .query_row(
+                &format!("SELECT total_bytes FROM {data_logs} WHERE log_id = ?1"),
+                params![u64_to_i64(log_ref.log_id)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error)?;
+        i64_to_u64(total_bytes).map_err(sqlite_error)
     }
 }

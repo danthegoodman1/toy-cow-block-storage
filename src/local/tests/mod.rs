@@ -3999,6 +3999,377 @@ fn durable_block_journal_ignores_incomplete_tail_after_reopen() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn durable_journal_replay_ignores_zero_padding_between_frames() {
+    let root = durable_temp_dir("block-journal-padding-frames");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("block.journal");
+    let device_id = DeviceId::from_raw(11);
+    let first = BlockJournalRecord::Lease {
+        device_id,
+        writer_epoch: WriterEpoch::from_raw(1),
+    };
+    let second = BlockJournalRecord::Flush {
+        device_id,
+        writer_epoch: WriterEpoch::from_raw(1),
+        durable_through: CommitSeq::from_raw(7),
+    };
+    let mut bytes = block_journal_records_frame(std::slice::from_ref(&first)).unwrap();
+    bytes.extend_from_slice(&[0_u8; 101]);
+    bytes.extend_from_slice(&block_journal_records_frame(std::slice::from_ref(&second)).unwrap());
+    bytes.extend_from_slice(&[0_u8; 37]);
+    fs::write(&path, bytes).unwrap();
+
+    assert_eq!(
+        load_block_journal_records(&path).unwrap(),
+        vec![first, second]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_data_log_scan_ignores_zero_padding_between_records() {
+    let root = durable_temp_dir("data-log-padding-records");
+    let cfg = config();
+    let data_dir = root.join("data");
+    fs::create_dir_all(node_data_log_dir(&data_dir, cfg.storage_node)).unwrap();
+    let path = data_log_path(&data_dir, cfg.storage_node, 1);
+    let first_payload = repeated_blocks(1, 21);
+    let second_payload = repeated_blocks(1, 22);
+    let first_id = SegmentId::from_raw(101);
+    let second_id = SegmentId::from_raw(102);
+    let mut bytes = encode_data_log_record(
+        first_id,
+        segment_payload_integrity(PayloadIntegrity::Verified, &first_payload),
+        &first_payload,
+    )
+    .unwrap();
+    bytes.extend_from_slice(&[0_u8; 73]);
+    bytes.extend_from_slice(
+        &encode_data_log_record(
+            second_id,
+            segment_payload_integrity(PayloadIntegrity::Verified, &second_payload),
+            &second_payload,
+        )
+        .unwrap(),
+    );
+    bytes.extend_from_slice(&[0_u8; 19]);
+    fs::write(&path, bytes).unwrap();
+
+    let recovered =
+        scan_node_data_logs_for_segments(&data_dir, cfg.storage_node, &BTreeSet::from([second_id]))
+            .unwrap();
+    assert_eq!(recovered[&second_id].bytes, second_payload);
+    assert!(recovered[&second_id].placement.record_offset > 4096);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_low_level_io_backend_fallback_is_deterministic() {
+    let root = durable_temp_dir("direct-io-fallback-selection");
+    let cfg = config();
+    let store = DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+        &root,
+        cfg,
+        vec![cfg.storage_node],
+        DurableDataLogPolicy::default(),
+        None,
+        AppendPublishBatchPolicy::default(),
+        BlockJournalBatchPolicy::default(),
+        AppendIngestPolicy::default(),
+        DurableLowLevelIoBackend::DirectIoOrFilesystem,
+    )
+    .unwrap();
+    let selected = store.resolved_low_level_io_backend_for_test();
+    drop(store);
+
+    let reopened = DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+        &root,
+        cfg,
+        vec![cfg.storage_node],
+        DurableDataLogPolicy::default(),
+        None,
+        AppendPublishBatchPolicy::default(),
+        BlockJournalBatchPolicy::default(),
+        AppendIngestPolicy::default(),
+        DurableLowLevelIoBackend::DirectIoOrFilesystem,
+    )
+    .unwrap();
+    assert_eq!(reopened.resolved_low_level_io_backend_for_test(), selected);
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+            root.join("direct-required"),
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
+            AppendIngestPolicy::default(),
+            DurableLowLevelIoBackend::DirectIo,
+        )
+        .is_err()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_required_direct_io_probe_failure_is_open_failure() {
+    let root = durable_temp_dir("direct-io-required-probe-failure");
+    let cfg = config();
+    fs::create_dir_all(root.join("data/direct-io-probe/probe.bin")).unwrap();
+
+    let fallback = DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+        &root,
+        cfg,
+        vec![cfg.storage_node],
+        DurableDataLogPolicy::default(),
+        None,
+        AppendPublishBatchPolicy::default(),
+        BlockJournalBatchPolicy::default(),
+        AppendIngestPolicy::default(),
+        DurableLowLevelIoBackend::DirectIoOrFilesystem,
+    )
+    .unwrap();
+    assert_eq!(
+        fallback.resolved_low_level_io_backend_for_test(),
+        DurableResolvedLowLevelIoBackend::Filesystem
+    );
+    drop(fallback);
+
+    assert!(
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+            &root,
+            cfg,
+            vec![cfg.storage_node],
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy::default(),
+            AppendIngestPolicy::default(),
+            DurableLowLevelIoBackend::DirectIo,
+        )
+        .is_err()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_direct_io_backend_pads_and_reopens_when_supported() {
+    let root = durable_temp_dir("direct-io-padded-reopen");
+    let cfg = LocalStoreConfig {
+        shard_count: 1,
+        ..config()
+    };
+    let store = DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+        &root,
+        cfg,
+        vec![cfg.storage_node],
+        DurableDataLogPolicy::default(),
+        None,
+        AppendPublishBatchPolicy::default(),
+        BlockJournalBatchPolicy::default(),
+        AppendIngestPolicy::default(),
+        DurableLowLevelIoBackend::DirectIoOrFilesystem,
+    )
+    .unwrap();
+    if store.resolved_low_level_io_backend_for_test() != DurableResolvedLowLevelIoBackend::DirectIo
+    {
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let payload = repeated_blocks(256, 33);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &payload,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.wait_block_segment_rows_published_for_test().unwrap();
+
+    let journal = store.durable.block_journal_shard_path_for_device(device_id);
+    assert_eq!(journal.metadata().unwrap().len() % 4096, 0);
+    let segment_id = store
+        .durable
+        .block_journal_records()
+        .unwrap()
+        .into_iter()
+        .find_map(|record| match record {
+            BlockJournalRecord::Write(commit) => commit.entries.into_iter().find_map(|entry| {
+                if let BlockJournalEntry::Segment { segment_id, .. } = entry {
+                    Some(segment_id)
+                } else {
+                    None
+                }
+            }),
+            BlockJournalRecord::PackedWrites(_)
+            | BlockJournalRecord::Lease { .. }
+            | BlockJournalRecord::Flush { .. } => None,
+        })
+        .unwrap();
+    let placement = store.durable.placement_for_test(segment_id).unwrap();
+    assert_eq!(placement.record_offset % 4096, 0);
+    assert_eq!(
+        placement.record_bytes,
+        DATA_LOG_HEADER_LEN as u64 + payload.len() as u64
+    );
+    let data_log = data_log_path(&root.join("data"), cfg.storage_node, placement.data_log_id);
+    assert_eq!(data_log.metadata().unwrap().len() % 4096, 0);
+    drop(store);
+
+    let reopened = DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend_for_test(
+        &root,
+        cfg,
+        vec![cfg.storage_node],
+        DurableDataLogPolicy::default(),
+        None,
+        AppendPublishBatchPolicy::default(),
+        BlockJournalBatchPolicy::default(),
+        AppendIngestPolicy::default(),
+        DurableLowLevelIoBackend::DirectIoOrFilesystem,
+    )
+    .unwrap();
+    let mut actual = vec![0; payload.len()];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_recovery_accounts_padded_data_log_total_bytes() {
+    let root = durable_temp_dir("direct-io-recovery-padded-total-bytes");
+    let cfg = LocalStoreConfig {
+        shard_count: 1,
+        ..config()
+    };
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: None,
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let payload = repeated_blocks(256, 45);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &payload,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.wait_block_segment_rows_published_for_test().unwrap();
+
+    let segment_id = store
+        .durable
+        .block_journal_records()
+        .unwrap()
+        .into_iter()
+        .find_map(|record| match record {
+            BlockJournalRecord::Write(commit) => commit.entries.into_iter().find_map(|entry| {
+                if let BlockJournalEntry::Segment { segment_id, .. } = entry {
+                    Some(segment_id)
+                } else {
+                    None
+                }
+            }),
+            BlockJournalRecord::PackedWrites(_)
+            | BlockJournalRecord::Lease { .. }
+            | BlockJournalRecord::Flush { .. } => None,
+        })
+        .unwrap();
+    let placement = store.durable.placement_for_test(segment_id).unwrap();
+    let log_ref = DurableDataLogRef {
+        storage_node: placement.storage_node,
+        log_id: placement.data_log_id,
+    };
+    let logical_end = placement
+        .record_offset
+        .checked_add(placement.record_bytes)
+        .unwrap();
+    let physical_end = logical_end.div_ceil(4096) * 4096;
+    assert!(physical_end > logical_end);
+    let data_log = data_log_path(
+        &root.join("data"),
+        placement.storage_node,
+        placement.data_log_id,
+    );
+    drop(store);
+
+    let file = OpenOptions::new().write(true).open(&data_log).unwrap();
+    file.set_len(physical_end).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+
+    let conn = node_catalog_conn(&root, placement.storage_node);
+    let before_total: u64 = conn
+        .query_row(
+            "SELECT total_bytes FROM data_logs WHERE log_id = ?1",
+            params![u64_to_i64(placement.data_log_id).unwrap()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| i64_to_u64(value).unwrap())
+        .unwrap();
+    assert_eq!(before_total, logical_end);
+    conn.execute(
+        "DELETE FROM segment_catalog_entries WHERE segment_id = ?1",
+        params![segment_id.raw().to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM segment_placements WHERE segment_id = ?1",
+        params![segment_id.raw().to_string()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let recovered = reopened.durable.placement_for_test(segment_id).unwrap();
+    assert_eq!(recovered.record_bytes, placement.record_bytes);
+    assert_eq!(
+        reopened
+            .durable
+            .data_log_total_bytes_for_test(log_ref)
+            .unwrap(),
+        physical_end
+    );
+    let mut actual = vec![0; payload.len()];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(0, payload.len() as u64),
+            &mut actual,
+        )
+        .unwrap();
+    assert_eq!(actual, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
 // Devices route round-robin onto per-node journal shard files, inline and
 // segment-ref records replay from every shard on reopen, and routing stays
 // pinned to the same shard file across reopens.
