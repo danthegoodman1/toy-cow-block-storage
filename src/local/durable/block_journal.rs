@@ -2373,6 +2373,7 @@ fn block_journal_records_frame(records: &[BlockJournalRecord]) -> Result<Vec<u8>
 fn observe_block_journal_replay_write(
     local: &LocalCoordinator,
     overlay: &BlockJournalOverlay,
+    materialized: &BTreeMap<DeviceId, CommitSeq>,
     latest_epoch: &mut BTreeMap<DeviceId, WriterEpoch>,
     writes: &mut BTreeMap<DeviceId, BTreeMap<u64, BlockJournalCommit>>,
     last_write_seq: &mut BTreeMap<DeviceId, u64>,
@@ -2399,6 +2400,12 @@ fn observe_block_journal_replay_write(
         .entry(commit.device_id)
         .and_modify(|epoch| *epoch = (*epoch).max(commit.writer_epoch))
         .or_insert(commit.writer_epoch);
+    if materialized
+        .get(&commit.device_id)
+        .is_some_and(|high| commit.commit_seq.raw() <= high.raw())
+    {
+        return Ok(());
+    }
     let device_writes = writes.entry(commit.device_id).or_default();
     if device_writes
         .insert(commit.commit_seq.raw(), commit)
@@ -2415,6 +2422,7 @@ impl DurableSqliteStore {
     fn load_block_journal_overlay(&self, local: &LocalCoordinator) -> Result<BlockJournalOverlay> {
         let records = self.block_journal_records()?;
         let overlay = BlockJournalOverlay::default();
+        let materialized = local.metadata.block_materialized_high_water()?;
         let mut latest_epoch = BTreeMap::<DeviceId, WriterEpoch>::new();
         let mut durable_through = BTreeMap::<DeviceId, CommitSeq>::new();
         let mut writes = BTreeMap::<DeviceId, BTreeMap<u64, BlockJournalCommit>>::new();
@@ -2437,6 +2445,7 @@ impl DurableSqliteStore {
                     observe_block_journal_replay_write(
                         local,
                         &overlay,
+                        &materialized,
                         &mut latest_epoch,
                         &mut writes,
                         &mut last_write_seq,
@@ -2448,6 +2457,7 @@ impl DurableSqliteStore {
                         observe_block_journal_replay_write(
                             local,
                             &overlay,
+                            &materialized,
                             &mut latest_epoch,
                             &mut writes,
                             &mut last_write_seq,
@@ -2469,6 +2479,12 @@ impl DurableSqliteStore {
                         .entry(device_id)
                         .and_modify(|epoch| *epoch = (*epoch).max(writer_epoch))
                         .or_insert(writer_epoch);
+                    if materialized
+                        .get(&device_id)
+                        .is_some_and(|high| flushed_through.raw() <= high.raw())
+                    {
+                        continue;
+                    }
                     durable_through
                         .entry(device_id)
                         .and_modify(|durable| *durable = (*durable).max(flushed_through))

@@ -49,6 +49,8 @@ pub struct DurableCoordinator {
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
+    #[cfg(test)]
+    root_copy_pause: Arc<(Mutex<RootCopyPauseState>, Condvar)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,6 +72,14 @@ struct StagedBlockSegmentRefs {
     committed_bytes: u64,
     write_count: u64,
     collapsed_range_count: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RootCopyPauseState {
+    enabled: bool,
+    paused: bool,
+    resume: bool,
 }
 
 /// Tracks in-flight block segment-ref payload staging.
@@ -878,6 +888,11 @@ impl DurableCoordinator {
             maintenance_policy,
             maintenance_cursor,
             maintenance_worker: None,
+            #[cfg(test)]
+            root_copy_pause: Arc::new((
+                Mutex::new(RootCopyPauseState::default()),
+                Condvar::new(),
+            )),
         };
         store.start_maintenance_worker_if_needed()?;
         Ok(store)
@@ -2216,6 +2231,7 @@ impl DurableCoordinator {
     ) -> Result<CommitSeq> {
         let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
         self.flush_visible_block_journal_heads()?;
+        self.materialize_durable_block_journal()?;
         let block_delta_prestage_wait_nanos = self.wait_for_all_block_delta_prestage()?;
         self.wait_for_block_segment_ref_staging()?;
         let lock_started = Instant::now();
@@ -2294,6 +2310,9 @@ impl DurableCoordinator {
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
         self.prune_pending_block_deltas_through(durable_through)?;
         self.prune_pending_native_file_deltas_through(durable_through)?;
+        let materialized = self.local.metadata.block_materialized_high_water()?;
+        self.durable
+            .prune_block_journal_records_through(&materialized)?;
         self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_through)
@@ -3349,6 +3368,12 @@ impl DurableCoordinator {
         run_maintenance_tick_parts(&self.maintenance_parts(), 0, 0)
     }
 
+    /// Deterministically fold durable block-journal high-water into immutable
+    /// CoW shard roots and prune records that are no longer replay roots.
+    pub fn materialize_block_journal(&self) -> Result<()> {
+        self.persist_now()
+    }
+
     /// Stop the optional always-on maintenance worker.
     ///
     /// Manual and opportunistic stores have no worker, so this is a no-op. For
@@ -3491,6 +3516,84 @@ impl DurableCoordinator {
     #[cfg(test)]
     fn set_append_payload_sync_delay_for_test(&self, delay: Option<Duration>) -> Result<()> {
         *lock(&self.durable.append_payload_sync_delay)? = delay;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_before_root_copy_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.root_copy_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("root-copy pause lock poisoned"))?;
+        state.enabled = true;
+        state.paused = false;
+        state.resume = false;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_until_root_copy_paused_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.root_copy_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("root-copy pause lock poisoned"))?;
+        while !state.paused {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("root-copy pause lock poisoned"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn resume_root_copy_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.root_copy_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("root-copy pause lock poisoned"))?;
+        state.resume = true;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn persist_without_block_journal_materialization_for_test(&self) -> Result<()> {
+        let total_started = Instant::now();
+        let _metadata_gate = write_lock(&self.metadata_persist_gate)?;
+        let block_delta_prestage_wait_nanos = self.wait_for_all_block_delta_prestage()?;
+        self.wait_for_block_segment_ref_staging()?;
+        let lock_started = Instant::now();
+        let _persist_guard = lock(&self.persist_lock)?;
+        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let snapshot_started = Instant::now();
+        let previous_segments = lock(&self.persisted_segments)?.clone();
+        let pending_append = lock(&self.pending_data_log_append)?.clone();
+        let mut exported_segments = previous_segments.clone();
+        exported_segments.extend(pending_append.segment_ids());
+        let (image, current_segments, new_segments) =
+            self.local.state_for_durable_persist(&exported_segments)?;
+        let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
+        let outcome = self.durable.persist(
+            &image,
+            &previous_segments,
+            &current_segments,
+            new_segments,
+            pending_append,
+            None,
+        )?;
+        *lock(&self.persisted_segments)? = outcome.kept_segments;
+        *lock(&self.pending_data_log_append)? = PendingDataLogAppend::default();
+        let mut profile = outcome.profile;
+        profile.lock_wait_nanos = lock_wait_nanos;
+        profile.block_delta_prestage_wait_nanos = block_delta_prestage_wait_nanos;
+        profile.local_snapshot_nanos = local_snapshot_nanos;
+        profile.total_nanos = duration_nanos_u64(total_started.elapsed());
+        let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
+        self.prune_pending_block_deltas_through(durable_through)?;
+        self.prune_pending_native_file_deltas_through(durable_through)?;
+        self.attach_metadata_publish_profile(&mut profile)?;
+        self.record_persist_profile(profile)?;
         Ok(())
     }
 
@@ -3816,6 +3919,43 @@ impl DurableCoordinator {
         }
     }
 
+    fn wait_for_block_journal_lanes_idle(&self) -> Result<()> {
+        for shard in 0..self.block_journal_flush.len() {
+            let lane = self
+                .block_journal_flush
+                .get(shard)
+                .ok_or_else(|| StorageError::corrupt("block journal shard has no lane"))?;
+            loop {
+                let mut state = lock(&lane.inner)?;
+                if !state.in_flight
+                    && state.pending.is_empty()
+                    && state.unapplied_writes.is_empty()
+                {
+                    break;
+                }
+                if !state.in_flight && !state.pending.is_empty() {
+                    state.in_flight = true;
+                    let batch = std::mem::take(&mut state.pending);
+                    drop(state);
+                    let result =
+                        self.persist_block_journal_lane_batch(Instant::now(), shard, batch);
+                    let mut state = lock(&lane.inner)?;
+                    state.in_flight = false;
+                    state.generation = state.generation.saturating_add(1);
+                    lane.cvar.notify_all();
+                    result?;
+                    continue;
+                }
+
+                let generation = state.generation;
+                while state.in_flight && state.generation == generation {
+                    state = wait_on_cvar(&lane.cvar, state)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Let nearby boundary requests join the owner's batch.
     ///
     /// A solo request proceeds immediately: the journal sync itself is the
@@ -4115,6 +4255,322 @@ impl DurableCoordinator {
             let info = self.local.metadata.device_info(device_id)?;
             self.flush_block_journal_device_through(device_id, info.latest_commit)?;
         }
+        Ok(())
+    }
+
+    fn block_journal_segment_offset_blocks(
+        &self,
+        offset: u64,
+        block_size: u64,
+    ) -> Result<BlockIndex> {
+        if !offset.is_multiple_of(block_size) {
+            return Err(StorageError::corrupt(
+                "block journal segment offset is not block aligned",
+            ));
+        }
+        Ok(BlockIndex::from_raw(offset / block_size))
+    }
+
+    fn append_block_journal_delta_entries(
+        &self,
+        out: &mut Vec<BlockDeltaEntry>,
+        info: &DeviceInfo,
+        range: ByteRange,
+        replacement: BlockDeltaReplacement,
+    ) -> Result<()> {
+        let chunks = self.local.split_device_range(info, range)?;
+        let block_size = u64::from(info.spec.block_size);
+        let range_start_block = range.offset / block_size;
+        for chunk in chunks {
+            let replacement = match replacement {
+                BlockDeltaReplacement::Segment {
+                    segment_id,
+                    segment_offset,
+                } => {
+                    let chunk_offset = chunk
+                        .range
+                        .start
+                        .raw()
+                        .checked_sub(range_start_block)
+                        .ok_or_else(|| {
+                            StorageError::corrupt("journal materialization chunk underflows")
+                        })?;
+                    BlockDeltaReplacement::Segment {
+                        segment_id,
+                        segment_offset: BlockIndex::from_raw(
+                            segment_offset
+                                .raw()
+                                .checked_add(chunk_offset)
+                                .ok_or_else(|| {
+                                    StorageError::corrupt(
+                                        "journal materialization segment offset overflows",
+                                    )
+                                })?,
+                        ),
+                    }
+                }
+                BlockDeltaReplacement::Sparse => BlockDeltaReplacement::Sparse,
+            };
+            out.push(BlockDeltaEntry {
+                shard_id: chunk.shard_id,
+                range: chunk.range,
+                replacement,
+            });
+        }
+        Ok(())
+    }
+
+    fn block_delta_from_journal_commit(
+        &self,
+        commit: &BlockJournalCommit,
+    ) -> Result<BlockDeltaCommit> {
+        let info = self.local.metadata.device_info(commit.device_id)?;
+        commit.validate(&info.spec)?;
+        let block_size = u64::from(info.spec.block_size);
+        let owner = MappingOwner::BlockDevice(commit.device_id);
+        let mut entries = Vec::new();
+        for entry in &commit.entries {
+            match entry {
+                BlockJournalEntry::Write {
+                    range,
+                    payload_integrity,
+                    bytes,
+                } => {
+                    let receipt = self.local.write_segment_for_intent_with_id_owned_verified(
+                        WriteGrantIntent::Internal { owner },
+                        self.local.next_write_intent()?,
+                        bytes.clone(),
+                        WriteDurability::Acknowledged,
+                        *payload_integrity,
+                    )?;
+                    let replacement = BlockDeltaReplacement::Segment {
+                        segment_id: receipt.descriptor().segment_id,
+                        segment_offset: BlockIndex::from_raw(0),
+                    };
+                    self.append_block_journal_delta_entries(
+                        &mut entries,
+                        &info,
+                        *range,
+                        replacement,
+                    )?;
+                }
+                BlockJournalEntry::Segment {
+                    range,
+                    segment_id,
+                    segment_offset,
+                    ..
+                } => {
+                    let replacement = BlockDeltaReplacement::Segment {
+                        segment_id: *segment_id,
+                        segment_offset: self
+                            .block_journal_segment_offset_blocks(*segment_offset, block_size)?,
+                    };
+                    self.append_block_journal_delta_entries(
+                        &mut entries,
+                        &info,
+                        *range,
+                        replacement,
+                    )?;
+                }
+                BlockJournalEntry::Sparse { range } => {
+                    self.append_block_journal_delta_entries(
+                        &mut entries,
+                        &info,
+                        *range,
+                        BlockDeltaReplacement::Sparse,
+                    )?;
+                }
+            }
+        }
+        Ok(BlockDeltaCommit {
+            device_id: commit.device_id,
+            commit_seq: commit.commit_seq,
+            write_count: commit.write_count,
+            collapsed_range_count: commit.collapsed_range_count,
+            committed_bytes: commit.committed_bytes,
+            entries,
+        })
+    }
+
+    fn materialize_block_delta_roots(&self, delta: &BlockDeltaCommit) -> Result<bool> {
+        if self
+            .local
+            .metadata
+            .block_timeline_contains_commit(delta.device_id, delta.commit_seq)?
+        {
+            return Ok(false);
+        }
+        let current = self.local.metadata.get_head(delta.device_id)?;
+        let mut receipts = BTreeMap::new();
+        for segment_id in delta.segment_ids() {
+            let receipt = self.local.storage_nodes.receipt_for_segment(segment_id)?;
+            receipts.insert(segment_id, self.local.authority.verify_segment_receipt(&receipt)?);
+        }
+        let all_receipts: Vec<_> = receipts.values().cloned().collect();
+
+        let mut by_shard = BTreeMap::<ShardId, Vec<BlockDeltaEntry>>::new();
+        for entry in &delta.entries {
+            by_shard
+                .entry(entry.shard_id)
+                .or_default()
+                .push(entry.clone());
+        }
+
+        let mut updates = Vec::with_capacity(by_shard.len());
+        for (shard_id, mut entries) in by_shard {
+            entries.sort_by_key(|entry| entry.range.start.raw());
+            let shard_index = usize::try_from(shard_id.raw())
+                .map_err(|_| StorageError::corrupt("block delta shard id overflows usize"))?;
+            let mut root = *current
+                .shard_roots
+                .get(shard_index)
+                .ok_or_else(|| StorageError::corrupt("block delta shard is outside device"))?;
+            let old_root = root;
+            let mut tree_edits = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let replacement = match entry.replacement {
+                    BlockDeltaReplacement::Segment {
+                        segment_id,
+                        segment_offset,
+                    } => {
+                        let Some(segment_base_raw) =
+                            entry.range.start.raw().checked_sub(segment_offset.raw())
+                        else {
+                            return Err(StorageError::corrupt(
+                                "block delta segment offset exceeds logical start",
+                            ));
+                        };
+                        Some(SegmentReplacement {
+                            segment_id,
+                            segment_base: BlockIndex::from_raw(segment_base_raw),
+                        })
+                    }
+                    BlockDeltaReplacement::Sparse => None,
+                };
+                tree_edits.push(TreeRangeEdit {
+                    range: entry.range,
+                    replacement,
+                });
+            }
+            root = self
+                .local
+                .replace_tree_ranges_with_receipts(root, &tree_edits, &all_receipts)?
+                .root;
+            if root != old_root {
+                updates.push(RootUpdate::BlockShard(ShardRootUpdate {
+                    shard_id,
+                    old_root,
+                    new_root: root,
+                }));
+            }
+        }
+
+        let materialized = self.local.metadata.materialize_block_journal_commit(
+            delta.device_id,
+            delta.commit_seq,
+            updates,
+        )?;
+        if materialized {
+            for receipt in receipts.values() {
+                self.local.storage_nodes.mark_segment_referenced(
+                    receipt.receipt(),
+                    delta.commit_seq,
+                    self.local.authority.as_ref(),
+                )?;
+            }
+        }
+        Ok(materialized)
+    }
+
+    fn materializable_block_journal_commits(&self) -> Result<Vec<BlockJournalCommit>> {
+        let records = self.durable.block_journal_records()?;
+        let materialized = self.local.metadata.block_materialized_high_water()?;
+        let mut durable_through = BTreeMap::<DeviceId, CommitSeq>::new();
+        let mut writes = Vec::new();
+        for record in records {
+            match record {
+                BlockJournalRecord::Write(commit) => writes.push(commit),
+                BlockJournalRecord::PackedWrites(packed) => {
+                    writes.extend(packed.expand_commits()?);
+                }
+                BlockJournalRecord::Flush {
+                    device_id,
+                    durable_through: flushed_through,
+                    ..
+                } => {
+                    durable_through
+                        .entry(device_id)
+                        .and_modify(|durable| *durable = (*durable).max(flushed_through))
+                        .or_insert(flushed_through);
+                }
+                BlockJournalRecord::Lease { .. } => {}
+            }
+        }
+        writes.sort_by_key(|commit| commit.commit_seq.raw());
+        let mut selected = Vec::new();
+        for commit in writes {
+            let Some(durable) = durable_through.get(&commit.device_id) else {
+                continue;
+            };
+            if commit.commit_seq.raw() > durable.raw() {
+                continue;
+            }
+            if materialized
+                .get(&commit.device_id)
+                .is_some_and(|high| commit.commit_seq.raw() <= high.raw())
+            {
+                continue;
+            }
+            if self
+                .local
+                .metadata
+                .block_timeline_contains_commit(commit.device_id, commit.commit_seq)?
+            {
+                continue;
+            }
+            selected.push(commit);
+        }
+        Ok(selected)
+    }
+
+    fn materialize_durable_block_journal(&self) -> Result<bool> {
+        let commits = self.materializable_block_journal_commits()?;
+        let mut materialized = false;
+        for commit in commits {
+            let delta = self.block_delta_from_journal_commit(&commit)?;
+            materialized |= self.materialize_block_delta_roots(&delta)?;
+        }
+        Ok(materialized)
+    }
+
+    fn materialize_block_journal_for_root_copy(&self) -> Result<()> {
+        self.wait_for_block_journal_lanes_idle()?;
+        self.flush_visible_block_journal_heads()?;
+        self.wait_for_block_journal_lanes_idle()?;
+        self.materialize_durable_block_journal()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_before_root_copy_if_requested_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.root_copy_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("root-copy pause lock poisoned"))?;
+        if !state.enabled {
+            return Ok(());
+        }
+        state.paused = true;
+        cvar.notify_all();
+        while !state.resume {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("root-copy pause lock poisoned"))?;
+        }
+        state.enabled = false;
+        state.paused = false;
+        state.resume = false;
+        cvar.notify_all();
         Ok(())
     }
 
@@ -5653,7 +6109,17 @@ impl DurableCoordinator {
         persist: bool,
         op: impl FnOnce(&LocalCoordinator) -> Result<T>,
     ) -> Result<T> {
+        let root_copy_guard = if persist {
+            let guard = lock(&self.block_delta_staging_lock)?;
+            self.materialize_block_journal_for_root_copy()?;
+            #[cfg(test)]
+            self.pause_before_root_copy_if_requested_for_test()?;
+            Some(guard)
+        } else {
+            None
+        };
         let result = op(&self.local);
+        drop(root_copy_guard);
         if !persist {
             return result;
         }

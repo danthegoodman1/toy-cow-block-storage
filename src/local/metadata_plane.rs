@@ -2189,6 +2189,29 @@ impl InMemoryMetadataPlane {
             .any(|commit| commit.device_id == device_id && commit.commit_seq == commit_seq)
     }
 
+    fn block_materialized_high_water_locked(
+        inner: &MetadataInner,
+    ) -> BTreeMap<DeviceId, CommitSeq> {
+        let mut high = BTreeMap::<DeviceId, CommitSeq>::new();
+        for commit in &inner.shard_commits {
+            high.entry(commit.device_id)
+                .and_modify(|current| *current = (*current).max(commit.commit_seq))
+                .or_insert(commit.commit_seq);
+        }
+        high
+    }
+
+    fn block_materialized_timeline_contains_commit_locked(
+        inner: &MetadataInner,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        inner
+            .shard_commits
+            .iter()
+            .any(|commit| commit.device_id == device_id && commit.commit_seq == commit_seq)
+    }
+
     fn target_commit_for_keyspace_restore_locked(
         inner: &MetadataInner,
         keyspace_id: KeyspaceId,
@@ -2771,6 +2794,132 @@ impl InMemoryMetadataPlane {
     pub fn last_mark_epoch_for_segment(&self, segment_id: SegmentId) -> Result<Option<u64>> {
         let inner = lock(&self.inner)?;
         Ok(inner.segment_last_mark_epoch.get(&segment_id).copied())
+    }
+
+    pub(super) fn block_materialized_high_water(&self) -> Result<BTreeMap<DeviceId, CommitSeq>> {
+        let inner = lock(&self.inner)?;
+        Ok(Self::block_materialized_high_water_locked(&inner))
+    }
+
+    pub(super) fn block_timeline_contains_commit(
+        &self,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+    ) -> Result<bool> {
+        let inner = lock(&self.inner)?;
+        Ok(Self::block_materialized_timeline_contains_commit_locked(
+            &inner, device_id, commit_seq,
+        ))
+    }
+
+    pub(super) fn materialize_block_journal_commit(
+        &self,
+        device_id: DeviceId,
+        commit_seq: CommitSeq,
+        updates: Vec<RootUpdate>,
+    ) -> Result<bool> {
+        let publish_started = Instant::now();
+        let mut inner = lock(&self.inner)?;
+        let publish_lock_wait_nanos = duration_nanos_u64(publish_started.elapsed());
+        if Self::block_materialized_timeline_contains_commit_locked(
+            &inner, device_id, commit_seq,
+        ) {
+            return Ok(false);
+        }
+
+        let current = inner
+            .device_heads
+            .get(&device_id)
+            .cloned()
+            .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
+        let mut next_roots = current.shard_roots.clone();
+        let mut shard_commits = Vec::new();
+        let mut commit_updates = Vec::new();
+
+        if updates.is_empty() {
+            let old_root = *next_roots
+                .first()
+                .ok_or_else(|| StorageError::corrupt("block device has no shard roots"))?;
+            shard_commits.push((ShardId::from_raw(0), old_root, old_root));
+            commit_updates.push(RootUpdate::BlockShard(ShardRootUpdate {
+                shard_id: ShardId::from_raw(0),
+                old_root,
+                new_root: old_root,
+            }));
+        } else {
+            for update in updates {
+                let RootUpdate::BlockShard(update) = update else {
+                    return Err(StorageError::invalid_argument(
+                        "block journal materialization cannot include file-root updates",
+                    ));
+                };
+                let shard = usize::try_from(update.shard_id.raw())
+                    .map_err(|_| StorageError::invalid_argument("shard ID overflows usize"))?;
+                if shard >= next_roots.len() {
+                    return Err(StorageError::invalid_argument(
+                        "shard update is outside device root set",
+                    ));
+                }
+                if next_roots[shard] != update.old_root {
+                    self.record_publish_profile(MetadataPublishProfile {
+                        lock_wait_nanos: publish_lock_wait_nanos,
+                        logical_conflict_count: 1,
+                        ..MetadataPublishProfile::default()
+                    })?;
+                    return Err(StorageError::conflict(
+                        "stale shard root during block journal materialization",
+                    ));
+                }
+                if !inner.metadata_nodes.contains_key(&update.new_root) {
+                    return Err(StorageError::not_found(
+                        "metadata_node",
+                        update.new_root.to_string(),
+                    ));
+                }
+                next_roots[shard] = update.new_root;
+                shard_commits.push((update.shard_id, update.old_root, update.new_root));
+                commit_updates.push(RootUpdate::BlockShard(update));
+            }
+        }
+
+        let commit_group_id = inner.alloc_commit_group_id();
+        let commit_group = CommitGroup {
+            commit_group: commit_group_id,
+            commit_seq,
+            owner: MappingOwner::BlockDevice(device_id),
+            updates: commit_updates,
+        };
+        for (shard_id, old_root, new_root) in shard_commits {
+            inner.shard_commits.push(ShardCommit {
+                commit_seq,
+                commit_group: commit_group_id,
+                time: LogicalTime::from_raw(commit_seq.raw()),
+                device_id,
+                shard_id,
+                old_root,
+                new_root,
+            });
+        }
+        let mut next_head = current;
+        next_head.generation = Self::next_generation(next_head.generation)?;
+        next_head.latest_commit = next_head.latest_commit.max(commit_seq);
+        next_head.shard_roots = next_roots;
+        inner.device_heads.insert(device_id, next_head);
+        inner
+            .commit_groups
+            .insert(commit_group.commit_group, commit_group.clone());
+        if commit_seq.raw() >= inner.next_commit_seq {
+            inner.next_commit_seq = commit_seq.raw().checked_add(1).ok_or_else(|| {
+                StorageError::conflict("block journal materialization sequence overflows")
+            })?;
+        }
+        self.record_publish_profile(MetadataPublishProfile {
+            lock_wait_nanos: publish_lock_wait_nanos,
+            touched_shard_head_rows: usize_to_u64(commit_group.updates.len()),
+            commit_rows_written: 1,
+            ..MetadataPublishProfile::default()
+        })?;
+        Ok(true)
     }
 }
 

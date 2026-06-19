@@ -393,6 +393,46 @@ Exit gate:
 - GC never reclaims inline journal payloads or segment refs needed by live
   heads, forks, or PITR windows.
 
+Stage 5 local checkpoint, 2026-06-19, macOS Docker dev container, baseline
+`3a23c81`:
+
+- Added an explicit deterministic `materialize_block_journal` path. Durable
+  persists and durable root-copy control operations first flush visible journal
+  heads, fold durable journal writes into immutable CoW shard roots, and only
+  then snapshot or persist metadata.
+- The materialized high-water is explicit per-device compact coverage derived
+  from shard timeline commits, including no-op root markers. Visible
+  `latest_commit` is not compact coverage. Reopen and journal pruning skip only
+  records covered by this materialized high-water; if a durable snapshot records
+  a visible head beyond compact roots, retained journal records still replay.
+- Durable root-copy operations hold the block-delta staging lock while draining
+  block-journal lanes, flushing visible heads, materializing compact roots, and
+  copying checkpoint/fork/restore roots. A concurrent writer can publish only
+  before the copied roots are folded or after the root-copy metadata has been
+  recorded; it cannot land between pre-materialization and root copy.
+- Inline journal payloads materialize into ordinary immutable segments; segment
+  reference records reuse their existing data-log segments; sparse zero/discard
+  records become sparse tree edits. Materialized commits keep their original
+  commit sequence in the shard timeline, including no-op root markers when a
+  sparse commit leaves roots unchanged, so PITR restore by commit/time remains
+  deterministic.
+- Journal pruning is per device and runs only after the materialized roots are
+  durably persisted. Pruning keeps lease records for stale-writer fencing,
+  drops covered write/flush records, and expands partially covered packed
+  records into equivalent ordinary writes.
+- Reopen skips journal writes covered by the explicit materialized high-water,
+  preventing retained-but-materialized journal history from shadowing newer
+  compact state without dropping journal-only history.
+- Focused tests cover mixed compact/materialized plus journal-only reads before
+  and after reopen, checkpoint/fork/restore root retention across
+  materialization and divergent writes, segment-ref and sparse materialization,
+  a stale-snapshot interleaving where visible latest exceeds materialized roots,
+  a concurrent writer interleaving with fork/checkpoint root copy, and the
+  failure case where journal records remain unpruned if durable root persist
+  fails. The Criterion regression harness has reopen timing proxies
+  (`open_after_32_block_writes`, `open_after_256_block_writes`); loadbench does
+  not currently expose a long-run reopen/replay workload.
+
 ### Stage 6: Direct I/O Backend
 
 Add a provider-private low-level backend for the block journal and data logs.

@@ -2259,6 +2259,94 @@ pub(super) fn load_block_journal_records(path: &Path) -> Result<Vec<BlockJournal
     Ok(batches.into_iter().flatten().collect())
 }
 
+fn block_journal_commit_is_materialized(
+    materialized: &BTreeMap<DeviceId, CommitSeq>,
+    commit: &BlockJournalCommit,
+) -> bool {
+    materialized
+        .get(&commit.device_id)
+        .is_some_and(|high| commit.commit_seq.raw() <= high.raw())
+}
+
+fn block_journal_record_pruned(
+    materialized: &BTreeMap<DeviceId, CommitSeq>,
+    record: BlockJournalRecord,
+    out: &mut Vec<BlockJournalRecord>,
+) -> Result<()> {
+    match record {
+        BlockJournalRecord::Lease { .. } => out.push(record),
+        BlockJournalRecord::Write(commit) => {
+            if !block_journal_commit_is_materialized(materialized, &commit) {
+                out.push(BlockJournalRecord::Write(commit));
+            }
+        }
+        BlockJournalRecord::PackedWrites(packed) => {
+            for commit in packed.expand_commits()? {
+                if !block_journal_commit_is_materialized(materialized, &commit) {
+                    out.push(BlockJournalRecord::Write(commit));
+                }
+            }
+        }
+        BlockJournalRecord::Flush {
+            device_id,
+            writer_epoch,
+            durable_through,
+        } => {
+            if materialized
+                .get(&device_id)
+                .is_none_or(|high| durable_through.raw() > high.raw())
+            {
+                out.push(BlockJournalRecord::Flush {
+                    device_id,
+                    writer_epoch,
+                    durable_through,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prune_block_journal_records_through(
+    path: &Path,
+    materialized: &BTreeMap<DeviceId, CommitSeq>,
+) -> Result<()> {
+    if materialized.is_empty() || !path.exists() {
+        return Ok(());
+    }
+    let records = load_block_journal_records(path)?;
+    let mut kept = Vec::new();
+    for record in records {
+        block_journal_record_pruned(materialized, record, &mut kept)?;
+    }
+
+    if kept.is_empty() {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(fs_error)?;
+        file.sync_data().map_err(fs_error)?;
+        return Ok(());
+    }
+
+    let tmp = path.with_extension("journal.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(fs_error)?;
+        file.write_all(&block_journal_records_frame(&kept)?)
+            .map_err(fs_error)?;
+        file.sync_data().map_err(fs_error)?;
+    }
+    fs::rename(&tmp, path).map_err(fs_error)?;
+    sync_parent_dir(path)
+}
+
 pub(super) fn append_append_visible_publish_journal_records(
     path: &Path,
     records: &[AppendVisiblePublish],
@@ -3128,6 +3216,24 @@ impl DurableSqliteStore {
             records.extend(load_block_journal_records(&path)?);
         }
         Ok(records)
+    }
+
+    fn prune_block_journal_records_through(
+        &self,
+        materialized: &BTreeMap<DeviceId, CommitSeq>,
+    ) -> Result<()> {
+        if materialized.is_empty() {
+            return Ok(());
+        }
+        for shard in 0..self.block_journal_shard_nodes.len() {
+            let path = self.block_journal_shard_path(shard)?;
+            let shard_lock = self.block_journal_shard_locks.get(shard).ok_or_else(|| {
+                StorageError::invalid_argument("block journal shard index out of range")
+            })?;
+            let _journal_guard = lock(shard_lock)?;
+            prune_block_journal_records_through(&path, materialized)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]

@@ -2775,6 +2775,447 @@ fn durable_block_journal_acknowledged_write_replays_after_flush_marker() {
 }
 
 #[test]
+fn durable_block_journal_materialization_mixes_compact_roots_and_journal_overlay_after_reopen() {
+    let root = durable_temp_dir("block-journal-materialized-mixed-reopen");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-materialized-mixed".to_string()),
+        })
+        .unwrap();
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(1, 11),
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    store.checkpoint(device_id).unwrap();
+
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 12),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.materialize_block_journal().unwrap();
+    let journal = store.durable.block_journal_shard_path_for_device(device_id);
+    assert!(
+        load_block_journal_records(&journal)
+            .unwrap()
+            .iter()
+            .all(|record| matches!(record, BlockJournalRecord::Lease { .. }))
+    );
+
+    store
+        .write_device_with_writer(
+            &lease,
+            2 * 4096,
+            &repeated_blocks(1, 13),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let mut live = vec![0; 3 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut live)
+        .unwrap();
+    assert_eq!(&live[0..4096], repeated_blocks(1, 11).as_slice());
+    assert_eq!(&live[4096..2 * 4096], repeated_blocks(1, 12).as_slice());
+    assert_eq!(&live[2 * 4096..3 * 4096], repeated_blocks(1, 13).as_slice());
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut reopened_bytes = vec![0; 3 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut reopened_bytes)
+        .unwrap();
+    assert_eq!(reopened_bytes, live);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_reopen_replays_retained_journal_when_latest_exceeds_materialized_roots() {
+    let root = durable_temp_dir("block-journal-stale-snapshot-replay");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-stale-snapshot".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 14),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store
+        .persist_without_block_journal_materialization_for_test()
+        .unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut reopened_bytes = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut reopened_bytes)
+        .unwrap();
+    assert_eq!(reopened_bytes, repeated_blocks(1, 14));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_root_copy_excludes_concurrent_writes_after_materialization() {
+    let root = durable_temp_dir("block-journal-root-copy-serialization");
+    let cfg = config();
+    let store = std::sync::Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-root-copy-source".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 61),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    store.pause_before_root_copy_for_test().unwrap();
+    let fork_store = std::sync::Arc::clone(&store);
+    let fork_thread = std::thread::spawn(move || {
+        fork_store
+            .fork_device(
+                device_id,
+                ForkRequest {
+                    target: None,
+                    name: Some("journal-root-copy-fork".to_string()),
+                },
+            )
+            .unwrap()
+    });
+    store.wait_until_root_copy_paused_for_test().unwrap();
+    let (fork_write_started, fork_write_waiting) = std::sync::mpsc::channel();
+    let fork_write_store = std::sync::Arc::clone(&store);
+    let fork_write_lease = lease;
+    let fork_writer = std::thread::spawn(move || {
+        fork_write_started.send(()).unwrap();
+        fork_write_store
+            .write_device_with_writer(
+                &fork_write_lease,
+                4096,
+                &repeated_blocks(1, 62),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+    });
+    fork_write_waiting.recv().unwrap();
+    store.resume_root_copy_for_test().unwrap();
+    let forked = fork_thread.join().unwrap();
+    fork_writer.join().unwrap();
+
+    let mut forked_bytes = vec![0; 2 * 4096];
+    store
+        .read_device(forked, ByteRange::new(0, 2 * 4096), &mut forked_bytes)
+        .unwrap();
+    assert_eq!(&forked_bytes[0..4096], repeated_blocks(1, 61).as_slice());
+    assert_eq!(&forked_bytes[4096..], vec![0; 4096].as_slice());
+
+    store.pause_before_root_copy_for_test().unwrap();
+    let checkpoint_store = std::sync::Arc::clone(&store);
+    let checkpoint_thread =
+        std::thread::spawn(move || checkpoint_store.checkpoint(device_id).unwrap());
+    store.wait_until_root_copy_paused_for_test().unwrap();
+    let (checkpoint_write_started, checkpoint_write_waiting) = std::sync::mpsc::channel();
+    let checkpoint_write_store = std::sync::Arc::clone(&store);
+    let checkpoint_write_lease = lease;
+    let checkpoint_writer = std::thread::spawn(move || {
+        checkpoint_write_started.send(()).unwrap();
+        checkpoint_write_store
+            .write_device_with_writer(
+                &checkpoint_write_lease,
+                2 * 4096,
+                &repeated_blocks(1, 63),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+    });
+    checkpoint_write_waiting.recv().unwrap();
+    store.resume_root_copy_for_test().unwrap();
+    let checkpoint = checkpoint_thread.join().unwrap();
+    checkpoint_writer.join().unwrap();
+
+    let restored = store
+        .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+        .unwrap();
+    let mut source = vec![0; 3 * 4096];
+    store
+        .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut source)
+        .unwrap();
+    assert_eq!(&source[0..4096], repeated_blocks(1, 61).as_slice());
+    assert_eq!(&source[4096..2 * 4096], repeated_blocks(1, 62).as_slice());
+    assert_eq!(
+        &source[2 * 4096..3 * 4096],
+        repeated_blocks(1, 63).as_slice()
+    );
+
+    let mut restored_bytes = vec![0; 3 * 4096];
+    store
+        .read_device(restored, ByteRange::new(0, 3 * 4096), &mut restored_bytes)
+        .unwrap();
+    assert_eq!(&restored_bytes[0..4096], repeated_blocks(1, 61).as_slice());
+    assert_eq!(
+        &restored_bytes[4096..2 * 4096],
+        repeated_blocks(1, 62).as_slice()
+    );
+    assert_eq!(
+        &restored_bytes[2 * 4096..3 * 4096],
+        vec![0; 4096].as_slice()
+    );
+
+    store.materialize_block_journal().unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut reopened_source = vec![0; 3 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 3 * 4096), &mut reopened_source)
+        .unwrap();
+    assert_eq!(reopened_source, source);
+    let mut reopened_fork = vec![0; 2 * 4096];
+    reopened
+        .read_device(forked, ByteRange::new(0, 2 * 4096), &mut reopened_fork)
+        .unwrap();
+    assert_eq!(reopened_fork, forked_bytes);
+    let mut reopened_restored = vec![0; 3 * 4096];
+    reopened
+        .read_device(
+            restored,
+            ByteRange::new(0, 3 * 4096),
+            &mut reopened_restored,
+        )
+        .unwrap();
+    assert_eq!(reopened_restored, restored_bytes);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_materialization_preserves_checkpoint_fork_and_restore_roots() {
+    let root = durable_temp_dir("block-journal-materialized-fork-restore");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-materialized-source".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 21),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    let checkpoint = store.checkpoint(device_id).unwrap();
+    let forked = store
+        .fork_device(
+            device_id,
+            ForkRequest {
+                target: None,
+                name: Some("journal-materialized-fork".to_string()),
+            },
+        )
+        .unwrap();
+    let restored = store
+        .restore_device(device_id, RestorePoint::Checkpoint(checkpoint))
+        .unwrap();
+    let fork_lease = store.acquire_block_writer(forked).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 22),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store
+        .write_device_with_writer(
+            &fork_lease,
+            4096,
+            &repeated_blocks(1, 23),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.materialize_block_journal().unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut source = vec![0; 2 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 2 * 4096), &mut source)
+        .unwrap();
+    assert_eq!(&source[0..4096], repeated_blocks(1, 21).as_slice());
+    assert_eq!(&source[4096..], repeated_blocks(1, 22).as_slice());
+
+    let mut fork = vec![0; 2 * 4096];
+    reopened
+        .read_device(forked, ByteRange::new(0, 2 * 4096), &mut fork)
+        .unwrap();
+    assert_eq!(&fork[0..4096], repeated_blocks(1, 21).as_slice());
+    assert_eq!(&fork[4096..], repeated_blocks(1, 23).as_slice());
+
+    let mut restored_bytes = vec![0; 2 * 4096];
+    reopened
+        .read_device(restored, ByteRange::new(0, 2 * 4096), &mut restored_bytes)
+        .unwrap();
+    assert_eq!(&restored_bytes[0..4096], repeated_blocks(1, 21).as_slice());
+    assert_eq!(&restored_bytes[4096..], vec![0; 4096].as_slice());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_materialization_preserves_segment_refs_and_sparse_ranges() {
+    let root = durable_temp_dir("block-journal-materialized-segment-sparse");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 64,
+                block_size: 4096,
+            },
+            name: Some("journal-materialized-segment-sparse".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(32, 41),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.write_zeroes_with_writer(&lease, 4096, 4096).unwrap();
+    store
+        .discard_device_with_writer(&lease, 3 * 4096, 2 * 4096)
+        .unwrap();
+    store.materialize_block_journal().unwrap();
+    let journal = store.durable.block_journal_shard_path_for_device(device_id);
+    assert!(
+        load_block_journal_records(&journal)
+            .unwrap()
+            .iter()
+            .all(|record| matches!(record, BlockJournalRecord::Lease { .. }))
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; 6 * 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 6 * 4096), &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes[0..4096], repeated_blocks(1, 41).as_slice());
+    assert_eq!(&bytes[4096..2 * 4096], vec![0; 4096].as_slice());
+    assert_eq!(
+        &bytes[2 * 4096..3 * 4096],
+        repeated_blocks(1, 41).as_slice()
+    );
+    assert_eq!(&bytes[3 * 4096..5 * 4096], vec![0; 2 * 4096].as_slice());
+    assert_eq!(
+        &bytes[5 * 4096..6 * 4096],
+        repeated_blocks(1, 41).as_slice()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_prunes_only_after_materialized_roots_are_durable() {
+    let root = durable_temp_dir("block-journal-prune-after-durable-materialize");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-prune-after-durable".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 31),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let journal = store.durable.block_journal_shard_path_for_device(device_id);
+    let before = fs::metadata(&journal).unwrap().len();
+    store.fail_next_persist_for_test();
+    assert!(store.materialize_block_journal().is_err());
+    assert_eq!(fs::metadata(&journal).unwrap().len(), before);
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 4096];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 4096), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, repeated_blocks(1, 31));
+    reopened.materialize_block_journal().unwrap();
+    assert!(
+        load_block_journal_records(&journal)
+            .unwrap()
+            .iter()
+            .all(|record| matches!(record, BlockJournalRecord::Lease { .. }))
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_block_journal_leased_zero_and_discard_replay_after_reopen() {
     let root = durable_temp_dir("block-journal-sparse-restart");
     let cfg = config();
