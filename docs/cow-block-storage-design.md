@@ -238,11 +238,14 @@ replay nothing; their staged payloads are invisible orphans for custodian
 cleanup. Reads resolve the compact tree and then apply the journal overlay,
 so read-after-write observes journal-backed writes without forcing immediate
 tree path-copy or node-catalog publication. The overlay keeps only a
-coalesced current-view read index keyed by range start; shadowed history lives
-in the journal shard files, which remain the replay and future
-materialization history. Until journal materialization exists, a device with unmaterialized
-journal state keeps later writes on the journal path instead of publishing a
-newer compact-tree root that older overlay entries could incorrectly cover.
+provider-private current view keyed by block-aligned LBA runs. Large contiguous
+writes stay as one run, sequential 4K batch fragments share payload references
+inside one run, and overlapping writes split only the affected runs. Shadowed
+history lives in the journal shard files, which remain the replay and future
+materialization history. Until journal materialization exists, a device with
+unmaterialized journal state keeps later writes on the journal path instead of
+publishing a newer compact-tree root that older overlay entries could
+incorrectly cover.
 SQLite block-delta checkpointing and maintenance fold durable deltas into
 immutable CoW shard roots before pruning covered rows. Journal records remain
 retained replay roots until a materialization pass folds them into the CoW

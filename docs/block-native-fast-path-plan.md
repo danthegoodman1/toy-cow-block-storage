@@ -98,11 +98,12 @@ BlockSource =
   CompactTree
 ```
 
-The first implementation can use a deterministic radix/page-table shape keyed
-by logical block number. It should replace the interval overlay read index for
-foreground block resolution. Interval history remains in the journal for replay
-and materialization, but the hot read/write map should be O(touched blocks), not
-O(existing ranges).
+The first implementation can use a deterministic block-aligned run map or
+radix/page-table shape keyed by logical block number. It should replace the
+interval overlay read index for foreground block resolution. Interval history
+remains in the journal for replay and materialization, but the hot read/write
+map should avoid O(existing ranges) scans and avoid one durable-current-view
+mutation per 4K page for large contiguous writes or sorted 4K batches.
 
 ### Journal Lanes
 
@@ -216,6 +217,50 @@ Exit gate:
   handoff, and read-after-write.
 - `block-write-4k-shard-lanes` improves materially or p99 drops materially
   versus the current read-index implementation.
+
+Stage 1 local checkpoint, 2026-06-19, macOS Docker dev container, baseline
+`a53158a`, artifacts under ignored `target/loadbench/block-lba-stage1-*`:
+
+- Replaced the old foreground overlay read index with a provider-private
+  block-aligned LBA run map.
+- Large contiguous journal entries create one run. Sorted 256 x 4K batch
+  entries coalesce into one fragmented inline run without copying payload bytes
+  into a new 1MiB buffer.
+- Segment-backed 1MiB overlay reads coalesce to one segment source read and run
+  outside the overlay mutex.
+- Deterministic tests cover overlap splitting, non-4K block size, sparse
+  zero/discard, 256-entry fragmented batch coalescing, segment-read call shape,
+  mixed compact-tree plus overlay reads, and replay.
+- Key 5s local deltas:
+  - `block-write-4k-shard-lanes` c16: `16320 -> 17223 IOPS`, p99
+    `1642 -> 1594 us`.
+  - `block-write-4k-device-lanes` c16: `14780 -> 16299 IOPS`, p99
+    `1792 -> 1446 us`.
+  - `block-batch-4k-256ops` c4: `1276 -> 1278 IOPS`, p99
+    `9118 -> 8001 us`.
+  - `block-batch-4k-256ops` c16: `1490 -> 1587 IOPS`, p99
+    `24152 -> 28200 us`.
+  - `block-read-1m` c16: `7376 -> 40445 IOPS`, p99
+    `71268 -> 1639 us`.
+- Focused reruns after noisy full-matrix rows:
+  - `block-read-4k` c1: `342293 -> 317915 IOPS`, p99
+    `7.38 -> 7.88 us`.
+  - `block-read-4k` c4: `229117 -> 241897 IOPS`, p99
+    `79.96 -> 68.63 us`.
+  - `block-read-4k` c16: `85032 -> 87085 IOPS`, p99
+    `1616 -> 1484 us`.
+  - `block-writeback-fsync-1m` c4: `995 -> 901 IOPS`, p99
+    `12728 -> 11985 us`.
+  - `block-writeback-fsync-1m` c16: `1580 -> 1555 IOPS`, p99
+    `25767 -> 28866 us`.
+  - `block-writeback-prestaged-fsync-1m` c4: `1138 -> 1193 IOPS`, p99
+    `10026 -> 7125 us`.
+  - `block-writeback-prestaged-fsync-1m` c16: `1568 -> 1719 IOPS`, p99
+    `17174 -> 11922 us`.
+- Residual watch items: `block-batch-4k-256ops` c16 p99 remains higher despite
+  better throughput, and `block-writeback-fsync-1m` c16 p99 remains higher with
+  roughly flat throughput. Follow-up profiling should focus on lane wait, sync,
+  publish-apply, and map-update slices before Stage 2/3 tuning.
 
 ### Stage 2: Packed 4K Journal Records
 

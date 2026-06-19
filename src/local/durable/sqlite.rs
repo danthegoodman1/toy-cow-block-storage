@@ -107,6 +107,7 @@ pub struct DurablePersistProfile {
     pub block_journal_publish_mark_nanos: u64,
     pub block_journal_publish_reserve_nanos: u64,
     pub block_journal_publish_apply_nanos: u64,
+    pub block_journal_lba_map_update_nanos: u64,
     pub block_journal_publish_receipt_nanos: u64,
     pub block_journal_publish_evidence_nanos: u64,
     pub block_journal_publish_dispatch_nanos: u64,

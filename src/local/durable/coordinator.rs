@@ -3718,6 +3718,7 @@ impl DurableCoordinator {
             block_journal_publish_mark_nanos: lane_timing.publish_mark_nanos,
             block_journal_publish_reserve_nanos: lane_timing.publish_reserve_nanos,
             block_journal_publish_apply_nanos: lane_timing.publish_apply_nanos,
+            block_journal_lba_map_update_nanos: lane_timing.lba_map_update_nanos,
             block_journal_publish_receipt_nanos: lane_timing.publish_receipt_nanos,
             block_journal_publish_evidence_nanos: lane_timing.publish_evidence_nanos,
             block_journal_publish_dispatch_nanos: lane_timing.publish_dispatch_nanos,
@@ -3975,8 +3976,10 @@ impl DurableCoordinator {
                 self.local
                     .metadata
                     .publish_reserved_block_journal_commit(commit.device_id, commit.commit_seq)?;
+                let block_size =
+                    u64::from(self.local.metadata.device_info(commit.device_id)?.spec.block_size);
                 let apply_started = Instant::now();
-                self.block_journal.apply_commit(commit)?;
+                let lba_map_update_nanos = self.block_journal.apply_commit(commit, block_size)?;
                 lane_timing.publish_mark_nanos = lane_timing
                     .publish_mark_nanos
                     .saturating_add(duration_nanos_u64(reserve_started - mark_started));
@@ -3986,6 +3989,9 @@ impl DurableCoordinator {
                 lane_timing.publish_apply_nanos = lane_timing
                     .publish_apply_nanos
                     .saturating_add(duration_nanos_u64(apply_started.elapsed()));
+                lane_timing.lba_map_update_nanos = lane_timing
+                    .lba_map_update_nanos
+                    .saturating_add(lba_map_update_nanos);
             }
             for (device_id, (writer_epoch, durable_through)) in &flushes {
                 self.block_journal.mark_durable(
@@ -4049,13 +4055,26 @@ impl DurableCoordinator {
         self.local
             .metadata
             .publish_reserved_block_journal_commit(commit.device_id, commit.commit_seq)?;
-        self.block_journal.apply_commit(commit)?;
+        let block_size = u64::from(
+            self.local
+                .metadata
+                .device_info(commit.device_id)?
+                .spec
+                .block_size,
+        );
+        let apply_started = Instant::now();
+        let lba_map_update_nanos = self.block_journal.apply_commit(commit, block_size)?;
+        let lane_timing = BlockJournalLaneBatchTiming {
+            publish_apply_nanos: duration_nanos_u64(apply_started.elapsed()),
+            lba_map_update_nanos,
+            ..BlockJournalLaneBatchTiming::default()
+        };
         self.record_block_journal_profile(
             total_started,
             profile,
             self.block_journal.durable_through(commit.device_id)?,
             0,
-            BlockJournalLaneBatchTiming::default(),
+            lane_timing,
         )
     }
 
@@ -4387,7 +4406,15 @@ impl DurableCoordinator {
         self.local
             .metadata
             .publish_reserved_block_journal_commit(lease.device_id, commit_seq)?;
-        self.block_journal.apply_commit(&commit)?;
+        let block_size = u64::from(info.spec.block_size);
+        let apply_started = Instant::now();
+        let lba_map_update_nanos = self.block_journal.apply_commit(&commit, block_size)?;
+        lane_timing.publish_apply_nanos = lane_timing
+            .publish_apply_nanos
+            .saturating_add(duration_nanos_u64(apply_started.elapsed()));
+        lane_timing.lba_map_update_nanos = lane_timing
+            .lba_map_update_nanos
+            .saturating_add(lba_map_update_nanos);
         drop(enqueue_guard);
         self.record_block_journal_profile(
             total_started,

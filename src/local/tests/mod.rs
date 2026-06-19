@@ -2853,6 +2853,72 @@ fn durable_block_journal_leased_zero_and_discard_replay_after_reopen() {
 }
 
 #[test]
+fn durable_block_journal_reads_mixed_base_tree_and_overlay_pages() {
+    let root = durable_temp_dir("block-journal-mixed-base-overlay");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let block = 4096_u64;
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 8,
+                block_size: 4096,
+            },
+            name: Some("journal-mixed-base-overlay".to_string()),
+        })
+        .unwrap();
+
+    store
+        .commit_block_batch(
+            device_id,
+            &[BlockBatchWrite {
+                offset: 0,
+                bytes: repeated_blocks(8, 1),
+                payload_integrity: PayloadIntegrity::Verified,
+            }],
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            block,
+            &repeated_blocks(1, 2),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store
+        .write_zeroes_with_writer(&lease, 3 * block, block)
+        .unwrap();
+    store
+        .discard_device_with_writer(&lease, 5 * block, 2 * block)
+        .unwrap();
+
+    let mut expected = repeated_blocks(8, 1);
+    expected[block as usize..(2 * block) as usize].fill(2);
+    expected[(3 * block) as usize..(4 * block) as usize].fill(0);
+    expected[(5 * block) as usize..(7 * block) as usize].fill(0);
+
+    let mut live = vec![0; expected.len()];
+    store
+        .read_device(device_id, ByteRange::new(0, 8 * block), &mut live)
+        .unwrap();
+    assert_eq!(live, expected);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; expected.len()];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 8 * block), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, expected);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn durable_block_journal_routes_large_flushed_writes_to_segment_refs() {
     let root = durable_temp_dir("block-journal-large-segment-refs");
     let cfg = config();

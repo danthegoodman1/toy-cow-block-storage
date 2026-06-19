@@ -46,10 +46,24 @@ pub(super) enum BlockJournalRecord {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct BlockJournalInlineFragment {
+    bytes: Arc<[u8]>,
+    source_offset: u64,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum BlockJournalOverlaySource {
     Bytes {
         payload_integrity: PayloadIntegrity,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
+        source_offset: u64,
+    },
+    BytesFragments {
+        payload_integrity: PayloadIntegrity,
+        fragments: Arc<[BlockJournalInlineFragment]>,
+        source_offset: u64,
     },
     Segment {
         storage_node: StorageNodeId,
@@ -71,11 +85,11 @@ pub(super) struct BlockJournalDeviceOverlay {
     writer_epoch: WriterEpoch,
     durable_through: CommitSeq,
     visible_through: CommitSeq,
-    // Collapsed newest-wins read index keyed by range start, so inserts and
-    // range reads cost O(log n + overlaps) instead of shifting a sorted
-    // vector. Only the current bytes per range are retained; shadowed
-    // history lives in the journal file, not in memory.
-    read_entries: BTreeMap<u64, BlockJournalOverlayEntry>,
+    block_size: Option<u64>,
+    // Current newest-wins read view keyed by starting logical block number.
+    // Each value is one non-overlapping block-aligned run; shadowed history
+    // lives in journal shard files for replay and future materialization.
+    lba_runs: BTreeMap<u64, BlockJournalOverlayEntry>,
 }
 
 impl Default for BlockJournalDeviceOverlay {
@@ -84,7 +98,8 @@ impl Default for BlockJournalDeviceOverlay {
             writer_epoch: WriterEpoch::from_raw(0),
             durable_through: CommitSeq::from_raw(0),
             visible_through: CommitSeq::from_raw(0),
-            read_entries: BTreeMap::new(),
+            block_size: None,
+            lba_runs: BTreeMap::new(),
         }
     }
 }
@@ -129,6 +144,7 @@ pub(super) struct BlockJournalLaneBatchTiming {
     pub(super) publish_mark_nanos: u64,
     pub(super) publish_reserve_nanos: u64,
     pub(super) publish_apply_nanos: u64,
+    pub(super) lba_map_update_nanos: u64,
     pub(super) publish_receipt_nanos: u64,
     pub(super) publish_evidence_nanos: u64,
     pub(super) publish_dispatch_nanos: u64,
@@ -259,40 +275,244 @@ impl BlockJournalCommit {
         Ok(())
     }
 
-    fn overlay_entries(&self) -> Vec<BlockJournalOverlayEntry> {
-        self.entries
-            .iter()
-            .map(|entry| {
-                let source = match entry {
-                    BlockJournalEntry::Write {
-                        payload_integrity,
-                        bytes,
-                        ..
-                    } => BlockJournalOverlaySource::Bytes {
-                        payload_integrity: *payload_integrity,
-                        bytes: bytes.clone(),
-                    },
-                    BlockJournalEntry::Segment {
-                        storage_node,
-                        segment_id,
-                        segment_offset,
-                        integrity,
-                        ..
-                    } => BlockJournalOverlaySource::Segment {
-                        storage_node: *storage_node,
-                        segment_id: *segment_id,
-                        segment_offset: *segment_offset,
-                        integrity: *integrity,
-                    },
-                    BlockJournalEntry::Sparse { .. } => BlockJournalOverlaySource::Sparse,
-                };
+    fn overlay_entries(&self) -> Result<Vec<BlockJournalOverlayEntry>> {
+        let mut entries = Vec::new();
+        for entry in &self.entries {
+            let source = match entry {
+                BlockJournalEntry::Write {
+                    payload_integrity,
+                    bytes,
+                    ..
+                } => BlockJournalOverlaySource::Bytes {
+                    payload_integrity: *payload_integrity,
+                    bytes: Arc::<[u8]>::from(bytes.clone()),
+                    source_offset: 0,
+                },
+                BlockJournalEntry::Segment {
+                    storage_node,
+                    segment_id,
+                    segment_offset,
+                    integrity,
+                    ..
+                } => BlockJournalOverlaySource::Segment {
+                    storage_node: *storage_node,
+                    segment_id: *segment_id,
+                    segment_offset: *segment_offset,
+                    integrity: *integrity,
+                },
+                BlockJournalEntry::Sparse { .. } => BlockJournalOverlaySource::Sparse,
+            };
+            push_coalesced_block_journal_commit_entry(
+                &mut entries,
                 BlockJournalOverlayEntry {
                     range: entry.range(),
                     source,
-                }
-            })
-            .collect()
+                },
+            )?;
+        }
+        Ok(entries)
     }
+}
+
+fn block_journal_inline_fragment_end(fragment: &BlockJournalInlineFragment) -> Result<u64> {
+    let end = fragment.offset.checked_add(fragment.len).ok_or_else(|| {
+        StorageError::corrupt("block journal inline fragment range overflows")
+    })?;
+    fragment
+        .source_offset
+        .checked_add(fragment.len)
+        .ok_or_else(|| StorageError::corrupt("block journal inline fragment source overflows"))?;
+    let bytes_len = u64::try_from(fragment.bytes.len())
+        .map_err(|_| StorageError::corrupt("block journal inline fragment length overflows"))?;
+    if end > bytes_len {
+        return Err(StorageError::corrupt(
+            "block journal inline fragment exceeds payload",
+        ));
+    }
+    Ok(end)
+}
+
+fn block_journal_inline_fragments_total_len(
+    fragments: &[BlockJournalInlineFragment],
+) -> Result<u64> {
+    let mut expected_offset = 0_u64;
+    for fragment in fragments {
+        block_journal_inline_fragment_end(fragment)?;
+        if fragment.source_offset != expected_offset {
+            return Err(StorageError::corrupt(
+                "block journal inline fragments are not contiguous",
+            ));
+        }
+        expected_offset = expected_offset
+            .checked_add(fragment.len)
+            .ok_or_else(|| StorageError::corrupt("block journal inline fragments overflow"))?;
+    }
+    Ok(expected_offset)
+}
+
+fn block_journal_inline_fragment_slice(
+    fragments: &[BlockJournalInlineFragment],
+    source_offset: u64,
+    len: u64,
+) -> Result<Vec<BlockJournalInlineFragment>> {
+    let source_end = source_offset
+        .checked_add(len)
+        .ok_or_else(|| StorageError::corrupt("block journal inline fragment slice overflows"))?;
+    let mut cursor = 0_u64;
+    let mut out = Vec::new();
+    for fragment in fragments {
+        block_journal_inline_fragment_end(fragment)?;
+        let fragment_start = fragment.source_offset;
+        let fragment_end = fragment
+            .source_offset
+            .checked_add(fragment.len)
+            .ok_or_else(|| StorageError::corrupt("block journal inline fragment cursor overflows"))?;
+        if fragment_start < source_end && fragment_end > source_offset {
+            let overlap_start = fragment_start.max(source_offset);
+            let overlap_end = fragment_end.min(source_end);
+            out.push(BlockJournalInlineFragment {
+                bytes: Arc::clone(&fragment.bytes),
+                source_offset: overlap_start - source_offset,
+                offset: fragment
+                    .offset
+                    .checked_add(overlap_start - fragment_start)
+                    .ok_or_else(|| {
+                        StorageError::corrupt("block journal inline fragment offset overflows")
+                    })?,
+                len: overlap_end - overlap_start,
+            });
+        }
+        cursor = cursor.max(fragment_end);
+        if fragment_end >= source_end {
+            break;
+        }
+    }
+    let sliced_len = out.iter().try_fold(0_u64, |sum, fragment| {
+        sum.checked_add(fragment.len)
+            .ok_or_else(|| StorageError::corrupt("block journal inline fragment slice overflows"))
+    })?;
+    if sliced_len != len {
+        return Err(StorageError::corrupt(
+            "block journal inline fragment slice out of bounds",
+        ));
+    }
+    Ok(out)
+}
+
+fn block_journal_inline_fragments_for_source(
+    source: &BlockJournalOverlaySource,
+    len: u64,
+) -> Result<(PayloadIntegrity, Vec<BlockJournalInlineFragment>)> {
+    match source {
+        BlockJournalOverlaySource::Bytes {
+            payload_integrity,
+            bytes,
+            source_offset,
+        } => {
+            let source_end = source_offset.checked_add(len).ok_or_else(|| {
+                StorageError::corrupt("block journal inline source range overflows")
+            })?;
+            let bytes_len = u64::try_from(bytes.len())
+                .map_err(|_| StorageError::corrupt("block journal inline source length overflows"))?;
+            if source_end > bytes_len {
+                return Err(StorageError::corrupt(
+                    "block journal inline source slice out of bounds",
+                ));
+            }
+            Ok((
+                *payload_integrity,
+                vec![BlockJournalInlineFragment {
+                    bytes: Arc::clone(bytes),
+                    source_offset: 0,
+                    offset: *source_offset,
+                    len,
+                }],
+            ))
+        }
+        BlockJournalOverlaySource::BytesFragments {
+            payload_integrity,
+            fragments,
+            source_offset,
+        } => Ok((
+            *payload_integrity,
+            block_journal_inline_fragment_slice(fragments, *source_offset, len)?,
+        )),
+        BlockJournalOverlaySource::Segment { .. } | BlockJournalOverlaySource::Sparse => {
+            Err(StorageError::corrupt(
+                "block journal source is not inline payload",
+            ))
+        }
+    }
+}
+
+fn copy_block_journal_inline_fragments(
+    fragments: &[BlockJournalInlineFragment],
+    source_offset: u64,
+    output: &mut [u8],
+) -> Result<()> {
+    let len = u64::try_from(output.len())
+        .map_err(|_| StorageError::corrupt("block journal read output length overflows"))?;
+    let source_end = source_offset
+        .checked_add(len)
+        .ok_or_else(|| StorageError::corrupt("block journal inline read range overflows"))?;
+    let mut output_written = 0_usize;
+    let mut index = fragments.partition_point(|fragment| {
+        fragment
+            .source_offset
+            .checked_add(fragment.len)
+            .is_some_and(|end| end <= source_offset)
+    });
+    while let Some(fragment) = fragments.get(index) {
+        block_journal_inline_fragment_end(fragment)?;
+        let fragment_start = fragment.source_offset;
+        let fragment_end = fragment
+            .source_offset
+            .checked_add(fragment.len)
+            .ok_or_else(|| StorageError::corrupt("block journal inline fragment cursor overflows"))?;
+        if fragment_start < source_end && fragment_end > source_offset {
+            let overlap_start = fragment_start.max(source_offset);
+            let overlap_end = fragment_end.min(source_end);
+            let source_start = fragment
+                .offset
+                .checked_add(overlap_start - fragment_start)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal inline read offset overflows")
+                })?;
+            let source_end = fragment
+                .offset
+                .checked_add(overlap_end - fragment_start)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal inline read end overflows")
+                })?;
+            let source_start = usize::try_from(source_start).map_err(|_| {
+                StorageError::corrupt("block journal inline read offset overflows usize")
+            })?;
+            let source_end = usize::try_from(source_end).map_err(|_| {
+                StorageError::corrupt("block journal inline read end overflows usize")
+            })?;
+            let source = fragment.bytes.get(source_start..source_end).ok_or_else(|| {
+                StorageError::corrupt("block journal inline read source out of bounds")
+            })?;
+            let output_end = output_written
+                .checked_add(source.len())
+                .ok_or_else(|| StorageError::corrupt("block journal inline output overflows"))?;
+            output
+                .get_mut(output_written..output_end)
+                .ok_or_else(|| StorageError::corrupt("block journal inline output out of bounds"))?
+                .copy_from_slice(source);
+            output_written = output_end;
+        }
+        if fragment_end >= source_end {
+            break;
+        }
+        index += 1;
+    }
+    if output_written != output.len() {
+        return Err(StorageError::corrupt(
+            "block journal inline read source out of bounds",
+        ));
+    }
+    Ok(())
 }
 
 fn block_journal_overlay_source_slice(
@@ -304,7 +524,7 @@ fn block_journal_overlay_source_slice(
     let slice_end = slice.end_exclusive()?;
     if slice.offset < source_range.offset || slice_end > source_end {
         return Err(StorageError::corrupt(
-            "block journal read index slice is outside source range",
+            "block journal LBA map slice is outside source range",
         ));
     }
     match source {
@@ -312,25 +532,54 @@ fn block_journal_overlay_source_slice(
         BlockJournalOverlaySource::Bytes {
             payload_integrity,
             bytes,
+            source_offset,
         } => {
-            let start = usize::try_from(slice.offset - source_range.offset).map_err(|_| {
-                StorageError::corrupt("block journal read index slice offset overflows usize")
-            })?;
-            let len = usize::try_from(slice.len).map_err(|_| {
-                StorageError::corrupt("block journal read index slice length overflows usize")
-            })?;
-            let end = start.checked_add(len).ok_or_else(|| {
-                StorageError::corrupt("block journal read index slice end overflows")
-            })?;
-            let bytes = bytes
-                .get(start..end)
+            let source_offset = source_offset
+                .checked_add(slice.offset - source_range.offset)
                 .ok_or_else(|| {
-                    StorageError::corrupt("block journal read index slice out of bounds")
-                })?
-                .to_vec();
+                    StorageError::corrupt("block journal LBA map source offset overflows")
+                })?;
+            let source_end = source_offset.checked_add(slice.len).ok_or_else(|| {
+                StorageError::corrupt("block journal LBA map source end overflows")
+            })?;
+            let start = usize::try_from(source_offset).map_err(|_| {
+                StorageError::corrupt("block journal LBA map source offset overflows usize")
+            })?;
+            let end = usize::try_from(source_end).map_err(|_| {
+                StorageError::corrupt("block journal LBA map source end overflows usize")
+            })?;
+            bytes.get(start..end).ok_or_else(|| {
+                StorageError::corrupt("block journal LBA map source slice out of bounds")
+            })?;
             Ok(BlockJournalOverlaySource::Bytes {
                 payload_integrity: *payload_integrity,
-                bytes,
+                bytes: Arc::clone(bytes),
+                source_offset,
+            })
+        }
+        BlockJournalOverlaySource::BytesFragments {
+            payload_integrity,
+            fragments,
+            source_offset,
+        } => {
+            let source_offset = source_offset
+                .checked_add(slice.offset - source_range.offset)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal LBA map source offset overflows")
+                })?;
+            let source_end = source_offset.checked_add(slice.len).ok_or_else(|| {
+                StorageError::corrupt("block journal LBA map source end overflows")
+            })?;
+            let total_len = block_journal_inline_fragments_total_len(fragments)?;
+            if source_end > total_len {
+                return Err(StorageError::corrupt(
+                    "block journal LBA map source slice out of bounds",
+                ));
+            }
+            Ok(BlockJournalOverlaySource::BytesFragments {
+                payload_integrity: *payload_integrity,
+                fragments: Arc::clone(fragments),
+                source_offset,
             })
         }
         BlockJournalOverlaySource::Segment {
@@ -361,76 +610,228 @@ fn block_journal_overlay_slice(
     })
 }
 
-fn insert_block_journal_read_entry(
-    entries: &mut BTreeMap<u64, BlockJournalOverlayEntry>,
+fn set_block_journal_overlay_block_size(
+    device: &mut BlockJournalDeviceOverlay,
+    block_size: u64,
+) -> Result<()> {
+    if block_size == 0 {
+        return Err(StorageError::corrupt(
+            "block journal LBA map block size must be nonzero",
+        ));
+    }
+    match device.block_size {
+        Some(existing) if existing != block_size => Err(StorageError::corrupt(
+            "block journal LBA map block size changed for device",
+        )),
+        Some(_) => Ok(()),
+        None => {
+            device.block_size = Some(block_size);
+            Ok(())
+        }
+    }
+}
+
+fn block_journal_lba_bounds(range: ByteRange, block_size: u64) -> Result<(u64, u64)> {
+    if block_size == 0 {
+        return Err(StorageError::corrupt(
+            "block journal LBA map block size must be nonzero",
+        ));
+    }
+    if !range.offset.is_multiple_of(block_size) || !range.len.is_multiple_of(block_size) {
+        return Err(StorageError::corrupt(
+            "block journal LBA map entry is not block aligned",
+        ));
+    }
+    let start_lba = range.offset / block_size;
+    let block_count = range.len / block_size;
+    let end_lba = start_lba
+        .checked_add(block_count)
+        .ok_or_else(|| StorageError::corrupt("block journal LBA range overflows"))?;
+    Ok((start_lba, end_lba))
+}
+
+fn block_journal_overlay_run_bounds(
+    start_lba: u64,
+    entry: &BlockJournalOverlayEntry,
+    block_size: u64,
+) -> Result<(u64, u64)> {
+    let (range_start_lba, range_end_lba) = block_journal_lba_bounds(entry.range, block_size)?;
+    if range_start_lba != start_lba {
+        return Err(StorageError::corrupt(
+            "block journal LBA run key disagrees with range",
+        ));
+    }
+    Ok((range_start_lba, range_end_lba))
+}
+
+fn block_journal_overlay_run_slice(
+    entry: &BlockJournalOverlayEntry,
+    block_size: u64,
+    start_lba: u64,
+    end_lba: u64,
+) -> Result<BlockJournalOverlayEntry> {
+    if end_lba < start_lba {
+        return Err(StorageError::corrupt(
+            "block journal LBA run slice is inverted",
+        ));
+    }
+    let offset = start_lba
+        .checked_mul(block_size)
+        .ok_or_else(|| StorageError::corrupt("block journal LBA run offset overflows"))?;
+    let len = end_lba
+        .checked_sub(start_lba)
+        .and_then(|blocks| blocks.checked_mul(block_size))
+        .ok_or_else(|| StorageError::corrupt("block journal LBA run length overflows"))?;
+    block_journal_overlay_slice(entry, ByteRange::new(offset, len))
+}
+
+fn insert_block_journal_lba_run(
+    runs: &mut BTreeMap<u64, BlockJournalOverlayEntry>,
+    block_size: u64,
     entry: BlockJournalOverlayEntry,
 ) -> Result<()> {
-    let entry_end = entry.range.end_exclusive()?;
-
-    let mut overlapping = Vec::new();
-    if let Some((&key, existing)) = entries.range(..entry.range.offset).next_back()
-        && existing.range.end_exclusive()? > entry.range.offset
-    {
-        overlapping.push(key);
+    let (start_lba, end_lba) = block_journal_lba_bounds(entry.range, block_size)?;
+    if start_lba == end_lba {
+        return Ok(());
     }
-    overlapping.extend(
-        entries
-            .range(entry.range.offset..entry_end)
-            .map(|(&key, _)| key),
-    );
-    for key in overlapping {
-        let Some(existing) = entries.remove(&key) else {
-            continue;
-        };
-        let existing_end = existing.range.end_exclusive()?;
-        if existing.range.offset < entry.range.offset {
-            let left = block_journal_overlay_slice(
-                &existing,
-                ByteRange::new(
-                    existing.range.offset,
-                    entry.range.offset - existing.range.offset,
-                ),
-            )?;
-            entries.insert(left.range.offset, left);
+
+    let first_key = match runs.range(..=start_lba).next_back() {
+        Some((key, existing)) => {
+            let (_, existing_end_lba) =
+                block_journal_overlay_run_bounds(*key, existing, block_size)?;
+            if existing_end_lba > start_lba {
+                *key
+            } else {
+                start_lba
+            }
         }
-        if existing_end > entry_end {
-            let right = block_journal_overlay_slice(
-                &existing,
-                ByteRange::new(entry_end, existing_end - entry_end),
-            )?;
-            entries.insert(right.range.offset, right);
+        None => start_lba,
+    };
+
+    let mut overlap_keys = Vec::new();
+    for (key, existing) in runs.range(first_key..end_lba) {
+        let (existing_start_lba, existing_end_lba) =
+            block_journal_overlay_run_bounds(*key, existing, block_size)?;
+        if existing_start_lba < end_lba && existing_end_lba > start_lba {
+            overlap_keys.push(*key);
         }
     }
 
-    // Merge with adjacent same-source neighbors so contiguous writes keep
-    // the index minimal.
-    let mut merged = entry;
-    let previous_key = entries
-        .range(..merged.range.offset)
-        .next_back()
-        .map(|(&key, _)| key);
-    if let Some(previous_key) = previous_key
-        && let Some(previous) = entries.get(&previous_key)
-        && previous.range.end_exclusive()? == merged.range.offset
-    {
-        let mut candidate = previous.clone();
-        if try_merge_block_journal_read_entry(&mut candidate, &merged)? {
-            entries.remove(&previous_key);
-            merged = candidate;
+    let mut fragments = Vec::new();
+    for key in overlap_keys {
+        let existing = runs.remove(&key).ok_or_else(|| {
+            StorageError::corrupt("block journal LBA overlap disappeared during insert")
+        })?;
+        let (existing_start_lba, existing_end_lba) =
+            block_journal_overlay_run_bounds(key, &existing, block_size)?;
+        if existing_start_lba < start_lba {
+            fragments.push((
+                existing_start_lba,
+                block_journal_overlay_run_slice(&existing, block_size, existing_start_lba, start_lba)?,
+            ));
+        }
+        if existing_end_lba > end_lba {
+            fragments.push((
+                end_lba,
+                block_journal_overlay_run_slice(&existing, block_size, end_lba, existing_end_lba)?,
+            ));
         }
     }
-    let merged_end = merged.range.end_exclusive()?;
-    if let Some(next) = entries.get(&merged_end) {
-        let next = next.clone();
-        if try_merge_block_journal_read_entry(&mut merged, &next)? {
-            entries.remove(&merged_end);
-        }
+
+    for (key, fragment) in fragments {
+        runs.insert(key, fragment);
     }
-    entries.insert(merged.range.offset, merged);
+    runs.insert(start_lba, entry);
     Ok(())
 }
 
-fn try_merge_block_journal_read_entry(
+fn apply_block_journal_read_entry(
+    storage: &impl StorageNodeReadService,
+    entry: &BlockJournalOverlayEntry,
+    requested: ByteRange,
+    verification: ReadVerification,
+    buf: &mut [u8],
+) -> Result<()> {
+    let Some(overlap) = byte_range_intersection(entry.range, requested)? else {
+        return Ok(());
+    };
+    let output_start = usize::try_from(overlap.offset - requested.offset)
+        .map_err(|_| StorageError::corrupt("block journal read output overflows usize"))?;
+    let output_len = usize::try_from(overlap.len)
+        .map_err(|_| StorageError::corrupt("block journal read length overflows usize"))?;
+    let output_end = output_start
+        .checked_add(output_len)
+        .ok_or_else(|| StorageError::corrupt("block journal read output end overflows"))?;
+    let output = buf
+        .get_mut(output_start..output_end)
+        .ok_or_else(|| StorageError::corrupt("block journal read output out of bounds"))?;
+    match &entry.source {
+        BlockJournalOverlaySource::Sparse => output.fill(0),
+        BlockJournalOverlaySource::Bytes {
+            payload_integrity,
+            bytes,
+            source_offset,
+        } => {
+            let source_start = source_offset
+                .checked_add(overlap.offset - entry.range.offset)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal read source offset overflows")
+                })?;
+            let source_start = usize::try_from(source_start)
+                .map_err(|_| StorageError::corrupt("block journal read source overflows usize"))?;
+            let source_end = source_start.checked_add(output_len).ok_or_else(|| {
+                StorageError::corrupt("block journal read source end overflows")
+            })?;
+            let source = bytes.get(source_start..source_end).ok_or_else(|| {
+                StorageError::corrupt("block journal read source out of bounds")
+            })?;
+            if !matches!(verification, ReadVerification::Skip) {
+                let integrity = segment_payload_integrity(*payload_integrity, source);
+                verify_read_integrity_policy(integrity, verification)?;
+            }
+            output.copy_from_slice(source);
+        }
+        BlockJournalOverlaySource::BytesFragments {
+            payload_integrity,
+            fragments,
+            source_offset,
+        } => {
+            let source_start = source_offset
+                .checked_add(overlap.offset - entry.range.offset)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal read source offset overflows")
+                })?;
+            copy_block_journal_inline_fragments(fragments, source_start, output)?;
+            if !matches!(verification, ReadVerification::Skip) {
+                let integrity = segment_payload_integrity(*payload_integrity, output);
+                verify_read_integrity_policy(integrity, verification)?;
+            }
+        }
+        BlockJournalOverlaySource::Segment {
+            storage_node,
+            segment_id,
+            segment_offset,
+            integrity,
+        } => {
+            let source_offset = segment_offset
+                .checked_add(overlap.offset - entry.range.offset)
+                .ok_or_else(|| {
+                    StorageError::corrupt("block journal segment read offset overflows")
+                })?;
+            storage.read_segment_source(
+                *storage_node,
+                *segment_id,
+                ByteRange::new(source_offset, overlap.len),
+                *integrity,
+                verification,
+                output,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn try_extend_block_journal_lba_read_entry(
     left: &mut BlockJournalOverlayEntry,
     right: &BlockJournalOverlayEntry,
 ) -> Result<bool> {
@@ -441,8 +842,8 @@ fn try_merge_block_journal_read_entry(
         .range
         .len
         .checked_add(right.range.len)
-        .ok_or_else(|| StorageError::corrupt("block journal read index range overflows"))?;
-    match (&mut left.source, &right.source) {
+        .ok_or_else(|| StorageError::corrupt("block journal LBA map read range overflows"))?;
+    match (&left.source, &right.source) {
         (BlockJournalOverlaySource::Sparse, BlockJournalOverlaySource::Sparse) => {
             left.range.len = merged_len;
             Ok(true)
@@ -451,13 +852,39 @@ fn try_merge_block_journal_read_entry(
             BlockJournalOverlaySource::Bytes {
                 payload_integrity: left_integrity,
                 bytes: left_bytes,
+                source_offset: left_source_offset,
             },
             BlockJournalOverlaySource::Bytes {
                 payload_integrity: right_integrity,
                 bytes: right_bytes,
+                source_offset: right_source_offset,
             },
-        ) if left_integrity == right_integrity && merged_len <= BLOCK_JOURNAL_INLINE_MAX_BYTES => {
-            left_bytes.extend_from_slice(right_bytes);
+        ) if left_integrity == right_integrity
+            && Arc::ptr_eq(left_bytes, right_bytes)
+            && left_source_offset
+                .checked_add(left.range.len)
+                .is_some_and(|end| end == *right_source_offset) =>
+        {
+            left.range.len = merged_len;
+            Ok(true)
+        }
+        (
+            BlockJournalOverlaySource::BytesFragments {
+                payload_integrity: left_integrity,
+                fragments: left_fragments,
+                source_offset: left_source_offset,
+            },
+            BlockJournalOverlaySource::BytesFragments {
+                payload_integrity: right_integrity,
+                fragments: right_fragments,
+                source_offset: right_source_offset,
+            },
+        ) if left_integrity == right_integrity
+            && Arc::ptr_eq(left_fragments, right_fragments)
+            && left_source_offset
+                .checked_add(left.range.len)
+                .is_some_and(|end| end == *right_source_offset) =>
+        {
             left.range.len = merged_len;
             Ok(true)
         }
@@ -488,67 +915,103 @@ fn try_merge_block_journal_read_entry(
     }
 }
 
-fn apply_block_journal_read_entry(
-    storage: &impl StorageNodeReadService,
-    entry: &BlockJournalOverlayEntry,
-    requested: ByteRange,
-    verification: ReadVerification,
-    buf: &mut [u8],
+fn push_coalesced_block_journal_lba_read_entry(
+    out: &mut Vec<BlockJournalOverlayEntry>,
+    entry: BlockJournalOverlayEntry,
 ) -> Result<()> {
-    let Some(overlap) = byte_range_intersection(entry.range, requested)? else {
+    if let Some(last) = out.last_mut()
+        && try_extend_block_journal_lba_read_entry(last, &entry)?
+    {
         return Ok(());
-    };
-    let output_start = usize::try_from(overlap.offset - requested.offset)
-        .map_err(|_| StorageError::corrupt("block journal read output overflows usize"))?;
-    let output_len = usize::try_from(overlap.len)
-        .map_err(|_| StorageError::corrupt("block journal read length overflows usize"))?;
-    let output_end = output_start
-        .checked_add(output_len)
-        .ok_or_else(|| StorageError::corrupt("block journal read output end overflows"))?;
-    let output = buf
-        .get_mut(output_start..output_end)
-        .ok_or_else(|| StorageError::corrupt("block journal read output out of bounds"))?;
-    match &entry.source {
-        BlockJournalOverlaySource::Sparse => output.fill(0),
-        BlockJournalOverlaySource::Bytes {
-            payload_integrity,
-            bytes,
-        } => {
-            let source_start = usize::try_from(overlap.offset - entry.range.offset)
-                .map_err(|_| StorageError::corrupt("block journal read source overflows usize"))?;
-            let source_end = source_start.checked_add(output_len).ok_or_else(|| {
-                StorageError::corrupt("block journal read source end overflows")
-            })?;
-            let source = bytes.get(source_start..source_end).ok_or_else(|| {
-                StorageError::corrupt("block journal read source out of bounds")
-            })?;
-            if !matches!(verification, ReadVerification::Skip) {
-                let integrity = segment_payload_integrity(*payload_integrity, source);
-                verify_read_integrity_policy(integrity, verification)?;
-            }
-            output.copy_from_slice(source);
+    }
+    out.push(entry);
+    Ok(())
+}
+
+fn try_extend_block_journal_commit_entry(
+    left: &mut BlockJournalOverlayEntry,
+    right: &BlockJournalOverlayEntry,
+) -> Result<bool> {
+    if left.range.end_exclusive()? != right.range.offset {
+        return Ok(false);
+    }
+    let merged_len = left
+        .range
+        .len
+        .checked_add(right.range.len)
+        .ok_or_else(|| StorageError::corrupt("block journal LBA map commit range overflows"))?;
+    match (&left.source, &right.source) {
+        (BlockJournalOverlaySource::Sparse, BlockJournalOverlaySource::Sparse) => {
+            left.range.len = merged_len;
+            Ok(true)
         }
-        BlockJournalOverlaySource::Segment {
-            storage_node,
-            segment_id,
-            segment_offset,
-            integrity,
-        } => {
-            let source_offset = segment_offset
-                .checked_add(overlap.offset - entry.range.offset)
-                .ok_or_else(|| {
-                    StorageError::corrupt("block journal segment read offset overflows")
-                })?;
-            storage.read_segment_source(
-                *storage_node,
-                *segment_id,
-                ByteRange::new(source_offset, overlap.len),
-                *integrity,
-                verification,
-                output,
-            )?;
+        (
+            BlockJournalOverlaySource::Segment {
+                storage_node: left_storage_node,
+                segment_id: left_segment_id,
+                segment_offset: left_segment_offset,
+                integrity: left_integrity,
+            },
+            BlockJournalOverlaySource::Segment {
+                storage_node: right_storage_node,
+                segment_id: right_segment_id,
+                segment_offset: right_segment_offset,
+                integrity: right_integrity,
+            },
+        ) if left_storage_node == right_storage_node
+            && left_segment_id == right_segment_id
+            && left_integrity == right_integrity
+            && left_segment_offset
+                .checked_add(left.range.len)
+                .is_some_and(|end| end == *right_segment_offset) =>
+        {
+            left.range.len = merged_len;
+            Ok(true)
+        }
+        _ => {
+            let Ok((left_integrity, mut fragments)) =
+                block_journal_inline_fragments_for_source(&left.source, left.range.len)
+            else {
+                return Ok(false);
+            };
+            let Ok((right_integrity, mut right_fragments)) =
+                block_journal_inline_fragments_for_source(&right.source, right.range.len)
+            else {
+                return Ok(false);
+            };
+            if left_integrity != right_integrity {
+                return Ok(false);
+            }
+            for fragment in &mut right_fragments {
+                fragment.source_offset = fragment
+                    .source_offset
+                    .checked_add(left.range.len)
+                    .ok_or_else(|| {
+                        StorageError::corrupt("block journal inline fragment source overflows")
+                    })?;
+            }
+            fragments.append(&mut right_fragments);
+            left.range.len = merged_len;
+            left.source = BlockJournalOverlaySource::BytesFragments {
+                payload_integrity: left_integrity,
+                fragments: Arc::<[BlockJournalInlineFragment]>::from(fragments),
+                source_offset: 0,
+            };
+            Ok(true)
         }
     }
+}
+
+fn push_coalesced_block_journal_commit_entry(
+    out: &mut Vec<BlockJournalOverlayEntry>,
+    entry: BlockJournalOverlayEntry,
+) -> Result<()> {
+    if let Some(last) = out.last_mut()
+        && try_extend_block_journal_commit_entry(last, &entry)?
+    {
+        return Ok(());
+    }
+    out.push(entry);
     Ok(())
 }
 
@@ -620,15 +1083,17 @@ impl BlockJournalOverlay {
             .unwrap_or_else(|| CommitSeq::from_raw(0)))
     }
 
-    fn apply_commit(&self, commit: &BlockJournalCommit) -> Result<()> {
+    fn apply_commit(&self, commit: &BlockJournalCommit, block_size: u64) -> Result<u64> {
+        let started = Instant::now();
         let mut inner = lock(&self.inner)?;
         let device = inner.entry(commit.device_id).or_default();
+        set_block_journal_overlay_block_size(device, block_size)?;
         device.writer_epoch = device.writer_epoch.max(commit.writer_epoch);
         device.visible_through = device.visible_through.max(commit.commit_seq);
-        for entry in commit.overlay_entries() {
-            insert_block_journal_read_entry(&mut device.read_entries, entry)?;
+        for entry in commit.overlay_entries()? {
+            insert_block_journal_lba_run(&mut device.lba_runs, block_size, entry)?;
         }
-        Ok(())
+        Ok(duration_nanos_u64(started.elapsed()))
     }
 
     fn mark_durable(
@@ -658,30 +1123,169 @@ impl BlockJournalOverlay {
         let Some(device) = inner.get(&device_id) else {
             return Ok(duration_nanos_u64(started.elapsed()));
         };
-        if let Some((_, entry)) = device.read_entries.range(..requested.offset).next_back()
-            && entry.range.end_exclusive()? > requested.offset
-        {
-            apply_block_journal_read_entry(storage, entry, requested, verification, buf)?;
+        if device.lba_runs.is_empty() {
+            return Ok(duration_nanos_u64(started.elapsed()));
         }
-        for (_, entry) in device.read_entries.range(requested.offset..requested_end) {
-            apply_block_journal_read_entry(storage, entry, requested, verification, buf)?;
+        let Some(block_size) = device.block_size else {
+            return Err(StorageError::corrupt(
+                "block journal LBA map has runs without block size",
+            ));
+        };
+        if !requested.offset.is_multiple_of(block_size) || !requested.len.is_multiple_of(block_size)
+        {
+            return Err(StorageError::corrupt(
+                "block journal LBA map read is not block aligned",
+            ));
+        }
+        let start_lba = requested.offset / block_size;
+        let end_lba = requested_end / block_size;
+        if start_lba == end_lba {
+            return Ok(duration_nanos_u64(started.elapsed()));
+        }
+        let first_key = match device.lba_runs.range(..=start_lba).next_back() {
+            Some((key, entry)) => {
+                let (_, run_end_lba) =
+                    block_journal_overlay_run_bounds(*key, entry, block_size)?;
+                if run_end_lba > start_lba {
+                    *key
+                } else {
+                    start_lba
+                }
+            }
+            None => start_lba,
+        };
+        let mut entries = Vec::new();
+        for (key, entry) in device.lba_runs.range(first_key..end_lba) {
+            let (run_start_lba, run_end_lba) =
+                block_journal_overlay_run_bounds(*key, entry, block_size)?;
+            if run_start_lba < end_lba && run_end_lba > start_lba {
+                push_coalesced_block_journal_lba_read_entry(&mut entries, entry.clone())?;
+            }
+        }
+        drop(inner);
+        for entry in entries {
+            apply_block_journal_read_entry(storage, &entry, requested, verification, buf)?;
         }
         Ok(duration_nanos_u64(started.elapsed()))
     }
 
     #[cfg(test)]
-    fn read_entry_count_for_test(&self, device_id: DeviceId) -> Result<usize> {
+    fn lba_run_count_for_test(&self, device_id: DeviceId) -> Result<usize> {
         let inner = lock(&self.inner)?;
         Ok(inner
             .get(&device_id)
-            .map(|device| device.read_entries.len())
+            .map(|device| device.lba_runs.len())
             .unwrap_or(0))
+    }
+
+    #[cfg(test)]
+    fn inline_payload_arc_count_for_test(&self, device_id: DeviceId) -> Result<usize> {
+        let inner = lock(&self.inner)?;
+        let Some(device) = inner.get(&device_id) else {
+            return Ok(0);
+        };
+        let mut ptrs = BTreeSet::new();
+        for entry in device.lba_runs.values() {
+            match &entry.source {
+                BlockJournalOverlaySource::Bytes { bytes, .. } => {
+                    ptrs.insert(bytes.as_ptr() as usize);
+                }
+                BlockJournalOverlaySource::BytesFragments { fragments, .. } => {
+                    for fragment in fragments.iter() {
+                        ptrs.insert(fragment.bytes.as_ptr() as usize);
+                    }
+                }
+                BlockJournalOverlaySource::Segment { .. } | BlockJournalOverlaySource::Sparse => {}
+            }
+        }
+        Ok(ptrs.len())
+    }
+
+    #[cfg(test)]
+    fn inline_payload_fragment_count_for_test(&self, device_id: DeviceId) -> Result<usize> {
+        let inner = lock(&self.inner)?;
+        let Some(device) = inner.get(&device_id) else {
+            return Ok(0);
+        };
+        let mut count = 0_usize;
+        for entry in device.lba_runs.values() {
+            match &entry.source {
+                BlockJournalOverlaySource::Bytes { .. } => count = count.saturating_add(1),
+                BlockJournalOverlaySource::BytesFragments { fragments, .. } => {
+                    count = count.saturating_add(fragments.len());
+                }
+                BlockJournalOverlaySource::Segment { .. } | BlockJournalOverlaySource::Sparse => {}
+            }
+        }
+        Ok(count)
     }
 }
 
 #[cfg(test)]
 mod block_journal_tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct CountingSegmentReadStorage {
+        inner: LocalCoordinator,
+        segment_reads: Mutex<Vec<ByteRange>>,
+    }
+
+    impl CountingSegmentReadStorage {
+        fn new(inner: LocalCoordinator) -> Self {
+            Self {
+                inner,
+                segment_reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn segment_reads(&self) -> Vec<ByteRange> {
+            lock(&self.segment_reads).unwrap().clone()
+        }
+    }
+
+    impl StorageNodeReadService for CountingSegmentReadStorage {
+        fn read_segment_source(
+            &self,
+            storage_node: StorageNodeId,
+            segment_id: SegmentId,
+            range: ByteRange,
+            integrity: SegmentPayloadIntegrity,
+            verification: ReadVerification,
+            buf: &mut [u8],
+        ) -> Result<ReadSourceProfile> {
+            lock(&self.segment_reads)?.push(range);
+            StorageNodeReadService::read_segment_source(
+                &self.inner,
+                storage_node,
+                segment_id,
+                range,
+                integrity,
+                verification,
+                buf,
+            )
+        }
+
+        fn read_append_run_source(
+            &self,
+            storage_node: StorageNodeId,
+            log_id: u64,
+            range: ByteRange,
+            integrity: SegmentPayloadIntegrity,
+            verification: ReadVerification,
+            buf: &mut [u8],
+        ) -> Result<ReadSourceProfile> {
+            StorageNodeReadService::read_append_run_source(
+                &self.inner,
+                storage_node,
+                log_id,
+                range,
+                integrity,
+                verification,
+                buf,
+            )
+        }
+    }
 
     fn journal_commit(
         device_id: DeviceId,
@@ -704,13 +1308,84 @@ mod block_journal_tests {
         }
     }
 
+    fn journal_commit_from_writes(
+        device_id: DeviceId,
+        commit_seq: u64,
+        writes: Vec<(u64, Vec<u8>)>,
+    ) -> BlockJournalCommit {
+        let committed_bytes = writes
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        let write_count = writes.len() as u64;
+        BlockJournalCommit {
+            device_id,
+            writer_epoch: WriterEpoch::from_raw(1),
+            commit_seq: CommitSeq::from_raw(commit_seq),
+            write_count,
+            collapsed_range_count: write_count,
+            committed_bytes,
+            entries: writes
+                .into_iter()
+                .map(|(offset, bytes)| BlockJournalEntry::Write {
+                    range: ByteRange::new(offset, bytes.len() as u64),
+                    payload_integrity: PayloadIntegrity::Verified,
+                    bytes,
+                })
+                .collect(),
+        }
+    }
+
+    fn sparse_commit(
+        device_id: DeviceId,
+        commit_seq: u64,
+        range: ByteRange,
+    ) -> BlockJournalCommit {
+        BlockJournalCommit {
+            device_id,
+            writer_epoch: WriterEpoch::from_raw(1),
+            commit_seq: CommitSeq::from_raw(commit_seq),
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: 0,
+            entries: vec![BlockJournalEntry::Sparse { range }],
+        }
+    }
+
+    fn segment_commit(
+        device_id: DeviceId,
+        commit_seq: u64,
+        range: ByteRange,
+        receipt: &SegmentWriteReceipt,
+    ) -> BlockJournalCommit {
+        BlockJournalCommit {
+            device_id,
+            writer_epoch: WriterEpoch::from_raw(1),
+            commit_seq: CommitSeq::from_raw(commit_seq),
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: range.len,
+            entries: vec![BlockJournalEntry::Segment {
+                range,
+                storage_node: receipt.storage_node,
+                segment_id: receipt.segment_id,
+                segment_offset: 0,
+                integrity: receipt.integrity,
+            }],
+        }
+    }
+
+    fn repeated_block(value: u8, block: usize) -> Vec<u8> {
+        vec![value; block]
+    }
+
     #[test]
-    fn block_journal_read_index_collapses_shadowed_ranges() {
+    fn block_journal_lba_map_latest_overlap_wins() {
         let overlay = BlockJournalOverlay::default();
         let device_id = DeviceId::from_raw(7);
         let block = 4096_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 4]))
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 4]), block as u64)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -718,9 +1393,9 @@ mod block_journal_tests {
                 2,
                 block as u64,
                 vec![2; block],
-            ))
+            ), block as u64)
             .unwrap();
-        assert_eq!(overlay.read_entry_count_for_test(device_id).unwrap(), 1);
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 3);
 
         let mut read = vec![9; block * 4];
         overlay
@@ -738,12 +1413,12 @@ mod block_journal_tests {
     }
 
     #[test]
-    fn block_journal_read_index_coalesces_adjacent_current_ranges() {
+    fn block_journal_lba_map_adjacent_writes_share_read_view() {
         let overlay = BlockJournalOverlay::default();
         let device_id = DeviceId::from_raw(8);
         let block = 4096_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]))
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]), block as u64)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -751,9 +1426,9 @@ mod block_journal_tests {
                 2,
                 block as u64,
                 vec![2; block],
-            ))
+            ), block as u64)
             .unwrap();
-        assert_eq!(overlay.read_entry_count_for_test(device_id).unwrap(), 1);
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 2);
 
         let mut read = vec![0; block * 2];
         overlay
@@ -770,12 +1445,12 @@ mod block_journal_tests {
     }
 
     #[test]
-    fn block_journal_read_index_preserves_disjoint_ranges_around_overlap() {
+    fn block_journal_lba_map_preserves_disjoint_ranges_around_overlap() {
         let overlay = BlockJournalOverlay::default();
         let device_id = DeviceId::from_raw(9);
         let block = 4096_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]))
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]), block as u64)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -783,7 +1458,7 @@ mod block_journal_tests {
                 2,
                 (block * 2) as u64,
                 vec![2; block],
-            ))
+            ), block as u64)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -791,9 +1466,9 @@ mod block_journal_tests {
                 3,
                 block as u64,
                 vec![3; block * 2],
-            ))
+            ), block as u64)
             .unwrap();
-        assert_eq!(overlay.read_entry_count_for_test(device_id).unwrap(), 1);
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 2);
 
         let mut read = vec![0; block * 3];
         overlay
@@ -807,6 +1482,249 @@ mod block_journal_tests {
             .unwrap();
         assert_eq!(&read[..block], vec![1; block]);
         assert_eq!(&read[block..], vec![3; block * 2]);
+    }
+
+    #[test]
+    fn block_journal_lba_map_sparse_zero_overlays_base_bytes() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(10);
+        let block = 4096_usize;
+        overlay
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 3]), block as u64)
+            .unwrap();
+        overlay
+            .apply_commit(
+                &sparse_commit(
+                    device_id,
+                    2,
+                    ByteRange::new(block as u64, block as u64),
+                ),
+                block as u64,
+            )
+            .unwrap();
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 3);
+
+        let mut read = vec![7; block * 3];
+        overlay
+            .apply_read_overlay(
+                &LocalCoordinator::new(),
+                device_id,
+                ByteRange::new(0, (block * 3) as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        assert_eq!(&read[..block], repeated_block(1, block));
+        assert_eq!(&read[block..block * 2], repeated_block(0, block));
+        assert_eq!(&read[block * 2..], repeated_block(1, block));
+    }
+
+    #[test]
+    fn block_journal_lba_map_leaves_base_bytes_for_unmapped_runs() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(11);
+        let block = 4096_usize;
+        overlay
+            .apply_commit(
+                &journal_commit(device_id, 1, block as u64, vec![4; block]),
+                block as u64,
+            )
+            .unwrap();
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
+
+        let mut read = vec![9; block * 3];
+        overlay
+            .apply_read_overlay(
+                &LocalCoordinator::new(),
+                device_id,
+                ByteRange::new(0, (block * 3) as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        assert_eq!(&read[..block], repeated_block(9, block));
+        assert_eq!(&read[block..block * 2], repeated_block(4, block));
+        assert_eq!(&read[block * 2..], repeated_block(9, block));
+    }
+
+    #[test]
+    fn block_journal_lba_map_uses_device_block_size_not_fixed_4k() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(12);
+        let block = 64 * 1024_usize;
+        overlay
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![5; block * 2]), block as u64)
+            .unwrap();
+        overlay
+            .apply_commit(
+                &journal_commit(device_id, 2, block as u64, vec![6; block]),
+                block as u64,
+            )
+            .unwrap();
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 2);
+
+        let mut read = vec![0; block * 2];
+        overlay
+            .apply_read_overlay(
+                &LocalCoordinator::new(),
+                device_id,
+                ByteRange::new(0, (block * 2) as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        assert_eq!(&read[..block], repeated_block(5, block));
+        assert_eq!(&read[block..], repeated_block(6, block));
+    }
+
+    #[test]
+    fn block_journal_lba_map_rejects_unaligned_overlay_entry() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(13);
+        let block = 4096_u64;
+        let error = overlay
+            .apply_commit(&journal_commit(device_id, 1, 1, vec![1; block as usize]), block)
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn block_journal_lba_map_contiguous_inline_write_creates_single_shared_run() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(14);
+        let block = 4096_usize;
+        let write_len = 1024 * 1024_usize;
+        overlay
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![8; write_len]), block as u64)
+            .unwrap();
+
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
+        assert_eq!(overlay.inline_payload_arc_count_for_test(device_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn block_journal_lba_map_contiguous_batch_entries_create_single_fragmented_run() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(17);
+        let block = 4096_usize;
+        let writes = (0..256_usize)
+            .map(|index| {
+                (
+                    (index * block) as u64,
+                    repeated_block(index.wrapping_rem(251) as u8, block),
+                )
+            })
+            .collect::<Vec<_>>();
+        overlay
+            .apply_commit(
+                &journal_commit_from_writes(device_id, 1, writes.clone()),
+                block as u64,
+            )
+            .unwrap();
+
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
+        assert_eq!(
+            overlay
+                .inline_payload_fragment_count_for_test(device_id)
+                .unwrap(),
+            256
+        );
+        let mut read = vec![0; block * 256];
+        overlay
+            .apply_read_overlay(
+                &LocalCoordinator::new(),
+                device_id,
+                ByteRange::new(0, (block * 256) as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        let expected = writes
+            .into_iter()
+            .flat_map(|(_, bytes)| bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn block_journal_lba_map_reads_segment_ref_run() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(15);
+        let block = 4096_usize;
+        let storage = LocalCoordinator::new();
+        let payload = [repeated_block(1, block), repeated_block(2, block)].concat();
+        let receipt = storage
+            .write_segment_for_owner(MappingOwner::BlockDevice(device_id), &payload)
+            .unwrap();
+        overlay
+            .apply_commit(
+                &segment_commit(
+                    device_id,
+                    1,
+                    ByteRange::new(0, (block * 2) as u64),
+                    &receipt,
+                ),
+                block as u64,
+            )
+            .unwrap();
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
+
+        let mut read = vec![0; block];
+        overlay
+            .apply_read_overlay(
+                &storage,
+                device_id,
+                ByteRange::new(block as u64, block as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+        assert_eq!(read, repeated_block(2, block));
+    }
+
+    #[test]
+    fn block_journal_lba_map_coalesces_contiguous_segment_ref_read() {
+        let overlay = BlockJournalOverlay::default();
+        let device_id = DeviceId::from_raw(16);
+        let block = 4096_usize;
+        let read_len = 1024 * 1024_usize;
+        let storage = LocalCoordinator::new();
+        let payload = (0..read_len)
+            .map(|index| (index / block) as u8)
+            .collect::<Vec<_>>();
+        let receipt = storage
+            .write_segment_for_owner(MappingOwner::BlockDevice(device_id), &payload)
+            .unwrap();
+        overlay
+            .apply_commit(
+                &segment_commit(
+                    device_id,
+                    1,
+                    ByteRange::new(0, read_len as u64),
+                    &receipt,
+                ),
+                block as u64,
+            )
+            .unwrap();
+        assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
+
+        let counting = CountingSegmentReadStorage::new(storage);
+        let mut read = vec![0; read_len];
+        overlay
+            .apply_read_overlay(
+                &counting,
+                device_id,
+                ByteRange::new(0, read_len as u64),
+                ReadVerification::RequireVerified,
+                &mut read,
+            )
+            .unwrap();
+
+        assert_eq!(read, payload);
+        assert_eq!(
+            counting.segment_reads(),
+            vec![ByteRange::new(0, read_len as u64)]
+        );
     }
 }
 
@@ -1046,6 +1964,8 @@ impl DurableSqliteStore {
             let Some(device_writes) = writes.get(&device_id) else {
                 continue;
             };
+            let info = local.metadata.device_info(device_id)?;
+            let block_size = u64::from(info.spec.block_size);
             for commit in device_writes.values() {
                 if commit.commit_seq.raw() > durable.raw() {
                     continue;
@@ -1065,7 +1985,7 @@ impl DurableSqliteStore {
                 local
                     .metadata
                     .replay_block_journal_commit(device_id, commit.commit_seq)?;
-                overlay.apply_commit(commit)?;
+                overlay.apply_commit(commit, block_size)?;
             }
             overlay.mark_durable(
                 device_id,
