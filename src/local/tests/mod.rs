@@ -21151,6 +21151,250 @@ fn durable_catalog_hold_profiles_surface_publish_mark_holds() {
     let _ = fs::remove_dir_all(root);
 }
 
+// The block-journal lane prestages payloads carried from staging, not
+// fetched from catalogs: a flushed segment-ref write must prestage every
+// staged segment with ZERO catalog-mutex acquisitions on the prestage tag
+// (on GCP the per-op all-catalog fetch was the dominant catalog holder and
+// waiter), and the carried bytes must be the durable truth — a reopen that
+// restores payloads from the data logs reads back the exact contents.
+#[test]
+fn block_lane_prestage_carries_staged_payloads_without_catalog_acquisitions() {
+    let root = durable_temp_dir("carried-prestage-block-lane");
+    let cfg = config();
+    let nodes = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+        StorageNodeId::from_raw(80),
+    ];
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            nodes.clone(),
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy {
+                segment_chunk_bytes: 2 * 1024 * 1024,
+                ..BlockJournalBatchPolicy::default()
+            },
+            AppendIngestPolicy::default(),
+        )
+        .unwrap();
+    store.enable_persist_profiling(1024).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("carried-prestage-block-lane".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let _ = store.drain_catalog_hold_profiles().unwrap();
+
+    // 8 MiB at a 2 MiB chunk policy stages four segments across the nodes.
+    let payload = repeated_blocks(2048, 63);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &payload,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    // Prestage ran (the lane profile attributes the staged payload bytes to
+    // this op) without a single prestage catalog acquisition anywhere.
+    let profiles = store.drain_catalog_hold_profiles().unwrap();
+    for profile in &profiles {
+        if profile.acquirer == CatalogAcquirer::PrestageDeltaSnapshot {
+            assert_eq!(
+                profile.acquisitions, 0,
+                "block-lane prestage acquired a catalog on node {}",
+                profile.storage_node
+            );
+            assert_eq!(profile.hold_nanos, 0);
+        }
+    }
+    let persist_profiles = store.drain_persist_profiles(1024).unwrap();
+    assert!(
+        persist_profiles
+            .iter()
+            .any(|profile| profile.data_log_prestaged_segment_count >= 4),
+        "flushed segment-ref write should prestage its staged segments"
+    );
+
+    // The carried payloads are the durable truth: reopen restores segment
+    // payloads from the prestaged data logs and reads back byte-identical
+    // contents.
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; payload.len()];
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(0, usize_to_u64(payload.len())),
+            &mut replayed,
+        )
+        .unwrap();
+    assert_eq!(replayed, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+// A not-yet-durable staged segment without a carried payload is corruption:
+// the block lane never falls back to a catalog scan, matching the
+// carried-node routing contract.
+#[test]
+fn block_lane_prestage_missing_carried_payload_is_corruption() {
+    let root = durable_temp_dir("carried-prestage-missing-payload");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let orphan = store.local.storage_nodes.allocate_segment_id().unwrap();
+    let mut staged = StagedBlockSegmentRefs {
+        entries: Vec::new(),
+        segment_ids: [orphan].into_iter().collect(),
+        payloads: BTreeMap::new(),
+        committed_bytes: 0,
+        write_count: 0,
+        collapsed_range_count: 0,
+    };
+    let _ = store.drain_catalog_hold_profiles().unwrap();
+    let error = store
+        .prestage_staged_block_segments(&mut staged)
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        StorageError::Corrupt { reason } if reason.contains("carried payload")
+    ));
+    // The failure surfaced without a fallback catalog scan: the tags such a
+    // scan would use stay at zero. Other tags are not asserted so a future
+    // time-driven maintenance trigger cannot flake this test.
+    for profile in store.drain_catalog_hold_profiles().unwrap() {
+        if matches!(
+            profile.acquirer,
+            CatalogAcquirer::PrestageDeltaSnapshot
+                | CatalogAcquirer::OwnerScan
+                | CatalogAcquirer::ReceiptLookup
+        ) {
+            assert_eq!(profile.acquisitions, 0, "{:?}", profile.acquirer);
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+// The persisted/pending filter runs before the carried-payload lookup: a
+// segment already covered by the pending set or the persisted set is
+// skipped without demanding a carried payload, so nothing double-prestages.
+#[test]
+fn block_lane_prestage_skips_pending_and_persisted_segments() {
+    let root = durable_temp_dir("carried-prestage-filter");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let segment_id = store.local.storage_nodes.allocate_segment_id().unwrap();
+    let bytes = vec![7_u8; 4096];
+    let carried = DurableSegmentPayload {
+        segment_id,
+        storage_node: cfg.storage_node,
+        integrity: segment_payload_integrity(PayloadIntegrity::Verified, &bytes),
+        bytes: SharedSegmentPayload::from_vec(bytes),
+    };
+    let mut staged = StagedBlockSegmentRefs {
+        entries: Vec::new(),
+        segment_ids: [segment_id].into_iter().collect(),
+        payloads: [(segment_id, carried)].into_iter().collect(),
+        committed_bytes: 0,
+        write_count: 0,
+        collapsed_range_count: 0,
+    };
+    let appended = store.prestage_staged_block_segments(&mut staged).unwrap();
+    assert_eq!(appended.placement_count(), 1);
+    assert!(staged.payloads.is_empty(), "carried payloads are consumed");
+
+    // Same segment again, now covered by the pending set: skipped before
+    // any payload lookup, so an empty carried map is not an error.
+    let mut again = StagedBlockSegmentRefs {
+        entries: Vec::new(),
+        segment_ids: [segment_id].into_iter().collect(),
+        payloads: BTreeMap::new(),
+        committed_bytes: 0,
+        write_count: 0,
+        collapsed_range_count: 0,
+    };
+    assert!(
+        store
+            .prestage_staged_block_segments(&mut again)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A segment in the persisted set is skipped the same way.
+    let persisted_id = store.local.storage_nodes.allocate_segment_id().unwrap();
+    lock(&store.persisted_segments)
+        .unwrap()
+        .insert(persisted_id);
+    let mut persisted_staged = StagedBlockSegmentRefs {
+        entries: Vec::new(),
+        segment_ids: [persisted_id].into_iter().collect(),
+        payloads: BTreeMap::new(),
+        committed_bytes: 0,
+        write_count: 0,
+        collapsed_range_count: 0,
+    };
+    assert!(
+        store
+            .prestage_staged_block_segments(&mut persisted_staged)
+            .unwrap()
+            .is_empty()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+// The block metadata-delta prestage path still fetches payload bytes
+// through the node catalogs (delta segments commit through the local
+// block-delta lane, whose payload windows the durable layer does not
+// hold), and its acquisitions surface under the delta-specific tag.
+#[test]
+fn delta_prestage_still_fetches_payloads_via_catalog() {
+    let root = durable_temp_dir("delta-prestage-catalog");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let write_intent = store.local.next_write_intent().unwrap();
+    let receipt = store
+        .local
+        .write_segment_for_intent_shared_verified(
+            WriteGrantIntent::Internal {
+                owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+            },
+            write_intent,
+            SharedSegmentPayload::from_vec(vec![9_u8; 4096]),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let segment_id = receipt.descriptor().segment_id;
+    let _ = store.drain_catalog_hold_profiles().unwrap();
+
+    let appended = store
+        .prestage_block_segments(&[segment_id].into_iter().collect())
+        .unwrap();
+    assert_eq!(appended.placement_count(), 1);
+    let profiles = store.drain_catalog_hold_profiles().unwrap();
+    let delta_row = profiles
+        .iter()
+        .find(|profile| {
+            profile.storage_node == cfg.storage_node
+                && profile.acquirer == CatalogAcquirer::PrestageDeltaSnapshot
+        })
+        .unwrap();
+    assert_eq!(delta_row.acquisitions, 1);
+    assert!(delta_row.hold_nanos > 0);
+    let _ = fs::remove_dir_all(root);
+}
+
 // The mark contract's mismatch gate: a node marks only segments its own
 // catalog holds. Marks addressed to the wrong node fail as corruption
 // without touching any state, and one bad id fails a whole batch before any

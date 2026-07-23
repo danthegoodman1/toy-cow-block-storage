@@ -74,6 +74,12 @@ enum PendingCompactDeltaRun {
 struct StagedBlockSegmentRefs {
     entries: Vec<BlockJournalEntry>,
     segment_ids: BTreeSet<SegmentId>,
+    /// Prestage payloads carried from staging, keyed by segment id: shared
+    /// windows into the write's collapsed buffer (no copies), paired with
+    /// the receipt-carried node and integrity. The block-journal lane
+    /// prestages only segments the op itself just wrote, so carrying them
+    /// here lets prestage run with zero catalog acquisitions.
+    payloads: BTreeMap<SegmentId, DurableSegmentPayload>,
     committed_bytes: u64,
     write_count: u64,
     collapsed_range_count: u64,
@@ -4959,6 +4965,7 @@ impl DurableCoordinator {
             .map_err(|_| StorageError::invalid_argument("segment chunk size overflows usize"))?;
         let mut entries = Vec::with_capacity(collapsed.len());
         let mut segment_ids = BTreeSet::new();
+        let mut payloads = BTreeMap::new();
         let mut committed_bytes = 0_u64;
 
         for write in collapsed {
@@ -4991,7 +4998,7 @@ impl DurableCoordinator {
                         owner: MappingOwner::BlockDevice(lease.device_id),
                     },
                     write_intent,
-                    chunk,
+                    chunk.clone(),
                     WriteDurability::Flushed,
                     payload_integrity,
                 )?;
@@ -5002,6 +5009,18 @@ impl DurableCoordinator {
                 }
                 let segment_id = receipt.descriptor().segment_id;
                 segment_ids.insert(segment_id);
+                // Carry the prestage payload from staging: the chunk window
+                // is the exact bytes the receipt covers, so prestage never
+                // has to re-fetch them from the node catalogs.
+                payloads.insert(
+                    segment_id,
+                    DurableSegmentPayload {
+                        segment_id,
+                        storage_node: receipt.receipt().storage_node,
+                        integrity: receipt.descriptor().integrity,
+                        bytes: chunk,
+                    },
+                );
                 entries.push(BlockJournalEntry::Segment {
                     range,
                     storage_node: receipt.receipt().storage_node,
@@ -5015,6 +5034,7 @@ impl DurableCoordinator {
         Ok(StagedBlockSegmentRefs {
             entries,
             segment_ids,
+            payloads,
             committed_bytes,
             write_count: usize_to_u64(writes.len()),
             collapsed_range_count,
@@ -5023,6 +5043,14 @@ impl DurableCoordinator {
 
     /// Append payloads for not-yet-durable segments to per-node data logs
     /// without syncing, and merge the placements into the shared pending set.
+    ///
+    /// This is the catalog-based path for the block metadata-delta prestage:
+    /// deltas reference segments committed through the local block-delta
+    /// lane, whose payload windows this layer does not hold, so their bytes
+    /// must come from the node catalogs and segment stores. The
+    /// block-journal lane does NOT use this — it carries payloads from
+    /// staging (`prestage_staged_block_segments`) and acquires no catalog
+    /// locks.
     ///
     /// Returns the appended placements so callers that need a durability
     /// boundary can sync exactly the files they touched.
@@ -5049,7 +5077,52 @@ impl DurableCoordinator {
         }
         let (_, payloads) = self
             .local
-            .state_for_segment_ids(CatalogAcquirer::PrestageSnapshot, &missing_segments)?;
+            .state_for_segment_ids(CatalogAcquirer::PrestageDeltaSnapshot, &missing_segments)?;
+        let appended = self.durable.prestage_segments(payloads, &active_logs)?;
+        lock(&self.pending_data_log_append)?.merge(appended.clone());
+        Ok(appended)
+    }
+
+    /// `prestage_block_segments` for the block-journal lane, fed by the
+    /// payloads carried from staging instead of catalog snapshots: the lane
+    /// prestages only segments this op just wrote, so it needs zero catalog
+    /// acquisitions (on GCP the per-op all-catalog fetch was the dominant
+    /// catalog-mutex holder and waiter; see the Phase 2 holder-attribution
+    /// trip). The persisted/pending filter is unchanged and runs before the
+    /// payload lookup, so an already-covered segment never demands a carried
+    /// payload. A not-yet-durable staged segment without a carried payload
+    /// is corruption — never a fallback catalog scan, matching the
+    /// carried-node routing contract.
+    fn prestage_staged_block_segments(
+        &self,
+        staged: &mut StagedBlockSegmentRefs,
+    ) -> Result<PendingDataLogAppend> {
+        let mut carried = std::mem::take(&mut staged.payloads);
+        let (pending_segments, active_logs) = {
+            let pending = lock(&self.pending_data_log_append)?;
+            (pending.segment_ids(), pending.manifests_only())
+        };
+        let payloads: Vec<DurableSegmentPayload> = {
+            let persisted = lock(&self.persisted_segments)?;
+            staged
+                .segment_ids
+                .iter()
+                .filter(|segment_id| {
+                    !persisted.contains(segment_id) && !pending_segments.contains(segment_id)
+                })
+                .map(|segment_id| {
+                    carried.remove(segment_id).ok_or_else(|| {
+                        StorageError::corrupt(
+                            "block journal prestage is missing a carried payload for a staged \
+                             segment",
+                        )
+                    })
+                })
+                .collect::<Result<_>>()?
+        };
+        if payloads.is_empty() {
+            return Ok(PendingDataLogAppend::default());
+        }
         let appended = self.durable.prestage_segments(payloads, &active_logs)?;
         lock(&self.pending_data_log_append)?.merge(appended.clone());
         Ok(appended)
@@ -5066,8 +5139,8 @@ impl DurableCoordinator {
     ) -> Result<(StagedBlockSegmentRefs, PendingDataLogAppend)> {
         self.begin_block_segment_ref_staging()?;
         let staged = (|| -> Result<(StagedBlockSegmentRefs, PendingDataLogAppend)> {
-            let staged = self.stage_block_journal_segment_ref_entries(lease, writes)?;
-            let appended = self.prestage_block_segments(&staged.segment_ids)?;
+            let mut staged = self.stage_block_journal_segment_ref_entries(lease, writes)?;
+            let appended = self.prestage_staged_block_segments(&mut staged)?;
             Ok((staged, appended))
         })();
         self.finish_block_segment_ref_staging()?;

@@ -1,5 +1,61 @@
 # Phase 2 Handoff: 64k Catalog-Mutex Contention
 
+## 0. Status addendum (2026-07-23, resumed on Linux/NVMe machine)
+
+Phase 2 resumed; the sections below are the pre-resume record and stay
+unchanged. What happened since:
+
+- Milestone 5 (commit `9f0c821`) built the missing measurement from section 3:
+  every catalog acquisition goes through a tagged mutex
+  (`CatalogAcquirer`, 24 call-site tags) recording per-tag
+  acquisitions/wait/hold/max, surfaced via `loadbench --catalog-hold-csv` and
+  passed through the confirm A/B harness only to binaries that support it.
+- GCP trip `phase2-holder-attr-20260723` (same-instance A/B, base `5966896`
+  vs instrumented `9f0c821`, us-east1-b; results local to the Linux machine
+  per repo convention) NAMED THE HOLDER: `prestage_snapshot` — the
+  `prestage_block_segments` -> `state_for_segment_ids` all-node catalog scan,
+  5 acquisitions per op, holding 14.3-15.5% of total catalog time at 64k c32
+  (~9.3us/acquisition) with ~9-10s cumulative lock wait per ~5s window.
+  `mark` is a victim (40ms held vs 1.3-1.5s waited). Instrumentation
+  overhead: fix >= base throughput in every cell; guards/reads flat.
+- Section 3 ledger updates: open suspect 1 (append-stream persist snapshots)
+  is REFUTED for block benches — every `Persist*` tag was zero in all 20 GCP
+  profiles; those paths never run there. Open suspect 2 (short-hold convoy)
+  is CONFIRMED in refined form: ~158k catalog acquisitions/s at c32
+  (~32k/s per catalog), with prestage both the dominant holder and waiter.
+  Block reads take zero catalog acquisitions. `staging_reserve` is the
+  secondary holder (4.3-4.7% held, max holds ~1.3ms, likely
+  preemption-inflated at c32 = vCPUs) — a candidate follow-up only if the
+  gate stays short after the prestage fix.
+- Milestone 6 (this commit): the block-journal lane carries
+  `DurableSegmentPayload` values (zero-copy windows) from staging receipts in
+  `StagedBlockSegmentRefs.payloads`; `prestage_staged_block_segments`
+  replaces the catalog fetch, so the lane takes ZERO catalog acquisitions for
+  prestage. The catalog-based `prestage_block_segments` survives only for the
+  block-delta writeback path under the honest tag `PrestageDeltaSnapshot`
+  (kept because that layer does not hold those segments' payload windows —
+  carrying them through `commit_block_batch_with_delta` is a legitimate
+  future milestone if that tag ever lights up). Corruption surface preserved:
+  a missing carried payload for a not-yet-durable staged segment is a corrupt
+  error, no fallback scans. Reviewer-approved twice (initial + delta);
+  8-scenario local A/B clean (throughput ratios 0.98-1.13, read watch item
+  flat at 1.005x).
+- Local-benching caveat learned: the Linux machine's consumer NVMe cannot
+  A/B bandwidth-heavy cells (SLC-cache/GC variance up to 2.2x within a side);
+  regression A/Bs run on the RAM-backed `/mnt/gcpsim` null_blk device (ext4,
+  ~200us fsync). Neither device reproduces the GCP contention magnitude
+  (max ~6us mark lock wait locally vs 77-120us on GCP), so GCP same-instance
+  A/Bs remain the only decisive measurement — as section 2 already said.
+- Pre-existing flakes on record (neither caused by M5/M6, both verified at
+  clean HEAD): `durable_persist_profiling_is_opt_in_and_records_physical_persists`
+  (first-run data-log sync timing) and
+  `durable_block_prestaged_flush_skips_directory_sync_for_existing_log`
+  (~10% under parallel `_prestage` filter, dir-sync accounting race on the
+  delta lane, present since 60c9c91). Worth a phase-level follow-up ruling.
+- Next: final gate trip `run_phase2_confirm_ab.sh` with `BASE_REF=9f0c821`,
+  `FIX_REF=<M6 commit>`, scored against the section 2 gate (1.5x stage6:
+  c16 1245.8 / c32 1351.9 MBps) or closed per the section 6 budget clause.
+
 Audience: an agent resuming Phase 2 of
 `docs/block-native-fast-path-continuation-plan.md` on a Linux machine with
 real local NVMe, with no access to the conversation that produced this state.

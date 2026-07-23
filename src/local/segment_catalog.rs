@@ -62,8 +62,12 @@ pub enum CatalogAcquirer {
     RowPublisherSnapshot,
     /// Row publisher's payload refetch for segments that missed prestaging.
     MissingSegmentsSnapshot,
-    /// Writeback prestage payload fetch for missing segments.
-    PrestageSnapshot,
+    /// Block metadata-delta prestage payload fetch: delta segments commit
+    /// through the local block-delta lane, so the durable layer does not
+    /// hold their payload windows and fetches them from the catalogs. The
+    /// block-journal lane never acquires here: it carries prestage payloads
+    /// from staging.
+    PrestageDeltaSnapshot,
     /// Block metadata-delta persist snapshot.
     PersistBlockDelta,
     /// Native-file metadata-delta persist snapshot.
@@ -106,7 +110,7 @@ impl CatalogAcquirer {
         CatalogAcquirer::ReadVerify,
         CatalogAcquirer::RowPublisherSnapshot,
         CatalogAcquirer::MissingSegmentsSnapshot,
-        CatalogAcquirer::PrestageSnapshot,
+        CatalogAcquirer::PrestageDeltaSnapshot,
         CatalogAcquirer::PersistBlockDelta,
         CatalogAcquirer::PersistNativeFileDelta,
         CatalogAcquirer::PersistPhysical,
@@ -135,7 +139,7 @@ impl CatalogAcquirer {
             CatalogAcquirer::ReadVerify => "read_verify",
             CatalogAcquirer::RowPublisherSnapshot => "row_publisher_snapshot",
             CatalogAcquirer::MissingSegmentsSnapshot => "missing_segments_snapshot",
-            CatalogAcquirer::PrestageSnapshot => "prestage_snapshot",
+            CatalogAcquirer::PrestageDeltaSnapshot => "prestage_delta_snapshot",
             CatalogAcquirer::PersistBlockDelta => "persist_block_delta",
             CatalogAcquirer::PersistNativeFileDelta => "persist_native_file_delta",
             CatalogAcquirer::PersistPhysical => "persist_physical",
