@@ -359,7 +359,9 @@ fn publish_block_segment_rows(
         drop(persist_guard);
         Vec::new()
     } else {
-        parts.local.state_for_segment_ids(&missing_segments)?.1
+        parts
+            .local
+            .state_for_segment_ids(CatalogAcquirer::MissingSegmentsSnapshot, &missing_segments)?.1
     };
     parts.durable.persist_block_journal_segment_refs(
         &nodes,
@@ -1051,6 +1053,16 @@ impl DurableCoordinator {
             .as_mut()
             .map(|profiler| profiler.drain(max))
             .unwrap_or_default())
+    }
+
+    /// Snapshot and reset per-acquirer catalog-mutex hold accounting for
+    /// every storage node.
+    ///
+    /// Always-on process-local diagnostics: one row per (storage node,
+    /// acquirer), zero rows included. Draining resets the counters, so
+    /// consecutive drains cover disjoint windows.
+    pub fn drain_catalog_hold_profiles(&self) -> Result<Vec<CatalogHoldProfile>> {
+        self.local.drain_catalog_hold_profiles()
     }
 
     fn record_persist_profile(&self, profile: DurablePersistProfile) -> Result<()> {
@@ -1969,7 +1981,9 @@ impl DurableCoordinator {
         let mut pending_append = lock(&self.pending_data_log_append)?.clone();
         pending_append.retain_current_placements(&segment_ids);
         let pending_segments = pending_append.segment_ids();
-        let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+        let (nodes, payloads) = self
+            .local
+            .state_for_segment_ids(CatalogAcquirer::PersistBlockDelta, &segment_ids)?;
         let new_segments: Vec<_> = payloads
             .into_iter()
             .filter(|payload| {
@@ -2117,7 +2131,9 @@ impl DurableCoordinator {
         let mut pending_append = lock(&self.pending_data_log_append)?.clone();
         pending_append.retain_current_placements(&segment_ids);
         let pending_segments = pending_append.segment_ids();
-        let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+        let (nodes, payloads) = self
+            .local
+            .state_for_segment_ids(CatalogAcquirer::PersistNativeFileDelta, &segment_ids)?;
         let new_segments: Vec<_> = payloads
             .into_iter()
             .filter(|payload| {
@@ -2367,7 +2383,9 @@ impl DurableCoordinator {
                 .native_metadata_delta_through(target_commit, previous_cursor)?
         {
             let segment_ids = delta.referenced_segment_ids.clone();
-            let (nodes, payloads) = self.local.state_for_segment_ids(&segment_ids)?;
+            let (nodes, payloads) = self
+                .local
+                .state_for_segment_ids(CatalogAcquirer::PersistPhysical, &segment_ids)?;
             let new_segments: Vec<_> = payloads
                 .into_iter()
                 .filter(|payload| !previous_segments.contains(&payload.segment_id))
@@ -2634,7 +2652,9 @@ impl DurableCoordinator {
                     .pending_append_run_manifests_for_log_refs(&plan_log_refs, None)?,
             );
         }
-        let nodes = self.local.selected_state_for_segment_ids(&segment_ids)?;
+        let nodes = self
+            .local
+            .selected_state_for_segment_ids(CatalogAcquirer::PersistAppendStreamBatch, &segment_ids)?;
         let cursor = self.local.durable_export_cursor()?;
         let exported_streams: Vec<_> = plans
             .iter()
@@ -2793,7 +2813,7 @@ impl DurableCoordinator {
         changed_segments.extend(delta.referenced_segment_ids.iter().copied());
         let nodes = self
             .local
-            .selected_state_for_segment_ids(&changed_segments)?;
+            .selected_state_for_segment_ids(CatalogAcquirer::PersistPublishDelta, &changed_segments)?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
         let mut profile = self.durable.persist_native_metadata_delta(
@@ -2962,7 +2982,9 @@ impl DurableCoordinator {
         let (pending_stream_append, mut stream_prefix_pending_lock_wait_nanos) =
             self.pending_append_for_append_publish_plans(plans)?;
         let changed_segments = BTreeSet::new();
-        let nodes = self.local.selected_state_for_segment_ids(&changed_segments)?;
+        let nodes = self
+            .local
+            .selected_state_for_segment_ids(CatalogAcquirer::PersistPreparedPlans, &changed_segments)?;
         let local_snapshot_nanos = duration_nanos_u64(snapshot_started.elapsed());
 
         let new_run_count = usize_to_u64(
@@ -5025,7 +5047,9 @@ impl DurableCoordinator {
         if missing_segments.is_empty() {
             return Ok(PendingDataLogAppend::default());
         }
-        let (_, payloads) = self.local.state_for_segment_ids(&missing_segments)?;
+        let (_, payloads) = self
+            .local
+            .state_for_segment_ids(CatalogAcquirer::PrestageSnapshot, &missing_segments)?;
         let appended = self.durable.prestage_segments(payloads, &active_logs)?;
         lock(&self.pending_data_log_append)?.merge(appended.clone());
         Ok(appended)

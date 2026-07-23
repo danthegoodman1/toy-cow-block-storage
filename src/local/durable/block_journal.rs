@@ -2553,7 +2553,10 @@ impl DurableSqliteStore {
                     else {
                         continue;
                     };
-                    if local.storage_nodes.segment_exists(*segment_id)? {
+                    if local
+                        .storage_nodes
+                        .segment_exists(CatalogAcquirer::Replay, *segment_id)?
+                    {
                         continue;
                     }
                     missing_segments
@@ -2660,7 +2663,7 @@ impl DurableSqliteStore {
                 adopted.insert(segment_id);
             }
         }
-        let nodes = local.selected_state_for_segment_ids(&adopted)?;
+        let nodes = local.selected_state_for_segment_ids(CatalogAcquirer::Replay, &adopted)?;
         self.persist_block_journal_segment_refs(&nodes, &adopted, Vec::new(), pending, true)?;
         Ok(())
     }

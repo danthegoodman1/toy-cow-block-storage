@@ -408,6 +408,14 @@ impl BenchStore {
         }
     }
 
+    fn drain_catalog_hold_profiles(&self) -> Result<Vec<CatalogHoldProfile>> {
+        match self {
+            Self::Local { store, .. } => store.drain_catalog_hold_profiles(),
+            Self::Durable { store, .. } => store.drain_catalog_hold_profiles(),
+            Self::Txn(_) => Ok(Vec::new()),
+        }
+    }
+
     fn drain_append_publish_wait_profiles(
         &self,
         max: usize,

@@ -19,7 +19,9 @@ impl LocalStorageNode {
     ) -> Result<ReadSourceProfile> {
         let total_started = Instant::now();
         let catalog_started = Instant::now();
-        let receipt = self.segment_catalog.receipt_for_segment(segment_id)?;
+        let receipt = self
+            .segment_catalog
+            .receipt_for_segment(CatalogAcquirer::ReadVerify, segment_id)?;
         let catalog_lookup_nanos = duration_nanos_u64(catalog_started.elapsed());
         if receipt.storage_node != self.storage_node
             || receipt.segment_id != segment_id
@@ -92,11 +94,13 @@ impl LocalStorageNode {
 
         let (contains_segment, contains_profile) = self
             .segment_catalog
-            .contains_segment_profiled(grant.segment_id)?;
+            .contains_segment_profiled(CatalogAcquirer::StagingProbe, grant.segment_id)?;
         profile.catalog_duplicate_probe_nanos = contains_profile.total_nanos;
         profile.catalog_duplicate_probe_lock_wait_nanos = contains_profile.lock_wait_nanos;
         if contains_segment {
-            let receipt = self.segment_catalog.receipt_for_segment(grant.segment_id)?;
+            let receipt = self
+                .segment_catalog
+                .receipt_for_segment(CatalogAcquirer::StagingProbe, grant.segment_id)?;
             self.authority.verify_segment_receipt(&receipt)?;
             if receipt.grant_id == grant.grant_id
                 && receipt.grant_hash == grant_hash
@@ -256,9 +260,10 @@ impl LocalStorageNode {
     fn run_maintenance_tick(&self) -> Result<StorageNodeMaintenanceReport> {
         let mut deleted_released_segments = Vec::new();
         let mut skipped_segments = Vec::new();
-        for (segment_id, state, _) in self.segment_catalog.entries()? {
+        for (segment_id, state, _) in self.segment_catalog.entries(CatalogAcquirer::MaintenanceTick)? {
             if state == SegmentLifecycleState::Released {
-                self.segment_catalog.delete_segment(segment_id)?;
+                self.segment_catalog
+                    .delete_segment_as(CatalogAcquirer::MaintenanceTick, segment_id)?;
                 self.segment_store.delete_segment(segment_id)?;
                 deleted_released_segments.push(segment_id);
             } else if matches!(
@@ -288,7 +293,9 @@ impl LocalStorageNode {
             deleted_released_segments: Vec::new(),
         };
 
-        for (segment_id, state, write_intent) in self.segment_catalog.entries()? {
+        for (segment_id, state, write_intent) in
+            self.segment_catalog.entries(CatalogAcquirer::Custodian)?
+        {
             match state {
                 SegmentLifecycleState::Reserved
                     if expired_write_intents.contains(&write_intent) =>
@@ -310,7 +317,8 @@ impl LocalStorageNode {
                     report.orphan_segments.push(segment_id);
                 }
                 SegmentLifecycleState::Released => {
-                    self.segment_catalog.delete_segment(segment_id)?;
+                    self.segment_catalog
+                        .delete_segment_as(CatalogAcquirer::Custodian, segment_id)?;
                     self.segment_store.delete_segment(segment_id)?;
                     report.deleted_released_segments.push(segment_id);
                 }
@@ -536,6 +544,7 @@ impl StorageNodeRegistry {
 
     fn state_for_segment_ids(
         &self,
+        acquirer: CatalogAcquirer,
         segment_ids: &BTreeSet<SegmentId>,
     ) -> Result<(SelectedStorageNodeState, Vec<DurableSegmentPayload>)> {
         let mut nodes = BTreeMap::new();
@@ -545,7 +554,10 @@ impl StorageNodeRegistry {
         }
         for (ordinal, node_id) in self.node_order.iter().enumerate() {
             let node = self.node(*node_id)?;
-            let Some(catalog) = node.segment_catalog.selected_state_inner(segment_ids)? else {
+            let Some(catalog) = node
+                .segment_catalog
+                .selected_state_inner(acquirer, segment_ids)?
+            else {
                 continue;
             };
             for segment_id in catalog.entries.keys() {
@@ -681,6 +693,7 @@ impl StorageNodeRegistry {
 
     fn selected_state_for_segment_ids(
         &self,
+        acquirer: CatalogAcquirer,
         segment_ids: &BTreeSet<SegmentId>,
     ) -> Result<SelectedStorageNodeState> {
         let mut nodes = BTreeMap::new();
@@ -690,7 +703,10 @@ impl StorageNodeRegistry {
         let mut found = BTreeSet::new();
         for (ordinal, node_id) in self.node_order.iter().enumerate() {
             let node = self.node(*node_id)?;
-            let Some(catalog) = node.segment_catalog.selected_state_inner(segment_ids)? else {
+            let Some(catalog) = node
+                .segment_catalog
+                .selected_state_inner(acquirer, segment_ids)?
+            else {
                 continue;
             };
             found.extend(catalog.entries.keys().copied());
@@ -749,9 +765,9 @@ impl StorageNodeRegistry {
         self.node_order.as_ref().clone()
     }
 
-    fn segment_exists(&self, segment_id: SegmentId) -> Result<bool> {
+    fn segment_exists(&self, acquirer: CatalogAcquirer, segment_id: SegmentId) -> Result<bool> {
         for node in self.nodes.values() {
-            if node.segment_catalog.contains_segment(segment_id)? {
+            if node.segment_catalog.contains_segment(acquirer, segment_id)? {
                 return Ok(true);
             }
         }
@@ -770,7 +786,10 @@ impl StorageNodeRegistry {
     fn owner_node_for_segment(&self, segment_id: SegmentId) -> Result<&LocalStorageNode> {
         let mut found = None;
         for (node_id, node) in self.nodes.iter() {
-            if node.segment_catalog.contains_segment(segment_id)? {
+            if node
+                .segment_catalog
+                .contains_segment(CatalogAcquirer::OwnerScan, segment_id)?
+            {
                 if found.is_some() {
                     return Err(StorageError::corrupt(
                         "segment appears in multiple storage-node catalogs",
@@ -804,7 +823,7 @@ impl StorageNodeRegistry {
     fn verify_unique_catalog_ownership(&self) -> Result<()> {
         let mut owners: BTreeMap<SegmentId, StorageNodeId> = BTreeMap::new();
         for (node_id, node) in self.nodes.iter() {
-            for (segment_id, _, _) in node.segment_catalog.entries()? {
+            for (segment_id, _, _) in node.segment_catalog.entries(CatalogAcquirer::Sweep)? {
                 if owners.insert(segment_id, *node_id).is_some() {
                     return Err(StorageError::corrupt(
                         "segment appears in multiple storage-node catalogs",
@@ -813,6 +832,27 @@ impl StorageNodeRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Snapshot and reset per-acquirer catalog-mutex hold accounting for
+    /// every storage node, one row per (node, acquirer) including
+    /// zero-acquisition rows.
+    fn drain_catalog_hold_profiles(&self) -> Result<Vec<CatalogHoldProfile>> {
+        let mut out = Vec::new();
+        for node_id in self.node_order.iter() {
+            let node = self.node(*node_id)?;
+            for (acquirer, counters) in node.segment_catalog.drain_hold_counters() {
+                out.push(CatalogHoldProfile {
+                    storage_node: *node_id,
+                    acquirer,
+                    acquisitions: counters.acquisitions,
+                    wait_nanos: counters.wait_nanos,
+                    hold_nanos: counters.hold_nanos,
+                    max_hold_nanos: counters.max_hold_nanos,
+                });
+            }
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -825,7 +865,7 @@ impl StorageNodeRegistry {
     fn receipt_for_segment(&self, segment_id: SegmentId) -> Result<SegmentWriteReceipt> {
         self.owner_node_for_segment(segment_id)?
             .segment_catalog
-            .receipt_for_segment(segment_id)
+            .receipt_for_segment(CatalogAcquirer::ReceiptLookup, segment_id)
     }
 
     fn state(&self, segment_id: SegmentId) -> Result<SegmentLifecycleState> {

@@ -857,6 +857,7 @@ mod tests {
             samples_per_worker: 1024,
             matrix_csv: None,
             durable_profile_csv: None,
+            catalog_hold_csv: None,
             append_publish_profile_csv: None,
             metadata_profile_csv: None,
             block_write_profile_csv: None,

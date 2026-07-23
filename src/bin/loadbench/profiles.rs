@@ -166,6 +166,60 @@ fn append_profile_csv(
     Ok(())
 }
 
+/// Per-run catalog-mutex holder attribution: one row per (storage node,
+/// acquirer) with nonzero acquisitions, aggregated over the measured run
+/// (counters are drained after warmup and again here, so warmup is
+/// excluded). `run_elapsed_seconds` is the measured-load wall time, so
+/// `acquisitions / run_elapsed_seconds` is the per-acquirer acquisition
+/// rate; the precomputed `acquisitions_per_second` column carries it.
+fn append_catalog_hold_csv(
+    args: &Args,
+    workload: Workload,
+    concurrency: usize,
+    elapsed: Duration,
+    profiles: &[CatalogHoldProfile],
+) -> Result<()> {
+    let Some(path) = &args.catalog_hold_csv else {
+        return Ok(());
+    };
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    let header = "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,storage_nodes,run_elapsed_seconds,storage_node,acquirer,acquisitions,acquisitions_per_second,wait_nanos,hold_nanos,max_hold_nanos";
+    let mut file = open_csv_append(path, header)?;
+    let seconds = elapsed.as_secs_f64();
+    for profile in profiles {
+        if profile.acquisitions == 0 {
+            continue;
+        }
+        let acquisitions_per_second = if seconds > 0.0 {
+            profile.acquisitions as f64 / seconds
+        } else {
+            0.0
+        };
+        let row = [
+            workload.name().to_string(),
+            args.provider.to_string(),
+            args.durability.to_string(),
+            args.rtt.as_micros().to_string(),
+            args.serial_rtts.to_string(),
+            concurrency.to_string(),
+            workload.op_size(args)?.to_string(),
+            args.storage_nodes.to_string(),
+            format!("{seconds:.6}"),
+            profile.storage_node.to_string(),
+            profile.acquirer.name().to_string(),
+            profile.acquisitions.to_string(),
+            format!("{acquisitions_per_second:.1}"),
+            profile.wait_nanos.to_string(),
+            profile.hold_nanos.to_string(),
+            profile.max_hold_nanos.to_string(),
+        ];
+        writeln!(file, "{}", row.join(",")).map_err(fs_error)?;
+    }
+    Ok(())
+}
+
 fn append_append_publish_profile_csv(
     args: &Args,
     workload: Workload,

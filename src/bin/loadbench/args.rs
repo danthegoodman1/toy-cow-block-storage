@@ -21,6 +21,7 @@ struct Args {
     samples_per_worker: usize,
     matrix_csv: Option<PathBuf>,
     durable_profile_csv: Option<PathBuf>,
+    catalog_hold_csv: Option<PathBuf>,
     append_publish_profile_csv: Option<PathBuf>,
     metadata_profile_csv: Option<PathBuf>,
     block_write_profile_csv: Option<PathBuf>,
@@ -75,6 +76,7 @@ impl Args {
             samples_per_worker: 200_000,
             matrix_csv: None,
             durable_profile_csv: None,
+            catalog_hold_csv: None,
             append_publish_profile_csv: None,
             metadata_profile_csv: None,
             block_write_profile_csv: None,
@@ -170,6 +172,12 @@ impl Args {
                     args.durable_profile_csv = Some(PathBuf::from(parse_next::<String>(
                         &mut raw,
                         "--durable-profile-csv",
+                    )?));
+                }
+                "--catalog-hold-csv" => {
+                    args.catalog_hold_csv = Some(PathBuf::from(parse_next::<String>(
+                        &mut raw,
+                        "--catalog-hold-csv",
                     )?));
                 }
                 "--append-publish-profile-csv" => {
@@ -564,6 +572,7 @@ options:\n\
   --samples-per-worker N                   latency reservoir size, default: 200000\n\
   --matrix-csv PATH                        append main loadbench rows to CSV\n\
   --durable-profile-csv PATH               append durable persist profiles to CSV\n\
+  --catalog-hold-csv PATH                  append per-acquirer catalog-mutex hold profiles to CSV\n\
   --append-publish-profile-csv PATH        append durable append publish wait profiles to CSV\n\
   --metadata-profile-csv PATH              append txn metadata profiles to CSV\n\
   --block-write-profile-csv PATH           append txn block write pipeline profiles to CSV\n\

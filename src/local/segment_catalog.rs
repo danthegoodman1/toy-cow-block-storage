@@ -33,11 +33,276 @@ pub(super) struct CatalogLifecycleCounts {
     freed: usize,
 }
 
+/// Compile-time identity of a catalog-mutex acquirer.
+///
+/// Every acquisition of the catalog mutex names its call site with one of
+/// these tags: within the catalog API the lock is reachable only through
+/// `TaggedCatalogMutex::lock`, which requires a tag. The tags are enumerated
+/// from the real call sites. Per-acquirer wait/hold accounting keyed by them
+/// answers who HOLDS the catalog mutex, which the per-caller
+/// `*_lock_wait_nanos` profile columns (who waits) cannot.
+///
+/// Like `ReadProfile`, this is process-local opt-in diagnostics: not durable
+/// state and not part of the public storage contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CatalogAcquirer {
+    /// Segment-write staging: duplicate probe (and duplicate receipt check).
+    StagingProbe,
+    /// Segment-write staging: reservation insert.
+    StagingReserve,
+    /// Segment-write staging: Reserved -> Writing transition.
+    StagingBegin,
+    /// Segment-write staging: receipt commit into DurablePendingMetadata.
+    StagingCommit,
+    /// Batched mark-referenced from publish, replay, and registry callers.
+    Mark,
+    /// Read-path receipt lookup before payload verification.
+    ReadVerify,
+    /// Async segment-row publisher's chunked live snapshot.
+    RowPublisherSnapshot,
+    /// Row publisher's payload refetch for segments that missed prestaging.
+    MissingSegmentsSnapshot,
+    /// Writeback prestage payload fetch for missing segments.
+    PrestageSnapshot,
+    /// Block metadata-delta persist snapshot.
+    PersistBlockDelta,
+    /// Native-file metadata-delta persist snapshot.
+    PersistNativeFileDelta,
+    /// Physical (whole-store) persist payload snapshot.
+    PersistPhysical,
+    /// Full-catalog clone for full persists and durable exports.
+    PersistFull,
+    /// Append-stream request-batch persist snapshot.
+    PersistAppendStreamBatch,
+    /// Append-stream publish-delta persist snapshot.
+    PersistPublishDelta,
+    /// Prepared append-publish-plan persist snapshot.
+    PersistPreparedPlans,
+    /// Owner-node discovery scans (`owner_node_for_segment`).
+    OwnerScan,
+    /// Cold point lookups: receipts, states, intents, placements.
+    ReceiptLookup,
+    /// Referenced -> Released transition from metadata GC evidence.
+    Release,
+    /// Reopen/recovery scans and adopted-segment snapshots.
+    Replay,
+    /// Maintenance-tick lifecycle scan and released-segment deletion.
+    MaintenanceTick,
+    /// Custodian scan and expired-intent reconciliation.
+    Custodian,
+    /// Unique-catalog-ownership sweep.
+    Sweep,
+    /// Lifecycle counts for maintenance observation and diagnostics.
+    MaintenanceObserve,
+}
+
+impl CatalogAcquirer {
+    pub(super) const ALL: [CatalogAcquirer; 24] = [
+        CatalogAcquirer::StagingProbe,
+        CatalogAcquirer::StagingReserve,
+        CatalogAcquirer::StagingBegin,
+        CatalogAcquirer::StagingCommit,
+        CatalogAcquirer::Mark,
+        CatalogAcquirer::ReadVerify,
+        CatalogAcquirer::RowPublisherSnapshot,
+        CatalogAcquirer::MissingSegmentsSnapshot,
+        CatalogAcquirer::PrestageSnapshot,
+        CatalogAcquirer::PersistBlockDelta,
+        CatalogAcquirer::PersistNativeFileDelta,
+        CatalogAcquirer::PersistPhysical,
+        CatalogAcquirer::PersistFull,
+        CatalogAcquirer::PersistAppendStreamBatch,
+        CatalogAcquirer::PersistPublishDelta,
+        CatalogAcquirer::PersistPreparedPlans,
+        CatalogAcquirer::OwnerScan,
+        CatalogAcquirer::ReceiptLookup,
+        CatalogAcquirer::Release,
+        CatalogAcquirer::Replay,
+        CatalogAcquirer::MaintenanceTick,
+        CatalogAcquirer::Custodian,
+        CatalogAcquirer::Sweep,
+        CatalogAcquirer::MaintenanceObserve,
+    ];
+
+    /// Stable snake_case name for CSV and report output.
+    pub fn name(self) -> &'static str {
+        match self {
+            CatalogAcquirer::StagingProbe => "staging_probe",
+            CatalogAcquirer::StagingReserve => "staging_reserve",
+            CatalogAcquirer::StagingBegin => "staging_begin",
+            CatalogAcquirer::StagingCommit => "staging_commit",
+            CatalogAcquirer::Mark => "mark",
+            CatalogAcquirer::ReadVerify => "read_verify",
+            CatalogAcquirer::RowPublisherSnapshot => "row_publisher_snapshot",
+            CatalogAcquirer::MissingSegmentsSnapshot => "missing_segments_snapshot",
+            CatalogAcquirer::PrestageSnapshot => "prestage_snapshot",
+            CatalogAcquirer::PersistBlockDelta => "persist_block_delta",
+            CatalogAcquirer::PersistNativeFileDelta => "persist_native_file_delta",
+            CatalogAcquirer::PersistPhysical => "persist_physical",
+            CatalogAcquirer::PersistFull => "persist_full",
+            CatalogAcquirer::PersistAppendStreamBatch => "persist_append_stream_batch",
+            CatalogAcquirer::PersistPublishDelta => "persist_publish_delta",
+            CatalogAcquirer::PersistPreparedPlans => "persist_prepared_plans",
+            CatalogAcquirer::OwnerScan => "owner_scan",
+            CatalogAcquirer::ReceiptLookup => "receipt_lookup",
+            CatalogAcquirer::Release => "release",
+            CatalogAcquirer::Replay => "replay",
+            CatalogAcquirer::MaintenanceTick => "maintenance_tick",
+            CatalogAcquirer::Custodian => "custodian",
+            CatalogAcquirer::Sweep => "sweep",
+            CatalogAcquirer::MaintenanceObserve => "maintenance_observe",
+        }
+    }
+
+    fn slot_index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Debug, Default)]
+struct CatalogHoldSlot {
+    acquisitions: AtomicU64,
+    wait_nanos: AtomicU64,
+    hold_nanos: AtomicU64,
+    max_hold_nanos: AtomicU64,
+}
+
+/// Snapshot of one acquirer's catalog-mutex accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CatalogHoldCounters {
+    pub(super) acquisitions: u64,
+    pub(super) wait_nanos: u64,
+    pub(super) hold_nanos: u64,
+    pub(super) max_hold_nanos: u64,
+}
+
+/// Per-acquirer catalog-mutex accounting for one storage node.
+///
+/// Process-local opt-in diagnostics (like `ReadProfile`): not durable state
+/// and not part of the public storage contracts. Draining resets the
+/// counters, so consecutive drains cover disjoint windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogHoldProfile {
+    pub storage_node: StorageNodeId,
+    pub acquirer: CatalogAcquirer,
+    /// Lock acquisitions recorded for this acquirer.
+    pub acquisitions: u64,
+    /// Total time spent waiting to acquire, in nanoseconds.
+    pub wait_nanos: u64,
+    /// Total time the lock was held, in nanoseconds.
+    pub hold_nanos: u64,
+    /// Longest single hold, in nanoseconds.
+    pub max_hold_nanos: u64,
+}
+
+/// The catalog mutex plus per-acquirer wait/hold accounting.
+///
+/// `lock` is the only path to the mutex within the catalog API and it
+/// requires a `CatalogAcquirer` tag; the returned guard records real
+/// measured wait and hold durations into the tag's slot when it drops. The
+/// storage-core files are `include!`d into one module, so the raw `mutex`
+/// field is technically reachable throughout `crate::local` — production
+/// call sites go through the tagged lock by convention, and nothing outside
+/// this file names `inner.mutex` (grep-checkable). The accounting is a
+/// clock read plus relaxed atomics per acquisition — a few tens of
+/// nanoseconds beyond the lock itself — so it stays on in production paths.
+#[derive(Debug)]
+struct TaggedCatalogMutex {
+    mutex: Mutex<CatalogInner>,
+    holds: [CatalogHoldSlot; CatalogAcquirer::ALL.len()],
+}
+
+impl TaggedCatalogMutex {
+    fn new(inner: CatalogInner) -> Self {
+        Self {
+            mutex: Mutex::new(inner),
+            holds: std::array::from_fn(|_| CatalogHoldSlot::default()),
+        }
+    }
+
+    fn lock(&self, acquirer: CatalogAcquirer) -> Result<CatalogHoldGuard<'_>> {
+        let wait_started = Instant::now();
+        let inner = lock(&self.mutex)?;
+        let acquired_at = Instant::now();
+        Ok(CatalogHoldGuard {
+            inner,
+            slot: &self.holds[acquirer.slot_index()],
+            acquired_at,
+            wait_nanos: duration_nanos_u64(acquired_at.duration_since(wait_started)),
+        })
+    }
+
+    /// Snapshot and reset every acquirer's counters.
+    ///
+    /// The drain is non-atomic with respect to an in-flight hold: an
+    /// acquisition straddling the drain can land its count in the old
+    /// window and its nanos in the new one, and a hold still in flight at a
+    /// final drain is lost entirely — at most one acquisition per catalog
+    /// per drain, noise at the aggregate scale this measures.
+    fn drain_hold_counters(&self) -> Vec<(CatalogAcquirer, CatalogHoldCounters)> {
+        CatalogAcquirer::ALL
+            .iter()
+            .map(|acquirer| {
+                let slot = &self.holds[acquirer.slot_index()];
+                (
+                    *acquirer,
+                    CatalogHoldCounters {
+                        acquisitions: slot.acquisitions.swap(0, Ordering::Relaxed),
+                        wait_nanos: slot.wait_nanos.swap(0, Ordering::Relaxed),
+                        hold_nanos: slot.hold_nanos.swap(0, Ordering::Relaxed),
+                        max_hold_nanos: slot.max_hold_nanos.swap(0, Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+struct CatalogHoldGuard<'a> {
+    inner: MutexGuard<'a, CatalogInner>,
+    slot: &'a CatalogHoldSlot,
+    acquired_at: Instant,
+    wait_nanos: u64,
+}
+
+impl CatalogHoldGuard<'_> {
+    fn lock_wait_nanos(&self) -> u64 {
+        self.wait_nanos
+    }
+}
+
+impl std::ops::Deref for CatalogHoldGuard<'_> {
+    type Target = CatalogInner;
+
+    fn deref(&self) -> &CatalogInner {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for CatalogHoldGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CatalogInner {
+        &mut self.inner
+    }
+}
+
+impl Drop for CatalogHoldGuard<'_> {
+    fn drop(&mut self) {
+        // Runs just before the mutex guard releases, so the measured hold
+        // covers the whole critical section. Relaxed ordering: the counters
+        // are statistics, not synchronization.
+        let hold_nanos = duration_nanos_u64(self.acquired_at.elapsed());
+        self.slot.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.slot.wait_nanos.fetch_add(self.wait_nanos, Ordering::Relaxed);
+        self.slot.hold_nanos.fetch_add(hold_nanos, Ordering::Relaxed);
+        self.slot.max_hold_nanos.fetch_max(hold_nanos, Ordering::Relaxed);
+    }
+}
+
 /// In-memory implementation of `LocalSegmentCatalog`.
 #[derive(Debug)]
 pub struct InMemoryLocalSegmentCatalog {
     config: LocalStoreConfig,
-    inner: Mutex<CatalogInner>,
+    inner: TaggedCatalogMutex,
 }
 
 impl InMemoryLocalSegmentCatalog {
@@ -45,7 +310,7 @@ impl InMemoryLocalSegmentCatalog {
         config.validate()?;
         Ok(Self {
             config,
-            inner: Mutex::new(CatalogInner {
+            inner: TaggedCatalogMutex::new(CatalogInner {
                 next_segment_id: 1,
                 entries: BTreeMap::new(),
             }),
@@ -56,12 +321,27 @@ impl InMemoryLocalSegmentCatalog {
         config.validate()?;
         Ok(Self {
             config,
-            inner: Mutex::new(inner),
+            inner: TaggedCatalogMutex::new(inner),
         })
     }
 
+    /// Snapshot and reset this catalog's per-acquirer hold accounting.
+    pub(super) fn drain_hold_counters(&self) -> Vec<(CatalogAcquirer, CatalogHoldCounters)> {
+        self.inner.drain_hold_counters()
+    }
+
+    /// Test-only corruption injection: remove an entry out from under the
+    /// catalog, bypassing lifecycle transitions and hold attribution. This
+    /// simulates external corruption, not a real acquirer, and keeps the raw
+    /// mutex unnamed outside this file.
+    #[cfg(test)]
+    pub(super) fn corrupt_remove_entry(&self, segment_id: SegmentId) -> Result<()> {
+        lock(&self.inner.mutex)?.entries.remove(&segment_id);
+        Ok(())
+    }
+
     fn state_inner(&self) -> Result<CatalogInner> {
-        Ok(lock(&self.inner)?.clone())
+        Ok(self.inner.lock(CatalogAcquirer::PersistFull)?.clone())
     }
 
     /// Copy of the catalog restricted to the requested segment ids.
@@ -71,9 +351,10 @@ impl InMemoryLocalSegmentCatalog {
     /// cataloged. Returns `None` when none of the ids live on this node.
     fn selected_state_inner(
         &self,
+        acquirer: CatalogAcquirer,
         segment_ids: &BTreeSet<SegmentId>,
     ) -> Result<Option<CatalogInner>> {
-        let inner = lock(&self.inner)?;
+        let inner = self.inner.lock(acquirer)?;
         let mut entries = BTreeMap::new();
         for segment_id in segment_ids {
             if let Some(entry) = inner.entries.get(segment_id) {
@@ -111,7 +392,7 @@ impl InMemoryLocalSegmentCatalog {
         let mut chunks = segment_ids.chunks(chunk_len.max(1)).peekable();
         while let Some(chunk) = chunks.next() {
             {
-                let inner = lock(&self.inner)?;
+                let inner = self.inner.lock(CatalogAcquirer::RowPublisherSnapshot)?;
                 next_segment_id = inner.next_segment_id;
                 for segment_id in chunk {
                     if let Some(entry) = inner.entries.get(segment_id) {
@@ -153,9 +434,8 @@ impl InMemoryLocalSegmentCatalog {
             ));
         }
 
-        let lock_started = Instant::now();
-        let mut inner = lock(&self.inner)?;
-        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let mut inner = self.inner.lock(CatalogAcquirer::StagingReserve)?;
+        let lock_wait_nanos = inner.lock_wait_nanos();
         if inner.entries.contains_key(&segment_id) {
             return Err(StorageError::conflict("segment ID already exists"));
         }
@@ -187,19 +467,23 @@ impl InMemoryLocalSegmentCatalog {
         ))
     }
 
-    pub fn contains_segment(&self, segment_id: SegmentId) -> Result<bool> {
-        self.contains_segment_profiled(segment_id)
+    pub fn contains_segment(
+        &self,
+        acquirer: CatalogAcquirer,
+        segment_id: SegmentId,
+    ) -> Result<bool> {
+        self.contains_segment_profiled(acquirer, segment_id)
             .map(|(contains, _)| contains)
     }
 
     fn contains_segment_profiled(
         &self,
+        acquirer: CatalogAcquirer,
         segment_id: SegmentId,
     ) -> Result<(bool, LocalCatalogOpProfile)> {
         let total_started = Instant::now();
-        let lock_started = Instant::now();
-        let inner = lock(&self.inner)?;
-        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let inner = self.inner.lock(acquirer)?;
+        let lock_wait_nanos = inner.lock_wait_nanos();
         Ok((
             inner.entries.contains_key(&segment_id),
             LocalCatalogOpProfile {
@@ -210,7 +494,7 @@ impl InMemoryLocalSegmentCatalog {
     }
 
     pub fn state(&self, segment_id: SegmentId) -> Result<SegmentLifecycleState> {
-        let inner = lock(&self.inner)?;
+        let inner = self.inner.lock(CatalogAcquirer::ReceiptLookup)?;
         inner
             .entries
             .get(&segment_id)
@@ -219,7 +503,7 @@ impl InMemoryLocalSegmentCatalog {
     }
 
     pub fn commit_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaCommit> {
-        let inner = lock(&self.inner)?;
+        let inner = self.inner.lock(CatalogAcquirer::ReceiptLookup)?;
         let entry = inner
             .entries
             .get(&segment_id)
@@ -231,8 +515,12 @@ impl InMemoryLocalSegmentCatalog {
             .ok_or_else(|| StorageError::unavailable("segment has no durable receipt"))
     }
 
-    pub fn receipt_for_segment(&self, segment_id: SegmentId) -> Result<SegmentWriteReceipt> {
-        let inner = lock(&self.inner)?;
+    pub fn receipt_for_segment(
+        &self,
+        acquirer: CatalogAcquirer,
+        segment_id: SegmentId,
+    ) -> Result<SegmentWriteReceipt> {
+        let inner = self.inner.lock(acquirer)?;
         let entry = inner
             .entries
             .get(&segment_id)
@@ -244,7 +532,7 @@ impl InMemoryLocalSegmentCatalog {
     }
 
     pub fn intent_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReservationIntent> {
-        let inner = lock(&self.inner)?;
+        let inner = self.inner.lock(CatalogAcquirer::ReceiptLookup)?;
         inner
             .entries
             .get(&segment_id)
@@ -252,8 +540,11 @@ impl InMemoryLocalSegmentCatalog {
             .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))
     }
 
-    pub fn entries(&self) -> Result<Vec<(SegmentId, SegmentLifecycleState, WriteIntentId)>> {
-        let inner = lock(&self.inner)?;
+    pub fn entries(
+        &self,
+        acquirer: CatalogAcquirer,
+    ) -> Result<Vec<(SegmentId, SegmentLifecycleState, WriteIntentId)>> {
+        let inner = self.inner.lock(acquirer)?;
         Ok(inner
             .entries
             .iter()
@@ -262,7 +553,7 @@ impl InMemoryLocalSegmentCatalog {
     }
 
     fn lifecycle_counts(&self) -> Result<CatalogLifecycleCounts> {
-        let inner = lock(&self.inner)?;
+        let inner = self.inner.lock(CatalogAcquirer::MaintenanceObserve)?;
         let mut counts = CatalogLifecycleCounts::default();
         for entry in inner.entries.values() {
             match entry.state {
@@ -282,9 +573,8 @@ impl InMemoryLocalSegmentCatalog {
         reservation: &SegmentReservation,
     ) -> Result<LocalCatalogOpProfile> {
         let total_started = Instant::now();
-        let lock_started = Instant::now();
-        let mut inner = lock(&self.inner)?;
-        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let mut inner = self.inner.lock(CatalogAcquirer::StagingBegin)?;
+        let lock_wait_nanos = inner.lock_wait_nanos();
         let entry = Self::get_entry_mut(&mut inner, reservation.segment_id)?;
         if entry.reservation != *reservation {
             return Err(StorageError::conflict(
@@ -315,9 +605,8 @@ impl InMemoryLocalSegmentCatalog {
         receipt: SegmentWriteReceipt,
     ) -> Result<LocalCatalogOpProfile> {
         let total_started = Instant::now();
-        let lock_started = Instant::now();
-        let mut inner = lock(&self.inner)?;
-        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let mut inner = self.inner.lock(CatalogAcquirer::StagingCommit)?;
+        let lock_wait_nanos = inner.lock_wait_nanos();
         let entry = Self::get_entry_mut(&mut inner, reservation.segment_id)?;
         if entry.reservation != reservation {
             return Err(StorageError::conflict(
@@ -381,9 +670,8 @@ impl InMemoryLocalSegmentCatalog {
         segment_ids: &[SegmentId],
     ) -> Result<LocalCatalogOpProfile> {
         let total_started = Instant::now();
-        let lock_started = Instant::now();
-        let mut inner = lock(&self.inner)?;
-        let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
+        let mut inner = self.inner.lock(CatalogAcquirer::Mark)?;
+        let lock_wait_nanos = inner.lock_wait_nanos();
         for segment_id in segment_ids {
             let entry = inner
                 .entries
@@ -408,6 +696,24 @@ impl InMemoryLocalSegmentCatalog {
         })
     }
 
+    /// `LocalSegmentCatalog::delete_segment` with an explicit acquirer tag:
+    /// the maintenance tick and the custodian both delete released segments,
+    /// so the shared transition names its caller here.
+    fn delete_segment_as(&self, acquirer: CatalogAcquirer, segment_id: SegmentId) -> Result<()> {
+        let mut inner = self.inner.lock(acquirer)?;
+        let entry = Self::get_entry_mut(&mut inner, segment_id)?;
+        match entry.state {
+            SegmentLifecycleState::Released => {
+                entry.state = SegmentLifecycleState::Freed;
+                Ok(())
+            }
+            SegmentLifecycleState::Freed => Ok(()),
+            _ => Err(StorageError::conflict(
+                "only Released segments are safe to delete",
+            )),
+        }
+    }
+
     fn get_entry_mut(inner: &mut CatalogInner, segment_id: SegmentId) -> Result<&mut CatalogEntry> {
         inner
             .entries
@@ -425,7 +731,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
         }
 
         let segment_id = {
-            let inner = lock(&self.inner)?;
+            let inner = self.inner.lock(CatalogAcquirer::StagingReserve)?;
             SegmentId::from_raw(inner.next_segment_id)
         };
         self.reserve_segment_with_id(segment_id, intent)
@@ -450,7 +756,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     }
 
     fn release_segment(&self, segment_id: SegmentId) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
+        let mut inner = self.inner.lock(CatalogAcquirer::Release)?;
         let entry = Self::get_entry_mut(&mut inner, segment_id)?;
         match entry.state {
             SegmentLifecycleState::Referenced => {
@@ -465,7 +771,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     }
 
     fn expire_reservation(&self, segment_id: SegmentId) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
+        let mut inner = self.inner.lock(CatalogAcquirer::Custodian)?;
         let entry = Self::get_entry_mut(&mut inner, segment_id)?;
         match entry.state {
             SegmentLifecycleState::Reserved => {
@@ -480,7 +786,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     }
 
     fn fail_write(&self, segment_id: SegmentId) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
+        let mut inner = self.inner.lock(CatalogAcquirer::Custodian)?;
         let entry = Self::get_entry_mut(&mut inner, segment_id)?;
         match entry.state {
             SegmentLifecycleState::Writing => {
@@ -495,7 +801,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     }
 
     fn free_orphan_segment(&self, segment_id: SegmentId) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
+        let mut inner = self.inner.lock(CatalogAcquirer::Custodian)?;
         let entry = Self::get_entry_mut(&mut inner, segment_id)?;
         match entry.state {
             SegmentLifecycleState::DurablePendingMetadata => {
@@ -510,7 +816,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     }
 
     fn locate_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaPlacement> {
-        let inner = lock(&self.inner)?;
+        let inner = self.inner.lock(CatalogAcquirer::ReceiptLookup)?;
         let entry = inner
             .entries
             .get(&segment_id)
@@ -533,17 +839,6 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     }
 
     fn delete_segment(&self, segment_id: SegmentId) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
-        let entry = Self::get_entry_mut(&mut inner, segment_id)?;
-        match entry.state {
-            SegmentLifecycleState::Released => {
-                entry.state = SegmentLifecycleState::Freed;
-                Ok(())
-            }
-            SegmentLifecycleState::Freed => Ok(()),
-            _ => Err(StorageError::conflict(
-                "only Released segments are safe to delete",
-            )),
-        }
+        self.delete_segment_as(CatalogAcquirer::Custodian, segment_id)
     }
 }

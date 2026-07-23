@@ -1745,7 +1745,10 @@ fn generated_end_to_end_simulator_is_replayable_across_operations_and_faults() {
         store: &LocalCoordinator,
         native_file_count: usize,
     ) -> crate::sim::ObjectGraphSummary {
-        let entries = store.segment_catalog().entries().unwrap();
+        let entries = store
+            .segment_catalog()
+            .entries(CatalogAcquirer::Sweep)
+            .unwrap();
         crate::sim::ObjectGraphSummary {
             live_devices: store.metadata().list_live_devices().unwrap().len(),
             deleted_devices: store.metadata().list_deleted_devices().unwrap().len(),
@@ -5723,7 +5726,7 @@ fn durable_block_journal_publish_routes_segment_refs_through_carried_nodes() {
                     .node(*other)
                     .unwrap()
                     .segment_catalog
-                    .contains_segment(*segment_id)
+                    .contains_segment(CatalogAcquirer::OwnerScan, *segment_id)
                     .unwrap()
             );
         }
@@ -12616,7 +12619,7 @@ fn durable_block_read_fails_when_storage_node_catalog_placement_is_missing() {
         .local
         .segment_catalog_for_node(placement.storage_node)
         .unwrap();
-    lock(&catalog.inner).unwrap().entries.remove(&segment_id);
+    catalog.corrupt_remove_entry(segment_id).unwrap();
 
     let mut bytes = vec![0; 4096];
     assert!(
@@ -19191,7 +19194,11 @@ fn native_file_write_at_preserves_unmodified_bytes_and_rejects_sparse_gaps() {
     file.read_at(0, &mut actual).unwrap();
     assert_eq!(actual, expected);
 
-    let segment_entries = store.segment_catalog().entries().unwrap().len();
+    let segment_entries = store
+        .segment_catalog()
+        .entries(CatalogAcquirer::Sweep)
+        .unwrap()
+        .len();
     let metadata_nodes = store.metadata().metadata_node_count().unwrap();
     let latest_commit = store
         .metadata()
@@ -19210,7 +19217,11 @@ fn native_file_write_at_preserves_unmodified_bytes_and_rejects_sparse_gaps() {
         latest_commit
     );
     assert_eq!(
-        store.segment_catalog().entries().unwrap().len(),
+        store
+            .segment_catalog()
+            .entries(CatalogAcquirer::Sweep)
+            .unwrap()
+            .len(),
         segment_entries
     );
     assert_eq!(
@@ -20821,7 +20832,7 @@ fn selected_live_state_snapshot_skips_vanished_ids_and_groups_by_node() {
     // The strict foreground snapshot still treats an unknown id as
     // corruption.
     assert!(matches!(
-        registry.selected_state_for_segment_ids(&request),
+        registry.selected_state_for_segment_ids(CatalogAcquirer::PersistPublishDelta, &request),
         Err(StorageError::Corrupt { .. })
     ));
 
@@ -20833,7 +20844,10 @@ fn selected_live_state_snapshot_skips_vanished_ids_and_groups_by_node() {
             .selected_state_inner_chunked(&ids, 1)
             .unwrap()
             .unwrap();
-        let single = catalog.selected_state_inner(&request).unwrap().unwrap();
+        let single = catalog
+            .selected_state_inner(CatalogAcquirer::PersistPublishDelta, &request)
+            .unwrap()
+            .unwrap();
         assert_eq!(chunked.entries, single.entries);
         assert!(chunked.entries.contains_key(segment_id));
     }
@@ -20889,14 +20903,18 @@ fn chunked_row_snapshot_bounds_foreground_catalog_waits() {
                             thread::sleep(Duration::from_micros(500));
                         }
                     } else {
-                        catalog.selected_state_inner(request).unwrap();
+                        catalog
+                            .selected_state_inner(CatalogAcquirer::PersistPublishDelta, request)
+                            .unwrap();
                     }
                 }
                 done.store(true, Ordering::SeqCst);
             });
             while !done.load(Ordering::SeqCst) {
                 let started = Instant::now();
-                catalog.contains_segment(probe_id).unwrap();
+                catalog
+                    .contains_segment(CatalogAcquirer::StagingProbe, probe_id)
+                    .unwrap();
                 max_wait_nanos = max_wait_nanos.max(duration_nanos_u64(started.elapsed()));
             }
         });
@@ -20923,6 +20941,214 @@ fn chunked_row_snapshot_bounds_foreground_catalog_waits() {
         "chunked snapshot failed to bound foreground waits: \
          chunked max {chunked_max}ns vs single-hold max {single_hold_max}ns"
     );
+}
+
+// Holder attribution on the catalog mutex: every acquisition carries a
+// compile-time acquirer tag, and per-tag counters record acquisitions,
+// waits, and holds. Driving known call paths must attribute holds to
+// exactly the tags those paths acquire — and to no others — and draining
+// must reset the counters so consecutive drains cover disjoint windows.
+#[test]
+fn catalog_hold_attribution_names_acquirers_and_resets_on_drain() {
+    let cfg = config();
+    let other_node = StorageNodeId::from_raw(78);
+    let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node, other_node]).unwrap();
+    let _ = registry.drain_catalog_hold_profiles().unwrap();
+
+    let mut segment_ids = Vec::new();
+    for index in 0..3_u128 {
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let grant = grant_for_segment(
+            cfg.storage_node,
+            segment_id,
+            WriteIntentId::from_raw(900 + index),
+            MappingOwner::BlockDevice(DeviceId::from_raw(9)),
+            4096,
+        );
+        registry
+            .transport_for_node(cfg.storage_node)
+            .unwrap()
+            .send(StorageNodeRequest::WriteSegment {
+                grant: Box::new(grant),
+                bytes: repeated_blocks(1, index as u8),
+            })
+            .unwrap();
+        segment_ids.push(segment_id);
+    }
+    registry
+        .mark_segments_referenced(cfg.storage_node, &segment_ids, CommitSeq::from_raw(1))
+        .unwrap();
+    let snapshot_ids: BTreeSet<SegmentId> = segment_ids.iter().copied().collect();
+    registry
+        .selected_live_state_for_segment_ids(&snapshot_ids)
+        .unwrap();
+    registry
+        .selected_state_for_segment_ids(CatalogAcquirer::PersistPublishDelta, &snapshot_ids)
+        .unwrap();
+
+    let profiles = registry.drain_catalog_hold_profiles().unwrap();
+    // One row per (node, acquirer), zero rows included.
+    assert_eq!(profiles.len(), 2 * CatalogAcquirer::ALL.len());
+    let row = |node: StorageNodeId, acquirer: CatalogAcquirer| {
+        *profiles
+            .iter()
+            .find(|profile| profile.storage_node == node && profile.acquirer == acquirer)
+            .unwrap()
+    };
+
+    // Three segment writes: one probe/reserve/begin/commit acquisition each,
+    // with real measured holds. One batched mark: one acquisition.
+    for acquirer in [
+        CatalogAcquirer::StagingProbe,
+        CatalogAcquirer::StagingReserve,
+        CatalogAcquirer::StagingBegin,
+        CatalogAcquirer::StagingCommit,
+    ] {
+        let staging = row(cfg.storage_node, acquirer);
+        assert_eq!(staging.acquisitions, 3, "{acquirer:?}");
+        assert!(staging.hold_nanos > 0, "{acquirer:?} recorded no hold time");
+        assert!(
+            staging.max_hold_nanos > 0 && staging.max_hold_nanos <= staging.hold_nanos,
+            "{acquirer:?} max hold must be a real observed hold"
+        );
+    }
+    let mark = row(cfg.storage_node, CatalogAcquirer::Mark);
+    assert_eq!(mark.acquisitions, 1);
+    assert!(mark.hold_nanos > 0);
+
+    // The snapshot passes touch every node's catalog exactly once (three ids
+    // fit one chunk), including the node that owns none of them.
+    for node in [cfg.storage_node, other_node] {
+        assert_eq!(
+            row(node, CatalogAcquirer::RowPublisherSnapshot).acquisitions,
+            1
+        );
+        assert_eq!(
+            row(node, CatalogAcquirer::PersistPublishDelta).acquisitions,
+            1
+        );
+    }
+
+    // Everything else acquired nothing: attribution reports exact zeros for
+    // untouched acquirers on both nodes.
+    let touched = [
+        CatalogAcquirer::StagingProbe,
+        CatalogAcquirer::StagingReserve,
+        CatalogAcquirer::StagingBegin,
+        CatalogAcquirer::StagingCommit,
+        CatalogAcquirer::Mark,
+        CatalogAcquirer::RowPublisherSnapshot,
+        CatalogAcquirer::PersistPublishDelta,
+    ];
+    for profile in &profiles {
+        if profile.storage_node == cfg.storage_node && touched.contains(&profile.acquirer) {
+            continue;
+        }
+        if profile.storage_node == other_node
+            && matches!(
+                profile.acquirer,
+                CatalogAcquirer::RowPublisherSnapshot | CatalogAcquirer::PersistPublishDelta
+            )
+        {
+            continue;
+        }
+        assert_eq!(
+            profile.acquisitions, 0,
+            "unexpected acquisitions for {:?} on node {}",
+            profile.acquirer, profile.storage_node
+        );
+        assert_eq!(profile.hold_nanos, 0);
+        assert_eq!(profile.wait_nanos, 0);
+        assert_eq!(profile.max_hold_nanos, 0);
+    }
+
+    // Draining reset every counter.
+    for profile in registry.drain_catalog_hold_profiles().unwrap() {
+        assert_eq!(profile.acquisitions, 0);
+        assert_eq!(profile.hold_nanos, 0);
+    }
+}
+
+// The holder attribution surfaces through the durable coordinator: a flushed
+// block write that stripes segment refs across nodes must report staging
+// holds and exactly one batched publish-mark hold per carried node, so a
+// loadbench run can name the catalog-mutex holder per (node, acquirer).
+#[test]
+fn durable_catalog_hold_profiles_surface_publish_mark_holds() {
+    let root = durable_temp_dir("catalog-hold-profiles");
+    let cfg = config();
+    let nodes = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+        StorageNodeId::from_raw(80),
+    ];
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            nodes.clone(),
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy {
+                segment_chunk_bytes: 2 * 1024 * 1024,
+                ..BlockJournalBatchPolicy::default()
+            },
+            AppendIngestPolicy::default(),
+        )
+        .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("catalog-hold-profiles".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let _ = store.drain_catalog_hold_profiles().unwrap();
+
+    // 8 MiB at a 2 MiB chunk policy stripes one segment onto each node.
+    let payload = repeated_blocks(2048, 41);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &payload,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    let profiles = store.drain_catalog_hold_profiles().unwrap();
+    assert_eq!(profiles.len(), nodes.len() * CatalogAcquirer::ALL.len());
+    for node in &nodes {
+        let row = |acquirer: CatalogAcquirer| {
+            *profiles
+                .iter()
+                .find(|profile| profile.storage_node == *node && profile.acquirer == acquirer)
+                .unwrap()
+        };
+        for acquirer in [
+            CatalogAcquirer::StagingReserve,
+            CatalogAcquirer::StagingCommit,
+        ] {
+            let staging = row(acquirer);
+            assert_eq!(staging.acquisitions, 1, "{acquirer:?} on node {node}");
+            assert!(staging.hold_nanos > 0);
+        }
+        // The publish mark is batched per carried node: one commit, one node
+        // call, one catalog lock hold.
+        let mark = row(CatalogAcquirer::Mark);
+        assert_eq!(mark.acquisitions, 1, "mark on node {node}");
+        assert!(mark.hold_nanos > 0);
+        assert!(mark.max_hold_nanos > 0 && mark.max_hold_nanos <= mark.hold_nanos);
+        // Nothing read during the window.
+        assert_eq!(row(CatalogAcquirer::ReadVerify).acquisitions, 0);
+    }
+    let _ = fs::remove_dir_all(root);
 }
 
 // The mark contract's mismatch gate: a node marks only segments its own
@@ -21191,7 +21417,7 @@ fn local_multi_node_custodian_reclaims_released_segments_on_owning_node_only() {
             !store
                 .segment_catalog_for_node(node_id)
                 .unwrap()
-                .contains_segment(released)
+                .contains_segment(CatalogAcquirer::OwnerScan, released)
                 .unwrap()
         );
     }

@@ -259,6 +259,13 @@ run_ab_case() {
   local node_dirs
   node_dirs="$(toy_node_dirs_for_run "${scoped_key}")"
   mkdir -p "${out}" "$(dirname "${root}")"
+  # Catalog-mutex holder attribution exists only on sides built after the
+  # flag landed; pass it only when this side's binary advertises it so a
+  # BASE_REF binary without the flag runs exactly as before.
+  local hold_csv_args=()
+  if "${loadbench}" --help 2>/dev/null | grep -q -- '--catalog-hold-csv'; then
+    hold_csv_args=(--catalog-hold-csv "${out}/catalog-hold.csv")
+  fi
   log "running ${side} ${run_key} workloads=${workloads} concurrency=${concurrency}"
   "${loadbench}" \
     --provider durable \
@@ -281,6 +288,7 @@ run_ab_case() {
     --storage-node-data-dirs "${node_dirs}" \
     --matrix-csv "${out}/matrix.csv" \
     --durable-profile-csv "${out}/durable-profile.csv" \
+    ${hold_csv_args[@]+"${hold_csv_args[@]}"} \
     "$@" \
     | tee "${out}/stdout.csv"
   cleanup_toy_run "${side}" "${run_key}"

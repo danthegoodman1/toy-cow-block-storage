@@ -776,6 +776,18 @@ The commands below are written for Linux hosts. On macOS hosts, run them inside
 the Linux container by starting `docker compose up -d dev` and prefixing the
 `cargo ...` invocation with `docker compose exec dev`.
 
+`--catalog-hold-csv PATH` records per-run catalog-mutex holder attribution:
+every acquisition of a storage node's segment-catalog mutex is tagged with a
+compile-time acquirer (staging probe/reserve/begin/commit, publish mark, row
+publisher and persist snapshots, sweeps, and so on), and at the end of each
+run loadbench appends one row per (storage node, acquirer) with nonzero
+acquisitions: acquisition count, `acquisitions_per_second` over the measured
+window, total wait, total hold, and max single hold in nanoseconds. Counters
+reset after warmup, so rows cover only the measured run. Rows are currently
+reported only for the local and durable providers; txn runs produce no rows.
+This is the "who holds the catalog mutex" measurement that pairs with the
+`*_lock_wait_nanos` columns (who waits) in `--durable-profile-csv`.
+
 ```sh
 # Broad public API smoke.
 cargo run --release --bin loadbench -- \

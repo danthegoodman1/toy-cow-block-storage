@@ -30,6 +30,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
     let _ = profile_store.drain_native_file_batch_commit_profiles(DEFAULT_PROFILE_CAPACITY)?;
+    let _ = profile_store.drain_catalog_hold_profiles()?;
     if !workload.is_native_stream_publish_fixed()
         && !workload.is_append_log_microbench()
         && !args.warmup.is_zero()
@@ -47,6 +48,7 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
         let _ = profile_store.drain_block_write_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_read_profiles(DEFAULT_PROFILE_CAPACITY)?;
         let _ = profile_store.drain_native_file_batch_commit_profiles(DEFAULT_PROFILE_CAPACITY)?;
+        let _ = profile_store.drain_catalog_hold_profiles()?;
     }
     let mut report = if workload.is_append_log_microbench() {
         execute_append_log_microbench_load(args, workload, concurrency, context)?
@@ -57,6 +59,10 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     } else {
         execute_load(args, workload, concurrency, context, args.duration)?
     };
+    // Snapshot the catalog hold counters immediately after the workers
+    // join, before any CSV file I/O, so trailing background acquisitions
+    // during the writes below do not leak into the measured window.
+    let catalog_hold_profiles = profile_store.drain_catalog_hold_profiles()?;
     report.provider = args.provider;
     report.durability = args.durability;
     report.workload = workload;
@@ -65,6 +71,13 @@ fn run_case(args: &Args, workload: Workload, concurrency: usize) -> Result<Bench
     report.serial_rtts = args.serial_rtts;
     report.op_size = workload.op_size(args)?;
     append_profile_csv(args, workload, concurrency, &profile_store)?;
+    append_catalog_hold_csv(
+        args,
+        workload,
+        concurrency,
+        report.elapsed,
+        &catalog_hold_profiles,
+    )?;
     append_append_publish_profile_csv(args, workload, concurrency, &profile_store)?;
     append_append_ingest_profile_csv(args, workload, concurrency, &profile_store)?;
     append_metadata_profile_csv(args, workload, concurrency, &profile_store)?;

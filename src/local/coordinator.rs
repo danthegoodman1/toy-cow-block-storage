@@ -706,17 +706,20 @@ impl LocalCoordinator {
 
     fn state_for_segment_ids(
         &self,
+        acquirer: CatalogAcquirer,
         segment_ids: &BTreeSet<SegmentId>,
     ) -> Result<(SelectedStorageNodeState, Vec<DurableSegmentPayload>)> {
-        self.storage_nodes.state_for_segment_ids(segment_ids)
+        self.storage_nodes
+            .state_for_segment_ids(acquirer, segment_ids)
     }
 
     fn selected_state_for_segment_ids(
         &self,
+        acquirer: CatalogAcquirer,
         segment_ids: &BTreeSet<SegmentId>,
     ) -> Result<SelectedStorageNodeState> {
         self.storage_nodes
-            .selected_state_for_segment_ids(segment_ids)
+            .selected_state_for_segment_ids(acquirer, segment_ids)
     }
 
     fn selected_live_state_for_segment_ids(
@@ -827,16 +830,10 @@ impl LocalCoordinator {
         }
         if commit_groups.values().any(|group| {
             !matches!(group.owner, MappingOwner::NativeKeyspace(_))
-                || group.updates.iter().any(|update| {
-                    !matches!(
-                        update,
-                        RootUpdate::FileRoot {
-                            old_root: _,
-                            new_root: _,
-                            ..
-                        }
-                    )
-                })
+                || group
+                    .updates
+                    .iter()
+                    .any(|update| !matches!(update, RootUpdate::FileRoot { .. }))
         }) {
             return Ok(None);
         }
@@ -1130,6 +1127,17 @@ impl LocalCoordinator {
 
     pub fn drain_events(&self, max: usize) -> Result<Vec<StorageEvent>> {
         self.observability.drain_events(max)
+    }
+
+    /// Snapshot and reset per-acquirer catalog-mutex hold accounting for
+    /// every storage node.
+    ///
+    /// Always-on process-local diagnostics (like the durable persist
+    /// profiles): one row per (storage node, acquirer), zero rows included.
+    /// Draining resets the counters, so consecutive drains cover disjoint
+    /// windows.
+    pub fn drain_catalog_hold_profiles(&self) -> Result<Vec<CatalogHoldProfile>> {
+        self.storage_nodes.drain_catalog_hold_profiles()
     }
 
     pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
