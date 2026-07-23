@@ -52,9 +52,26 @@ unchanged. What happened since:
   `durable_block_prestaged_flush_skips_directory_sync_for_existing_log`
   (~10% under parallel `_prestage` filter, dir-sync accounting race on the
   delta lane, present since 60c9c91). Worth a phase-level follow-up ruling.
-- Next: final gate trip `run_phase2_confirm_ab.sh` with `BASE_REF=9f0c821`,
-  `FIX_REF=<M6 commit>`, scored against the section 2 gate (1.5x stage6:
-  c16 1245.8 / c32 1351.9 MBps) or closed per the section 6 budget clause.
+- Final gate trip `phase2-m6-gate-20260723` (same-instance A/B, base
+  `9f0c821` vs fix `9282933` = M6, us-east1-b, zero errors): c32 publish
+  117.5/169.8us -> 47.7/49.8us with publish-mark lock wait 91.4/139.3us ->
+  24.4/25.6us (reps 1/2); c16 publish 56.7/62.2 -> 26.4/25.8us. Publish is
+  now well below sync (fix sync 158.6-174.5us at c32). Throughput fix/base:
+  c16 1.017/1.035x, c32 1.042/1.058x; vs stage6: c16 918.9-946.5 MBps
+  (1.11-1.14x), c32 1089.3-1114.0 (1.21-1.24x). Fix-side holder profile:
+  prestage tags absent entirely (zero acquisitions), mark wait down ~4x,
+  total catalog pressure roughly halved; `staging_reserve` is now the top
+  holder (6.6% held at c32) and is the recorded reopening point if catalog
+  contention ever returns. Watch item `block-read-4k` c32 fix/base
+  0.964/0.992 — inside the band; 4k guard flat.
+- PHASE 2 CLOSED 2026-07-23 under the section 6 budget clause:
+  publish-below-sync met, 1.5x throughput unmet, and the remaining 64k
+  budget is the sync-side residual (sync grows with concurrency;
+  158.6-193.7us at c32 this trip), which belongs to Phase 3 lane
+  pipelining. The plan ledger row in
+  `docs/block-native-fast-path-continuation-plan.md` records the same
+  resolution. Teardown verified: zero instances, zero `toy-cow-*` networks
+  in the project after the final trip.
 
 Audience: an agent resuming Phase 2 of
 `docs/block-native-fast-path-continuation-plan.md` on a Linux machine with
