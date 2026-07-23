@@ -195,34 +195,48 @@ impl LocalStorageNode {
         Ok((receipt, profile))
     }
 
-    fn mark_segment_referenced_profiled(
+    /// Mark a batch of segments referenced for one metadata commit.
+    ///
+    /// Marks are routed here by the storage node carried in segment refs and
+    /// receipts, and that id is authoritative: a segment missing from this
+    /// node's catalog is corruption, and there is no fallback scan of other
+    /// catalogs. The whole batch takes one catalog lock and records one
+    /// observability event.
+    fn mark_segments_referenced_profiled(
         &self,
-        evidence: ReferenceEvidence,
+        segment_ids: &[SegmentId],
+        metadata_commit: CommitSeq,
     ) -> Result<LocalMarkReferencedProfile> {
         let mut profile = LocalMarkReferencedProfile::default();
-        let segment_id = evidence.segment_id;
-        let verify_started = Instant::now();
-        self.authority
-            .verify_reference_evidence(&evidence, segment_id, self.storage_node)?;
-        profile.verify_nanos = duration_nanos_u64(verify_started.elapsed());
-
-        let catalog_profile = self
+        let catalog_profile = match self
             .segment_catalog
-            .mark_segment_referenced_profiled(segment_id)?;
+            .mark_segments_referenced_profiled(segment_ids)
+        {
+            Ok(catalog_profile) => catalog_profile,
+            Err(StorageError::NotFound { .. }) => {
+                return Err(StorageError::corrupt(
+                    "segment ref carries a storage node whose catalog has no such segment",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         profile.catalog_mark_nanos = catalog_profile.total_nanos;
         profile.catalog_mark_lock_wait_nanos = catalog_profile.lock_wait_nanos;
 
+        let marked = usize_to_u64(segment_ids.len());
+        let observability_started = Instant::now();
         self.observability.record_with_update(
             StorageEventKind::StorageSegmentReferenced,
             Some(self.storage_node),
-            Some(segment_id),
-            Some(evidence.metadata_commit),
+            segment_ids.first().copied(),
+            Some(metadata_commit),
             None,
             |counters| {
                 counters.storage_segment_references =
-                    counters.storage_segment_references.saturating_add(1);
+                    counters.storage_segment_references.saturating_add(marked);
             },
         );
+        profile.observability_record_nanos = duration_nanos_u64(observability_started.elapsed());
         Ok(profile)
     }
 
@@ -316,7 +330,7 @@ impl StorageNodeTransport for LocalStorageNode {
     fn send(&self, request: StorageNodeRequest) -> Result<StorageNodeResponse> {
         match request {
             StorageNodeRequest::WriteSegment { grant, bytes } => {
-                let (receipt, _) = self.write_segment_profiled(grant, bytes)?;
+                let (receipt, _) = self.write_segment_profiled(*grant, bytes)?;
                 Ok(StorageNodeResponse::WriteSegment {
                     receipt: Box::new(receipt),
                 })
@@ -330,8 +344,11 @@ impl StorageNodeTransport for LocalStorageNode {
                     .read_segment(segment_id, range, &mut bytes)?;
                 Ok(StorageNodeResponse::ReadSegment { bytes })
             }
-            StorageNodeRequest::MarkReferenced { evidence } => {
-                self.mark_segment_referenced_profiled(evidence)?;
+            StorageNodeRequest::MarkReferenced {
+                segment_ids,
+                metadata_commit,
+            } => {
+                self.mark_segments_referenced_profiled(&segment_ids, metadata_commit)?;
                 Ok(StorageNodeResponse::MarkReferenced)
             }
             StorageNodeRequest::Release { segment_id } => {
@@ -721,6 +738,37 @@ impl StorageNodeRegistry {
         self.node(node_id)
     }
 
+    /// Resolve a storage node carried by a segment reference (a journal
+    /// segment-ref entry or a segment receipt).
+    ///
+    /// The carried id is authoritative for routing: an unknown id is
+    /// corruption, never a reason to fall back to scanning catalogs.
+    fn carried_node(&self, storage_node: StorageNodeId) -> Result<&LocalStorageNode> {
+        self.nodes.get(&storage_node).ok_or_else(|| {
+            StorageError::corrupt("segment reference carries unknown storage node")
+        })
+    }
+
+    /// Sweep every node catalog for the unique-ownership invariant: a segment
+    /// id present in more than one catalog is corruption.
+    ///
+    /// Publish and replay route by the carried storage node without scanning
+    /// other catalogs, so this background sweep is the invariant's home; the
+    /// foreground paths surface only missing-from-carried-catalog corruption.
+    fn verify_unique_catalog_ownership(&self) -> Result<()> {
+        let mut owners: BTreeMap<SegmentId, StorageNodeId> = BTreeMap::new();
+        for (node_id, node) in self.nodes.iter() {
+            for (segment_id, _, _) in node.segment_catalog.entries()? {
+                if owners.insert(segment_id, *node_id).is_some() {
+                    return Err(StorageError::corrupt(
+                        "segment appears in multiple storage-node catalogs",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn commit_for_segment(&self, segment_id: SegmentId) -> Result<SegmentReplicaCommit> {
         self.owner_node_for_segment(segment_id)?
@@ -740,16 +788,20 @@ impl StorageNodeRegistry {
             .state(segment_id)
     }
 
-    fn mark_segment_referenced(
+    /// Mark segments referenced on the storage node carried by their receipts
+    /// or journal segment refs; marks never scan catalogs to find an owner.
+    fn mark_segments_referenced(
         &self,
-        receipt: &SegmentWriteReceipt,
-        commit_seq: CommitSeq,
-        authority: &dyn GrantReceiptAuthority,
+        storage_node: StorageNodeId,
+        segment_ids: &[SegmentId],
+        metadata_commit: CommitSeq,
     ) -> Result<()> {
-        let evidence = authority.create_reference_evidence(receipt, commit_seq)?;
         let response = self
-            .transport_for_segment(receipt.segment_id)?
-            .send(StorageNodeRequest::MarkReferenced { evidence })?;
+            .carried_node(storage_node)?
+            .send(StorageNodeRequest::MarkReferenced {
+                segment_ids: segment_ids.to_vec(),
+                metadata_commit,
+            })?;
         if response != StorageNodeResponse::MarkReferenced {
             return Err(StorageError::corrupt(
                 "storage node returned unexpected mark-referenced response",
@@ -758,27 +810,29 @@ impl StorageNodeRegistry {
         Ok(())
     }
 
-    fn mark_segment_referenced_profiled(
+    fn mark_segments_referenced_profiled(
         &self,
-        receipt: &SegmentWriteReceipt,
-        commit_seq: CommitSeq,
-        authority: &dyn GrantReceiptAuthority,
+        storage_node: StorageNodeId,
+        segment_ids: &[SegmentId],
+        metadata_commit: CommitSeq,
     ) -> Result<LocalMarkReferencedProfile> {
-        let evidence_started = Instant::now();
-        let evidence = authority.create_reference_evidence(receipt, commit_seq)?;
-        let mut profile = LocalMarkReferencedProfile {
-            evidence_create_nanos: duration_nanos_u64(evidence_started.elapsed()),
-            ..LocalMarkReferencedProfile::default()
-        };
+        let routing_started = Instant::now();
+        let node = self.carried_node(storage_node)?;
+        let routing_nanos = duration_nanos_u64(routing_started.elapsed());
 
-        let dispatch_started = Instant::now();
-        let node = self.owner_node_for_segment(receipt.segment_id)?;
-        profile.transport_dispatch_nanos = duration_nanos_u64(dispatch_started.elapsed());
-
-        let node_profile = node.mark_segment_referenced_profiled(evidence)?;
-        profile.verify_nanos = node_profile.verify_nanos;
-        profile.catalog_mark_nanos = node_profile.catalog_mark_nanos;
-        profile.catalog_mark_lock_wait_nanos = node_profile.catalog_mark_lock_wait_nanos;
+        let call_started = Instant::now();
+        let mut profile = node.mark_segments_referenced_profiled(segment_ids, metadata_commit)?;
+        let call_nanos = duration_nanos_u64(call_started.elapsed());
+        profile.routing_nanos = routing_nanos;
+        // The in-process transport is a direct call, so the residual is
+        // whatever the call cost beyond the node-side measured buckets; a
+        // remote transport would grow this into serialization plus network
+        // time.
+        profile.mark_call_residual_nanos = call_nanos.saturating_sub(
+            profile
+                .catalog_mark_nanos
+                .saturating_add(profile.observability_record_nanos),
+        );
         Ok(profile)
     }
 

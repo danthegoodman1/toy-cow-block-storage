@@ -252,9 +252,7 @@ fn txn_block_write_profile_is_empty_when_disabled_and_records_successful_writes(
     assert!(profile.tree_path_copy_nanos > 0);
     assert!(profile.metadata_publish_call_nanos > 0);
     assert!(profile.mark_referenced_nanos > 0);
-    assert!(profile.mark_reference_evidence_nanos > 0);
-    assert!(profile.mark_reference_transport_dispatch_nanos > 0);
-    assert!(profile.mark_reference_verify_nanos > 0);
+    assert!(profile.mark_reference_dispatch_nanos > 0);
     assert!(profile.mark_reference_catalog_nanos > 0);
 }
 

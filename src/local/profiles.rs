@@ -176,9 +176,9 @@ pub struct NativeFileBatchCommitProfile {
     pub tree_path_copy_nanos: u64,
     pub metadata_publish_nanos: u64,
     pub mark_referenced_nanos: u64,
-    pub mark_reference_evidence_nanos: u64,
-    pub mark_reference_transport_dispatch_nanos: u64,
-    pub mark_reference_verify_nanos: u64,
+    /// Mark dispatch outside the catalog transition: carried-node routing,
+    /// the node call residual, and node-side event recording.
+    pub mark_reference_dispatch_nanos: u64,
     pub mark_reference_catalog_nanos: u64,
     pub mark_reference_catalog_lock_wait_nanos: u64,
     pub append_stream_invalidate_nanos: u64,
@@ -261,15 +261,15 @@ impl NativeFileBatchCommitProfile {
     }
 
     fn absorb_mark_referenced(&mut self, profile: LocalMarkReferencedProfile) {
-        self.mark_reference_evidence_nanos = self
-            .mark_reference_evidence_nanos
-            .saturating_add(profile.evidence_create_nanos);
-        self.mark_reference_transport_dispatch_nanos = self
-            .mark_reference_transport_dispatch_nanos
-            .saturating_add(profile.transport_dispatch_nanos);
-        self.mark_reference_verify_nanos = self
-            .mark_reference_verify_nanos
-            .saturating_add(profile.verify_nanos);
+        // This profile keeps one dispatch bucket, so carried-node routing,
+        // the call overhead, and node-side event recording all land in it;
+        // the block journal lane profile reports them as separate columns
+        // instead.
+        self.mark_reference_dispatch_nanos = self
+            .mark_reference_dispatch_nanos
+            .saturating_add(profile.routing_nanos)
+            .saturating_add(profile.mark_call_residual_nanos)
+            .saturating_add(profile.observability_record_nanos);
         self.mark_reference_catalog_nanos = self
             .mark_reference_catalog_nanos
             .saturating_add(profile.catalog_mark_nanos);
@@ -414,9 +414,15 @@ impl LocalSegmentWriteProfile {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct LocalMarkReferencedProfile {
-    evidence_create_nanos: u64,
-    transport_dispatch_nanos: u64,
-    verify_nanos: u64,
+    /// Point resolution of the storage node carried by receipts or segment
+    /// refs; marks never scan catalogs to find a segment's owner.
+    routing_nanos: u64,
+    /// Node call time not attributed to the catalog mark or event recording.
+    /// This is the in-process stand-in for request serialization/transport,
+    /// measured as the call wall time minus the node-side measured buckets.
+    mark_call_residual_nanos: u64,
     catalog_mark_nanos: u64,
     catalog_mark_lock_wait_nanos: u64,
+    /// Node-side observability event/counter recording during the mark.
+    observability_record_nanos: u64,
 }

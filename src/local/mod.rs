@@ -54,14 +54,13 @@ use crate::provider::{
     DiagnosticsSnapshot, GrantReceiptAuthority, LocalSegmentCatalog, MetadataCreateDeviceRequest,
     MetadataCreateFileRequest, MetadataCreateKeyspaceRequest, MetadataFence, MetadataForkRequest,
     MetadataNodeWrite, MetadataPlane, MetadataSnapshotKeyspaceRequest, ObservableProvider,
-    PlacementPolicy, ProofScheme, ReferenceEvidence, RetentionPolicy, SegmentReceiptLifecycle,
-    SegmentReplicaCommit, SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent,
-    SegmentStore, SegmentWriteReceipt, StorageEvent, StorageEventKind, StorageNodeCustodianReport,
+    PlacementPolicy, ProofScheme, RetentionPolicy, SegmentReceiptLifecycle, SegmentReplicaCommit,
+    SegmentReplicaPlacement, SegmentReservation, SegmentReservationIntent, SegmentStore,
+    SegmentWriteReceipt, StorageEvent, StorageEventKind, StorageNodeCustodianReport,
     StorageNodeDirectory, StorageNodeMaintenanceObservation, StorageNodeMaintenanceReport,
     StorageNodeRequest, StorageNodeResponse, StorageNodeTransport, VerifiedSegmentReceipt,
     WriteGrant, WriteGrantIntent, WriteGrantRequest, deterministic_test_grant_hash_and_proof,
     deterministic_test_proof_for_grant, deterministic_test_proof_for_receipt,
-    deterministic_test_proof_for_reference,
 };
 
 include!("profiles.rs");

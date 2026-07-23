@@ -166,12 +166,18 @@ pub(super) struct BlockJournalLaneBatchTiming {
     pub(super) publish_reserve_nanos: u64,
     pub(super) publish_apply_nanos: u64,
     pub(super) lba_map_update_nanos: u64,
-    pub(super) publish_receipt_nanos: u64,
-    pub(super) publish_evidence_nanos: u64,
-    pub(super) publish_dispatch_nanos: u64,
-    pub(super) publish_verify_nanos: u64,
+    /// Routing work for the per-node mark dispatch: grouping a commit's
+    /// segment refs by their carried storage node plus the point resolution
+    /// of each carried node. Publish never scans catalogs to find a
+    /// segment's owner.
+    pub(super) publish_routing_nanos: u64,
+    /// Mark call time not attributed to the catalog mark or event recording
+    /// (in-process transport stand-in).
+    pub(super) publish_mark_call_residual_nanos: u64,
     pub(super) publish_mark_catalog_nanos: u64,
     pub(super) publish_mark_lock_wait_nanos: u64,
+    /// Node-side observability event/counter recording during the mark.
+    pub(super) publish_mark_observability_nanos: u64,
 }
 
 #[derive(Debug, Default)]
@@ -241,12 +247,6 @@ impl BlockJournalEntry {
         }
     }
 
-    fn segment_id(&self) -> Option<SegmentId> {
-        match self {
-            Self::Segment { segment_id, .. } => Some(*segment_id),
-            Self::Write { .. } | Self::Sparse { .. } => None,
-        }
-    }
 }
 
 impl BlockJournalCommit {
@@ -1164,37 +1164,71 @@ fn mark_block_journal_segment_refs_referenced(
     commit: &BlockJournalCommit,
     timing: &mut BlockJournalLaneBatchTiming,
 ) -> Result<()> {
-    for segment_id in commit
-        .entries
-        .iter()
-        .filter_map(BlockJournalEntry::segment_id)
-    {
-        let receipt_started = Instant::now();
-        let receipt = local.storage_nodes.receipt_for_segment(segment_id)?;
-        timing.publish_receipt_nanos = timing
-            .publish_receipt_nanos
-            .saturating_add(duration_nanos_u64(receipt_started.elapsed()));
-        let mark_profile = local.storage_nodes.mark_segment_referenced_profiled(
-            &receipt,
-            commit.commit_seq,
-            local.authority.as_ref(),
-        )?;
-        timing.publish_evidence_nanos = timing
-            .publish_evidence_nanos
-            .saturating_add(mark_profile.evidence_create_nanos);
-        timing.publish_dispatch_nanos = timing
-            .publish_dispatch_nanos
-            .saturating_add(mark_profile.transport_dispatch_nanos);
-        timing.publish_verify_nanos = timing
-            .publish_verify_nanos
-            .saturating_add(mark_profile.verify_nanos);
-        timing.publish_mark_catalog_nanos = timing
-            .publish_mark_catalog_nanos
-            .saturating_add(mark_profile.catalog_mark_nanos);
-        timing.publish_mark_lock_wait_nanos = timing
-            .publish_mark_lock_wait_nanos
-            .saturating_add(mark_profile.catalog_mark_lock_wait_nanos);
+    // Group segment refs by their carried storage node: a commit's entries
+    // can span nodes (chunk striping round-robins segments across nodes),
+    // and the carried id is authoritative for routing, so each group
+    // dispatches one batched mark to its node and never scans other
+    // catalogs. Marks on distinct segments commute, so per-node order is
+    // free to differ from entry order.
+    let total_started = Instant::now();
+    let grouping_started = Instant::now();
+    let mut segment_refs_by_node: BTreeMap<StorageNodeId, Vec<SegmentId>> = BTreeMap::new();
+    for entry in &commit.entries {
+        let BlockJournalEntry::Segment {
+            storage_node,
+            segment_id,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        segment_refs_by_node
+            .entry(*storage_node)
+            .or_default()
+            .push(*segment_id);
     }
+    if segment_refs_by_node.is_empty() {
+        return Ok(());
+    }
+    let mut routing_nanos = duration_nanos_u64(grouping_started.elapsed());
+    let mut catalog_nanos = 0_u64;
+    let mut catalog_lock_wait_nanos = 0_u64;
+    let mut observability_nanos = 0_u64;
+    for (storage_node, segment_ids) in segment_refs_by_node {
+        let mark_profile = local.storage_nodes.mark_segments_referenced_profiled(
+            storage_node,
+            &segment_ids,
+            commit.commit_seq,
+        )?;
+        routing_nanos = routing_nanos.saturating_add(mark_profile.routing_nanos);
+        catalog_nanos = catalog_nanos.saturating_add(mark_profile.catalog_mark_nanos);
+        catalog_lock_wait_nanos =
+            catalog_lock_wait_nanos.saturating_add(mark_profile.catalog_mark_lock_wait_nanos);
+        observability_nanos =
+            observability_nanos.saturating_add(mark_profile.observability_record_nanos);
+    }
+    let total_nanos = duration_nanos_u64(total_started.elapsed());
+    timing.publish_routing_nanos = timing.publish_routing_nanos.saturating_add(routing_nanos);
+    timing.publish_mark_catalog_nanos = timing
+        .publish_mark_catalog_nanos
+        .saturating_add(catalog_nanos);
+    timing.publish_mark_lock_wait_nanos = timing
+        .publish_mark_lock_wait_nanos
+        .saturating_add(catalog_lock_wait_nanos);
+    timing.publish_mark_observability_nanos = timing
+        .publish_mark_observability_nanos
+        .saturating_add(observability_nanos);
+    // Everything not attributed to routing, the catalog transition, or event
+    // recording lands here (dispatch call overhead plus loop bookkeeping), so
+    // the mark buckets reconcile against the mark wall clock.
+    timing.publish_mark_call_residual_nanos =
+        timing
+            .publish_mark_call_residual_nanos
+            .saturating_add(total_nanos.saturating_sub(
+                routing_nanos
+                    .saturating_add(catalog_nanos)
+                    .saturating_add(observability_nanos),
+            ));
     Ok(())
 }
 

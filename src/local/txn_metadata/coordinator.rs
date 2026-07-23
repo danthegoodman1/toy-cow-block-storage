@@ -321,17 +321,17 @@ impl TxnBlockCoordinator {
         let started = profile_enabled.then(Instant::now);
         for receipt in &segment_receipts {
             if profile_enabled {
-                let mark_profile = self.local.storage_nodes.mark_segment_referenced_profiled(
-                    receipt.receipt(),
+                let mark_profile = self.local.storage_nodes.mark_segments_referenced_profiled(
+                    receipt.receipt().storage_node,
+                    &[receipt.receipt().segment_id],
                     commit_group.commit_seq,
-                    self.local.authority.as_ref(),
                 )?;
                 profile.absorb_mark_referenced(mark_profile);
             } else {
-                self.local.storage_nodes.mark_segment_referenced(
-                    receipt.receipt(),
+                self.local.storage_nodes.mark_segments_referenced(
+                    receipt.receipt().storage_node,
+                    &[receipt.receipt().segment_id],
                     commit_group.commit_seq,
-                    self.local.authority.as_ref(),
                 )?;
             }
         }

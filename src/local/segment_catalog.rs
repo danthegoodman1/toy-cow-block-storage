@@ -328,31 +328,41 @@ impl InMemoryLocalSegmentCatalog {
         }
     }
 
-    fn mark_segment_referenced_profiled(
+    /// Mark a batch of segments referenced under one lock acquisition.
+    ///
+    /// Validates every segment before applying any transition, so a bad id
+    /// mid-batch leaves the catalog untouched. Marking is idempotent for
+    /// segments already referenced.
+    fn mark_segments_referenced_profiled(
         &self,
-        segment_id: SegmentId,
+        segment_ids: &[SegmentId],
     ) -> Result<LocalCatalogOpProfile> {
         let total_started = Instant::now();
         let lock_started = Instant::now();
         let mut inner = lock(&self.inner)?;
         let lock_wait_nanos = duration_nanos_u64(lock_started.elapsed());
-        let entry = Self::get_entry_mut(&mut inner, segment_id)?;
-        match entry.state {
-            SegmentLifecycleState::DurablePendingMetadata => {
-                entry.state = SegmentLifecycleState::Referenced;
-                Ok(LocalCatalogOpProfile {
-                    total_nanos: duration_nanos_u64(total_started.elapsed()),
-                    lock_wait_nanos,
-                })
+        for segment_id in segment_ids {
+            let entry = inner
+                .entries
+                .get(segment_id)
+                .ok_or_else(|| StorageError::not_found("segment", segment_id.to_string()))?;
+            if !matches!(
+                entry.state,
+                SegmentLifecycleState::DurablePendingMetadata | SegmentLifecycleState::Referenced
+            ) {
+                return Err(StorageError::conflict(
+                    "segment can be referenced only from DurablePendingMetadata state",
+                ));
             }
-            SegmentLifecycleState::Referenced => Ok(LocalCatalogOpProfile {
-                total_nanos: duration_nanos_u64(total_started.elapsed()),
-                lock_wait_nanos,
-            }),
-            _ => Err(StorageError::conflict(
-                "segment can be referenced only from DurablePendingMetadata state",
-            )),
         }
+        for segment_id in segment_ids {
+            let entry = Self::get_entry_mut(&mut inner, *segment_id)?;
+            entry.state = SegmentLifecycleState::Referenced;
+        }
+        Ok(LocalCatalogOpProfile {
+            total_nanos: duration_nanos_u64(total_started.elapsed()),
+            lock_wait_nanos,
+        })
     }
 
     fn get_entry_mut(inner: &mut CatalogInner, segment_id: SegmentId) -> Result<&mut CatalogEntry> {
@@ -392,7 +402,7 @@ impl LocalSegmentCatalog for InMemoryLocalSegmentCatalog {
     }
 
     fn mark_segment_referenced(&self, segment_id: SegmentId) -> Result<()> {
-        self.mark_segment_referenced_profiled(segment_id)
+        self.mark_segments_referenced_profiled(std::slice::from_ref(&segment_id))
             .map(|_| ())
     }
 

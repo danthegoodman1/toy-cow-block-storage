@@ -54,6 +54,8 @@ pub struct DurableCoordinator {
     #[cfg(test)]
     block_journal_materialization_pause:
         Arc<(Mutex<BlockJournalMaterializationPauseState>, Condvar)>,
+    #[cfg(test)]
+    fail_next_block_journal_publish_mark: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -982,6 +984,8 @@ impl DurableCoordinator {
                 Mutex::new(BlockJournalMaterializationPauseState::default()),
                 Condvar::new(),
             )),
+            #[cfg(test)]
+            fail_next_block_journal_publish_mark: Arc::new(AtomicBool::new(false)),
         };
         store.start_maintenance_worker_if_needed()?;
         Ok(store)
@@ -3577,6 +3581,29 @@ impl DurableCoordinator {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Fail the next lane batch's publish mark step after its journal records
+    /// are durable, modeling a publish failure between the shared sync and
+    /// segment-ref marking. Replay is unaffected: the durable records replay
+    /// normally on reopen.
+    #[cfg(test)]
+    fn fail_next_block_journal_publish_mark_for_test(&self) {
+        self.fail_next_block_journal_publish_mark
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_block_journal_publish_mark_if_requested_for_test(&self) -> Result<()> {
+        if self
+            .fail_next_block_journal_publish_mark
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::unavailable(
+                "injected block journal publish mark failure",
+            ));
+        }
+        Ok(())
+    }
+
     /// Park the row publisher so queued catalog rows never publish, including
     /// the drain a clean drop would run; dropping the store while paused
     /// models a crash with rows unpublished.
@@ -4049,12 +4076,13 @@ impl DurableCoordinator {
             block_journal_publish_reserve_nanos: lane_timing.publish_reserve_nanos,
             block_journal_publish_apply_nanos: lane_timing.publish_apply_nanos,
             block_journal_lba_map_update_nanos: lane_timing.lba_map_update_nanos,
-            block_journal_publish_receipt_nanos: lane_timing.publish_receipt_nanos,
-            block_journal_publish_evidence_nanos: lane_timing.publish_evidence_nanos,
-            block_journal_publish_dispatch_nanos: lane_timing.publish_dispatch_nanos,
-            block_journal_publish_verify_nanos: lane_timing.publish_verify_nanos,
+            block_journal_publish_routing_nanos: lane_timing.publish_routing_nanos,
+            block_journal_publish_mark_call_residual_nanos: lane_timing
+                .publish_mark_call_residual_nanos,
             block_journal_publish_mark_catalog_nanos: lane_timing.publish_mark_catalog_nanos,
             block_journal_publish_mark_lock_wait_nanos: lane_timing.publish_mark_lock_wait_nanos,
+            block_journal_publish_mark_observability_nanos: lane_timing
+                .publish_mark_observability_nanos,
             durable_commit_high_water: durable_commit_high_water.raw(),
             ..DurablePersistProfile::default()
         })
@@ -4343,6 +4371,8 @@ impl DurableCoordinator {
                 let BlockJournalRecord::Write(commit) = record else {
                     continue;
                 };
+                #[cfg(test)]
+                self.fail_block_journal_publish_mark_if_requested_for_test()?;
                 let mark_started = Instant::now();
                 mark_block_journal_segment_refs_referenced(&self.local, commit, &mut lane_timing)?;
                 let reserve_started = Instant::now();
@@ -4699,10 +4729,10 @@ impl DurableCoordinator {
         )?;
         if materialized {
             for receipt in receipts.values() {
-                self.local.storage_nodes.mark_segment_referenced(
-                    receipt.receipt(),
+                self.local.storage_nodes.mark_segments_referenced(
+                    receipt.receipt().storage_node,
+                    &[receipt.receipt().segment_id],
                     delta.commit_seq,
-                    self.local.authority.as_ref(),
                 )?;
             }
         }

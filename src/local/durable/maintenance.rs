@@ -98,9 +98,36 @@ pub(super) fn maintenance_worker_loop(
         guard.notified = false;
         drop(guard);
 
-        while let Ok(report) = run_maintenance_tick_parts(&parts, 0, 0) {
-            if report.plan.commands.is_empty() {
-                break;
+        loop {
+            match run_maintenance_tick_parts(&parts, 0, 0) {
+                Ok(report) => {
+                    if report.plan.commands.is_empty() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    // A failed background tick must leave an operator
+                    // signal: this loop is the only driver in AlwaysOn mode,
+                    // and it now also owns the duplicate-catalog corruption
+                    // sweep, so a swallowed error would hide corruption and
+                    // silently stall compaction until the next notify.
+                    let reason = match &error {
+                        StorageError::Corrupt { .. } => "corrupt",
+                        _ => "error",
+                    };
+                    parts.local.observability.record_with_update(
+                        StorageEventKind::MaintenanceTickFailed,
+                        None,
+                        None,
+                        None,
+                        Some(reason),
+                        |counters| {
+                            counters.maintenance_tick_failures =
+                                counters.maintenance_tick_failures.saturating_add(1);
+                        },
+                    );
+                    break;
+                }
             }
         }
     }
@@ -129,6 +156,12 @@ pub(super) fn run_maintenance_tick_parts(
     recent_write_bytes: u64,
     recent_flushed_write_bytes: u64,
 ) -> Result<MaintenanceTickReport> {
+    // Publish routes segment refs by their carried storage node and never
+    // scans other catalogs, so the maintenance tick owns the cross-catalog
+    // unique-ownership invariant. The tick already walks every catalog for
+    // lifecycle reconciliation, so the sweep rides the same cadence off the
+    // foreground path.
+    parts.local.storage_nodes.verify_unique_catalog_ownership()?;
     let scheduler = MaintenanceScheduler::new(parts.maintenance_policy)?;
     let cursor = *lock(&parts.maintenance_cursor)?;
     let observation = parts.durable.maintenance_observation(

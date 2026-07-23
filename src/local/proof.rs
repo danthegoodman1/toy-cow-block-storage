@@ -37,13 +37,6 @@ impl LocalGrantReceiptAuthority {
         )
     }
 
-    fn verify_reference_proof(evidence: &ReferenceEvidence) -> Result<()> {
-        Self::verify_expected_proof(
-            deterministic_test_proof_for_reference(evidence.node_key_id, evidence),
-            evidence.proof,
-        )
-    }
-
     fn verify_not_expired(expires_at: LogicalDeadline) -> Result<()> {
         if expires_at.raw() < LOCAL_GRANT_EPOCH.raw() {
             return Err(StorageError::unavailable("write grant expired"));
@@ -310,57 +303,5 @@ impl GrantReceiptAuthority for LocalGrantReceiptAuthority {
             receipt: receipt.clone(),
             descriptor: receipt.descriptor.clone(),
         })
-    }
-
-    fn create_reference_evidence(
-        &self,
-        receipt: &SegmentWriteReceipt,
-        metadata_commit: CommitSeq,
-    ) -> Result<ReferenceEvidence> {
-        self.verify_segment_receipt(receipt)?;
-        let mut evidence = ReferenceEvidence {
-            tenant: receipt.tenant,
-            principal: receipt.principal,
-            owner: receipt.owner,
-            grant_id: receipt.grant_id,
-            segment_id: receipt.segment_id,
-            storage_node: receipt.storage_node,
-            metadata_commit,
-            receipt_epoch: receipt.receipt_epoch,
-            node_key_id: receipt.node_key_id,
-            proof_scheme: ProofScheme::DeterministicTestMacV1,
-            proof: crate::provider::ProofTag::ZERO,
-        };
-        evidence.proof = deterministic_test_proof_for_reference(evidence.node_key_id, &evidence);
-        Ok(evidence)
-    }
-
-    fn verify_reference_evidence(
-        &self,
-        evidence: &ReferenceEvidence,
-        segment_id: SegmentId,
-        storage_node: StorageNodeId,
-    ) -> Result<()> {
-        if evidence.proof_scheme != ProofScheme::DeterministicTestMacV1 {
-            return Err(StorageError::unsupported(
-                "local reference verifier supports only deterministic test proofs",
-            ));
-        }
-        if evidence.segment_id != segment_id {
-            return Err(StorageError::conflict(
-                "reference evidence segment ID does not match request",
-            ));
-        }
-        if evidence.storage_node != storage_node {
-            return Err(StorageError::conflict(
-                "reference evidence storage node does not match request",
-            ));
-        }
-        if evidence.node_key_id != Self::node_key_id(storage_node) {
-            return Err(StorageError::conflict(
-                "reference evidence key does not match storage node",
-            ));
-        }
-        Self::verify_reference_proof(evidence)
     }
 }

@@ -1588,10 +1588,10 @@ impl LocalCoordinator {
         })?;
 
         for receipt in &segment_receipts {
-            self.storage_nodes.mark_segment_referenced(
-                receipt.receipt(),
+            self.storage_nodes.mark_segments_referenced(
+                receipt.receipt().storage_node,
+                &[receipt.receipt().segment_id],
                 commit_group.commit_seq,
-                self.authority.as_ref(),
             )?;
         }
 
@@ -1704,10 +1704,10 @@ impl LocalCoordinator {
             ));
         }
         for receipt in receipts.values() {
-            self.storage_nodes.mark_segment_referenced(
-                receipt.receipt(),
+            self.storage_nodes.mark_segments_referenced(
+                receipt.receipt().storage_node,
+                &[receipt.receipt().segment_id],
                 commit.commit_seq,
-                self.authority.as_ref(),
             )?;
         }
         Ok(())
@@ -1801,10 +1801,10 @@ impl LocalCoordinator {
             ));
         }
         for receipt in receipts.values() {
-            self.storage_nodes.mark_segment_referenced(
-                receipt.receipt(),
+            self.storage_nodes.mark_segments_referenced(
+                receipt.receipt().storage_node,
+                &[receipt.receipt().segment_id],
                 commit.commit_seq,
-                self.authority.as_ref(),
             )?;
         }
         self.metadata
@@ -3746,7 +3746,7 @@ impl LocalCoordinator {
         let storage_node = grant.storage_node;
         let response = self.storage_nodes.transport_for_node(storage_node)?.send(
             StorageNodeRequest::WriteSegment {
-                grant: grant.clone(),
+                grant: Box::new(grant.clone()),
                 bytes: data,
             },
         )?;
@@ -3941,10 +3941,10 @@ impl LocalCoordinator {
                 new_root,
             })],
         })?;
-        self.storage_nodes.mark_segment_referenced(
-            &receipt,
+        self.storage_nodes.mark_segments_referenced(
+            receipt.storage_node,
+            &[receipt.segment_id],
             commit_group.commit_seq,
-            self.authority.as_ref(),
         )?;
         let block_size = u64::from(self.metadata.config.block_size);
         let byte_offset = range
@@ -4075,17 +4075,17 @@ impl LocalCoordinator {
         for edit in &publish.edits {
             let started = profile.is_some().then(Instant::now);
             if let Some(profile) = profile.as_mut() {
-                let mark_profile = self.storage_nodes.mark_segment_referenced_profiled(
-                    edit.receipt.receipt(),
+                let mark_profile = self.storage_nodes.mark_segments_referenced_profiled(
+                    edit.receipt.receipt().storage_node,
+                    &[edit.receipt.receipt().segment_id],
                     commit_group.commit_seq,
-                    self.authority.as_ref(),
                 )?;
                 profile.absorb_mark_referenced(mark_profile);
             } else {
-                self.storage_nodes.mark_segment_referenced(
-                    edit.receipt.receipt(),
+                self.storage_nodes.mark_segments_referenced(
+                    edit.receipt.receipt().storage_node,
+                    &[edit.receipt.receipt().segment_id],
                     commit_group.commit_seq,
-                    self.authority.as_ref(),
                 )?;
             }
             if let (Some(profile), Some(started)) = (profile.as_mut(), started) {

@@ -107,9 +107,9 @@ pub struct TxnBlockWriteProfile {
     pub tree_path_copy_nanos: u64,
     pub metadata_publish_call_nanos: u64,
     pub mark_referenced_nanos: u64,
-    pub mark_reference_evidence_nanos: u64,
-    pub mark_reference_transport_dispatch_nanos: u64,
-    pub mark_reference_verify_nanos: u64,
+    /// Mark dispatch outside the catalog transition: carried-node routing,
+    /// the node call residual, and node-side event recording.
+    pub mark_reference_dispatch_nanos: u64,
     pub mark_reference_catalog_nanos: u64,
     pub mark_reference_catalog_lock_wait_nanos: u64,
     pub touched_shard_count: u64,
@@ -188,15 +188,15 @@ impl TxnBlockWriteProfile {
     }
 
     fn absorb_mark_referenced(&mut self, profile: LocalMarkReferencedProfile) {
-        self.mark_reference_evidence_nanos = self
-            .mark_reference_evidence_nanos
-            .saturating_add(profile.evidence_create_nanos);
-        self.mark_reference_transport_dispatch_nanos = self
-            .mark_reference_transport_dispatch_nanos
-            .saturating_add(profile.transport_dispatch_nanos);
-        self.mark_reference_verify_nanos = self
-            .mark_reference_verify_nanos
-            .saturating_add(profile.verify_nanos);
+        // This profile keeps one dispatch bucket, so carried-node routing,
+        // the call overhead, and node-side event recording all land in it;
+        // the block journal lane profile reports them as separate columns
+        // instead.
+        self.mark_reference_dispatch_nanos = self
+            .mark_reference_dispatch_nanos
+            .saturating_add(profile.routing_nanos)
+            .saturating_add(profile.mark_call_residual_nanos)
+            .saturating_add(profile.observability_record_nanos);
         self.mark_reference_catalog_nanos = self
             .mark_reference_catalog_nanos
             .saturating_add(profile.catalog_mark_nanos);

@@ -813,8 +813,9 @@ segment bytes. When a coordinator persists a metadata leaf that references
 segments, it supplies verified storage-node receipt evidence. The metadata
 plane extracts segment descriptors from those verified receipts to validate
 leaf shape without opening a storage node. Storage nodes later receive
-metadata-produced reference or release evidence from the coordinator; they do
-not infer logical visibility by reading current metadata heads.
+post-publish mark-referenced requests and metadata-produced release evidence
+from the coordinator; they do not infer logical visibility by reading current
+metadata heads.
 
 ### `SegmentStore` and `LocalSegmentCatalog`
 
@@ -1106,8 +1107,19 @@ client/coordinator writes bytes to the granted storage node
 storage node returns a verifiable durable-pending segment receipt
 client/coordinator submits grant, receipt, and metadata update intent
 metadata verifies the grant, receipt, grant/receipt binding, and fencing, then publishes roots
-coordinator/metadata-produced evidence marks the storage node referenced
+coordinator marks the referenced segments on their storage nodes after publish
 ```
+
+Mark-referenced requests are routed by the storage node carried in receipts
+and journal segment refs, batched per node per publish, and carry the segment
+ids plus the metadata commit. The node validates that every marked segment
+exists in its own catalog with matching identity; a segment absent from the
+addressed catalog is corruption, never a reason to scan other catalogs. The
+former per-segment `ReferenceEvidence` proof was a keyless deterministic hash
+over public inputs — mismatch detection, not custody security — and those
+field-equality checks now ride the mark request directly. If a real keyed
+proof scheme is ever adopted for marks, it returns as a per-batch proof over
+the marked segment set and metadata commit, not as per-segment evidence.
 
 A write grant should bind the tenant, principal, mapping owner, operation
 intent, write intent, segment identity or reservation class, byte length,
@@ -1130,8 +1142,9 @@ shape when receipts need independent verification or stronger node
 accountability.
 
 That Phase 30 boundary is production-secure for forged, stale, wrong-scope, and
-replayed grant, receipt, and reference evidence under a provisioned active
-keyset. Later key rotation, retirement, revocation, admin inspection, and
+replayed grant and receipt evidence under a provisioned active keyset; marks
+carry no per-segment proof, so a production mark proof would be the per-batch
+shape described above. Later key rotation, retirement, revocation, admin inspection, and
 external authorization policy are operational layers. They must not change the
 canonical proof bodies or create a second path for making segment bytes
 logically visible.
@@ -1140,15 +1153,15 @@ Metadata verifies grant/receipt evidence and their binding before it accepts a
 new segment reference, but must still not open storage-node catalogs or read
 segment bytes. Storage nodes may authenticate a grant and issue a receipt, but
 must still not publish metadata, assign file versions, or mark a segment
-referenced from a client's word alone. Reference state follows
-metadata-produced evidence after publish.
+referenced from a client's word alone. Reference state follows coordinator
+mark requests issued only after a successful metadata publish.
 
 ### Remote Storage-Node Transport
 
 The coordinator-to-storage-node boundary is a separate network surface from the
 public block/native client transports. A remote storage-node transport carries
 the same typed messages as the in-process `StorageNodeTransport`: write segment
-with grant, read segment, mark referenced with metadata evidence, release,
+with grant, read segment, mark referenced for a metadata commit, release,
 custodian, and maintenance requests.
 
 Remote storage nodes remain storage authorities only. They own local data logs,

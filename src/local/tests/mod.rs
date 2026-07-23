@@ -97,6 +97,7 @@ fn observability_names_and_event_kinds_are_stable() {
             "storage_segment_releases",
             "maintenance_plans",
             "maintenance_ticks",
+            "maintenance_tick_failures",
             "maintenance_logs_selected",
             "maintenance_logs_skipped",
             "maintenance_bytes_copied",
@@ -149,6 +150,7 @@ fn observability_names_and_event_kinds_are_stable() {
             "StorageNodeCustodianRan",
             "MaintenancePlanned",
             "MaintenanceTicked",
+            "MaintenanceTickFailed",
             "GrantIssued",
             "GrantRejected",
             "ReceiptVerified",
@@ -5614,6 +5616,712 @@ fn durable_block_journal_stripes_large_write_across_storage_nodes() {
         .read_device(device_id, ByteRange::new(0, 2048 * 4096), &mut replayed)
         .unwrap();
     assert_eq!(replayed, payload);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Publish resolves every segment ref through the storage node carried by its
+// journal entry, including when one commit's entries span several nodes:
+// each segment must be Referenced in exactly its carried node's catalog. The
+// no-scanning half of the routing contract is proven by the wrong-node test
+// below, where a scan would have found the segment elsewhere and succeeded.
+#[test]
+fn durable_block_journal_publish_routes_segment_refs_through_carried_nodes() {
+    let root = durable_temp_dir("block-segref-carried-node-routing");
+    let cfg = config();
+    let nodes = vec![
+        cfg.storage_node,
+        StorageNodeId::from_raw(78),
+        StorageNodeId::from_raw(79),
+        StorageNodeId::from_raw(80),
+    ];
+    let store =
+        DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_and_append_policies(
+            &root,
+            cfg,
+            nodes.clone(),
+            DurableDataLogPolicy::default(),
+            None,
+            AppendPublishBatchPolicy::default(),
+            BlockJournalBatchPolicy {
+                segment_chunk_bytes: 2 * 1024 * 1024,
+                ..BlockJournalBatchPolicy::default()
+            },
+            AppendIngestPolicy::default(),
+        )
+        .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("segref-carried-node-routing".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    // 8 MiB at a 2 MiB chunk policy stripes one chunk onto each of the four
+    // nodes inside a single commit.
+    let payload = repeated_blocks(2048, 73);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &payload,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    let mut spanning_commit = None;
+    for record in store.durable.block_journal_records().unwrap() {
+        let BlockJournalRecord::Write(commit) = record else {
+            continue;
+        };
+        if commit
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, BlockJournalEntry::Segment { .. }))
+        {
+            spanning_commit = Some(commit);
+        }
+    }
+    let commit = spanning_commit.expect("striped write should journal segment refs");
+    let mut carried_nodes = BTreeSet::new();
+    let mut segment_count = 0;
+    for entry in &commit.entries {
+        let BlockJournalEntry::Segment {
+            storage_node,
+            segment_id,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        segment_count += 1;
+        carried_nodes.insert(*storage_node);
+        // Publish marked the segment in exactly the carried node's catalog.
+        assert_eq!(
+            store
+                .local
+                .storage_nodes
+                .node(*storage_node)
+                .unwrap()
+                .segment_catalog
+                .state(*segment_id)
+                .unwrap(),
+            SegmentLifecycleState::Referenced,
+        );
+        for other in &nodes {
+            if other == storage_node {
+                continue;
+            }
+            assert!(
+                !store
+                    .local
+                    .storage_nodes
+                    .node(*other)
+                    .unwrap()
+                    .segment_catalog
+                    .contains_segment(*segment_id)
+                    .unwrap()
+            );
+        }
+    }
+    assert_eq!(segment_count, 4, "8 MiB write should stage four chunks");
+    assert_eq!(
+        carried_nodes.len(),
+        nodes.len(),
+        "one commit's entries should span every storage node"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+// A segment-ref entry carrying the wrong storage node fails publish with a
+// clean corruption error instead of falling back to scanning other
+// catalogs: before direct routing, the owner scan would have found the
+// segment on its real node and marked it successfully.
+#[test]
+fn durable_block_journal_publish_rejects_segment_ref_carrying_wrong_storage_node() {
+    let root = durable_temp_dir("block-segref-wrong-node-publish");
+    let cfg = config();
+    let nodes = vec![cfg.storage_node, StorageNodeId::from_raw(78)];
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        nodes.clone(),
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("segref-wrong-node-publish".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let write = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 51),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    let mut real_entry = None;
+    for record in store.durable.block_journal_records().unwrap() {
+        let BlockJournalRecord::Write(commit) = record else {
+            continue;
+        };
+        for entry in &commit.entries {
+            if matches!(entry, BlockJournalEntry::Segment { .. }) {
+                real_entry = Some(entry.clone());
+            }
+        }
+    }
+    let real_entry = real_entry.expect("flushed 1 MiB write should journal a segment ref");
+    let BlockJournalEntry::Segment {
+        storage_node: owner,
+        segment_id,
+        ..
+    } = &real_entry
+    else {
+        unreachable!();
+    };
+    let (owner, segment_id) = (*owner, *segment_id);
+    let wrong_node = nodes
+        .iter()
+        .copied()
+        .find(|node| *node != owner)
+        .expect("two-node registry has a non-owner node");
+
+    let crafted = |storage_node: StorageNodeId| {
+        let mut entry = real_entry.clone();
+        let BlockJournalEntry::Segment {
+            storage_node: carried,
+            ..
+        } = &mut entry
+        else {
+            unreachable!();
+        };
+        *carried = storage_node;
+        BlockJournalCommit {
+            device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq: CommitSeq::from_raw(write.commit_seq.raw() + 1),
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: entry.committed_bytes(),
+            entries: vec![entry],
+        }
+    };
+
+    // Wrong-but-registered node: its catalog has no such segment.
+    let error = mark_block_journal_segment_refs_referenced(
+        &store.local,
+        &crafted(wrong_node),
+        &mut BlockJournalLaneBatchTiming::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        &error,
+        StorageError::Corrupt { reason }
+            if reason.contains("whose catalog has no such segment")
+    ));
+
+    // Unregistered node id: routing fails before any catalog is touched.
+    let error = mark_block_journal_segment_refs_referenced(
+        &store.local,
+        &crafted(StorageNodeId::from_raw(9999)),
+        &mut BlockJournalLaneBatchTiming::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        &error,
+        StorageError::Corrupt { reason }
+            if reason.contains("unknown storage node")
+    ));
+
+    // Control: the carried owner routes and re-marks idempotently.
+    mark_block_journal_segment_refs_referenced(
+        &store.local,
+        &crafted(owner),
+        &mut BlockJournalLaneBatchTiming::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .local
+            .storage_nodes
+            .node(owner)
+            .unwrap()
+            .segment_catalog
+            .state(segment_id)
+            .unwrap(),
+        SegmentLifecycleState::Referenced,
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+// Replay shares the publish path's direct routing: a durable journal record
+// whose segment ref carries the wrong storage node fails reopen with the
+// same clean corruption error instead of scanning catalogs.
+#[test]
+fn durable_block_journal_replay_rejects_segment_ref_carrying_wrong_storage_node() {
+    let root = durable_temp_dir("block-segref-wrong-node-replay");
+    let cfg = config();
+    let nodes = vec![cfg.storage_node, StorageNodeId::from_raw(78)];
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        nodes.clone(),
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("segref-wrong-node-replay".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let write = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 52),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    let mut real_entry = None;
+    for record in store.durable.block_journal_records().unwrap() {
+        let BlockJournalRecord::Write(commit) = record else {
+            continue;
+        };
+        for entry in &commit.entries {
+            if matches!(entry, BlockJournalEntry::Segment { .. }) {
+                real_entry = Some(entry.clone());
+            }
+        }
+    }
+    let mut entry = real_entry.expect("flushed 1 MiB write should journal a segment ref");
+    let BlockJournalEntry::Segment {
+        storage_node: carried,
+        ..
+    } = &mut entry
+    else {
+        unreachable!();
+    };
+    let owner = *carried;
+    *carried = nodes
+        .iter()
+        .copied()
+        .find(|node| *node != owner)
+        .expect("two-node registry has a non-owner node");
+
+    let poisoned_seq = CommitSeq::from_raw(write.commit_seq.raw() + 1);
+    let poisoned = BlockJournalCommit {
+        device_id,
+        writer_epoch: lease.writer_epoch,
+        commit_seq: poisoned_seq,
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: entry.committed_bytes(),
+        entries: vec![entry],
+    };
+    let shard = store.durable.block_journal_shard_for_device(device_id);
+    store
+        .durable
+        .append_block_journal_records_unsynced(
+            shard,
+            &[
+                BlockJournalRecord::Write(poisoned),
+                BlockJournalRecord::Flush {
+                    device_id,
+                    writer_epoch: lease.writer_epoch,
+                    durable_through: poisoned_seq,
+                },
+            ],
+        )
+        .unwrap();
+    store.durable.sync_block_journal(shard).unwrap();
+    drop(store);
+
+    let error = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        nodes,
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        &error,
+        StorageError::Corrupt { reason }
+            if reason.contains("whose catalog has no such segment")
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+// The duplicate-catalog invariant lives in the maintenance-tick sweep now
+// that publish routes by carried node id without scanning: a segment id
+// planted in a second node's catalog fails the tick with a clean corruption
+// error, while a clean store's tick passes.
+#[test]
+fn maintenance_tick_sweep_detects_segment_in_multiple_node_catalogs() {
+    let root = durable_temp_dir("maintenance-duplicate-catalog-sweep");
+    let cfg = config();
+    let other_node = StorageNodeId::from_raw(78);
+    let store = DurableCoordinator::open_with_storage_nodes_and_data_log_policy(
+        &root,
+        cfg,
+        vec![cfg.storage_node, other_node],
+        DurableDataLogPolicy::default(),
+    )
+    .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("duplicate-catalog-sweep".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 53),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.run_maintenance_tick().unwrap();
+
+    let mut planted = None;
+    for record in store.durable.block_journal_records().unwrap() {
+        let BlockJournalRecord::Write(commit) = record else {
+            continue;
+        };
+        for entry in &commit.entries {
+            if let BlockJournalEntry::Segment {
+                storage_node,
+                segment_id,
+                ..
+            } = entry
+            {
+                planted = Some((*storage_node, *segment_id));
+            }
+        }
+    }
+    let (owner, segment_id) = planted.expect("flushed 1 MiB write should journal a segment ref");
+    let duplicate_node = if owner == other_node {
+        cfg.storage_node
+    } else {
+        other_node
+    };
+    store
+        .local
+        .storage_nodes
+        .node(duplicate_node)
+        .unwrap()
+        .segment_catalog
+        .reserve_segment_with_id(
+            segment_id,
+            SegmentReservationIntent {
+                write_intent: WriteIntentId::from_raw(999),
+                owner: MappingOwner::BlockDevice(device_id),
+                bytes: 4096,
+            },
+        )
+        .unwrap();
+
+    let error = store.run_maintenance_tick().unwrap_err();
+    assert!(matches!(
+        &error,
+        StorageError::Corrupt { reason }
+            if reason.contains("multiple storage-node catalogs")
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+// In AlwaysOn mode the background worker is the only tick driver, so a tick
+// failure — such as the duplicate-catalog sweep detecting corruption — must
+// surface as an observability event and counter instead of being swallowed.
+#[test]
+fn always_on_maintenance_worker_surfaces_tick_failures() {
+    let root = durable_temp_dir("always-on-tick-failure-visible");
+    let cfg = config();
+    let other_node = StorageNodeId::from_raw(78);
+    let policy = MaintenancePolicy {
+        mode: MaintenanceMode::AlwaysOn,
+        data_log_policy: DurableDataLogPolicy::default(),
+        write_backpressure_enabled: false,
+        dirty_low_watermark_bytes: 1,
+        dirty_high_watermark_bytes: u64::MAX,
+        max_sealed_logs: 64,
+        max_reclaimable_debt_bytes: u64::MAX,
+        compaction_copy_budget_per_tick: u64::MAX,
+        max_sqlite_wal_bytes: u64::MAX,
+        max_logs_scanned_per_tick: 64,
+        max_concurrent_compaction_jobs: 1,
+    };
+    let store = DurableCoordinator::open_with_storage_nodes_and_maintenance_policy(
+        &root,
+        cfg,
+        vec![cfg.storage_node, other_node],
+        policy,
+    )
+    .unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 1024,
+                block_size: 4096,
+            },
+            name: Some("tick-failure-visible".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(256, 54),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    let mut planted = None;
+    for record in store.durable.block_journal_records().unwrap() {
+        let BlockJournalRecord::Write(commit) = record else {
+            continue;
+        };
+        for entry in &commit.entries {
+            if let BlockJournalEntry::Segment {
+                storage_node,
+                segment_id,
+                ..
+            } = entry
+            {
+                planted = Some((*storage_node, *segment_id));
+            }
+        }
+    }
+    let (owner, segment_id) = planted.expect("flushed 1 MiB write should journal a segment ref");
+    let duplicate_node = if owner == other_node {
+        cfg.storage_node
+    } else {
+        other_node
+    };
+    store
+        .local
+        .storage_nodes
+        .node(duplicate_node)
+        .unwrap()
+        .segment_catalog
+        .reserve_segment_with_id(
+            segment_id,
+            SegmentReservationIntent {
+                write_intent: WriteIntentId::from_raw(998),
+                owner: MappingOwner::BlockDevice(device_id),
+                bytes: 4096,
+            },
+        )
+        .unwrap();
+
+    store.notify_background_maintenance();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let snapshot = loop {
+        let snapshot = store.diagnostics_snapshot().unwrap();
+        if snapshot.counters.maintenance_tick_failures >= 1 {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker tick failure never surfaced in diagnostics"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(snapshot.recent_events.iter().any(|event| {
+        event.kind == StorageEventKind::MaintenanceTickFailed && event.reason == Some("corrupt")
+    }));
+    store.shutdown_maintenance();
+    let _ = fs::remove_dir_all(root);
+}
+
+// A publish-mark failure after the batch's journal records are durable must
+// complete every waiter in the batch with the error, leave the lane usable,
+// and leave replay-consistent state: nothing is visible live, and reopen
+// replays the durable records so their marks and data land exactly as if
+// the publish had succeeded.
+#[test]
+fn durable_block_journal_publish_mark_failure_mid_batch_errors_waiters_and_replays() {
+    let root = durable_temp_dir("block-segref-mark-failure-mid-batch");
+    let cfg = config();
+    let store = std::sync::Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("segref-mark-failure-mid-batch".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    // An acknowledged write leaves a durability gap, so the flush below
+    // must occupy the lane while both flushed writes queue behind it: the
+    // batch owner takes every pending request, forcing both writes into one
+    // batch whose publish mark then fails. The flush-only batch carries no
+    // Write records, so it does not consume the injected failure.
+    store
+        .write_device_with_writer(
+            &lease,
+            2048 * 4096,
+            &repeated_blocks(1, 60),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store
+        .pause_block_journal_after_unsynced_append_for_test()
+        .unwrap();
+    let first = repeated_blocks(256, 61);
+    let second = repeated_blocks(256, 62);
+    let (first_result, second_result) = thread::scope(|scope| {
+        let flush_store = std::sync::Arc::clone(&store);
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let first = &first;
+        let second = &second;
+        let flusher = scope.spawn(move || flush_store.flush_device_with_writer(lease));
+        store
+            .wait_until_block_journal_append_paused_for_test()
+            .unwrap();
+        let first_write = scope.spawn(move || {
+            first_store.write_device_with_writer(
+                lease,
+                0,
+                first,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                512 * 4096,
+                second,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        loop {
+            if lane.inner.lock().unwrap().pending.len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        store.fail_next_block_journal_publish_mark_for_test();
+        store.resume_block_journal_append_for_test().unwrap();
+        flusher.join().unwrap().unwrap();
+        (first_write.join().unwrap(), second_write.join().unwrap())
+    });
+    for result in [&first_result, &second_result] {
+        assert!(matches!(
+            result,
+            Err(StorageError::Unavailable { reason })
+                if reason.contains("injected block journal publish mark failure")
+        ));
+    }
+
+    // Nothing from the failed batch is visible live.
+    let mut live = vec![9; 1024 * 1024];
+    store
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut live)
+        .unwrap();
+    assert_eq!(live, vec![0; 1024 * 1024]);
+
+    // The lane is not wedged: a later write on the same device succeeds.
+    let third = repeated_blocks(256, 63);
+    store
+        .write_device_with_writer(
+            &lease,
+            1024 * 4096,
+            &third,
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    // Reopen replays the durable records of the failed batch: both
+    // unacknowledged writes and the acknowledged one land, and their
+    // segments are marked referenced by replay.
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut replayed = vec![0; 1024 * 1024];
+    reopened
+        .read_device(device_id, ByteRange::new(0, 1024 * 1024), &mut replayed)
+        .unwrap();
+    assert_eq!(replayed, first);
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(512 * 4096, 1024 * 1024),
+            &mut replayed,
+        )
+        .unwrap();
+    assert_eq!(replayed, second);
+    reopened
+        .read_device(
+            device_id,
+            ByteRange::new(1024 * 4096, 1024 * 1024),
+            &mut replayed,
+        )
+        .unwrap();
+    assert_eq!(replayed, third);
+    for record in reopened.durable.block_journal_records().unwrap() {
+        let BlockJournalRecord::Write(commit) = record else {
+            continue;
+        };
+        for entry in &commit.entries {
+            let BlockJournalEntry::Segment {
+                storage_node,
+                segment_id,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            assert_eq!(
+                reopened
+                    .local
+                    .storage_nodes
+                    .node(*storage_node)
+                    .unwrap()
+                    .segment_catalog
+                    .state(*segment_id)
+                    .unwrap(),
+                SegmentLifecycleState::Referenced,
+            );
+        }
+    }
     let _ = fs::remove_dir_all(root);
 }
 
@@ -19557,7 +20265,7 @@ fn storage_node_transport_write_receipt_stays_pending_until_reference_message() 
         .transport_for_node(cfg.storage_node)
         .unwrap()
         .send(StorageNodeRequest::WriteSegment {
-            grant,
+            grant: Box::new(grant),
             bytes: repeated_blocks(1, 12),
         })
         .unwrap();
@@ -19572,13 +20280,13 @@ fn storage_node_transport_write_receipt_stays_pending_until_reference_message() 
         SegmentLifecycleState::DurablePendingMetadata
     );
 
-    let evidence = authority
-        .create_reference_evidence(&receipt, CommitSeq::from_raw(1))
-        .unwrap();
     let response = registry
-        .transport_for_segment(segment_id)
+        .transport_for_node(receipt.storage_node)
         .unwrap()
-        .send(StorageNodeRequest::MarkReferenced { evidence })
+        .send(StorageNodeRequest::MarkReferenced {
+            segment_ids: vec![segment_id],
+            metadata_commit: CommitSeq::from_raw(1),
+        })
         .unwrap();
     assert_eq!(response, StorageNodeResponse::MarkReferenced);
     assert_eq!(
@@ -19606,7 +20314,7 @@ fn grants_and_receipts_reject_scope_and_proof_corruption() {
             .transport_for_node(cfg.storage_node)
             .unwrap()
             .send(StorageNodeRequest::WriteSegment {
-                grant,
+                grant: Box::new(grant),
                 bytes: repeated_blocks(1, 1),
             })
             .is_err()
@@ -19623,7 +20331,7 @@ fn grants_and_receipts_reject_scope_and_proof_corruption() {
         .transport_for_node(cfg.storage_node)
         .unwrap()
         .send(StorageNodeRequest::WriteSegment {
-            grant,
+            grant: Box::new(grant),
             bytes: repeated_blocks(1, 2),
         })
         .unwrap();
@@ -19663,7 +20371,7 @@ fn grants_and_receipts_reject_signed_semantic_mismatches() {
             .transport_for_node(cfg.storage_node)
             .unwrap()
             .send(StorageNodeRequest::WriteSegment {
-                grant: wrong_owner_grant,
+                grant: Box::new(wrong_owner_grant),
                 bytes: repeated_blocks(1, 3),
             })
             .is_err()
@@ -19677,7 +20385,7 @@ fn grants_and_receipts_reject_signed_semantic_mismatches() {
             .transport_for_node(cfg.storage_node)
             .unwrap()
             .send(StorageNodeRequest::WriteSegment {
-                grant: stale_epoch_grant,
+                grant: Box::new(stale_epoch_grant),
                 bytes: repeated_blocks(1, 3),
             })
             .is_err()
@@ -19688,7 +20396,7 @@ fn grants_and_receipts_reject_signed_semantic_mismatches() {
             .transport_for_node(cfg.storage_node)
             .unwrap()
             .send(StorageNodeRequest::WriteSegment {
-                grant: grant.clone(),
+                grant: Box::new(grant.clone()),
                 bytes: repeated_blocks(1, 3)[..2048].to_vec(),
             })
             .is_err()
@@ -19699,7 +20407,7 @@ fn grants_and_receipts_reject_signed_semantic_mismatches() {
         .transport_for_node(cfg.storage_node)
         .unwrap()
         .send(StorageNodeRequest::WriteSegment {
-            grant: grant.clone(),
+            grant: Box::new(grant.clone()),
             bytes: repeated_blocks(1, 3),
         })
         .unwrap();
@@ -19755,13 +20463,13 @@ fn storage_node_retries_same_grant_idempotently_but_rejects_conflicting_bytes() 
     let transport = registry.transport_for_node(cfg.storage_node).unwrap();
     let first = transport
         .send(StorageNodeRequest::WriteSegment {
-            grant: grant.clone(),
+            grant: Box::new(grant.clone()),
             bytes: repeated_blocks(1, 8),
         })
         .unwrap();
     let retry = transport
         .send(StorageNodeRequest::WriteSegment {
-            grant: grant.clone(),
+            grant: Box::new(grant.clone()),
             bytes: repeated_blocks(1, 8),
         })
         .unwrap();
@@ -19769,7 +20477,7 @@ fn storage_node_retries_same_grant_idempotently_but_rejects_conflicting_bytes() 
     assert!(
         transport
             .send(StorageNodeRequest::WriteSegment {
-                grant,
+                grant: Box::new(grant),
                 bytes: repeated_blocks(1, 9),
             })
             .is_err()
@@ -19796,7 +20504,7 @@ fn storage_node_duplicate_retry_compares_stored_bytes_not_only_receipt_checksum(
     let original = repeated_blocks(1, 7);
     transport
         .send(StorageNodeRequest::WriteSegment {
-            grant: grant.clone(),
+            grant: Box::new(grant.clone()),
             bytes: original.clone(),
         })
         .unwrap();
@@ -19811,7 +20519,7 @@ fn storage_node_duplicate_retry_compares_stored_bytes_not_only_receipt_checksum(
     assert!(
         transport
             .send(StorageNodeRequest::WriteSegment {
-                grant,
+                grant: Box::new(grant),
                 bytes: original,
             })
             .is_err()
@@ -20061,10 +20769,15 @@ fn generated_trusted_block_receipt_flow_matches_normal_writes() {
     }
 }
 
+// The mark contract's mismatch gate: a node marks only segments its own
+// catalog holds. Marks addressed to the wrong node fail as corruption
+// without touching any state, and one bad id fails a whole batch before any
+// transition applies.
 #[test]
-fn storage_node_rejects_reference_without_metadata_evidence() {
+fn storage_node_rejects_reference_for_segment_absent_from_catalog() {
     let cfg = config();
-    let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+    let other_node = StorageNodeId::from_raw(78);
+    let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node, other_node]).unwrap();
     let segment_id = registry.allocate_segment_id().unwrap();
     let grant = grant_for_segment(
         cfg.storage_node,
@@ -20077,22 +20790,45 @@ fn storage_node_rejects_reference_without_metadata_evidence() {
         .transport_for_node(cfg.storage_node)
         .unwrap()
         .send(StorageNodeRequest::WriteSegment {
-            grant,
+            grant: Box::new(grant),
             bytes: repeated_blocks(1, 9),
         })
         .unwrap();
     let StorageNodeResponse::WriteSegment { receipt } = response else {
         panic!("expected receipt");
     };
-    let mut evidence = LocalGrantReceiptAuthority
-        .create_reference_evidence(&receipt, CommitSeq::from_raw(1))
-        .unwrap();
-    evidence.proof.0[0] ^= 0xff;
+    assert_eq!(receipt.storage_node, cfg.storage_node);
+
+    // Addressed to a node whose catalog has no such segment: corruption, no
+    // fallback scan, no state change on the true owner.
+    let error = registry
+        .transport_for_node(other_node)
+        .unwrap()
+        .send(StorageNodeRequest::MarkReferenced {
+            segment_ids: vec![segment_id],
+            metadata_commit: CommitSeq::from_raw(1),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        StorageError::Corrupt { reason }
+            if reason.contains("whose catalog has no such segment")
+    ));
+    assert_eq!(
+        registry.state(segment_id).unwrap(),
+        SegmentLifecycleState::DurablePendingMetadata
+    );
+
+    // A batch with one unknown id marks nothing, including its valid ids.
+    let bogus = registry.allocate_segment_id().unwrap();
     assert!(
         registry
-            .transport_for_segment(segment_id)
+            .transport_for_node(cfg.storage_node)
             .unwrap()
-            .send(StorageNodeRequest::MarkReferenced { evidence })
+            .send(StorageNodeRequest::MarkReferenced {
+                segment_ids: vec![segment_id, bogus],
+                metadata_commit: CommitSeq::from_raw(1),
+            })
             .is_err()
     );
     assert_eq!(
@@ -20119,7 +20855,7 @@ fn chaos_storage_node_transport_exercises_duplicate_delay_and_corruption() {
     chaos.duplicate_next_request().unwrap();
     let response = chaos
         .send(StorageNodeRequest::WriteSegment {
-            grant: grant.clone(),
+            grant: Box::new(grant.clone()),
             bytes: repeated_blocks(1, 10),
         })
         .unwrap();
@@ -20143,7 +20879,7 @@ fn chaos_storage_node_transport_exercises_duplicate_delay_and_corruption() {
     assert!(
         chaos
             .send(StorageNodeRequest::WriteSegment {
-                grant: delayed_grant.clone(),
+                grant: Box::new(delayed_grant.clone()),
                 bytes: repeated_blocks(1, 11),
             })
             .is_err()
@@ -20164,7 +20900,7 @@ fn chaos_storage_node_transport_exercises_duplicate_delay_and_corruption() {
     chaos.corrupt_next_receipt().unwrap();
     let response = chaos
         .send(StorageNodeRequest::WriteSegment {
-            grant: corrupt_grant,
+            grant: Box::new(corrupt_grant),
             bytes: repeated_blocks(1, 12),
         })
         .unwrap();
@@ -20194,20 +20930,20 @@ fn storage_node_maintenance_messages_return_typed_reports() {
         .transport_for_node(cfg.storage_node)
         .unwrap()
         .send(StorageNodeRequest::WriteSegment {
-            grant,
+            grant: Box::new(grant),
             bytes: repeated_blocks(1, 13),
         })
         .unwrap();
     let StorageNodeResponse::WriteSegment { receipt } = response else {
         panic!("expected receipt");
     };
-    let evidence = LocalGrantReceiptAuthority
-        .create_reference_evidence(&receipt, CommitSeq::from_raw(1))
-        .unwrap();
     registry
-        .transport_for_segment(segment_id)
+        .transport_for_node(receipt.storage_node)
         .unwrap()
-        .send(StorageNodeRequest::MarkReferenced { evidence })
+        .send(StorageNodeRequest::MarkReferenced {
+            segment_ids: vec![segment_id],
+            metadata_commit: CommitSeq::from_raw(1),
+        })
         .unwrap();
     registry.release_segment(segment_id).unwrap();
 

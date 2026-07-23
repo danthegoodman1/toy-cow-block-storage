@@ -266,44 +266,6 @@ impl VerifiedSegmentReceipt {
     }
 }
 
-/// Metadata-produced evidence that a pending storage segment is now referenced.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ReferenceEvidence {
-    pub tenant: TenantId,
-    pub principal: PrincipalId,
-    pub owner: MappingOwner,
-    pub grant_id: GrantId,
-    pub segment_id: SegmentId,
-    pub storage_node: StorageNodeId,
-    pub metadata_commit: CommitSeq,
-    pub receipt_epoch: GrantEpoch,
-    pub node_key_id: StorageNodeKeyId,
-    pub proof_scheme: ProofScheme,
-    pub proof: ProofTag,
-}
-
-impl ReferenceEvidence {
-    pub fn canonical_body(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(128);
-        self.write_canonical(&mut out);
-        out
-    }
-
-    fn write_canonical(&self, out: &mut impl CanonicalSink) {
-        put_bytes(out, b"TCOW_REFERENCE_EVIDENCE_V1");
-        put_u128(out, self.tenant.raw());
-        put_u128(out, self.principal.raw());
-        put_mapping_owner(out, self.owner);
-        put_u128(out, self.grant_id.raw());
-        put_u128(out, self.segment_id.raw());
-        put_u128(out, self.storage_node.raw());
-        put_u64(out, self.metadata_commit.raw());
-        put_u64(out, self.receipt_epoch.raw());
-        put_u128(out, self.node_key_id.raw());
-        put_proof_scheme(out, self.proof_scheme);
-    }
-}
-
 /// Node-local maintenance observation returned through storage-node transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageNodeMaintenanceObservation {
@@ -342,6 +304,7 @@ pub const DIAGNOSTICS_COUNTER_NAMES: &[&str] = &[
     "storage_segment_releases",
     "maintenance_plans",
     "maintenance_ticks",
+    "maintenance_tick_failures",
     "maintenance_logs_selected",
     "maintenance_logs_skipped",
     "maintenance_bytes_copied",
@@ -398,6 +361,7 @@ pub struct DiagnosticsCounters {
     pub storage_segment_releases: u64,
     pub maintenance_plans: u64,
     pub maintenance_ticks: u64,
+    pub maintenance_tick_failures: u64,
     pub maintenance_logs_selected: u64,
     pub maintenance_logs_skipped: u64,
     pub maintenance_bytes_copied: u64,
@@ -468,6 +432,7 @@ pub enum StorageEventKind {
     StorageNodeCustodianRan,
     MaintenancePlanned,
     MaintenanceTicked,
+    MaintenanceTickFailed,
     GrantIssued,
     GrantRejected,
     ReceiptVerified,
@@ -491,6 +456,7 @@ pub const STORAGE_EVENT_KIND_NAMES: &[&str] = &[
     "StorageNodeCustodianRan",
     "MaintenancePlanned",
     "MaintenanceTicked",
+    "MaintenanceTickFailed",
     "GrantIssued",
     "GrantRejected",
     "ReceiptVerified",
@@ -582,29 +548,6 @@ pub trait GrantReceiptAuthority: Send + Sync {
         &self,
         receipt: &SegmentWriteReceipt,
     ) -> Result<VerifiedSegmentReceipt>;
-
-    /// Create evidence that metadata publish made a segment referenced.
-    ///
-    /// Success means storage nodes may transition the matching
-    /// durable-pending segment to referenced for this metadata commit. It must
-    /// be produced only after metadata publish succeeds.
-    fn create_reference_evidence(
-        &self,
-        receipt: &SegmentWriteReceipt,
-        metadata_commit: CommitSeq,
-    ) -> Result<ReferenceEvidence>;
-
-    /// Verify reference evidence at the storage-node boundary.
-    ///
-    /// Success authorizes only the matching segment on the matching storage
-    /// node to move from durable-pending to referenced. Failure must not expose
-    /// or free data.
-    fn verify_reference_evidence(
-        &self,
-        evidence: &ReferenceEvidence,
-        segment_id: SegmentId,
-        storage_node: StorageNodeId,
-    ) -> Result<()>;
 }
 
 /// A metadata-root publish request.
@@ -1042,7 +985,7 @@ pub struct SegmentReplicaCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageNodeRequest {
     WriteSegment {
-        grant: WriteGrant,
+        grant: Box<WriteGrant>,
         bytes: Vec<u8>,
     },
     ReadSegment {
@@ -1050,7 +993,8 @@ pub enum StorageNodeRequest {
         range: ByteRange,
     },
     MarkReferenced {
-        evidence: ReferenceEvidence,
+        segment_ids: Vec<SegmentId>,
+        metadata_commit: CommitSeq,
     },
     Release {
         segment_id: SegmentId,
@@ -1083,8 +1027,11 @@ pub enum StorageNodeResponse {
 /// - `WriteSegment` reserves the supplied logical segment ID, writes and syncs
 ///   bytes, and returns a durable-pending receipt. It must not make metadata
 ///   roots visible.
-/// - `MarkReferenced` may only mark a durable-pending segment after the
-///   coordinator has a successful metadata publish.
+/// - `MarkReferenced` may only mark durable-pending segments after the
+///   coordinator has a successful metadata publish for the carried metadata
+///   commit. The node validates that every marked segment exists in its own
+///   catalog with matching identity; a segment absent from the catalog is
+///   corruption, not a routing miss.
 /// - Storage nodes never decide logical visibility, writer fencing, PITR
 ///   retention, or commit-group ordering.
 pub trait StorageNodeTransport: Send + Sync {
@@ -1218,13 +1165,6 @@ pub(crate) fn deterministic_test_proof_for_receipt(
     receipt: &SegmentWriteReceipt,
 ) -> ProofTag {
     deterministic_test_proof_for_canonical(key_id, |hash| receipt.write_canonical(hash))
-}
-
-pub(crate) fn deterministic_test_proof_for_reference(
-    key_id: StorageNodeKeyId,
-    evidence: &ReferenceEvidence,
-) -> ProofTag {
-    deterministic_test_proof_for_canonical(key_id, |hash| evidence.write_canonical(hash))
 }
 
 fn deterministic_test_proof_for_canonical(
@@ -1575,25 +1515,6 @@ mod tests {
         assert_eq!(
             deterministic_test_proof_for_receipt(key_id, &receipt),
             deterministic_test_proof(key_id, &receipt.canonical_body())
-        );
-
-        let mut evidence = ReferenceEvidence {
-            tenant: receipt.tenant,
-            principal: receipt.principal,
-            owner: receipt.owner,
-            grant_id: receipt.grant_id,
-            segment_id: receipt.segment_id,
-            storage_node: receipt.storage_node,
-            metadata_commit: CommitSeq::from_raw(35),
-            receipt_epoch: receipt.receipt_epoch,
-            node_key_id: key_id,
-            proof_scheme: ProofScheme::DeterministicTestMacV1,
-            proof: ProofTag::ZERO,
-        };
-        evidence.proof = deterministic_test_proof(key_id, &evidence.canonical_body());
-        assert_eq!(
-            deterministic_test_proof_for_reference(key_id, &evidence),
-            deterministic_test_proof(key_id, &evidence.canonical_body())
         );
     }
 }

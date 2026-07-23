@@ -360,7 +360,7 @@ fn bench_local_grant_receipt_flow(c: &mut Criterion) {
             |(transport, grant, bytes)| {
                 transport
                     .send(StorageNodeRequest::WriteSegment {
-                        grant: black_box(grant),
+                        grant: Box::new(black_box(grant)),
                         bytes: black_box(bytes),
                     })
                     .unwrap()
