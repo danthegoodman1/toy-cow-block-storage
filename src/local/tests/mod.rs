@@ -20769,6 +20769,162 @@ fn generated_trusted_block_receipt_flow_matches_normal_writes() {
     }
 }
 
+// The row-publisher snapshot resolves liveness and entry state in one pass:
+// ids that vanished between enqueue and drain are skipped (never an error,
+// never a per-id scan of every catalog), entries group under their owning
+// node, and chunked lock holds collect the same entries as one hold.
+#[test]
+fn selected_live_state_snapshot_skips_vanished_ids_and_groups_by_node() {
+    let cfg = config();
+    let other_node = StorageNodeId::from_raw(78);
+    let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node, other_node]).unwrap();
+    let mut written = Vec::new();
+    for (index, node) in [cfg.storage_node, other_node].into_iter().enumerate() {
+        let segment_id = registry.allocate_segment_id().unwrap();
+        let grant = grant_for_segment(
+            node,
+            segment_id,
+            WriteIntentId::from_raw(700 + index as u128),
+            MappingOwner::BlockDevice(DeviceId::from_raw(9)),
+            4096,
+        );
+        registry
+            .transport_for_node(node)
+            .unwrap()
+            .send(StorageNodeRequest::WriteSegment {
+                grant: Box::new(grant),
+                bytes: repeated_blocks(1, 20 + index as u8),
+            })
+            .unwrap();
+        written.push((node, segment_id));
+    }
+    let vanished = registry.allocate_segment_id().unwrap();
+    let request: BTreeSet<SegmentId> = written
+        .iter()
+        .map(|(_, segment_id)| *segment_id)
+        .chain([vanished])
+        .collect();
+
+    let (nodes, live) = registry
+        .selected_live_state_for_segment_ids(&request)
+        .unwrap();
+    let expected_live: BTreeSet<SegmentId> =
+        written.iter().map(|(_, segment_id)| *segment_id).collect();
+    assert_eq!(live, expected_live);
+    assert_eq!(nodes.len(), 2);
+    for (node, segment_id) in &written {
+        let (_, inner) = nodes.get(node).unwrap();
+        assert!(inner.segment_catalog.entries.contains_key(segment_id));
+        assert_eq!(inner.segment_catalog.entries.len(), 1);
+    }
+
+    // The strict foreground snapshot still treats an unknown id as
+    // corruption.
+    assert!(matches!(
+        registry.selected_state_for_segment_ids(&request),
+        Err(StorageError::Corrupt { .. })
+    ));
+
+    // Chunked collection returns the same entries as a single-hold snapshot.
+    let ids: Vec<SegmentId> = request.iter().copied().collect();
+    for (node, segment_id) in &written {
+        let catalog = &registry.node(*node).unwrap().segment_catalog;
+        let chunked = catalog
+            .selected_state_inner_chunked(&ids, 1)
+            .unwrap()
+            .unwrap();
+        let single = catalog.selected_state_inner(&request).unwrap().unwrap();
+        assert_eq!(chunked.entries, single.entries);
+        assert!(chunked.entries.contains_key(segment_id));
+    }
+}
+
+// Mechanism repro for the GCP catalog-mutex contention
+// (`phase2-publish-fastpath-20260723` 64k: publish-mark lock waits of
+// 41.9us/120.1us at c16/c32 behind the row publisher's whole-backlog
+// snapshot): while a snapshotter clones a large id set from the catalog,
+// foreground acquisitions must not stall for the length of the backlog.
+// The fixed publisher pattern — bounded drain cycles of chunked-hold
+// snapshots separated by lock-free row writes — bounds the foreground
+// wait; one whole-backlog hold does not.
+#[test]
+fn chunked_row_snapshot_bounds_foreground_catalog_waits() {
+    let cfg = config();
+    let registry = StorageNodeRegistry::new(cfg, vec![cfg.storage_node]).unwrap();
+    let catalog = &registry.node(cfg.storage_node).unwrap().segment_catalog;
+    let mut ids = Vec::new();
+    for _ in 0..100_000 {
+        let segment_id = registry.allocate_segment_id().unwrap();
+        catalog
+            .reserve_segment_with_id(
+                segment_id,
+                SegmentReservationIntent {
+                    write_intent: WriteIntentId::from_raw(1),
+                    owner: MappingOwner::BlockDevice(DeviceId::from_raw(1)),
+                    bytes: 4096,
+                },
+            )
+            .unwrap();
+        ids.push(segment_id);
+    }
+    let request: BTreeSet<SegmentId> = ids.iter().copied().collect();
+    let probe_id = ids[0];
+
+    let max_foreground_wait = |chunked: bool| -> u64 {
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let mut max_wait_nanos = 0_u64;
+        let ids = &ids;
+        let request = &request;
+        thread::scope(|scope| {
+            let done = &done;
+            scope.spawn(move || {
+                for _ in 0..6 {
+                    if chunked {
+                        // The publisher's fixed shape: bounded drain cycles
+                        // of chunked-hold snapshots, with the lock-free
+                        // SQLite row write between cycles modeled as a
+                        // short sleep.
+                        for cycle in ids.chunks(512) {
+                            catalog.selected_state_inner_chunked(cycle, 32).unwrap();
+                            thread::sleep(Duration::from_micros(500));
+                        }
+                    } else {
+                        catalog.selected_state_inner(request).unwrap();
+                    }
+                }
+                done.store(true, Ordering::SeqCst);
+            });
+            while !done.load(Ordering::SeqCst) {
+                let started = Instant::now();
+                catalog.contains_segment(probe_id).unwrap();
+                max_wait_nanos = max_wait_nanos.max(duration_nanos_u64(started.elapsed()));
+            }
+        });
+        max_wait_nanos
+    };
+
+    let single_hold_max = max_foreground_wait(false);
+    let chunked_max = max_foreground_wait(true);
+    eprintln!(
+        "catalog snapshot foreground waits: single-hold max {single_hold_max}ns, \
+         chunked max {chunked_max}ns"
+    );
+    // The single-hold snapshot clones 100k entries per acquisition, so a
+    // foreground probe must have observed a hold-length stall; chunked holds
+    // cover 32 entries, so probes stay well below it. Margins are wide to
+    // absorb scheduler noise.
+    assert!(
+        single_hold_max > 1_000_000,
+        "single-hold snapshot never stalled the probe (max {single_hold_max}ns); \
+         repro invalid"
+    );
+    assert!(
+        chunked_max < single_hold_max / 3 && chunked_max < 20_000_000,
+        "chunked snapshot failed to bound foreground waits: \
+         chunked max {chunked_max}ns vs single-hold max {single_hold_max}ns"
+    );
+}
+
 // The mark contract's mismatch gate: a node marks only segments its own
 // catalog holds. Marks addressed to the wrong node fail as corruption
 // without touching any state, and one bad id fails a whole batch before any

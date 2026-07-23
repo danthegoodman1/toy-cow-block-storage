@@ -89,6 +89,49 @@ impl InMemoryLocalSegmentCatalog {
         }))
     }
 
+    /// `selected_state_inner` with the lock held for at most `chunk_len` ids
+    /// per acquisition and a scheduler yield between acquisitions.
+    ///
+    /// The async segment-row publisher snapshots row batches while foreground
+    /// reserve/commit/mark operations contend for the same mutex. Short holds
+    /// and yields alone do not guarantee fairness (a tight release-reacquire
+    /// loop can win the unfair mutex back before a parked waiter wakes), so
+    /// the publisher also bounds each drain cycle and spends the gap between
+    /// cycles in lock-free SQLite writes; this method keeps the per-cycle
+    /// lock work short. Entries may change between chunks, which the
+    /// row-publish contract already tolerates: rows reflect a catalog state
+    /// no older than enqueue time, and lifecycle states only advance.
+    fn selected_state_inner_chunked(
+        &self,
+        segment_ids: &[SegmentId],
+        chunk_len: usize,
+    ) -> Result<Option<CatalogInner>> {
+        let mut entries = BTreeMap::new();
+        let mut next_segment_id = 0_u128;
+        let mut chunks = segment_ids.chunks(chunk_len.max(1)).peekable();
+        while let Some(chunk) = chunks.next() {
+            {
+                let inner = lock(&self.inner)?;
+                next_segment_id = inner.next_segment_id;
+                for segment_id in chunk {
+                    if let Some(entry) = inner.entries.get(segment_id) {
+                        entries.insert(*segment_id, entry.clone());
+                    }
+                }
+            }
+            if chunks.peek().is_some() {
+                std::thread::yield_now();
+            }
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CatalogInner {
+            next_segment_id,
+            entries,
+        }))
+    }
+
     fn reserve_segment_with_id(
         &self,
         segment_id: SegmentId,

@@ -633,6 +633,52 @@ impl StorageNodeRegistry {
         ))
     }
 
+    /// Snapshot catalog entries for the requested ids grouped by owning node,
+    /// returning the set of ids found on any node.
+    ///
+    /// Unlike `selected_state_for_segment_ids`, requested ids found on no
+    /// node are skipped rather than treated as corruption: the async
+    /// segment-row publisher's enqueue-to-drain window legitimately races
+    /// full persists that publish and free segments. Catalog locks are held
+    /// in short chunks so a large row backlog cannot stall foreground
+    /// reserve/commit/mark operations behind one long snapshot hold.
+    fn selected_live_state_for_segment_ids(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<(SelectedStorageNodeState, BTreeSet<SegmentId>)> {
+        const SNAPSHOT_LOCK_CHUNK_IDS: usize = 32;
+        let mut nodes = BTreeMap::new();
+        let mut live = BTreeSet::new();
+        if segment_ids.is_empty() {
+            return Ok((nodes, live));
+        }
+        let ids: Vec<SegmentId> = segment_ids.iter().copied().collect();
+        for (ordinal, node_id) in self.node_order.iter().enumerate() {
+            let node = self.node(*node_id)?;
+            let Some(catalog) = node
+                .segment_catalog
+                .selected_state_inner_chunked(&ids, SNAPSHOT_LOCK_CHUNK_IDS)?
+            else {
+                continue;
+            };
+            live.extend(catalog.entries.keys().copied());
+            nodes.insert(
+                *node_id,
+                (
+                    ordinal,
+                    StorageNodeInner {
+                        segment_store: SegmentStoreInner {
+                            next_offset: node.segment_store.next_offset()?,
+                            segments: BTreeMap::new(),
+                        },
+                        segment_catalog: catalog,
+                    },
+                ),
+            );
+        }
+        Ok((nodes, live))
+    }
+
     fn selected_state_for_segment_ids(
         &self,
         segment_ids: &BTreeSet<SegmentId>,

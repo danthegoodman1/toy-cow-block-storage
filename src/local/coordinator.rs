@@ -719,6 +719,14 @@ impl LocalCoordinator {
             .selected_state_for_segment_ids(segment_ids)
     }
 
+    fn selected_live_state_for_segment_ids(
+        &self,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<(SelectedStorageNodeState, BTreeSet<SegmentId>)> {
+        self.storage_nodes
+            .selected_live_state_for_segment_ids(segment_ids)
+    }
+
     fn durable_export_cursor(&self) -> Result<DurableExportCursor> {
         let metadata = lock(&self.metadata.inner)?;
         Ok(DurableExportCursor {

@@ -286,7 +286,18 @@ fn block_segment_row_publisher_loop(
             }
             return;
         }
-        let batch = std::mem::take(&mut guard.queued);
+        // Bounded drain: each cycle snapshots and publishes at most this many
+        // rows, so catalog lock work per cycle stays short and the SQLite row
+        // write (which holds no catalog locks) gives foreground catalog users
+        // a guaranteed window between cycles. An unbounded drain snapshots
+        // the whole backlog in one tight lock loop, which starved publish
+        // marks for the backlog length (the 41.9us/120.1us c16/c32 publish
+        // mark lock waits in `phase2-publish-fastpath-20260723`).
+        const DRAIN_BATCH_IDS: usize = 512;
+        let batch: BTreeSet<SegmentId> = guard.queued.iter().take(DRAIN_BATCH_IDS).copied().collect();
+        for segment_id in &batch {
+            guard.queued.remove(segment_id);
+        }
         guard.publishing = true;
         drop(guard);
         let result = publish_block_segment_rows(&parts, &batch);
@@ -319,12 +330,12 @@ fn publish_block_segment_rows(
     segment_ids: &BTreeSet<SegmentId>,
 ) -> Result<()> {
     let persist_guard = lock(&parts.persist_lock)?;
-    let mut live_ids = BTreeSet::new();
-    for segment_id in segment_ids {
-        if parts.local.storage_nodes.segment_exists(*segment_id)? {
-            live_ids.insert(*segment_id);
-        }
-    }
+    // One chunked-lock snapshot pass resolves liveness and entry state
+    // together: a per-id existence scan across every node catalog plus a
+    // whole-batch clone under one hold would stall foreground catalog
+    // operations for the length of the backlog (the publish-mark lock waits
+    // measured in `phase2-publish-fastpath-20260723`).
+    let (nodes, live_ids) = parts.local.selected_live_state_for_segment_ids(segment_ids)?;
     if live_ids.is_empty() {
         return Ok(());
     }
@@ -344,7 +355,6 @@ fn publish_block_segment_rows(
             })
             .collect()
     };
-    let nodes = parts.local.selected_state_for_segment_ids(&live_ids)?;
     let new_segments = if missing_segments.is_empty() {
         drop(persist_guard);
         Vec::new()
