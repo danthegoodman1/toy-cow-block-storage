@@ -180,9 +180,13 @@ pub(super) enum BlockJournalLaneRequest {
 pub(super) struct BlockJournalFlushCoordinator {
     inner: Mutex<BlockJournalFlushState>,
     cvar: Condvar,
-    /// Dedicated condvar for the pipeline's two ordering waits (append
-    /// window and sync turn): at most one batch owner parks on it, so
-    /// signaling it never wakes the whole waiter herd on `cvar`.
+    /// Dedicated condvar for the pipeline's ordering waits (append window
+    /// and publish turns). One window parker at most, but SEVERAL
+    /// publishers can park behind a stalled publish (up to the writer
+    /// thread count); `notify_all` on this condvar wakes only those parked
+    /// owners — each re-checks its own ticket — never the request-waiter
+    /// herd on `cvar`, so the wakeup cost stays bounded by in-flight
+    /// batches, not by waiters.
     pipeline_cvar: Condvar,
 }
 
@@ -227,12 +231,13 @@ pub(super) struct BlockJournalLaneBatchTiming {
     /// Device-pending-payloads mutex wait on the row's path (acknowledged
     /// registration or the lane leader's payload recheck).
     pub(super) pending_payload_lock_wait_nanos: u64,
-    /// Pipeline ordering wait, three components: the append-window wait
+    /// Pipeline ordering wait, two components: the append-window wait
     /// (parked through the predecessor's whole fsync — the dominant
-    /// component by design), the sync-turn wait after this batch's own
-    /// append, and the rare pre-append poison drain. A time bucket, not a
-    /// lock-wait column: it is the deliberate serialization point of the
-    /// two-stage pipeline.
+    /// component by design; the window IS this batch's sync turn, held
+    /// through its own fsync) and the publish-turn wait (near zero: a
+    /// predecessor's publish runs under this batch's much longer fsync).
+    /// A time bucket, not a lock-wait column: these are the deliberate
+    /// serialization points of the pipeline.
     pub(super) pipeline_order_wait_nanos: u64,
 }
 
@@ -246,21 +251,22 @@ pub(super) struct BlockJournalFlushState {
     /// Ticket handed to each elected batch, in election order. Because the
     /// write stage is exclusive, ticket order is also journal append order.
     next_batch_ticket: u64,
-    /// Ticket allowed into the serialized SYNC stage (own fsync, publish,
-    /// waiter completion). Advancing this is the pipeline's ordering
-    /// commitment: per-device publish order equals ticket order.
+    /// Ticket allowed to seal, append, and fsync. Advances the moment the
+    /// owner's own fsync RETURNS (success or failure), so the successor's
+    /// append window opens at the predecessor's fsync end (group-commit
+    /// cohorts preserved) and its fsync starts while the predecessor is
+    /// still publishing. On failure the store tail poison is set under the
+    /// shard lock before this advances, so the successor's append must
+    /// first re-establish the tail — no lane batch's frames can ever exist
+    /// behind an unfinished or failed predecessor fsync.
     next_sync_ticket: u64,
-    /// Set when a batch's data sync failed: every batch with a ticket
-    /// GREATER than the stored ticket must error instead of acknowledging
-    /// (its frames sit beyond bytes whose durability is unknown). Cleared
-    /// by the first later batch after it drains the pipeline and its
-    /// recovering append re-establishes the shard tail.
-    poisoned_after: Option<(u64, StorageError)>,
-    /// True while the sync-stage owner is at or past its fsync. The next
-    /// batch times its append to this window, so the batch captures every
-    /// request that arrived before the predecessor's fsync began and the
-    /// encode+write genuinely overlap that fsync.
-    stage_s_syncing: bool,
+    /// Ticket allowed into the serialized PUBLISH stage (mark refs,
+    /// publish-head advance, overlay apply, durable mark, waiter
+    /// completion). Advancing this at completion is the pipeline's
+    /// visibility-ordering commitment: per-device publish order equals
+    /// ticket order, and no waiter completes before its batch's own fsync
+    /// AND its own publish.
+    next_publish_ticket: u64,
     generation: u64,
     next_request_id: u64,
     pending: BTreeMap<u64, BlockJournalLaneRequest>,
@@ -275,12 +281,20 @@ pub(super) struct BlockJournalFlushState {
 impl BlockJournalFlushState {
     /// Whether a new batch may be elected into the write stage.
     ///
-    /// The pipeline is exactly two deep: one batch in the write stage
-    /// overlapping one batch in the sync stage. Electing a third batch
-    /// while one is already parked waiting for its sync turn would only
-    /// fragment group commit — arrivals during an in-flight sync must
-    /// accumulate in `pending` and form ONE next batch, which is what gave
-    /// the serial lane its batching (its busy window spanned the sync).
+    /// At most one batch is elected-but-unsynced: the owner parks in its
+    /// append window (which IS its sync turn) until the predecessor's
+    /// fsync returns. Electing further ahead would only fragment group
+    /// commit — arrivals during an in-flight fsync must accumulate in
+    /// `pending` and form ONE next batch, which is what gives the lane its
+    /// serial-equivalent cohorts.
+    ///
+    /// Honesty note: this bounds UNSYNCED batches only. Nothing bounds
+    /// `next_sync_ticket - next_publish_ticket`; behind a stalled publish,
+    /// fsynced batches park at their publish turns, one per writer thread,
+    /// so the publish queue depth is bounded by the number of concurrent
+    /// writers rather than by this gate. Accepted by ruling (a
+    /// sync-vs-publish election guard would re-couple elections to publish
+    /// progress); revisit only if profiles show pathological queuing.
     fn admits_election(&self) -> bool {
         self.next_batch_ticket.saturating_sub(self.next_sync_ticket) <= 1
     }

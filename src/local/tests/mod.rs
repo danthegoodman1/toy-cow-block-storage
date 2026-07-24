@@ -22688,8 +22688,29 @@ fn durable_block_journal_pipeline_append_failure_errors_batch_and_recovers_tail(
     // the second batch would be spurious).
     second_result.unwrap();
 
+    // The failed batch advanced BOTH pipeline tickets exactly once (it
+    // never fsyncs, so its error path must advance the sync ticket and
+    // then take its publish turn): a follow-up write completes and the
+    // lane fully drains.
+    store
+        .write_device_with_writer(
+            &lease,
+            2 * 4096,
+            &repeated_blocks(1, 13),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    {
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        let state = lane.inner.lock().unwrap();
+        assert_eq!(state.next_sync_ticket, state.next_batch_ticket);
+        assert_eq!(state.next_publish_ticket, state.next_sync_ticket);
+    }
+
     assert_eq!(read_block(&store, device_id, 0), vec![0; 4096]);
     assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 12));
+    assert_eq!(read_block(&store, device_id, 2), repeated_blocks(1, 13));
 
     drop(store);
     let reopened = DurableCoordinator::open(&root, config()).unwrap();
@@ -23492,4 +23513,396 @@ fn block_journal_frame_region_validator_rejects_boundary_zero_runs() {
         Err(StorageError::Corrupt { reason })
             if reason.contains("zero run at an alignment boundary")
     ));
+}
+
+#[test]
+fn durable_block_journal_publish_failure_overlaps_successor_and_spares_it() {
+    let (root, store, device_id, lease) = pipeline_store("m3-publish-failure-overlap");
+    store
+        .request_block_journal_sync_stage_pause_for_test()
+        .unwrap();
+    let first = repeated_blocks(1, 41);
+    let second = repeated_blocks(1, 42);
+    let (first_result, second_result) = thread::scope(|scope| {
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let first = &first;
+        let second = &second;
+        let first_write = scope.spawn(move || {
+            first_store.write_device_with_writer(
+                lease,
+                0,
+                first,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_sync_stage_pause_for_test()
+            .unwrap();
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                4096,
+                second,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        loop {
+            let state = lane.inner.lock().unwrap();
+            if state.write_stage_busy && state.next_batch_ticket >= 2 {
+                break;
+            }
+            drop(state);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The first batch's publish fails AFTER its fsync succeeded, while
+        // the successor (unblocked by the sync-ticket advance) appends and
+        // fsyncs concurrently.
+        store.fail_next_block_journal_publish_mark_for_test();
+        store.resume_block_journal_sync_stage_for_test().unwrap();
+        (first_write.join().unwrap(), second_write.join().unwrap())
+    });
+    assert!(matches!(
+        &first_result,
+        Err(StorageError::Unavailable { reason })
+            if reason.contains("injected block journal publish mark failure")
+    ));
+    // A publish failure advances the publish ticket without poisoning:
+    // the successor publishes and completes normally.
+    second_result.unwrap();
+    assert_eq!(read_block(&store, device_id, 0), vec![0; 4096]);
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 42));
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    // Deliberately no assertion on block 0: the failed-publish batch's
+    // frames are durable and MAY replay under the provider's pre-existing
+    // errored-write semantics.
+    assert_eq!(read_block(&reopened, device_id, 1), repeated_blocks(1, 42));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_completion_is_readable_before_successor_fsync() {
+    let (root, store, device_id, lease) = pipeline_store("m3-ryw-overlap");
+    store
+        .request_block_journal_sync_stage_pause_for_test()
+        .unwrap();
+    let first = repeated_blocks(1, 51);
+    let second = repeated_blocks(1, 52);
+    thread::scope(|scope| {
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let first = &first;
+        let second = &second;
+        let first_write = scope.spawn(move || {
+            first_store.write_device_with_writer(
+                lease,
+                0,
+                first,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_sync_stage_pause_for_test()
+            .unwrap();
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                4096,
+                second,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        loop {
+            let state = lane.inner.lock().unwrap();
+            if state.write_stage_busy && state.next_batch_ticket >= 2 {
+                break;
+            }
+            drop(state);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Hold the successor after its append, before its fsync: the first
+        // batch's publish and completion run entirely within the
+        // successor's pre-fsync pipeline overlap.
+        store
+            .pause_block_journal_after_unsynced_append_for_test()
+            .unwrap();
+        store.resume_block_journal_sync_stage_for_test().unwrap();
+        first_write.join().unwrap().unwrap();
+        store
+            .wait_until_block_journal_append_paused_for_test()
+            .unwrap();
+        // The first write completed while the successor has not fsynced:
+        // its data must already be readable (ack never precedes
+        // visibility, and visibility never waits for the successor).
+        assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 51));
+        assert!(!second_write.is_finished());
+        store.resume_block_journal_append_for_test().unwrap();
+        second_write.join().unwrap().unwrap();
+    });
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 52));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_publish_stage_serializes_visibility_in_ticket_order() {
+    let (root, store, device_id, lease) = pipeline_store("m3-publish-order");
+    store
+        .request_block_journal_publish_stage_pause_for_test()
+        .unwrap();
+    let first = repeated_blocks(1, 61);
+    let second = repeated_blocks(1, 62);
+    thread::scope(|scope| {
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let first = &first;
+        let second = &second;
+        let first_write = scope.spawn(move || {
+            first_store.write_device_with_writer(
+                lease,
+                0,
+                first,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_publish_stage_pause_for_test()
+            .unwrap();
+        // The first batch's fsync is done (it reached its publish turn);
+        // the successor may seal, append, and fsync concurrently.
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                4096,
+                second,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        loop {
+            let state = lane.inner.lock().unwrap();
+            // Both writes have fsynced (every elected ticket passed the
+            // sync stage) while the paused first batch still holds the
+            // publish stage with the second queued behind it. Ticket
+            // numbers are relative: earlier lane traffic (the lease
+            // acquisition) also consumed tickets.
+            if state.next_sync_ticket == state.next_batch_ticket
+                && state.next_sync_ticket == state.next_publish_ticket + 2
+                && !state.write_stage_busy
+            {
+                break;
+            }
+            drop(state);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Both batches are fsynced; NEITHER may be visible or complete:
+        // the first is paused before its visibility work, and the second
+        // is ticket-ordered behind it.
+        assert!(!first_write.is_finished());
+        assert!(!second_write.is_finished());
+        assert_eq!(read_block(&store, device_id, 0), vec![0; 4096]);
+        assert_eq!(read_block(&store, device_id, 1), vec![0; 4096]);
+        store.resume_block_journal_publish_stage_for_test().unwrap();
+        // Publishes drain in ticket order: the first batch completes and
+        // becomes visible, then the second.
+        first_write.join().unwrap().unwrap();
+        assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 61));
+        second_write.join().unwrap().unwrap();
+    });
+    assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 61));
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 62));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_double_fault_recovery_repairs_torn_then_suspect() {
+    let (root, store, device_id, lease) = pipeline_store("m3-double-fault-recover");
+    let ack_device = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("m3-double-fault-ack".to_string()),
+        })
+        .unwrap();
+    let ack_lease = store.acquire_block_writer(ack_device).unwrap();
+    let shard = store.durable.block_journal_shard_for_device(device_id);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 71),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    // Double fault: a bypass append tears the tail while a lane fsync is
+    // held in flight, and that same fsync then fails.
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(120))
+        .unwrap();
+    store.fail_next_block_journal_sync_for_test();
+    thread::scope(|scope| {
+        let write_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let failing = scope.spawn(move || {
+            write_store.write_device_with_writer(
+                lease,
+                4096,
+                &repeated_blocks(1, 72),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        thread::sleep(Duration::from_millis(40));
+        store.fail_next_block_journal_append_for_test();
+        assert!(
+            store
+                .write_device_with_writer(
+                    &ack_lease,
+                    0,
+                    &repeated_blocks(1, 73),
+                    WriteDurability::Acknowledged,
+                    PayloadIntegrity::Verified,
+                )
+                .is_err()
+        );
+        assert!(failing.join().unwrap().is_err());
+    });
+    // Both facts must be recorded — neither erased the other.
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        assert!(tail.poison.torn);
+        assert!(tail.poison.sync_suspect);
+    }
+    // The next append repairs both in order (truncate, then validate and
+    // rewrite the suspect range) and the lane serves writes again.
+    store
+        .write_device_with_writer(
+            &lease,
+            2 * 4096,
+            &repeated_blocks(1, 74),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        assert!(!tail.poison.is_active());
+        assert_eq!(tail.synced_offset, tail.end_offset);
+    }
+    assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 71));
+    assert_eq!(read_block(&store, device_id, 2), repeated_blocks(1, 74));
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 71));
+    assert_eq!(read_block(&reopened, device_id, 2), repeated_blocks(1, 74));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_double_fault_still_validates_suspect_range() {
+    let (root, store, device_id, lease) = pipeline_store("m3-double-fault-validate");
+    let ack_device = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("m3-double-fault-validate-ack".to_string()),
+        })
+        .unwrap();
+    let ack_lease = store.acquire_block_writer(ack_device).unwrap();
+    let shard_path = store.durable.block_journal_shard_path_for_device(device_id);
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 75),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let synced_len = fs::metadata(&shard_path).unwrap().len();
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(120))
+        .unwrap();
+    store.fail_next_block_journal_sync_for_test();
+    thread::scope(|scope| {
+        let write_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let failing = scope.spawn(move || {
+            write_store.write_device_with_writer(
+                lease,
+                4096,
+                &repeated_blocks(1, 76),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        thread::sleep(Duration::from_millis(40));
+        store.fail_next_block_journal_append_for_test();
+        assert!(
+            store
+                .write_device_with_writer(
+                    &ack_lease,
+                    0,
+                    &repeated_blocks(1, 77),
+                    WriteDurability::Acknowledged,
+                    PayloadIntegrity::Verified,
+                )
+                .is_err()
+        );
+        assert!(failing.join().unwrap().is_err());
+    });
+    let end_len = fs::metadata(&shard_path).unwrap().len();
+    // Drop the suspect pages (they read back as zeros). The REGRESSION
+    // this guards: a torn-only recovery would truncate the tear and skip
+    // validating this range, letting the next sync launder the loss.
+    {
+        use std::os::unix::fs::FileExt;
+
+        let file = OpenOptions::new().write(true).open(&shard_path).unwrap();
+        let zeros = vec![0_u8; (end_len - synced_len) as usize];
+        file.write_all_at(&zeros, synced_len).unwrap();
+        file.sync_data().unwrap();
+    }
+    assert!(matches!(
+        store.write_device_with_writer(
+            &lease,
+            2 * 4096,
+            &repeated_blocks(1, 78),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Corrupt { reason })
+            if reason.contains("journal tail recovery read back zero bytes")
+    ));
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 75));
+    assert_eq!(read_block(&reopened, device_id, 1), vec![0; 4096]);
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
 }

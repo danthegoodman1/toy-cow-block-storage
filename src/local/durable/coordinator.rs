@@ -105,6 +105,9 @@ struct BlockJournalMaterializationPauseState {
     pause_in_write_stage: bool,
     paused_in_write_stage: bool,
     resume_write_stage: bool,
+    pause_in_publish_stage: bool,
+    paused_in_publish_stage: bool,
+    resume_publish_stage: bool,
     pause_after_lane_wait_before_scan: bool,
     paused_after_lane_wait_before_scan: bool,
     resume_after_lane_wait: bool,
@@ -4242,10 +4245,11 @@ impl DurableCoordinator {
             loop {
                 let mut state = lock(&lane.inner)?;
                 // Idle means no batch anywhere in the pipeline: the write
-                // stage is free AND every allocated ticket has passed the
-                // sync stage.
+                // stage is free AND every allocated ticket has passed both
+                // the sync stage and the publish stage.
                 let pipeline_idle = !state.write_stage_busy
-                    && state.next_sync_ticket == state.next_batch_ticket;
+                    && state.next_sync_ticket == state.next_batch_ticket
+                    && state.next_publish_ticket == state.next_sync_ticket;
                 if pipeline_idle
                     && state.pending.is_empty()
                     && state.unapplied_writes.is_empty()
@@ -4345,23 +4349,25 @@ impl DurableCoordinator {
         if batch.is_empty() {
             // Elections take non-empty pending sets, but stay safe if that
             // ever changes: release the write stage and pass the ticket
-            // through the sync stage with nothing to complete.
+            // through both stages with nothing to complete.
             let mut state = lock(&lane.inner)?;
             state.write_stage_busy = false;
             state.generation = state.generation.saturating_add(1);
             lane.cvar.notify_all();
             drop(state);
             let mut lane_timing = BlockJournalLaneBatchTiming::default();
-            let state = self.wait_for_block_journal_sync_turn(lane, ticket, &mut lane_timing)?;
+            let state = self.wait_for_block_journal_append_window(lane, ticket, &mut lane_timing)?;
+            drop(state);
+            self.advance_block_journal_sync_ticket(lane, ticket)?;
+            let state = self.wait_for_block_journal_publish_turn(lane, ticket, &mut lane_timing)?;
             self.complete_block_journal_lane_batch(lane, state, &[], BTreeMap::new(), &Ok(()));
             return Ok(());
         }
         let mut lane_timing = BlockJournalLaneBatchTiming::default();
         // Wait for the append window BEFORE sealing the batch, then fold in
         // every request that arrived while this owner was parked: the batch
-        // captures all arrivals up to the predecessor's fsync start.
-        let (mut state, drained_for_recovery) =
-            self.wait_for_block_journal_append_window(lane, ticket, &mut lane_timing)?;
+        // captures all arrivals up to the predecessor's fsync end.
+        let mut state = self.wait_for_block_journal_append_window(lane, ticket, &mut lane_timing)?;
         let late_arrivals = std::mem::take(&mut state.pending);
         drop(state);
         batch.extend(late_arrivals);
@@ -4457,11 +4463,12 @@ impl DurableCoordinator {
         // the leader's path.
         let measure = self.persist_profiler.is_enabled();
 
-        // WRITE stage: payload recheck, encode, journal append — running
-        // inside the predecessor's fsync window. The write stage is
-        // exclusive, so append order equals ticket order. While the lane is
-        // poisoned the window wait above fully drained the pipeline, so the
-        // recovering append cannot launder a suspect in-flight batch.
+        // WRITE stage: payload recheck, encode, journal append. The write
+        // stage is exclusive, so append order equals ticket order, and this
+        // batch already owns the sync turn (its window), so the fsync below
+        // follows the append with no further wait. A poisoned shard tail
+        // (from a failed predecessor append or fsync) is repaired inside
+        // the append before any new frame is written.
         let write_result = (|| -> Result<AppendVisibleJournalProfile> {
             // Every Flush this batch makes durable must not cover an
             // acknowledged segment payload that is still volatile. Callers
@@ -4497,37 +4504,10 @@ impl DurableCoordinator {
         })();
         let mut profile = match write_result {
             Ok(profile) => {
-                // Hand the write stage to the next batch: from here on its
-                // encode and append overlap this batch's fsync and publish.
+                // Hand the write stage to the next batch: it may elect and
+                // coalesce now, parking in its window until this batch's
+                // fsync returns.
                 let mut state = lock(&lane.inner)?;
-                // POISON-CLEAR INVARIANT (this exact condition has been
-                // wrong twice — first the unconditional clear, then the
-                // reviewer-traced ticket-position clear — so state it
-                // precisely): the lane poison may be cleared only when
-                // BOTH hold.
-                //   1. `next_sync_ticket == ticket`: every earlier ticket
-                //      has passed the sync stage, so no suspect in-flight
-                //      batch remains that could acknowledge after the
-                //      clear removed its condemnation.
-                //   2. This batch's frames were provably written AFTER the
-                //      shard tail was re-established: either it observed
-                //      the poison before appending and drained the
-                //      pipeline (`drained_for_recovery`, its append then
-                //      repairing or confirming the tail), or the store
-                //      reports the tail recovery ran inside this very
-                //      append (`profile.tail_recovered`).
-                // A batch that appended BEFORE the poison landed satisfies
-                // neither arm and stays condemned: by ticket position
-                // alone it is indistinguishable from a post-recovery
-                // append once the failer has advanced, and clearing for it
-                // would acknowledge bytes whose durability is unknown
-                // (caught by the sync-failure pipeline test).
-                if state.poisoned_after.is_some()
-                    && state.next_sync_ticket == ticket
-                    && (drained_for_recovery || profile.tail_recovered)
-                {
-                    state.poisoned_after = None;
-                }
                 state.write_stage_busy = false;
                 state.generation = state.generation.saturating_add(1);
                 lane.cvar.notify_all();
@@ -4540,11 +4520,14 @@ impl DurableCoordinator {
                 state.generation = state.generation.saturating_add(1);
                 lane.cvar.notify_all();
                 drop(state);
-                // Nothing to publish; still take the sync turn so the
-                // ticket advances exactly once and completions stay in
-                // pipeline order.
+                // Nothing to fsync or publish. The failed append poisoned
+                // the shard tail under the shard lock, so advancing the
+                // sync ticket is safe: the successor's append re-establishes
+                // the tail before writing any frame. Complete in publish
+                // order.
+                self.advance_block_journal_sync_ticket(lane, ticket)?;
                 let state =
-                    self.wait_for_block_journal_sync_turn(lane, ticket, &mut lane_timing)?;
+                    self.wait_for_block_journal_publish_turn(lane, ticket, &mut lane_timing)?;
                 let result = Err(error);
                 self.complete_block_journal_lane_batch(
                     lane,
@@ -4557,55 +4540,30 @@ impl DurableCoordinator {
             }
         };
 
-        // SYNC stage, serialized by ticket: own fsync, then publish, then
-        // waiter completion. Per-device publish order equals ticket order.
-        let state = self.wait_for_block_journal_sync_turn(lane, ticket, &mut lane_timing)?;
-        if let Some((poisoned_after, error)) = &state.poisoned_after
-            && ticket > *poisoned_after
-        {
-            // An earlier batch's sync failed after this batch's frames were
-            // already written: their durability is unknown even if our own
-            // fsync were to succeed, so this batch must never acknowledge.
-            let result = Err(error.clone());
-            self.complete_block_journal_lane_batch(
-                lane,
-                state,
-                &request_ids,
-                applied_writes,
-                &result,
-            );
-            return result;
-        }
-        drop(state);
-
         #[cfg(test)]
         self.pause_block_journal_sync_if_requested_for_test()?;
 
-        // Coverage accounting: this fsync begins only after this batch's
-        // append fully returned, and it completes only this batch — records
-        // appended while it is in flight wait for their own later sync.
+        // SYNC stage — pure fsync; this batch has owned its sync turn since
+        // its append window opened. Coverage accounting: this fsync begins
+        // only after this batch's append fully returned, and it completes
+        // only this batch — records appended while it is in flight wait for
+        // their own later sync.
         match self.durable.sync_block_journal(shard) {
             Ok(sync_nanos) => {
                 profile.sync_nanos = sync_nanos;
-                // Open the next batch's append window: this batch's fsync is
-                // done, so the successor seals its batch NOW (capturing every
-                // request that arrived during the fsync — group commit keeps
-                // its serial cohorts) and its encode+write overlap this
-                // batch's publish and completion handoff. Only the pipeline
-                // condvar is signaled: election and completion waiters do
-                // not read this flag.
-                let mut state = lock(&lane.inner)?;
-                state.stage_s_syncing = true;
-                lane.pipeline_cvar.notify_all();
-                drop(state);
+                // Successor's fsync may start now, overlapping this batch's
+                // publish and completion below.
+                self.advance_block_journal_sync_ticket(lane, ticket)?;
             }
             Err(error) => {
-                let mut state = lock(&lane.inner)?;
-                debug_assert!(state.poisoned_after.is_none());
-                // Poison the lane: every batch with a later ticket has (or
-                // will have) frames beyond bytes whose durability is
-                // unknown, and must error until the tail is re-established.
-                state.poisoned_after = Some((ticket, error.clone()));
+                // The store poisoned the tail under the shard lock BEFORE
+                // this advance, so the successor's very next append must
+                // first re-establish the tail; no later lane batch's frames
+                // can ever sit behind this failed fsync. Publish is
+                // skipped; waiters error in publish order.
+                self.advance_block_journal_sync_ticket(lane, ticket)?;
+                let state =
+                    self.wait_for_block_journal_publish_turn(lane, ticket, &mut lane_timing)?;
                 let result = Err(error);
                 self.complete_block_journal_lane_batch(
                     lane,
@@ -4617,6 +4575,45 @@ impl DurableCoordinator {
                 return result;
             }
         }
+
+        // VISIBILITY ORDERING (3B): publish runs OFF the sync critical
+        // path, overlapping the successor's fsync, and ordering is
+        // preserved because:
+        //   1. Publishes are serialized in ticket order by
+        //      `next_publish_ticket`; ticket order equals per-device
+        //      enqueue order equals per-device commit-seq order (reserve
+        //      happens under the staging lock before enqueue), so
+        //      per-device publish order is unchanged from the serial lane.
+        //   2. A batch reaches this point only after its OWN fsync
+        //      succeeded, and completes its waiters only after its OWN
+        //      publish applied — an ack can never precede durability or
+        //      visibility (read-your-writes preserved).
+        //   3. The successor's overlapping fsync covers only bytes, never
+        //      visibility: overlay state and device heads move here, in
+        //      publish order, exactly as before.
+        //   4. Acknowledged bypass publishes still gate on
+        //      `has_unapplied_writes`, whose release also happens at
+        //      completion below, so a bypass apply can never overtake an
+        //      in-flight lane write for its device.
+        // Two honest caveats. First, "no lane frames behind an unfinished
+        // or failed fsync" is a LANE-only claim: bypass appends CAN land
+        // while a lane fsync is in flight — those are closed by the
+        // store's sync-entry poison refusal, the append-time tail
+        // recovery, and the double-fault poison (torn and sync-suspect are
+        // independent facts repaired in order). Second, nothing bounds
+        // `next_sync_ticket - next_publish_ticket`: behind a stalled
+        // publish, every writer thread can park one fsynced batch at its
+        // publish turn, so the publish queue depth is bounded only by the
+        // number of concurrent writers. That is accepted by ruling —
+        // gating elections on publish progress would re-couple exactly
+        // what this change decouples — and is revisited only if profiles
+        // show pathological queuing.
+        let publish_turn =
+            self.wait_for_block_journal_publish_turn(lane, ticket, &mut lane_timing)?;
+        drop(publish_turn);
+
+        #[cfg(test)]
+        self.pause_block_journal_publish_stage_if_requested_for_test()?;
 
         let publish_result = (|| -> Result<()> {
             // Publish in commit-seq order after this batch's own sync:
@@ -4685,9 +4682,11 @@ impl DurableCoordinator {
         // the lane: the journal tail is intact and durable, which is the
         // same exposure the serial lane had. Failed writes never published
         // their reserved sequences, so later acknowledged writes may apply
-        // without waiting on them.
+        // without waiting on them; the publish ticket still advances, so
+        // later batches (whose fsyncs may already have completed during
+        // this publish) publish and complete normally.
         let state = lock(&lane.inner)?;
-        debug_assert_eq!(state.next_sync_ticket, ticket);
+        debug_assert_eq!(state.next_publish_ticket, ticket);
         self.complete_block_journal_lane_batch(
             lane,
             state,
@@ -4711,48 +4710,18 @@ impl DurableCoordinator {
         Ok(())
     }
 
-    /// Block until `ticket` may append: either every earlier ticket has
-    /// completed (serial fallback, and the only window allowed while the
-    /// lane is poisoned — recovery must not run under suspect in-flight
-    /// batches), or the immediately preceding ticket is at its fsync — the
-    /// pipeline's overlap point. Waiting this long before CAPTURING the
-    /// batch is what preserves group commit: every request that arrived
-    /// before the predecessor's fsync began joins this batch instead of
-    /// parking a period behind a prematurely sealed one. Returns the lane
-    /// lock plus whether the wait fully drained the pipeline (poison
-    /// recovery precondition).
+    /// Block until `ticket` may seal and append: its append window IS its
+    /// sync turn, which the predecessor advances the moment its own fsync
+    /// returns. Waiting this long before CAPTURING the batch is what
+    /// preserves group commit: every request that arrived before the
+    /// predecessor's fsync completed joins this batch instead of parking a
+    /// period behind a prematurely sealed one. From here through its own
+    /// fsync the batch owns the sync turn — there is no second wait
+    /// between append and fsync. If the predecessor's fsync (or an append)
+    /// failed, the store tail poison was set under the shard lock before
+    /// the ticket advanced, so this batch's append re-establishes the tail
+    /// before writing any frame.
     fn wait_for_block_journal_append_window<'a>(
-        &self,
-        lane: &'a BlockJournalFlushCoordinator,
-        ticket: u64,
-        lane_timing: &mut BlockJournalLaneBatchTiming,
-    ) -> Result<(MutexGuard<'a, BlockJournalFlushState>, bool)> {
-        let mut state = lock(&lane.inner)?;
-        let mut wait_started = None;
-        loop {
-            let drained = state.next_sync_ticket == ticket;
-            let overlap = state.poisoned_after.is_none()
-                && state.next_sync_ticket.saturating_add(1) == ticket
-                && state.stage_s_syncing;
-            if drained || overlap {
-                if let Some(wait_started) = wait_started {
-                    lane_timing.pipeline_order_wait_nanos = lane_timing
-                        .pipeline_order_wait_nanos
-                        .saturating_add(duration_nanos_u64(
-                            Instant::now().duration_since(wait_started),
-                        ));
-                }
-                return Ok((state, drained));
-            }
-            wait_started.get_or_insert_with(Instant::now);
-            state = wait_on_cvar(&lane.pipeline_cvar, state)?;
-        }
-    }
-
-    /// Block until `ticket` owns the lane's SYNC stage, charging the wait
-    /// to the pipeline-order bucket. Returns with the lane lock held at the
-    /// batch's turn.
-    fn wait_for_block_journal_sync_turn<'a>(
         &self,
         lane: &'a BlockJournalFlushCoordinator,
         ticket: u64,
@@ -4772,13 +4741,61 @@ impl DurableCoordinator {
         Ok(state)
     }
 
-    /// Complete a batch's waiters and advance the lane's SYNC stage.
+    /// THE SYNC-ADVANCE POINT (the 3B seam): called exactly once per
+    /// ticket, the moment its fsync has returned (success or failure) or
+    /// its append failed before any fsync. Opens the successor's append
+    /// window so the next fsync starts while this batch is still
+    /// publishing. Elections gate on the sync ticket, so the waiter herd
+    /// is woken only when an election could actually proceed.
+    fn advance_block_journal_sync_ticket(
+        &self,
+        lane: &BlockJournalFlushCoordinator,
+        ticket: u64,
+    ) -> Result<()> {
+        let mut state = lock(&lane.inner)?;
+        debug_assert_eq!(state.next_sync_ticket, ticket);
+        state.next_sync_ticket = state.next_sync_ticket.saturating_add(1);
+        lane.pipeline_cvar.notify_all();
+        if !state.write_stage_busy && !state.pending.is_empty() && state.admits_election() {
+            state.generation = state.generation.saturating_add(1);
+            lane.cvar.notify_all();
+        }
+        Ok(())
+    }
+
+    /// Block until `ticket` owns the lane's PUBLISH stage, charging the
+    /// wait to the pipeline-order bucket (arithmetically near zero: a
+    /// predecessor's publish runs under this batch's much longer fsync).
+    /// Returns with the lane lock held at the batch's turn.
+    fn wait_for_block_journal_publish_turn<'a>(
+        &self,
+        lane: &'a BlockJournalFlushCoordinator,
+        ticket: u64,
+        lane_timing: &mut BlockJournalLaneBatchTiming,
+    ) -> Result<MutexGuard<'a, BlockJournalFlushState>> {
+        let mut state = lock(&lane.inner)?;
+        if state.next_publish_ticket == ticket {
+            return Ok(state);
+        }
+        let wait_started = Instant::now();
+        while state.next_publish_ticket != ticket {
+            state = wait_on_cvar(&lane.pipeline_cvar, state)?;
+        }
+        lane_timing.pipeline_order_wait_nanos = lane_timing
+            .pipeline_order_wait_nanos
+            .saturating_add(duration_nanos_u64(wait_started.elapsed()));
+        Ok(state)
+    }
+
+    /// Complete a batch's waiters and advance the lane's PUBLISH stage.
     ///
-    /// THE TICKET-ADVANCE POINT: `next_sync_ticket` moves forward here and
-    /// only here, after this batch's own fsync outcome and publish are
-    /// settled, so per-device visibility order equals ticket order.
-    /// (Plan item 3B will move publish off this critical path; when it
-    /// does, this is the line whose placement changes.)
+    /// THE PUBLISH-ADVANCE POINT (3B): `next_publish_ticket` moves forward
+    /// here and only here, after this batch's own fsync outcome AND its
+    /// publish are settled — waiters therefore never observe an ack before
+    /// visibility, and per-device visibility order equals ticket order.
+    /// The sync ticket advanced earlier, at the fsync return (see
+    /// `advance_block_journal_sync_ticket`), which is what lets the
+    /// successor's fsync overlap this batch's publish.
     fn complete_block_journal_lane_batch(
         &self,
         lane: &BlockJournalFlushCoordinator,
@@ -4793,8 +4810,7 @@ impl DurableCoordinator {
         for request_id in request_ids {
             state.completed.insert(*request_id, result.clone());
         }
-        state.stage_s_syncing = false;
-        state.next_sync_ticket = state.next_sync_ticket.saturating_add(1);
+        state.next_publish_ticket = state.next_publish_ticket.saturating_add(1);
         state.generation = state.generation.saturating_add(1);
         lane.cvar.notify_all();
         lane.pipeline_cvar.notify_all();
@@ -5297,6 +5313,72 @@ impl DurableCoordinator {
             .lock()
             .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
         state.resume_write_stage = true;
+        cvar.notify_all();
+        drop(state);
+        Ok(())
+    }
+
+    /// Test-only pause at the head of the PUBLISH stage, after the batch
+    /// owns its publish turn and before any visibility work: while one
+    /// batch is held here, its successor's fsync (already unblocked by the
+    /// sync-ticket advance) runs concurrently, and nothing of the held
+    /// batch is visible or acknowledged.
+    #[cfg(test)]
+    fn pause_block_journal_publish_stage_if_requested_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        if !state.pause_in_publish_stage {
+            return Ok(());
+        }
+        state.paused_in_publish_stage = true;
+        cvar.notify_all();
+        while !state.resume_publish_stage {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        }
+        state.pause_in_publish_stage = false;
+        state.paused_in_publish_stage = false;
+        state.resume_publish_stage = false;
+        cvar.notify_all();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn request_block_journal_publish_stage_pause_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        state.pause_in_publish_stage = true;
+        cvar.notify_all();
+        drop(state);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_for_block_journal_publish_stage_pause_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        while !state.paused_in_publish_stage {
+            state = cvar
+                .wait(state)
+                .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn resume_block_journal_publish_stage_for_test(&self) -> Result<()> {
+        let (lock_state, cvar) = &*self.block_journal_materialization_pause;
+        let mut state = lock_state
+            .lock()
+            .map_err(|_| StorageError::conflict("block-journal materialization pause poisoned"))?;
+        state.resume_publish_stage = true;
         cvar.notify_all();
         drop(state);
         Ok(())

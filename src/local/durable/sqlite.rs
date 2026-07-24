@@ -184,12 +184,14 @@ pub struct DurablePersistProfile {
     /// flush-boundary payload recheck (inside the payload-recheck bucket;
     /// contended-only, zero when uncontended; see `lock_timed`).
     pub block_journal_pending_payload_lock_wait_nanos: u64,
-    /// Pipeline ordering wait, three components: the append-window wait
+    /// Pipeline ordering wait, two components: the append-window wait
     /// (the batch owner parks through its predecessor's whole fsync — the
-    /// dominant component by design), the sync-turn wait after its own
-    /// append, and the rare pre-append poison drain. An unconditional time
-    /// bucket like the other `*_nanos` stage columns, not a contended-only
-    /// lock-wait column.
+    /// dominant component by design; the window IS the batch's sync turn,
+    /// held through its own fsync) and the publish-turn wait
+    /// (arithmetically near zero: a predecessor's publish runs under this
+    /// batch's much longer fsync). An unconditional time bucket like the
+    /// other `*_nanos` stage columns, not a contended-only lock-wait
+    /// column.
     pub block_journal_pipeline_order_wait_nanos: u64,
 }
 
@@ -1921,15 +1923,24 @@ pub(super) struct BlockJournalShardTail {
     end_offset: u64,
     /// End offset covered by the last successful data sync.
     synced_offset: u64,
-    poison: Option<BlockJournalTailPoison>,
+    poison: BlockJournalTailPoison,
 }
 
 /// Why a shard tail is unsafe to append past, and how to re-establish it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BlockJournalTailPoison {
-    /// A failed append may have left partial frame bytes past `end_offset`;
-    /// recovery truncates back to `end_offset`.
-    Torn,
+///
+/// The two facts are INDEPENDENT and can hold simultaneously (a bypass
+/// append can tear the tail while a lane fsync is in flight, and that
+/// fsync can then fail): setting one must never erase the other, or the
+/// combined recovery would skip an arm — a torn-only recovery truncates
+/// without validating the suspect range, silently laundering bytes the
+/// failed fsync may have dropped. Recovery therefore repairs both in
+/// order: truncate the torn bytes past `end_offset` first, then validate
+/// and rewrite `[synced_offset, end_offset)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct BlockJournalTailPoison {
+    /// A failed append may have left partial frame bytes past
+    /// `end_offset`; recovery truncates back to `end_offset`.
+    torn: bool,
     /// A failed data sync left `[synced_offset, end_offset)` with unknown
     /// durability (after fsync reports an error the kernel may drop the
     /// dirty pages, so a LATER successful fsync does not cover them).
@@ -1938,7 +1949,13 @@ pub(super) enum BlockJournalTailPoison {
     /// acknowledged-durability bypass records that a later Flush boundary
     /// must still be able to make durable — deleting them would let that
     /// Flush promise durability for a record that no longer exists.
-    SyncSuspect,
+    sync_suspect: bool,
+}
+
+impl BlockJournalTailPoison {
+    fn is_active(self) -> bool {
+        self.torn || self.sync_suspect
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3336,25 +3353,31 @@ impl DurableSqliteStore {
         let (_, consumed) = load_block_journal_records_with_consumed(path)?;
         tail.end_offset = consumed;
         tail.synced_offset = consumed;
-        tail.poison = (physical > consumed).then_some(BlockJournalTailPoison::Torn);
+        tail.poison.torn = physical > consumed;
         tail.initialized = true;
         Ok(())
     }
 
     /// Re-establish a poisoned shard tail before the next append.
     ///
-    /// Runs under the shard lock. The poison clears only after the
+    /// Runs under the shard lock. Each poison arm clears only after its
     /// backend-side repair fully succeeds; on error the shard stays
     /// poisoned and the caller's append fails, so the lane keeps erroring
     /// flush boundaries instead of laundering suspect bytes (fail-safe).
+    /// Both arms can be set at once (double fault: a bypass tear during an
+    /// in-flight lane fsync that then fails); the torn bytes past
+    /// `end_offset` are truncated FIRST, then the suspect range
+    /// `[synced_offset, end_offset)` is validated and rewritten — a
+    /// torn-only repair would otherwise let the next successful sync cover
+    /// bytes the failed fsync may have dropped.
     fn recover_block_journal_tail_locked(
         &self,
         path: &Path,
         tail: &mut BlockJournalShardTail,
     ) -> Result<()> {
-        let Some(poison) = tail.poison else {
+        if !tail.poison.is_active() {
             return Ok(());
-        };
+        }
         #[cfg(test)]
         if self
             .fail_next_block_journal_tail_recovery
@@ -3364,44 +3387,42 @@ impl DurableSqliteStore {
                 "injected block journal tail recovery failure",
             ));
         }
-        match poison {
-            BlockJournalTailPoison::Torn => {
-                self.low_level_io
-                    .recover_torn_tail(path, tail.end_offset)?;
-            }
-            BlockJournalTailPoison::SyncSuspect => {
-                // Rewrite, never truncate: see `BlockJournalTailPoison`.
-                // The read-back must still parse as the intact frames that
-                // were appended — after an fsync error the kernel may have
-                // dropped the suspect pages (dropped extents read back as
-                // zeros), and rewriting zeros would silently destroy
-                // records that a later Flush could then falsely promise as
-                // durable. On validation failure recovery fails and the
-                // shard stays poisoned: fail-safe unavailability, which
-                // acknowledged-durability semantics tolerate because the
-                // suspect records were never flush-covered.
-                let region = self.low_level_io.read_tail_region(
-                    path,
-                    tail.synced_offset,
-                    tail.end_offset,
-                )?;
-                validate_block_journal_frame_region(
-                    &region,
-                    self.low_level_io.append_alignment(),
-                )?;
-                // The rewrite re-dirties every suspect page, which is what
-                // makes the recovery fsync trustworthy: fsync reports an
-                // error once and clears it, so only pages dirtied AFTER the
-                // failure are covered by the next successful fsync.
-                self.low_level_io.rewrite_tail_region(
-                    path,
-                    tail.synced_offset,
-                    &region,
-                )?;
-                tail.synced_offset = tail.end_offset;
-            }
+        if tail.poison.torn {
+            self.low_level_io.recover_torn_tail(path, tail.end_offset)?;
+            tail.poison.torn = false;
         }
-        tail.poison = None;
+        if tail.poison.sync_suspect {
+            // Rewrite, never truncate: see `BlockJournalTailPoison`. The
+            // read-back must still parse as the intact frames that were
+            // appended — after an fsync error the kernel may have dropped
+            // the suspect pages (dropped extents read back as zeros), and
+            // rewriting zeros would silently destroy records that a later
+            // Flush could then falsely promise as durable. On validation
+            // failure recovery fails and the shard stays poisoned:
+            // fail-safe unavailability, which acknowledged-durability
+            // semantics tolerate because the suspect records were never
+            // flush-covered.
+            let region = self.low_level_io.read_tail_region(
+                path,
+                tail.synced_offset,
+                tail.end_offset,
+            )?;
+            validate_block_journal_frame_region(
+                &region,
+                self.low_level_io.append_alignment(),
+            )?;
+            // The rewrite re-dirties every suspect page, which is what
+            // makes the recovery fsync trustworthy: fsync reports an error
+            // once and clears it, so only pages dirtied AFTER the failure
+            // are covered by the next successful fsync.
+            self.low_level_io.rewrite_tail_region(
+                path,
+                tail.synced_offset,
+                &region,
+            )?;
+            tail.synced_offset = tail.end_offset;
+            tail.poison.sync_suspect = false;
+        }
         Ok(())
     }
 
@@ -3422,11 +3443,11 @@ impl DurableSqliteStore {
         let shard_lock = self.block_journal_shard_lock(shard)?;
         let (mut tail, lock_wait_nanos) = lock_timed(shard_lock, measure)?;
         self.ensure_block_journal_tail_initialized(&path, &mut tail)?;
-        let tail_recovered = tail.poison.is_some();
+        let tail_recovered = tail.poison.is_active();
         self.recover_block_journal_tail_locked(&path, &mut tail)?;
         #[cfg(test)]
         if self.fail_next_block_journal_append.swap(false, Ordering::SeqCst) {
-            tail.poison = Some(BlockJournalTailPoison::Torn);
+            tail.poison.torn = true;
             return Err(StorageError::unavailable(
                 "injected block journal append failure",
             ));
@@ -3435,7 +3456,7 @@ impl DurableSqliteStore {
             match append_block_journal_records_unsynced(&path, records, &self.low_level_io) {
                 Ok(profile) => profile,
                 Err(error) => {
-                    tail.poison = Some(BlockJournalTailPoison::Torn);
+                    tail.poison.torn = true;
                     return Err(error);
                 }
             };
@@ -3461,7 +3482,7 @@ impl DurableSqliteStore {
         let cover = {
             let mut tail = lock(shard_lock)?;
             self.ensure_block_journal_tail_initialized(&path, &mut tail)?;
-            if tail.poison.is_some() {
+            if tail.poison.is_active() {
                 // Syncing a poisoned tail would launder suspect bytes into
                 // an acknowledged durability boundary.
                 return Err(StorageError::unavailable(
@@ -3471,18 +3492,20 @@ impl DurableSqliteStore {
             tail.end_offset
         };
         let sync_result = (|| -> Result<u64> {
+            // Test-only: hold this fsync in flight after its coverage was
+            // captured, so appends landing during the sync are provably not
+            // credited to it. The delay runs BEFORE the injected failure so
+            // tests can stage faults (like a bypass tear) during a held
+            // fsync that then fails.
+            #[cfg(test)]
+            if let Some(delay) = lock(&self.block_journal_sync_delay)?.take() {
+                std::thread::sleep(delay);
+            }
             #[cfg(test)]
             if self.fail_next_block_journal_sync.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::unavailable(
                     "injected block journal sync failure",
                 ));
-            }
-            // Test-only: hold this fsync in flight after its coverage was
-            // captured, so appends landing during the sync are provably not
-            // credited to it.
-            #[cfg(test)]
-            if let Some(delay) = lock(&self.block_journal_sync_delay)?.take() {
-                std::thread::sleep(delay);
             }
             let file = OpenOptions::new()
                 .append(true)
@@ -3499,8 +3522,9 @@ impl DurableSqliteStore {
                 Ok(nanos)
             }
             Err(error) => {
-                tail.poison
-                    .get_or_insert(BlockJournalTailPoison::SyncSuspect);
+                // Never erase a concurrent tear: both facts must survive
+                // for the combined recovery.
+                tail.poison.sync_suspect = true;
                 Err(error)
             }
         }
@@ -3531,7 +3555,7 @@ impl DurableSqliteStore {
         for shard in 0..self.block_journal_shard_nodes.len() {
             let path = self.block_journal_shard_path(shard)?;
             let mut tail = lock(self.block_journal_shard_lock(shard)?)?;
-            if tail.poison.is_some() {
+            if tail.poison.is_active() {
                 // A poisoned tail truncates the record load at the damage;
                 // pruning from that partial view could drop reachable
                 // frames. Skip until the lane re-establishes the tail.
