@@ -2459,21 +2459,53 @@ fn block_journal_commit_is_materialized(
         .is_some_and(|high| commit.commit_seq.raw() <= high.raw())
 }
 
+/// Whether every journal record naming `device_id` is dead state that prune
+/// may drop outright.
+///
+/// `retired` is the caller's proof, and it is a conjunction, not a guess:
+/// metadata carries delete evidence for the id AND no live head answers to it
+/// (`InMemoryMetadataPlane::retired_block_device_ids_locked`). Both halves are
+/// load-bearing at this site, which physically rewrites the shard. Delete
+/// evidence alone would be wrong — an id CAN be handed out again, because
+/// retention expires the deleted head and `fork_device`'s target guard
+/// rejects only ids that are live or CURRENTLY deleted — and absence from the
+/// live heads alone would be wrong too, because a record naming a device that
+/// never existed must stay in the journal for replay to report as corruption.
+///
+/// Given that proof, dropping is not merely safe but required: the records
+/// describe a device that is gone, and if the id is later re-taken the new
+/// device must not inherit the old one's leases or commits. It is also the
+/// only thing that retires `Lease` records at all — a `Lease` is invisible to
+/// the materialized high-water map, which is built from `shard_commits` and
+/// says nothing about leases.
+fn block_journal_device_is_retired(retired: &BTreeSet<DeviceId>, device_id: DeviceId) -> bool {
+    retired.contains(&device_id)
+}
+
 fn block_journal_record_pruned(
     materialized: &BTreeMap<DeviceId, CommitSeq>,
+    retired: &BTreeSet<DeviceId>,
     record: BlockJournalRecord,
     out: &mut Vec<BlockJournalRecord>,
 ) -> Result<()> {
     match record {
-        BlockJournalRecord::Lease { .. } => out.push(record),
+        BlockJournalRecord::Lease { device_id, .. } => {
+            if !block_journal_device_is_retired(retired, device_id) {
+                out.push(record);
+            }
+        }
         BlockJournalRecord::Write(commit) => {
-            if !block_journal_commit_is_materialized(materialized, &commit) {
+            if !block_journal_device_is_retired(retired, commit.device_id)
+                && !block_journal_commit_is_materialized(materialized, &commit)
+            {
                 out.push(BlockJournalRecord::Write(commit));
             }
         }
         BlockJournalRecord::PackedWrites(packed) => {
             for commit in packed.expand_commits()? {
-                if !block_journal_commit_is_materialized(materialized, &commit) {
+                if !block_journal_device_is_retired(retired, commit.device_id)
+                    && !block_journal_commit_is_materialized(materialized, &commit)
+                {
                     out.push(BlockJournalRecord::Write(commit));
                 }
             }
@@ -2483,9 +2515,10 @@ fn block_journal_record_pruned(
             writer_epoch,
             durable_through,
         } => {
-            if materialized
-                .get(&device_id)
-                .is_none_or(|high| durable_through.raw() > high.raw())
+            if !block_journal_device_is_retired(retired, device_id)
+                && materialized
+                    .get(&device_id)
+                    .is_none_or(|high| durable_through.raw() > high.raw())
             {
                 out.push(BlockJournalRecord::Flush {
                     device_id,
@@ -2501,14 +2534,18 @@ fn block_journal_record_pruned(
 fn prune_block_journal_records_through(
     path: &Path,
     materialized: &BTreeMap<DeviceId, CommitSeq>,
+    retired: &BTreeSet<DeviceId>,
 ) -> Result<()> {
-    if materialized.is_empty() || !path.exists() {
+    // A store with no materialized commits can still owe a prune: a device
+    // that was leased and deleted without ever being written leaves a `Lease`
+    // record behind while contributing nothing to the high-water map.
+    if (materialized.is_empty() && retired.is_empty()) || !path.exists() {
         return Ok(());
     }
     let records = load_block_journal_records(path)?;
     let mut kept = Vec::new();
     for record in records {
-        block_journal_record_pruned(materialized, record, &mut kept)?;
+        block_journal_record_pruned(materialized, retired, record, &mut kept)?;
     }
 
     if kept.is_empty() {
@@ -3736,8 +3773,9 @@ impl DurableSqliteStore {
     fn prune_block_journal_records_through(
         &self,
         materialized: &BTreeMap<DeviceId, CommitSeq>,
+        retired: &BTreeSet<DeviceId>,
     ) -> Result<()> {
-        if materialized.is_empty() {
+        if materialized.is_empty() && retired.is_empty() {
             return Ok(());
         }
         for shard in 0..self.block_journal_shard_nodes.len() {
@@ -3749,7 +3787,7 @@ impl DurableSqliteStore {
                 // frames. Skip until the lane re-establishes the tail.
                 continue;
             }
-            prune_block_journal_records_through(&path, materialized)?;
+            prune_block_journal_records_through(&path, materialized, retired)?;
             self.low_level_io.forget_path(&path)?;
             // The prune made the surviving state durable (rename of a
             // synced NEW inode when records survive; an in-place synced

@@ -23930,7 +23930,7 @@ fn durable_block_journal_prune_interleaving_sync_skips_stale_cover() {
         materialized.insert(device_id, CommitSeq::from_raw(1));
         store
             .durable
-            .prune_block_journal_records_through(&materialized)
+            .prune_block_journal_records_through(&materialized, &BTreeSet::new())
             .unwrap();
         inflight.join().unwrap().unwrap();
     });
@@ -24028,7 +24028,7 @@ fn durable_block_journal_fs_fd_cache_reuses_across_batches_and_drops_on_prune() 
     materialized.insert(device_id, CommitSeq::from_raw(1));
     store
         .durable
-        .prune_block_journal_records_through(&materialized)
+        .prune_block_journal_records_through(&materialized, &BTreeSet::new())
         .unwrap();
     {
         let tail = store.durable.block_journal_shard_locks[shard]
@@ -24921,5 +24921,622 @@ fn durable_block_journal_cohort_capture_survives_a_failed_predecessor_publish() 
     successor.join().unwrap().unwrap();
     assert_eq!(read_block(&store, device_id, 2), repeated_blocks(1, 100));
     drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+fn lease_delete_device_request(name: &str) -> CreateDeviceRequest {
+    CreateDeviceRequest {
+        spec: DeviceSpec {
+            logical_blocks: 16,
+            block_size: 4096,
+        },
+        name: Some(name.to_string()),
+    }
+}
+
+// The retired-set rule, asserted on its own rather than through a store:
+// delete evidence must never retire an id that a live head still answers to,
+// and losing one artifact must not lose the proof while the other survives.
+// Reachable states keep `deleted_device_heads` and `delete_records` expiring
+// together, so nothing else would notice if the liveness subtraction were
+// dropped — and the two sites that act on this set destroy state (prune
+// rewrites the shard, the materialization scan blocks the commit).
+#[test]
+fn retired_block_device_ids_exclude_live_heads_and_survive_a_missing_artifact() {
+    let metadata = InMemoryMetadataPlane::new(config()).unwrap();
+    let live = metadata.create_device(device_request()).unwrap().device_id;
+    let doomed = metadata.create_device(device_request()).unwrap().device_id;
+    let deleted = metadata.delete_device(doomed).unwrap();
+
+    let mut inner = metadata.state_inner().unwrap();
+    assert_eq!(
+        InMemoryMetadataPlane::retired_block_device_ids_locked(&inner),
+        BTreeSet::from([doomed])
+    );
+
+    // Drop the deleted head, keep the `DeleteRecord`: either artifact alone
+    // is still proof.
+    inner.deleted_device_heads.remove(&doomed);
+    // ...and plant a `DeleteRecord` naming a device that IS live, the shape a
+    // future decoupling of the two artifacts would produce.
+    let stale = inner
+        .delete_records
+        .get(&deleted.commit_seq)
+        .cloned()
+        .unwrap();
+    inner.delete_records.insert(
+        CommitSeq::from_raw(stale.commit_seq.raw() + 1),
+        DeleteRecord {
+            device_id: live,
+            ..stale
+        },
+    );
+    assert_eq!(
+        InMemoryMetadataPlane::retired_block_device_ids_locked(&inner),
+        BTreeSet::from([doomed]),
+        "a live head must never be retired, and a surviving delete record must still prove the deleted one"
+    );
+}
+
+/// Which record classes name `device_id`. Packed writes count as "write":
+/// replay expands them into exactly that.
+fn block_journal_record_classes_for_device(
+    records: &[BlockJournalRecord],
+    device_id: DeviceId,
+) -> BTreeSet<&'static str> {
+    records
+        .iter()
+        .filter(|record| block_journal_record_names_device(record, device_id))
+        .map(|record| match record {
+            BlockJournalRecord::Lease { .. } => "lease",
+            BlockJournalRecord::Write(_) | BlockJournalRecord::PackedWrites(_) => "write",
+            BlockJournalRecord::Flush { .. } => "flush",
+        })
+        .collect()
+}
+
+fn block_journal_record_names_device(record: &BlockJournalRecord, device_id: DeviceId) -> bool {
+    match record {
+        BlockJournalRecord::Lease { device_id: id, .. }
+        | BlockJournalRecord::Flush { device_id: id, .. } => *id == device_id,
+        BlockJournalRecord::Write(commit) => commit.device_id == device_id,
+        BlockJournalRecord::PackedWrites(packed) => packed
+            .expand_commits()
+            .unwrap()
+            .iter()
+            .any(|commit| commit.device_id == device_id),
+    }
+}
+
+// A device that ever held a block writer lease must survive its own
+// deletion. Acquiring the lease puts a `Lease` record in the block journal;
+// deleting the device drops its head from `device_heads`. Replay resolves
+// every journal record's device id through `device_info`, so the surviving
+// record turned into a NotFound that propagated straight out of
+// `DurableCoordinator::open` — one leased-then-deleted device bricked the
+// whole store, permanently, with no recovery path.
+//
+// No lane write is needed for the doomed device: the lease alone is the
+// repro.
+#[test]
+fn durable_leased_then_deleted_device_reopens_and_leaves_store_usable() {
+    let root = durable_temp_dir("lease-delete-reopen");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let doomed = store
+        .create_device(lease_delete_device_request("doomed"))
+        .unwrap();
+    let survivor = store
+        .create_device(lease_delete_device_request("survivor"))
+        .unwrap();
+    let survivor_lease = store.acquire_block_writer(survivor).unwrap();
+    let doomed_lease = store.acquire_block_writer(doomed).unwrap();
+    store
+        .write_device_with_writer(
+            &survivor_lease,
+            0,
+            &repeated_blocks(1, 41),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    store.delete_device(doomed).unwrap();
+    assert!(matches!(
+        store.write_device_with_writer(
+            &doomed_lease,
+            0,
+            &repeated_blocks(1, 42),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::NotFound { .. })
+    ));
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&reopened, survivor, 0), repeated_blocks(1, 41));
+    assert!(matches!(
+        reopened.read_device(doomed, ByteRange::new(0, 4096), &mut vec![0; 4096]),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert!(matches!(
+        reopened.acquire_block_writer(doomed),
+        Err(StorageError::NotFound { .. })
+    ));
+
+    // Usable afterwards: the surviving device still leases and writes, and
+    // the store reopens again on top of that.
+    let fresh = reopened.acquire_block_writer(survivor).unwrap();
+    reopened
+        .write_device_with_writer(
+            &fresh,
+            4096,
+            &repeated_blocks(1, 43),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    drop(reopened);
+
+    let again = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&again, survivor, 0), repeated_blocks(1, 41));
+    assert_eq!(read_block(&again, survivor, 1), repeated_blocks(1, 43));
+    drop(again);
+    let _ = fs::remove_dir_all(root);
+}
+
+// A store that never wrote a block has an empty materialized high-water map,
+// and prune used to return early on exactly that — so a device leased and
+// deleted before its first write left the most durable `Lease` record of all.
+// Prune now owes work whenever there is delete evidence, whether or not
+// anything is materialized.
+#[test]
+fn durable_lease_and_delete_before_any_write_prunes_and_reopens() {
+    let root = durable_temp_dir("lease-delete-no-writes");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let doomed = store
+        .create_device(lease_delete_device_request("doomed"))
+        .unwrap();
+    let lease = store.acquire_block_writer(doomed).unwrap();
+    assert!(
+        store
+            .durable
+            .block_journal_records()
+            .unwrap()
+            .iter()
+            .any(|record| block_journal_record_names_device(record, doomed)),
+        "the lease must reach the journal, or the check below is vacuous"
+    );
+    assert!(
+        store
+            .metadata()
+            .block_materialized_high_water()
+            .unwrap()
+            .is_empty(),
+        "a store with no writes must have nothing materialized, or this test picks the wrong path"
+    );
+
+    store.delete_device(doomed).unwrap();
+    assert!(matches!(
+        store.flush_device_with_writer(&lease),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert!(
+        !store
+            .durable
+            .block_journal_records()
+            .unwrap()
+            .iter()
+            .any(|record| block_journal_record_names_device(record, doomed)),
+        "prune must retire the lease record even with nothing materialized"
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let fresh = reopened
+        .create_device(lease_delete_device_request("after"))
+        .unwrap();
+    let fresh_lease = reopened.acquire_block_writer(fresh).unwrap();
+    reopened
+        .write_device_with_writer(
+            &fresh_lease,
+            0,
+            &repeated_blocks(1, 91),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert_eq!(read_block(&reopened, fresh, 0), repeated_blocks(1, 91));
+    drop(reopened);
+
+    let again = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&again, fresh, 0), repeated_blocks(1, 91));
+    drop(again);
+    let _ = fs::remove_dir_all(root);
+}
+
+// The fuller path: the doomed device was also written through its lease, so
+// the journal held Write and Flush records for it too. Those prune off the
+// materialized high-water map, which is why the `Lease` record was the sole
+// survivor and the sole reason reopen failed. Prune now drops every record
+// class for a device metadata proves was deleted, so the journal is clean
+// before the store even closes.
+#[test]
+fn durable_leased_written_then_deleted_device_leaves_no_journal_records() {
+    let root = durable_temp_dir("lease-write-delete-reopen");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let doomed = store
+        .create_device(lease_delete_device_request("doomed"))
+        .unwrap();
+    let survivor = store
+        .create_device(lease_delete_device_request("survivor"))
+        .unwrap();
+    let doomed_lease = store.acquire_block_writer(doomed).unwrap();
+    let survivor_lease = store.acquire_block_writer(survivor).unwrap();
+    for (offset, byte) in [(0, 51_u8), (4096, 52)] {
+        store
+            .write_device_with_writer(
+                &doomed_lease,
+                offset,
+                &repeated_blocks(1, byte),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+    }
+    store
+        .write_device_with_writer(
+            &survivor_lease,
+            0,
+            &repeated_blocks(1, 53),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert_eq!(read_block(&store, doomed, 1), repeated_blocks(1, 52));
+    // Per class, not merely "some record": the point of the test is that
+    // every class goes, and a check that accepted the Lease alone would not
+    // notice a Write or Flush left behind.
+    assert_eq!(
+        block_journal_record_classes_for_device(
+            &store.durable.block_journal_records().unwrap(),
+            doomed,
+        ),
+        BTreeSet::from(["flush", "lease", "write"]),
+        "the doomed device must own every record class before the delete, or the check below is vacuous"
+    );
+
+    store.delete_device(doomed).unwrap();
+    let survived = block_journal_record_classes_for_device(
+        &store.durable.block_journal_records().unwrap(),
+        doomed,
+    );
+    assert!(
+        survived.is_empty(),
+        "the delete's prune must retire every record class for the deleted device, Lease included: {survived:?}"
+    );
+    // The survivor keeps its own records and its data.
+    assert_eq!(read_block(&store, survivor, 0), repeated_blocks(1, 53));
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&reopened, survivor, 0), repeated_blocks(1, 53));
+    assert!(matches!(
+        reopened.read_device(doomed, ByteRange::new(0, 4096), &mut vec![0; 4096]),
+        Err(StorageError::NotFound { .. })
+    ));
+    let fresh = reopened.acquire_block_writer(survivor).unwrap();
+    reopened
+        .write_device_with_writer(
+            &fresh,
+            4096,
+            &repeated_blocks(1, 54),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert_eq!(read_block(&reopened, survivor, 1), repeated_blocks(1, 54));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Prune only helps journals written from here on. Stores already on disk
+// carry the bad state — a `Lease` record for a deleted device that no prune
+// ever retired — and a shard that was poisoned when the delete pruned would
+// reach the same place on a current build. Replay is what un-bricks those:
+// records whose device metadata proves was deleted are skipped, for every
+// record class, and the reopen completes.
+#[test]
+fn durable_reopen_tolerates_already_written_records_for_a_deleted_device() {
+    let root = durable_temp_dir("lease-delete-planted-replay");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let doomed = store
+        .create_device(lease_delete_device_request("doomed"))
+        .unwrap();
+    let survivor = store
+        .create_device(lease_delete_device_request("survivor"))
+        .unwrap();
+    let survivor_lease = store.acquire_block_writer(survivor).unwrap();
+    store
+        .write_device_with_writer(
+            &survivor_lease,
+            0,
+            &repeated_blocks(1, 81),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let doomed_lease = store.acquire_block_writer(doomed).unwrap();
+    let doomed_commit = store
+        .write_device_with_writer(
+            &doomed_lease,
+            0,
+            &repeated_blocks(1, 82),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+    store.delete_device(doomed).unwrap();
+
+    // Re-plant the records the pre-fix journal would still be holding,
+    // after the delete's prune has already run.
+    let shard = store.durable.block_journal_shard_for_device(doomed);
+    store
+        .durable
+        .append_block_journal_records_unsynced(
+            shard,
+            &[
+                BlockJournalRecord::Lease {
+                    device_id: doomed,
+                    writer_epoch: doomed_lease.writer_epoch,
+                },
+                // A `Sparse` entry commits no bytes, so `committed_bytes`
+                // must be 0: a mismatch is a shape `commit.validate()`
+                // rejects, which would let this record be refused for a
+                // reason that has nothing to do with the deleted device.
+                BlockJournalRecord::Write(BlockJournalCommit {
+                    device_id: doomed,
+                    writer_epoch: doomed_lease.writer_epoch,
+                    commit_seq: doomed_commit,
+                    write_count: 1,
+                    collapsed_range_count: 1,
+                    committed_bytes: 0,
+                    entries: vec![BlockJournalEntry::Sparse {
+                        range: ByteRange::new(0, 4096),
+                    }],
+                }),
+                BlockJournalRecord::Flush {
+                    device_id: doomed,
+                    writer_epoch: doomed_lease.writer_epoch,
+                    durable_through: doomed_commit,
+                },
+            ],
+            false,
+        )
+        .unwrap();
+    store.durable.sync_block_journal(shard).unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&reopened, survivor, 0), repeated_blocks(1, 81));
+    assert!(matches!(
+        reopened.acquire_block_writer(doomed),
+        Err(StorageError::NotFound { .. })
+    ));
+    // The next persist retires the planted records, so the bad state is
+    // cleared rather than carried forever.
+    let fresh = reopened.acquire_block_writer(survivor).unwrap();
+    reopened
+        .write_device_with_writer(
+            &fresh,
+            4096,
+            &repeated_blocks(1, 83),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    reopened.flush_device(survivor).unwrap();
+    reopened
+        .run_metadata_custodian(RetentionPolicy::retain_deleted_devices())
+        .unwrap();
+    assert!(
+        !reopened
+            .durable
+            .block_journal_records()
+            .unwrap()
+            .iter()
+            .any(|record| block_journal_record_names_device(record, doomed)),
+        "a later persist must retire the planted records for the deleted device"
+    );
+    drop(reopened);
+
+    let again = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&again, survivor, 0), repeated_blocks(1, 81));
+    assert_eq!(read_block(&again, survivor, 1), repeated_blocks(1, 83));
+    drop(again);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Tolerating a deleted device must not blunt the corruption signal. Delete
+// evidence — the deleted head plus the `DeleteRecord` naming the id — is the
+// whole licence to skip; a record naming a device that was never created has
+// none, so replay must still fail reopen exactly as it did before the fix.
+#[test]
+fn durable_block_journal_record_for_unknown_device_still_fails_reopen() {
+    for planted in ["lease", "write", "flush"] {
+        let root = durable_temp_dir(&format!("journal-unknown-device-{planted}"));
+        let cfg = config();
+        let store = DurableCoordinator::open(&root, cfg).unwrap();
+        let device_id = store
+            .create_device(lease_delete_device_request("known"))
+            .unwrap();
+        let lease = store.acquire_block_writer(device_id).unwrap();
+        store
+            .write_device_with_writer(
+                &lease,
+                0,
+                &repeated_blocks(1, 61),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+
+        // Never created, never deleted: nothing in metadata names it.
+        let unknown = DeviceId::from_raw(4242);
+        let epoch = WriterEpoch::from_raw(1);
+        let commit_seq = CommitSeq::from_raw(u64::from(u32::MAX));
+        let record = match planted {
+            "lease" => BlockJournalRecord::Lease {
+                device_id: unknown,
+                writer_epoch: epoch,
+            },
+            // `committed_bytes` matches the entries (a `Sparse` entry
+            // commits none), so the record is well-formed and the only thing
+            // wrong with it is the device it names.
+            "write" => BlockJournalRecord::Write(BlockJournalCommit {
+                device_id: unknown,
+                writer_epoch: epoch,
+                commit_seq,
+                write_count: 1,
+                collapsed_range_count: 1,
+                committed_bytes: 0,
+                entries: vec![BlockJournalEntry::Sparse {
+                    range: ByteRange::new(0, 4096),
+                }],
+            }),
+            _ => BlockJournalRecord::Flush {
+                device_id: unknown,
+                writer_epoch: epoch,
+                durable_through: commit_seq,
+            },
+        };
+        let shard = store.durable.block_journal_shard_for_device(unknown);
+        store
+            .durable
+            .append_block_journal_records_unsynced(shard, &[record], false)
+            .unwrap();
+        store.durable.sync_block_journal(shard).unwrap();
+        drop(store);
+
+        let error = DurableCoordinator::open(&root, cfg).unwrap_err();
+        assert!(
+            matches!(&error, StorageError::NotFound { kind, id }
+                if *kind == "device" && id == &unknown.to_string()),
+            "a {planted} record for a device with no delete evidence must still fail reopen, got {error:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+// Delete evidence is not permanent: retention expires the deleted head and
+// its `DeleteRecord`, and a `Lease` record that outlived them would name a
+// device that is neither live nor provably deleted — unskippable by
+// construction, and back to a bricked store. That is why the fix is on both
+// sides: prune retires the record while the evidence still stands, so replay
+// is never asked to cope with an expired one. The first reopen below is the
+// assertion that pins it.
+//
+// Expiring the evidence also frees the id. Ordinary paths never reuse one —
+// `alloc_device_id` only counts up, and reopen restores `next_device_id` as
+// the max over live heads, deleted heads, and the persisted cursor — but
+// `fork_device` with an explicit target takes a caller-chosen id, rejecting
+// only ids that are live or still-deleted. So an id can come back, and the
+// store must survive that too.
+#[test]
+fn durable_device_id_reused_after_retention_expires_the_deleted_head_reopens() {
+    let root = durable_temp_dir("lease-delete-id-reuse");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let doomed = store
+        .create_device(lease_delete_device_request("doomed"))
+        .unwrap();
+    let survivor = store
+        .create_device(lease_delete_device_request("survivor"))
+        .unwrap();
+    let survivor_lease = store.acquire_block_writer(survivor).unwrap();
+    store
+        .write_device_with_writer(
+            &survivor_lease,
+            0,
+            &repeated_blocks(1, 71),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let doomed_lease = store.acquire_block_writer(doomed).unwrap();
+    store
+        .write_device_with_writer(
+            &doomed_lease,
+            0,
+            &repeated_blocks(1, 72),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.delete_device(doomed).unwrap();
+
+    // While the delete evidence stands, the id cannot be taken back.
+    assert!(matches!(
+        store.fork_device(
+            survivor,
+            ForkRequest {
+                target: Some(doomed),
+                name: Some("too-early".to_string()),
+            },
+        ),
+        Err(StorageError::Conflict { .. })
+    ));
+
+    // Retention drops the deleted head and its `DeleteRecord`; the id is now
+    // free, and no delete evidence is left to license a skip.
+    store
+        .run_metadata_custodian(RetentionPolicy::expire_deleted_immediately())
+        .unwrap();
+    assert!(
+        !store
+            .metadata()
+            .deleted_device_ids()
+            .unwrap()
+            .contains(&doomed),
+        "the custodian must expire the deleted head, or this test proves nothing"
+    );
+    drop(store);
+
+    // Nothing in metadata names the doomed device any more. Reopen only
+    // survives because the journal no longer names it either.
+    let expired = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&expired, survivor, 0), repeated_blocks(1, 71));
+    let reborn = expired
+        .fork_device(
+            survivor,
+            ForkRequest {
+                target: Some(doomed),
+                name: Some("reborn".to_string()),
+            },
+        )
+        .unwrap();
+    assert_eq!(reborn, doomed);
+    drop(expired);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&reopened, survivor, 0), repeated_blocks(1, 71));
+    assert_eq!(read_block(&reopened, reborn, 0), repeated_blocks(1, 71));
+    let fresh = reopened.acquire_block_writer(reborn).unwrap();
+    reopened
+        .write_device_with_writer(
+            &fresh,
+            4096,
+            &repeated_blocks(1, 73),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert_eq!(read_block(&reopened, reborn, 1), repeated_blocks(1, 73));
+    drop(reopened);
     let _ = fs::remove_dir_all(root);
 }

@@ -861,6 +861,46 @@ impl InMemoryMetadataPlane {
         Ok(inner.deleted_device_heads.keys().copied().collect())
     }
 
+    /// Device ids this view proves are retired: it carries delete evidence
+    /// for them, and no live head answers to the id.
+    ///
+    /// `delete_device` keeps the head in `deleted_device_heads` and writes a
+    /// `DeleteRecord` naming the device; both are persisted and restored, so
+    /// the evidence survives reopen. The union of the two is deliberate —
+    /// either surviving artifact is proof on its own — and so is subtracting
+    /// the live heads afterwards, from the same view. Neither half stands
+    /// alone. Evidence without the liveness check would retire a LIVE device
+    /// whenever the two artifacts disagreed (retention expires a deleted head
+    /// and `fork_device` hands the id straight back out, while a stale
+    /// `DeleteRecord` for it still names the id); absence from the live heads
+    /// without evidence would silently swallow a record naming a device that
+    /// never existed, which must stay a corruption error.
+    ///
+    /// Taking a view rather than the lock is what lets the block-journal
+    /// prune judge a durable image by the same rule live metadata is judged
+    /// by, so a persist and the prune that follows it cannot disagree about
+    /// which devices are gone.
+    pub(super) fn retired_block_device_ids_locked(inner: &MetadataInner) -> BTreeSet<DeviceId> {
+        inner
+            .deleted_device_heads
+            .keys()
+            .copied()
+            .chain(inner.delete_records.values().map(|record| record.device_id))
+            .filter(|device_id| !inner.device_heads.contains_key(device_id))
+            .collect()
+    }
+
+    /// The materialized high-water map and the retired-device set
+    /// (`retired_block_device_ids_locked`) as of one lock hold, for the
+    /// block-journal paths that need both.
+    pub(super) fn block_journal_device_view(&self) -> Result<BlockJournalDeviceView> {
+        let inner = lock(&self.inner)?;
+        Ok(BlockJournalDeviceView {
+            materialized: Self::block_materialized_high_water_locked(&inner),
+            retired: Self::retired_block_device_ids_locked(&inner),
+        })
+    }
+
     pub fn shard_commits_for_device(&self, device_id: DeviceId) -> Result<Vec<ShardCommit>> {
         let inner = lock(&self.inner)?;
         Ok(Self::shard_commits_for_device_locked(&inner, device_id))

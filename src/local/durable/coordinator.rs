@@ -2432,8 +2432,20 @@ impl DurableCoordinator {
         self.prune_pending_block_deltas_through(durable_through)?;
         self.prune_pending_native_file_deltas_through(durable_through)?;
         let materialized = self.local.metadata.block_materialized_high_water()?;
+        // Judged against the image that was just persisted, NOT against live
+        // metadata. Prune destroys records, and the store a crash here
+        // reopens from is exactly this image, so the two must agree on which
+        // devices are gone. A live read disagrees in both directions: a
+        // delete landing after the snapshot would retire a device the image
+        // still shows live, and a bounded persist rewinds a device deleted
+        // after `target_commit` back into the image's live heads
+        // (`metadata_through_commit`) while live metadata calls it deleted.
+        // Either way the reopened store would find a live device whose
+        // `Lease` record had been pruned out from under it, leaving its
+        // writer epoch unseeded.
+        let retired = InMemoryMetadataPlane::retired_block_device_ids_locked(&image.metadata);
         self.durable
-            .prune_block_journal_records_through(&materialized)?;
+            .prune_block_journal_records_through(&materialized, &retired)?;
         self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_through)
@@ -5330,7 +5342,7 @@ impl DurableCoordinator {
         #[cfg(test)]
         self.note_block_journal_materialization_scan_for_test()?;
         let records = self.durable.block_journal_records()?;
-        let materialized = self.local.metadata.block_materialized_high_water()?;
+        let devices = self.local.metadata.block_journal_device_view()?;
         let mut durable_through = BTreeMap::<DeviceId, CommitSeq>::new();
         let mut writes = Vec::new();
         for record in records {
@@ -5355,13 +5367,26 @@ impl DurableCoordinator {
         writes.sort_by_key(|commit| commit.commit_seq.raw());
         let mut selected = Vec::new();
         for commit in writes {
+            // Same rule replay and prune use: a commit naming a device
+            // metadata proves retired — delete evidence, and no live head —
+            // is dead state. Materializing it would ask `device_info` for a
+            // head that is gone, which used to fail the whole persist, so a
+            // journal still carrying such a record (a shard poisoned when the
+            // delete pruned, or a store written before the lane stopped
+            // emitting them) could reopen but never persist again. The
+            // liveness half of the proof is what keeps this from blocking
+            // materialization for an id that has since been handed back out.
+            if block_journal_device_is_retired(&devices.retired, commit.device_id) {
+                continue;
+            }
             let Some(durable) = durable_through.get(&commit.device_id) else {
                 continue;
             };
             if commit.commit_seq.raw() > durable.raw() {
                 continue;
             }
-            if materialized
+            if devices
+                .materialized
                 .get(&commit.device_id)
                 .is_some_and(|high| commit.commit_seq.raw() <= high.raw())
             {

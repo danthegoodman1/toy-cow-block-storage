@@ -2742,15 +2742,68 @@ fn append_block_journal_records_frame_into(
     Ok(())
 }
 
+/// The metadata view a journal record is resolved against: how far each
+/// device is already materialized, and which ids metadata proves are retired
+/// (`InMemoryMetadataPlane::retired_block_device_ids_locked`).
+pub(super) struct BlockJournalDeviceView {
+    pub(super) materialized: BTreeMap<DeviceId, CommitSeq>,
+    pub(super) retired: BTreeSet<DeviceId>,
+}
+
+/// Whether replay must skip every journal record naming `device_id`.
+///
+/// Replay resolves each record's device through `device_info`, so a record
+/// for a device that restored metadata does not know is normally corruption
+/// and must stay a hard error. The one benign case is a device that was
+/// deleted on purpose: `delete_device` drops the head but keeps the deleted
+/// head and a `DeleteRecord` naming the id, and nothing retired an already
+/// written `Lease` record for it, so without this a single leased-then-
+/// deleted device failed every later `open()` for the whole store.
+///
+/// Skipping the records of a device with no live head loses nothing: no lease
+/// can validate and no commit can resolve against a head that is not there.
+/// What this must NOT lean on is the id staying gone. Ids do come back —
+/// once retention expires the deleted head, `fork_device` accepts it as an
+/// explicit target again, because that guard rejects only ids which are live
+/// or CURRENTLY deleted. So the liveness half is load-bearing, not
+/// decorative: a reborn id resolves through `device_info` and is replayed
+/// normally, and the dead device's records must never seed into it. The
+/// retired set is already subtracted against the live heads once, at the top
+/// of replay; re-resolving per record is what makes this call self-sufficient
+/// rather than dependent on that set still being accurate.
+fn block_journal_replay_skips_retired_device(
+    local: &LocalCoordinator,
+    retired: &BTreeSet<DeviceId>,
+    device_id: DeviceId,
+) -> Result<bool> {
+    if !retired.contains(&device_id) {
+        return Ok(false);
+    }
+    match local.metadata.device_info(device_id) {
+        Ok(_) => Ok(false),
+        Err(StorageError::NotFound { .. }) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
 fn observe_block_journal_replay_write(
     local: &LocalCoordinator,
     overlay: &BlockJournalOverlay,
-    materialized: &BTreeMap<DeviceId, CommitSeq>,
+    devices: &BlockJournalDeviceView,
     latest_epoch: &mut BTreeMap<DeviceId, WriterEpoch>,
     writes: &mut BTreeMap<DeviceId, BTreeMap<u64, BlockJournalCommit>>,
     last_write_seq: &mut BTreeMap<DeviceId, u64>,
     commit: BlockJournalCommit,
 ) -> Result<()> {
+    if block_journal_replay_skips_retired_device(local, &devices.retired, commit.device_id)? {
+        // The commit is dead, but its sequence really was issued: keep the
+        // allocator floor above it so no live device is ever handed a
+        // sequence a durable record already names.
+        local
+            .metadata
+            .observe_allocated_commit_seq(commit.commit_seq)?;
+        return Ok(());
+    }
     if last_write_seq
         .get(&commit.device_id)
         .is_some_and(|previous| commit.commit_seq.raw() <= *previous)
@@ -2772,7 +2825,8 @@ fn observe_block_journal_replay_write(
         .entry(commit.device_id)
         .and_modify(|epoch| *epoch = (*epoch).max(commit.writer_epoch))
         .or_insert(commit.writer_epoch);
-    if materialized
+    if devices
+        .materialized
         .get(&commit.device_id)
         .is_some_and(|high| commit.commit_seq.raw() <= high.raw())
     {
@@ -2794,7 +2848,7 @@ impl DurableSqliteStore {
     fn load_block_journal_overlay(&self, local: &LocalCoordinator) -> Result<BlockJournalOverlay> {
         let records = self.block_journal_records()?;
         let overlay = BlockJournalOverlay::default();
-        let materialized = local.metadata.block_materialized_high_water()?;
+        let devices = local.metadata.block_journal_device_view()?;
         let mut latest_epoch = BTreeMap::<DeviceId, WriterEpoch>::new();
         let mut durable_through = BTreeMap::<DeviceId, CommitSeq>::new();
         let mut writes = BTreeMap::<DeviceId, BTreeMap<u64, BlockJournalCommit>>::new();
@@ -2806,6 +2860,13 @@ impl DurableSqliteStore {
                     device_id,
                     writer_epoch,
                 } => {
+                    if block_journal_replay_skips_retired_device(
+                        local,
+                        &devices.retired,
+                        device_id,
+                    )? {
+                        continue;
+                    }
                     local.seed_block_writer_epoch(device_id, writer_epoch)?;
                     overlay.set_writer_epoch(device_id, writer_epoch)?;
                     latest_epoch
@@ -2817,7 +2878,7 @@ impl DurableSqliteStore {
                     observe_block_journal_replay_write(
                         local,
                         &overlay,
-                        &materialized,
+                        &devices,
                         &mut latest_epoch,
                         &mut writes,
                         &mut last_write_seq,
@@ -2829,7 +2890,7 @@ impl DurableSqliteStore {
                         observe_block_journal_replay_write(
                             local,
                             &overlay,
-                            &materialized,
+                            &devices,
                             &mut latest_epoch,
                             &mut writes,
                             &mut last_write_seq,
@@ -2845,13 +2906,21 @@ impl DurableSqliteStore {
                     local
                         .metadata
                         .observe_allocated_commit_seq(flushed_through)?;
+                    if block_journal_replay_skips_retired_device(
+                        local,
+                        &devices.retired,
+                        device_id,
+                    )? {
+                        continue;
+                    }
                     local.seed_block_writer_epoch(device_id, writer_epoch)?;
                     overlay.mark_durable(device_id, writer_epoch, flushed_through, false)?;
                     latest_epoch
                         .entry(device_id)
                         .and_modify(|epoch| *epoch = (*epoch).max(writer_epoch))
                         .or_insert(writer_epoch);
-                    if materialized
+                    if devices
+                        .materialized
                         .get(&device_id)
                         .is_some_and(|high| flushed_through.raw() <= high.raw())
                     {
