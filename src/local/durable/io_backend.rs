@@ -92,6 +92,96 @@ impl ResolvedDurableLowLevelIoBackend {
         }
     }
 
+    /// Re-establish a torn shard tail: discard any partial frame bytes
+    /// past `end_offset` and persist the trim.
+    ///
+    /// Filesystem: a failed `write_all` may have extended the file by an
+    /// unknown amount, so truncate back to the last good end. Direct I/O:
+    /// the backend writes positionally from its tracked length, which a
+    /// failed write never advanced, so the next append overwrites the
+    /// damage in place; trimming the visible length keeps replay from
+    /// reading the stale bytes if no append ever comes.
+    fn recover_torn_tail(&self, path: &Path, end_offset: u64) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        match self {
+            Self::Filesystem => {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(fs_error)?;
+                if file.metadata().map_err(fs_error)?.len() > end_offset {
+                    file.set_len(end_offset).map_err(fs_error)?;
+                }
+                file.sync_data().map_err(fs_error)?;
+                Ok(())
+            }
+            Self::DirectIo(backend) => backend.recover_torn_tail(path, end_offset),
+        }
+    }
+
+    /// Alignment appends are padded to, if any: zero runs in a journal
+    /// region are legal only as padding to this boundary.
+    fn append_alignment(&self) -> Option<usize> {
+        match self {
+            Self::Filesystem => None,
+            Self::DirectIo(backend) => Some(backend.alignment),
+        }
+    }
+
+    /// Read `[from, to)` of a journal file for tail recovery.
+    fn read_tail_region(&self, path: &Path, from: u64, to: u64) -> Result<Vec<u8>> {
+        let len = usize::try_from(to.saturating_sub(from)).map_err(|_| {
+            StorageError::invalid_argument("journal tail region length overflows usize")
+        })?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        use std::os::unix::fs::FileExt;
+
+        match self {
+            Self::Filesystem => {
+                let file = OpenOptions::new().read(true).open(path).map_err(fs_error)?;
+                let mut bytes = vec![0_u8; len];
+                file.read_exact_at(&mut bytes, from).map_err(fs_error)?;
+                Ok(bytes)
+            }
+            Self::DirectIo(backend) => backend.read_tail_region(path, from, len),
+        }
+    }
+
+    /// Re-establish durability for a validated suspect region after a
+    /// failed data sync by rewriting the bytes in place and syncing them.
+    /// The rewrite re-dirties every page so the fsync below really covers
+    /// them (fsync reports an error once and clears it; only pages dirtied
+    /// after the failure are covered by a later successful fsync). The
+    /// region is rewritten, never truncated: it can hold intact
+    /// acknowledged-durability records that a later Flush boundary must
+    /// still be able to make durable.
+    fn rewrite_tail_region(&self, path: &Path, from: u64, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Filesystem => {
+                if !path.exists() {
+                    return Ok(());
+                }
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(fs_error)?;
+                if !bytes.is_empty() {
+                    use std::os::unix::fs::FileExt;
+
+                    file.write_all_at(bytes, from).map_err(fs_error)?;
+                }
+                file.sync_data().map_err(fs_error)?;
+                Ok(())
+            }
+            Self::DirectIo(backend) => backend.rewrite_tail_region(path, from, bytes),
+        }
+    }
+
     fn sync_file(&self, file: DataLogFileToSync) -> Result<(u64, u64)> {
         let started = Instant::now();
         file.file.sync_data().map_err(fs_error)?;
@@ -272,6 +362,90 @@ impl DirectIoFileBackend {
         lock(&self.files)?.remove(path);
         Ok(())
     }
+
+    /// See `ResolvedDurableLowLevelIoBackend::recover_torn_tail`.
+    ///
+    /// `end_offset` may be unaligned when the tail was initialized from a
+    /// crash-torn file (the consumed prefix ends wherever the last intact
+    /// frame did). Direct I/O files must keep aligned lengths, so the torn
+    /// suffix of the final block is zeroed in place (zeros parse as
+    /// padding) and the file is trimmed to the alignment boundary.
+    fn recover_torn_tail(&self, path: &Path, end_offset: u64) -> Result<()> {
+        let alignment = usize_to_u64(self.alignment);
+        let aligned_end = end_offset
+            .checked_add(alignment - 1)
+            .map(|value| value / alignment * alignment)
+            .ok_or_else(|| {
+                StorageError::invalid_argument("direct I/O tail recovery length overflows")
+            })?;
+        let (handle, _, _) = self.file(path)?;
+        let mut file = lock(handle.as_ref())?;
+        if end_offset != aligned_end {
+            // Zero the torn suffix of the final block via an aligned
+            // read-modify-write.
+            let block_start = end_offset / alignment * alignment;
+            let suffix_from = usize::try_from(end_offset - block_start).map_err(|_| {
+                StorageError::invalid_argument("direct I/O tail recovery offset overflows")
+            })?;
+            file.scratch.ensure_len(self.alignment)?;
+            let DirectIoFile { file, scratch, .. } = &mut *file;
+            let block = &mut scratch.as_mut_slice()[..self.alignment];
+            block.fill(0);
+            if file.metadata().map_err(fs_error)?.len() > block_start {
+                use std::os::unix::fs::FileExt;
+
+                // The block may extend past the physical end; read what is
+                // there and keep the intact prefix.
+                let _ = file.read_at(block, block_start).map_err(fs_error)?;
+            }
+            block[suffix_from..].fill(0);
+            write_all_at(
+                file,
+                &scratch.as_slice()[..self.alignment],
+                block_start,
+                self.alignment,
+            )?;
+        }
+        if file.file.metadata().map_err(fs_error)?.len() > aligned_end {
+            file.file.set_len(aligned_end).map_err(fs_error)?;
+        }
+        file.len = aligned_end;
+        file.file.sync_data().map_err(fs_error)?;
+        Ok(())
+    }
+
+    /// See `ResolvedDurableLowLevelIoBackend::read_tail_region`.
+    fn read_tail_region(&self, path: &Path, from: u64, len: usize) -> Result<Vec<u8>> {
+        let (handle, _, _) = self.file(path)?;
+        let mut file = lock(handle.as_ref())?;
+        file.scratch.ensure_len(len)?;
+        let DirectIoFile { file, scratch, .. } = &mut *file;
+        read_exact_at_direct(file, scratch.as_mut_slice(), len, from)?;
+        Ok(scratch.as_slice()[..len].to_vec())
+    }
+
+    /// See `ResolvedDurableLowLevelIoBackend::rewrite_tail_region`. The
+    /// range bounds are alignment multiples by construction (appends and
+    /// sync covers only advance the tail by aligned physical lengths).
+    fn rewrite_tail_region(&self, path: &Path, from: u64, bytes: &[u8]) -> Result<()> {
+        let (handle, _, _) = self.file(path)?;
+        let mut file = lock(handle.as_ref())?;
+        if !bytes.is_empty() {
+            if !bytes.len().is_multiple_of(self.alignment)
+                || !from.is_multiple_of(usize_to_u64(self.alignment))
+            {
+                return Err(StorageError::corrupt(
+                    "direct I/O journal tail rewrite range is not aligned",
+                ));
+            }
+            file.scratch.ensure_len(bytes.len())?;
+            let DirectIoFile { file, scratch, .. } = &mut *file;
+            scratch.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+            write_all_at(file, &scratch.as_slice()[..bytes.len()], from, self.alignment)?;
+        }
+        file.file.sync_data().map_err(fs_error)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -333,6 +507,20 @@ fn open_direct_io_file(path: &Path) -> Result<File> {
 
 #[cfg(not(target_os = "linux"))]
 fn open_direct_io_file(_path: &Path) -> Result<File> {
+    Err(StorageError::unsupported(
+        "direct I/O backend requires Linux O_DIRECT support",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn read_exact_at_direct(file: &File, buf: &mut [u8], len: usize, offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    file.read_exact_at(&mut buf[..len], offset).map_err(fs_error)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_exact_at_direct(_file: &File, _buf: &mut [u8], _len: usize, _offset: u64) -> Result<()> {
     Err(StorageError::unsupported(
         "direct I/O backend requires Linux O_DIRECT support",
     ))

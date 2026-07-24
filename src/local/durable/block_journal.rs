@@ -180,6 +180,10 @@ pub(super) enum BlockJournalLaneRequest {
 pub(super) struct BlockJournalFlushCoordinator {
     inner: Mutex<BlockJournalFlushState>,
     cvar: Condvar,
+    /// Dedicated condvar for the pipeline's two ordering waits (append
+    /// window and sync turn): at most one batch owner parks on it, so
+    /// signaling it never wakes the whole waiter herd on `cvar`.
+    pipeline_cvar: Condvar,
 }
 
 /// Leader-side timing for one journal lane batch, attributing time spent
@@ -223,11 +227,40 @@ pub(super) struct BlockJournalLaneBatchTiming {
     /// Device-pending-payloads mutex wait on the row's path (acknowledged
     /// registration or the lane leader's payload recheck).
     pub(super) pending_payload_lock_wait_nanos: u64,
+    /// Pipeline ordering wait, three components: the append-window wait
+    /// (parked through the predecessor's whole fsync — the dominant
+    /// component by design), the sync-turn wait after this batch's own
+    /// append, and the rare pre-append poison drain. A time bucket, not a
+    /// lock-wait column: it is the deliberate serialization point of the
+    /// two-stage pipeline.
+    pub(super) pipeline_order_wait_nanos: u64,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct BlockJournalFlushState {
-    in_flight: bool,
+    /// Exclusive WRITE stage of the two-stage lane pipeline: the owner
+    /// holds it through payload recheck, encode, and the journal append,
+    /// then releases it so the next batch can encode and write while this
+    /// batch's fsync is still in flight.
+    write_stage_busy: bool,
+    /// Ticket handed to each elected batch, in election order. Because the
+    /// write stage is exclusive, ticket order is also journal append order.
+    next_batch_ticket: u64,
+    /// Ticket allowed into the serialized SYNC stage (own fsync, publish,
+    /// waiter completion). Advancing this is the pipeline's ordering
+    /// commitment: per-device publish order equals ticket order.
+    next_sync_ticket: u64,
+    /// Set when a batch's data sync failed: every batch with a ticket
+    /// GREATER than the stored ticket must error instead of acknowledging
+    /// (its frames sit beyond bytes whose durability is unknown). Cleared
+    /// by the first later batch after it drains the pipeline and its
+    /// recovering append re-establishes the shard tail.
+    poisoned_after: Option<(u64, StorageError)>,
+    /// True while the sync-stage owner is at or past its fsync. The next
+    /// batch times its append to this window, so the batch captures every
+    /// request that arrived before the predecessor's fsync began and the
+    /// encode+write genuinely overlap that fsync.
+    stage_s_syncing: bool,
     generation: u64,
     next_request_id: u64,
     pending: BTreeMap<u64, BlockJournalLaneRequest>,
@@ -240,6 +273,18 @@ pub(super) struct BlockJournalFlushState {
 }
 
 impl BlockJournalFlushState {
+    /// Whether a new batch may be elected into the write stage.
+    ///
+    /// The pipeline is exactly two deep: one batch in the write stage
+    /// overlapping one batch in the sync stage. Electing a third batch
+    /// while one is already parked waiting for its sync turn would only
+    /// fragment group commit — arrivals during an in-flight sync must
+    /// accumulate in `pending` and form ONE next batch, which is what gave
+    /// the serial lane its batching (its busy window spanned the sync).
+    fn admits_election(&self) -> bool {
+        self.next_batch_ticket.saturating_sub(self.next_sync_ticket) <= 1
+    }
+
     fn enqueue(&mut self, request: BlockJournalLaneRequest) -> u64 {
         if let BlockJournalLaneRequest::Write { commit, .. } = &request {
             *self.unapplied_writes.entry(commit.device_id).or_default() += 1;
@@ -272,6 +317,7 @@ impl BlockJournalFlushCoordinator {
         Self {
             inner: Mutex::new(BlockJournalFlushState::default()),
             cvar: Condvar::new(),
+            pipeline_cvar: Condvar::new(),
         }
     }
 }

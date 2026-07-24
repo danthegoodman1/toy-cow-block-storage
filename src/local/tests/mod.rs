@@ -22602,3 +22602,894 @@ fn read_resolve_profile_reports_tree_walk_placement_and_contended_metadata_lock_
         profiles[0].metadata_lock_wait_nanos
     );
 }
+
+fn pipeline_store(
+    name: &str,
+) -> (
+    PathBuf,
+    std::sync::Arc<DurableCoordinator>,
+    DeviceId,
+    BlockWriterLease,
+) {
+    let root = durable_temp_dir(name);
+    let store = std::sync::Arc::new(DurableCoordinator::open(&root, config()).unwrap());
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some(name.to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    (root, store, device_id, lease)
+}
+
+fn read_block(store: &DurableCoordinator, device_id: DeviceId, block: u64) -> Vec<u8> {
+    let mut bytes = vec![0_u8; 4096];
+    store
+        .read_device(device_id, ByteRange::new(block * 4096, 4096), &mut bytes)
+        .unwrap();
+    bytes
+}
+
+#[test]
+fn durable_block_journal_pipeline_append_failure_errors_batch_and_recovers_tail() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-append-failure");
+    store
+        .request_block_journal_write_stage_pause_for_test()
+        .unwrap();
+    let first = repeated_blocks(1, 11);
+    let second = repeated_blocks(1, 12);
+    let (first_result, second_result) = thread::scope(|scope| {
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let first = &first;
+        let second = &second;
+        let first_write = scope.spawn(move || {
+            first_store.write_device_with_writer(
+                lease,
+                0,
+                first,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_write_stage_pause_for_test()
+            .unwrap();
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                4096,
+                second,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        while lane.inner.lock().unwrap().pending.is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        store.fail_next_block_journal_append_for_test();
+        store.resume_block_journal_write_stage_for_test().unwrap();
+        (first_write.join().unwrap(), second_write.join().unwrap())
+    });
+    assert!(matches!(
+        first_result,
+        Err(StorageError::Unavailable { reason })
+            if reason.contains("injected block journal append failure")
+    ));
+    // The failed append poisoned the shard tail; the queued batch's own
+    // append re-established it inline and succeeded (agreed deviation: no
+    // frame was ever written past the failure before recovery, so erroring
+    // the second batch would be spurious).
+    second_result.unwrap();
+
+    assert_eq!(read_block(&store, device_id, 0), vec![0; 4096]);
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 12));
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), vec![0; 4096]);
+    assert_eq!(read_block(&reopened, device_id, 1), repeated_blocks(1, 12));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_pipeline_sync_failure_recovers_via_next_batch_append() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-sync-poison");
+    store
+        .request_block_journal_sync_stage_pause_for_test()
+        .unwrap();
+    let first = repeated_blocks(1, 21);
+    let second = repeated_blocks(1, 22);
+    let (first_result, second_result) = thread::scope(|scope| {
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let first = &first;
+        let second = &second;
+        let first_write = scope.spawn(move || {
+            first_store.write_device_with_writer(
+                lease,
+                0,
+                first,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_sync_stage_pause_for_test()
+            .unwrap();
+        // The second batch elects and parks in its append window: batches
+        // never write behind an unfinished fsync, so a failed sync can
+        // never strand fully written successor frames.
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                4096,
+                second,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        loop {
+            let state = lane.inner.lock().unwrap();
+            if state.write_stage_busy && state.next_batch_ticket >= 2 {
+                break;
+            }
+            drop(state);
+            thread::sleep(Duration::from_millis(1));
+        }
+        store.fail_next_block_journal_sync_for_test();
+        store.resume_block_journal_sync_stage_for_test().unwrap();
+        (first_write.join().unwrap(), second_write.join().unwrap())
+    });
+    assert!(matches!(
+        &first_result,
+        Err(StorageError::Unavailable { reason })
+            if reason.contains("injected block journal sync failure")
+    ));
+    // The parked successor drains the poisoned pipeline, its append
+    // validates and rewrites the suspect tail, and it completes normally:
+    // its frames were written after the tail was re-established.
+    second_result.unwrap();
+    assert_eq!(read_block(&store, device_id, 0), vec![0; 4096]);
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 22));
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    // Deliberately no assertion on block 0 after reopen: the failed
+    // batch's frames were rewritten durable by the recovery, and an
+    // errored write MAY apply at replay under the provider's pre-existing
+    // errored-write semantics — asserting either way would encode more
+    // than the contract promises.
+    assert_eq!(read_block(&reopened, device_id, 1), repeated_blocks(1, 22));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_pipeline_credits_records_only_to_their_own_sync() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-sync-coverage");
+    store.enable_persist_profiling(64).unwrap();
+    let ack_device = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("pipeline-sync-coverage-ack".to_string()),
+        })
+        .unwrap();
+    let ack_lease = store.acquire_block_writer(ack_device).unwrap();
+    let shard = store.durable.block_journal_shard_for_device(device_id);
+    assert_eq!(
+        shard,
+        store.durable.block_journal_shard_for_device(ack_device),
+        "coverage test requires both devices on one shard"
+    );
+
+    // Hold a flushed write's fsync in flight (after its coverage capture)
+    // while an acknowledged bypass record lands on the same shard.
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(120))
+        .unwrap();
+    thread::scope(|scope| {
+        let write_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let flushed = scope.spawn(move || {
+            write_store.write_device_with_writer(
+                lease,
+                0,
+                &repeated_blocks(1, 31),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        thread::sleep(Duration::from_millis(40));
+        store
+            .write_device_with_writer(
+                &ack_lease,
+                0,
+                &repeated_blocks(1, 32),
+                WriteDurability::Acknowledged,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+        flushed.join().unwrap().unwrap();
+    });
+    // The ack record was appended while the fsync was in flight: the
+    // finished sync must not have credited it.
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        assert!(
+            tail.synced_offset < tail.end_offset,
+            "bytes appended during an in-flight fsync must stay uncovered"
+        );
+    }
+    // Its own later sync (the flush boundary) covers it.
+    store.flush_device_with_writer(&ack_lease).unwrap();
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        assert_eq!(tail.synced_offset, tail.end_offset);
+    }
+
+    // Order-wait bucket: hold a batch at its fsync while a second batch
+    // waits for its append window.
+    let _ = store.drain_persist_profiles(64).unwrap();
+    store
+        .request_block_journal_sync_stage_pause_for_test()
+        .unwrap();
+    thread::scope(|scope| {
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let first_write = scope.spawn(move || {
+            first_store.write_device_with_writer(
+                lease,
+                2 * 4096,
+                &repeated_blocks(1, 33),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_sync_stage_pause_for_test()
+            .unwrap();
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                3 * 4096,
+                &repeated_blocks(1, 34),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        // Wait until the second batch is parked in its append window.
+        let (_, lane) = store.block_journal_lane(device_id).unwrap();
+        loop {
+            let state = lane.inner.lock().unwrap();
+            if state.write_stage_busy && state.next_batch_ticket >= 2 {
+                break;
+            }
+            drop(state);
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(30));
+        store.resume_block_journal_sync_stage_for_test().unwrap();
+        first_write.join().unwrap().unwrap();
+        second_write.join().unwrap().unwrap();
+    });
+    let profiles = store.drain_persist_profiles(64).unwrap();
+    let max_order_wait = profiles
+        .iter()
+        .map(|profile| profile.block_journal_pipeline_order_wait_nanos)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_order_wait >= 10_000_000,
+        "expected the second batch to record its append-window wait, got {max_order_wait} nanos"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_pipeline_preserves_read_your_write_visibility() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-read-your-write");
+    let workers = 4_u64;
+    let writes_per_worker = 6_u64;
+    thread::scope(|scope| {
+        for worker in 0..workers {
+            let store = std::sync::Arc::clone(&store);
+            let lease = &lease;
+            scope.spawn(move || {
+                for index in 0..writes_per_worker {
+                    let block = worker * writes_per_worker + index;
+                    let byte = 100 + block as u8;
+                    store
+                        .write_device_with_writer(
+                            lease,
+                            block * 4096,
+                            &repeated_blocks(1, byte),
+                            WriteDurability::Flushed,
+                            PayloadIntegrity::Verified,
+                        )
+                        .unwrap();
+                    // Read-your-write immediately after the flushed commit
+                    // returns, while other lanes batches are in flight.
+                    let mut bytes = vec![0_u8; 4096];
+                    store
+                        .read_device(device_id, ByteRange::new(block * 4096, 4096), &mut bytes)
+                        .unwrap();
+                    assert_eq!(bytes, repeated_blocks(1, byte));
+                }
+            });
+        }
+    });
+    for block in 0..workers * writes_per_worker {
+        assert_eq!(
+            read_block(&store, device_id, block),
+            repeated_blocks(1, 100 + block as u8)
+        );
+    }
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    for block in 0..workers * writes_per_worker {
+        assert_eq!(
+            read_block(&reopened, device_id, block),
+            repeated_blocks(1, 100 + block as u8)
+        );
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_pipeline_rejects_stale_lease_across_batches() {
+    let (root, store, device_id, stale) = pipeline_store("pipeline-stale-lease");
+    store
+        .write_device_with_writer(
+            &stale,
+            0,
+            &repeated_blocks(1, 41),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let fresh = store.acquire_block_writer(device_id).unwrap();
+    // Hold a fresh-lease batch mid-pipeline and interleave a stale write.
+    store
+        .request_block_journal_sync_stage_pause_for_test()
+        .unwrap();
+    thread::scope(|scope| {
+        let fresh_store = std::sync::Arc::clone(&store);
+        let fresh = &fresh;
+        let fresh_write = scope.spawn(move || {
+            fresh_store.write_device_with_writer(
+                fresh,
+                4096,
+                &repeated_blocks(1, 42),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_sync_stage_pause_for_test()
+            .unwrap();
+        assert!(matches!(
+            store.write_device_with_writer(
+                &stale,
+                2 * 4096,
+                &repeated_blocks(1, 43),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            ),
+            Err(StorageError::Conflict { .. })
+        ));
+        store.resume_block_journal_sync_stage_for_test().unwrap();
+        fresh_write.join().unwrap().unwrap();
+    });
+    assert!(matches!(
+        store.flush_device_with_writer(&stale),
+        Err(StorageError::Conflict { .. })
+    ));
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 42));
+    assert_eq!(read_block(&store, device_id, 2), vec![0; 4096]);
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_pipeline_replay_matches_acknowledged_prefix_after_crash() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-crash-residue");
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 51),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let shard_path = store.durable.block_journal_shard_path_for_device(device_id);
+    drop(store);
+
+    // Simulate a crash torn mid-append: a frame header promising more
+    // payload than the file holds, exactly what an interrupted write leaves.
+    {
+        let mut torn = Vec::new();
+        torn.extend_from_slice(b"BLKJNL01");
+        torn.extend_from_slice(&1000_u64.to_le_bytes());
+        torn.extend_from_slice(&0_u64.to_le_bytes());
+        torn.extend_from_slice(&[0xAB; 10]);
+        let mut file = OpenOptions::new().append(true).open(&shard_path).unwrap();
+        file.write_all(&torn).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    // Replay stops at the torn frame: the acknowledged prefix survives.
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 51));
+    // The first append truncates the residue (the tail initialized as
+    // torn) and the lane runs normally afterwards.
+    let lease = reopened.acquire_block_writer(device_id).unwrap();
+    reopened
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 52),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    drop(reopened);
+
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 51));
+    assert_eq!(read_block(&reopened, device_id, 1), repeated_blocks(1, 52));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_pipeline_failed_tail_recovery_keeps_lane_poisoned() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-failed-recovery");
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 61),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.fail_next_block_journal_sync_for_test();
+    assert!(
+        store
+            .write_device_with_writer(
+                &lease,
+                4096,
+                &repeated_blocks(1, 62),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .is_err()
+    );
+    // Recovery itself fails: the lane stays poisoned and everything that
+    // needs the shard tail keeps erroring, acknowledging nothing.
+    store.fail_next_block_journal_tail_recovery_for_test();
+    assert!(matches!(
+        store.write_device_with_writer(
+            &lease,
+            2 * 4096,
+            &repeated_blocks(1, 63),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Unavailable { reason })
+            if reason.contains("injected block journal tail recovery failure")
+    ));
+    store.fail_next_block_journal_tail_recovery_for_test();
+    assert!(
+        store
+            .write_device_with_writer(
+                &lease,
+                3 * 4096,
+                &repeated_blocks(1, 64),
+                WriteDurability::Acknowledged,
+                PayloadIntegrity::Verified,
+            )
+            .is_err()
+    );
+    for block in [1_u64, 2, 3] {
+        assert_eq!(read_block(&store, device_id, block), vec![0; 4096]);
+    }
+    // Once recovery can run, the next batch re-establishes the tail and
+    // the lane serves writes again.
+    store
+        .write_device_with_writer(
+            &lease,
+            4 * 4096,
+            &repeated_blocks(1, 65),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 61));
+    assert_eq!(read_block(&store, device_id, 4), repeated_blocks(1, 65));
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 61));
+    assert_eq!(read_block(&reopened, device_id, 4), repeated_blocks(1, 65));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_sync_suspect_recovery_preserves_ack_records_for_later_flush() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-ack-preserved");
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 71),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    // An acknowledged bypass record lands beyond the synced offset.
+    store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 72),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    // A failed sync poisons the tail with the ack record inside the
+    // suspect region.
+    store.fail_next_block_journal_sync_for_test();
+    assert!(
+        store
+            .write_device_with_writer(
+                &lease,
+                2 * 4096,
+                &repeated_blocks(1, 73),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .is_err()
+    );
+    // The flush drains the poison, and recovery REWRITES the suspect
+    // region rather than truncating it: truncation would delete the ack
+    // record while this very flush then promised durability for it.
+    let flush = store.flush_device_with_writer(&lease).unwrap();
+    assert!(flush.durable_through.raw() > 0);
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 72));
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 71));
+    // The flush-covered ack record replays: durability was promised and
+    // kept because the record survived recovery.
+    assert_eq!(read_block(&reopened, device_id, 1), repeated_blocks(1, 72));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_sync_suspect_recovery_fails_safe_when_pages_dropped() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-ack-dropped");
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 81),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let shard_path = store.durable.block_journal_shard_path_for_device(device_id);
+    let synced_len = fs::metadata(&shard_path).unwrap().len();
+    store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 82),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.fail_next_block_journal_sync_for_test();
+    assert!(
+        store
+            .write_device_with_writer(
+                &lease,
+                2 * 4096,
+                &repeated_blocks(1, 83),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .is_err()
+    );
+    let end_len = fs::metadata(&shard_path).unwrap().len();
+    // Simulate the kernel dropping the suspect dirty pages after the fsync
+    // error: the un-synced region reads back as zeros.
+    {
+        use std::os::unix::fs::FileExt;
+
+        let file = OpenOptions::new().write(true).open(&shard_path).unwrap();
+        let zeros = vec![0_u8; (end_len - synced_len) as usize];
+        file.write_all_at(&zeros, synced_len).unwrap();
+        file.sync_data().unwrap();
+    }
+    // Recovery validation reads back zeros where frames were written:
+    // recovery fails and the shard stays poisoned, so no flush can falsely
+    // promise durability for the destroyed ack record.
+    assert!(matches!(
+        store.flush_device_with_writer(&lease),
+        Err(StorageError::Corrupt { reason })
+            if reason.contains("journal tail recovery read back zero bytes")
+    ));
+    assert!(
+        store
+            .write_device_with_writer(
+                &lease,
+                3 * 4096,
+                &repeated_blocks(1, 84),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .is_err()
+    );
+    drop(store);
+    // After the crash the destroyed records are simply gone — which is
+    // safe, because nothing ever acknowledged their durability.
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 81));
+    assert_eq!(read_block(&reopened, device_id, 1), vec![0; 4096]);
+    assert_eq!(read_block(&reopened, device_id, 2), vec![0; 4096]);
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_pipeline_ack_append_tear_recovers_before_next_lane_append() {
+    let (root, store, device_id, lease) = pipeline_store("pipeline-ack-tear-pre-append");
+    let ack_device = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("pipeline-ack-tear-source".to_string()),
+        })
+        .unwrap();
+    let ack_lease = store.acquire_block_writer(ack_device).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 91),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    // Hold a lane batch in its write stage past the append window (the
+    // poison checks) but before its journal append.
+    store
+        .request_block_journal_write_stage_pause_for_test()
+        .unwrap();
+    let second = repeated_blocks(1, 92);
+    let second_result = thread::scope(|scope| {
+        let second_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let second = &second;
+        let second_write = scope.spawn(move || {
+            second_store.write_device_with_writer(
+                lease,
+                4096,
+                second,
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        store
+            .wait_for_block_journal_write_stage_pause_for_test()
+            .unwrap();
+        // An acknowledged bypass append on the same shard tears the tail
+        // AFTER the lane batch passed its checks and BEFORE its frames are
+        // written — the subtlest remaining interleave.
+        store.fail_next_block_journal_append_for_test();
+        assert!(
+            store
+                .write_device_with_writer(
+                    &ack_lease,
+                    0,
+                    &repeated_blocks(1, 93),
+                    WriteDurability::Acknowledged,
+                    PayloadIntegrity::Verified,
+                )
+                .is_err()
+        );
+        store.resume_block_journal_write_stage_for_test().unwrap();
+        second_write.join().unwrap()
+    });
+    // The lane batch's own append repaired the torn tail inline before
+    // writing its frames, so it completes normally.
+    second_result.unwrap();
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 92));
+    assert_eq!(read_block(&store, ack_device, 0), vec![0; 4096]);
+
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 91));
+    assert_eq!(read_block(&reopened, device_id, 1), repeated_blocks(1, 92));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_direct_io_sync_suspect_zeroed_blocks_fail_safe() {
+    let root = durable_temp_dir("pipeline-dio-zeroed-region");
+    let cfg = config();
+    // Strict direct-I/O backend; skip (like the io_backend probe tests)
+    // where the filesystem does not support O_DIRECT.
+    let store = match DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend(
+        &root,
+        cfg,
+        vec![cfg.storage_node],
+        DurableDataLogPolicy::default(),
+        None,
+        AppendPublishBatchPolicy::default(),
+        BlockJournalBatchPolicy::default(),
+        AppendIngestPolicy::default(),
+        "direct-io",
+    ) {
+        Ok(store) => std::sync::Arc::new(store),
+        Err(_) => {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+    };
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("pipeline-dio-zeroed-region".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 85),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let shard_path = store.durable.block_journal_shard_path_for_device(device_id);
+    let synced_len = fs::metadata(&shard_path).unwrap().len();
+    store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 86),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    store.fail_next_block_journal_sync_for_test();
+    assert!(
+        store
+            .write_device_with_writer(
+                &lease,
+                2 * 4096,
+                &repeated_blocks(1, 87),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .is_err()
+    );
+    let end_len = fs::metadata(&shard_path).unwrap().len();
+    assert!(end_len > synced_len);
+    // The direct-I/O analogue of dropped pages: the device lost the
+    // suspect writes and whole ALIGNED BLOCKS read back as zeros. Without
+    // the boundary rule this region would validate as pure padding.
+    {
+        use std::os::unix::fs::FileExt;
+
+        let file = OpenOptions::new().write(true).open(&shard_path).unwrap();
+        let zeros = vec![0_u8; (end_len - synced_len) as usize];
+        file.write_all_at(&zeros, synced_len).unwrap();
+        file.sync_data().unwrap();
+    }
+    assert!(matches!(
+        store.flush_device_with_writer(&lease),
+        Err(StorageError::Corrupt { reason })
+            if reason.contains("zero run at an alignment boundary")
+    ));
+    assert!(
+        store
+            .write_device_with_writer(
+                &lease,
+                3 * 4096,
+                &repeated_blocks(1, 88),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .is_err()
+    );
+    drop(store);
+    // Nothing ever acknowledged durability for the zeroed records; after
+    // the crash they are simply gone while the synced prefix survives.
+    let reopened = DurableCoordinator::open_with_storage_nodes_data_log_policy_append_visible_publish_journal_append_policies_and_low_level_io_backend(
+        &root,
+        cfg,
+        vec![cfg.storage_node],
+        DurableDataLogPolicy::default(),
+        None,
+        AppendPublishBatchPolicy::default(),
+        BlockJournalBatchPolicy::default(),
+        AppendIngestPolicy::default(),
+        "direct-io",
+    )
+    .unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 85));
+    assert_eq!(read_block(&reopened, device_id, 1), vec![0; 4096]);
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn block_journal_frame_region_validator_rejects_boundary_zero_runs() {
+    let alignment = 4096_usize;
+    // A legal direct-I/O region: one frame whose zero padding is a strict
+    // tail of its final block.
+    let mut frame = Vec::new();
+    let payload = encode_row(&vec![BlockJournalRecord::Lease {
+        device_id: DeviceId::from_raw(1),
+        writer_epoch: WriterEpoch::from_raw(1),
+    }])
+    .unwrap();
+    frame.extend_from_slice(b"BLKJNL01");
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&data_log_checksum(&payload).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    let mut region = frame.clone();
+    region.resize(alignment, 0);
+    validate_block_journal_frame_region(&region, Some(alignment)).unwrap();
+    // Buffered regions permit no zeros at all.
+    assert!(validate_block_journal_frame_region(&region, None).is_err());
+    // A wholly zeroed aligned region must NOT validate as padding: legal
+    // padding never starts at an alignment boundary (offset zero is one).
+    let zeroed = vec![0_u8; alignment];
+    assert!(matches!(
+        validate_block_journal_frame_region(&zeroed, Some(alignment)),
+        Err(StorageError::Corrupt { reason })
+            if reason.contains("zero run at an alignment boundary")
+    ));
+    // Same for a zeroed block after an intact one mid-region.
+    let mut trailing_zeroed = region.clone();
+    trailing_zeroed.resize(2 * alignment, 0);
+    assert!(matches!(
+        validate_block_journal_frame_region(&trailing_zeroed, Some(alignment)),
+        Err(StorageError::Corrupt { reason })
+            if reason.contains("zero run at an alignment boundary")
+    ));
+}

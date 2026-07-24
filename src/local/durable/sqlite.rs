@@ -11,7 +11,10 @@ pub(super) struct DurableSqliteStore {
     // Sorted at open and validated against the persisted shard count, so
     // device-to-shard routing is stable across reopens.
     block_journal_shard_nodes: Arc<Vec<StorageNodeId>>,
-    block_journal_shard_locks: Arc<Vec<Mutex<()>>>,
+    // One lock per journal shard guarding both the shard file's append
+    // order and its tracked tail state (offsets plus poison), so tail
+    // safety decisions and file writes are made under one authority.
+    block_journal_shard_locks: Arc<Vec<Mutex<BlockJournalShardTail>>>,
     native_publish_journal_lock: Arc<Mutex<()>>,
     append_visible_publish_journal_lock: Arc<Mutex<()>>,
     append_visible_publish_journal_lane_locks: Arc<Vec<Mutex<()>>>,
@@ -27,6 +30,12 @@ pub(super) struct DurableSqliteStore {
     append_payload_sync_delay: Arc<Mutex<Option<Duration>>>,
     #[cfg(test)]
     fail_next_block_journal_append: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_block_journal_sync: Arc<AtomicBool>,
+    #[cfg(test)]
+    block_journal_sync_delay: Arc<Mutex<Option<Duration>>>,
+    #[cfg(test)]
+    fail_next_block_journal_tail_recovery: Arc<AtomicBool>,
     #[cfg(test)]
     fail_node_segment_append: Arc<Mutex<Option<StorageNodeId>>>,
 }
@@ -134,13 +143,16 @@ pub struct DurablePersistProfile {
     /// `lock_timed`). Same-row carve-out, like every other
     /// `*_lock_wait_nanos` column below except the `enqueue_` pair.
     ///
-    /// Metric convention note for this and the six columns below: these
+    /// Metric convention note for the seven `block_journal_*_lock_wait_nanos`
+    /// columns (`append`, `publish_reserve`, `overlay`, `staging`,
+    /// `enqueue_staging`, `enqueue_reserve`, `pending_payload`): these
     /// report CONTENDED-ONLY wait via `lock_timed`, while the pre-existing
     /// `*_lock_wait_nanos` columns above (persist, sqlite, metadata
     /// publish, node-catalog, append-visible journal, publish mark) and the
     /// M5 catalog-hold CSV keep their original pair-per-acquisition
     /// "acquisition elapsed" meaning — cross-column comparisons mix the two
-    /// metrics.
+    /// metrics. `block_journal_pipeline_order_wait_nanos` below is neither:
+    /// it is an unconditional time bucket.
     pub block_journal_append_lock_wait_nanos: u64,
     /// Contended metadata-plane mutex wait on this row's own commit path:
     /// device-spec lookups, commit-seq reserves, and publish-head advances
@@ -172,6 +184,13 @@ pub struct DurablePersistProfile {
     /// flush-boundary payload recheck (inside the payload-recheck bucket;
     /// contended-only, zero when uncontended; see `lock_timed`).
     pub block_journal_pending_payload_lock_wait_nanos: u64,
+    /// Pipeline ordering wait, three components: the append-window wait
+    /// (the batch owner parks through its predecessor's whole fsync — the
+    /// dominant component by design), the sync-turn wait after its own
+    /// append, and the rare pre-append poison drain. An unconditional time
+    /// bucket like the other `*_nanos` stage columns, not a contended-only
+    /// lock-wait column.
+    pub block_journal_pipeline_order_wait_nanos: u64,
 }
 
 /// Process-local timing for one append publish wait call.
@@ -1886,9 +1905,50 @@ const DURABLE_JOURNAL_PREALLOC_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"TCPJNL01";
 const APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"AVPJNL01";
 
+/// Tracked tail of one block-journal shard file.
+///
+/// Guarded by the shard's journal lock, which is the authority on file
+/// order: every writer (lane batches and the acknowledged bypass path)
+/// appends under it, so poison decisions here are race-free — after a
+/// failure no writer can put an intact frame beyond the damaged region,
+/// which replay would silently drop after truncating at the first torn
+/// frame.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct BlockJournalShardTail {
+    initialized: bool,
+    /// Exclusive end offset of the last fully successful append (physical
+    /// bytes, including any direct-I/O alignment padding).
+    end_offset: u64,
+    /// End offset covered by the last successful data sync.
+    synced_offset: u64,
+    poison: Option<BlockJournalTailPoison>,
+}
+
+/// Why a shard tail is unsafe to append past, and how to re-establish it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlockJournalTailPoison {
+    /// A failed append may have left partial frame bytes past `end_offset`;
+    /// recovery truncates back to `end_offset`.
+    Torn,
+    /// A failed data sync left `[synced_offset, end_offset)` with unknown
+    /// durability (after fsync reports an error the kernel may drop the
+    /// dirty pages, so a LATER successful fsync does not cover them).
+    /// Recovery rewrites that range in place and syncs it. Truncating
+    /// instead would be unsound: the range can hold intact
+    /// acknowledged-durability bypass records that a later Flush boundary
+    /// must still be able to make durable — deleting them would let that
+    /// Flush promise durability for a record that no longer exists.
+    SyncSuspect,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct AppendVisibleJournalProfile {
     lock_wait_nanos: u64,
+    /// True when this append repaired a poisoned shard tail before writing
+    /// (block-journal appends only): the frames were written after the tail
+    /// was re-established, so the batch is safe to acknowledge even if the
+    /// lane was poisoned while it was in flight.
+    tail_recovered: bool,
     encode_nanos: u64,
     open_nanos: u64,
     write_nanos: u64,
@@ -1952,8 +2012,32 @@ fn load_durable_journal_records<T: DurableCodec>(
     length_overflow_reason: &'static str,
     checksum_mismatch_reason: &'static str,
 ) -> Result<Vec<T>> {
+    load_durable_journal_records_with_consumed(
+        path,
+        magic,
+        invalid_magic_reason,
+        too_large_reason,
+        length_overflow_reason,
+        checksum_mismatch_reason,
+    )
+    .map(|(records, _)| records)
+}
+
+/// `load_durable_journal_records` that also reports how many leading bytes
+/// parsed cleanly (frames plus tolerated zero padding). A file whose
+/// physical length exceeds the consumed offset carries a crash-torn tail:
+/// a partial trailing frame that replay silently stops at, which the shard
+/// tail tracking must treat as torn rather than blessing as good bytes.
+fn load_durable_journal_records_with_consumed<T: DurableCodec>(
+    path: &Path,
+    magic: &[u8; 8],
+    invalid_magic_reason: &'static str,
+    too_large_reason: &'static str,
+    length_overflow_reason: &'static str,
+    checksum_mismatch_reason: &'static str,
+) -> Result<(Vec<T>, u64)> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut bytes = Vec::new();
     File::open(path)
@@ -1997,7 +2081,96 @@ fn load_durable_journal_records<T: DurableCodec>(
         records.push(decode_row(payload)?);
         offset = payload_end;
     }
-    Ok(records)
+    // Trailing zeros were consumed by the skip above only up to the final
+    // sub-header remainder; treat a wholly-zero remainder as consumed
+    // (direct-I/O padding), anything else as a torn tail.
+    if bytes[offset..].iter().all(|byte| *byte == 0) {
+        offset = bytes.len();
+    }
+    Ok((records, usize_to_u64(offset)))
+}
+
+/// F1 recovery validation: `bytes` must decode as an intact sequence of
+/// checksummed block-journal frames consuming the whole region, with zero
+/// runs tolerated only as direct-I/O alignment padding (a zero run must
+/// extend exactly to the next `alignment` boundary or the region end).
+///
+/// This is what makes sync-failure recovery sound: after an fsync error
+/// the kernel may have dropped the suspect dirty pages, and dropped
+/// filesystem extents read back as zeros. A read-back that still parses as
+/// the original intact frames proves the page cache retained the bytes; a
+/// mismatch means the data is already lost, recovery must fail, and the
+/// shard stays poisoned so no later Flush can falsely promise durability.
+fn validate_block_journal_frame_region(bytes: &[u8], alignment: Option<usize>) -> Result<()> {
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        if bytes[offset] == 0 {
+            let Some(alignment) = alignment else {
+                return Err(StorageError::corrupt(
+                    "journal tail recovery read back zero bytes where a frame was written",
+                ));
+            };
+            // Legal padding is always a strict TAIL of its append's final
+            // block (`align_up(logical) - logical < alignment`, after
+            // nonzero frame bytes), and the suspect region starts at an
+            // append boundary — so no legal zero run can begin at an
+            // alignment boundary. Without this check, a region whose
+            // blocks were entirely zeroed (the direct-I/O analogue of
+            // dropped pages) would validate as pure padding and recovery
+            // would launder the loss. This also rejects an all-zeros
+            // region, since region offset zero is a boundary.
+            if offset.is_multiple_of(alignment) {
+                return Err(StorageError::corrupt(
+                    "journal tail recovery read back a zero run at an alignment boundary",
+                ));
+            }
+            let boundary = ((offset / alignment) + 1)
+                .checked_mul(alignment)
+                .ok_or_else(|| {
+                    StorageError::corrupt("journal tail recovery padding boundary overflows")
+                })?;
+            let end = boundary.min(bytes.len());
+            if bytes[offset..end].iter().any(|byte| *byte != 0) {
+                return Err(StorageError::corrupt(
+                    "journal tail recovery read back a corrupt padding run",
+                ));
+            }
+            offset = end;
+            continue;
+        }
+        if bytes.len().saturating_sub(offset) < DURABLE_JOURNAL_HEADER_BYTES {
+            return Err(StorageError::corrupt(
+                "journal tail recovery read back a partial frame header",
+            ));
+        }
+        let mut header = [0_u8; DURABLE_JOURNAL_HEADER_BYTES];
+        header.copy_from_slice(&bytes[offset..offset + DURABLE_JOURNAL_HEADER_BYTES]);
+        let (payload_len, expected_checksum) = decode_durable_journal_header(
+            &header,
+            &BLOCK_JOURNAL_MAGIC,
+            "journal tail recovery read back an invalid frame magic",
+            "journal tail recovery read back an oversized frame",
+        )?;
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            StorageError::corrupt("journal tail recovery frame length overflows")
+        })?;
+        let payload_start = offset + DURABLE_JOURNAL_HEADER_BYTES;
+        let payload_end = payload_start.checked_add(payload_len).ok_or_else(|| {
+            StorageError::corrupt("journal tail recovery frame length overflows")
+        })?;
+        if payload_end > bytes.len() {
+            return Err(StorageError::corrupt(
+                "journal tail recovery read back a truncated frame payload",
+            ));
+        }
+        if data_log_checksum(&bytes[payload_start..payload_end]) != expected_checksum {
+            return Err(StorageError::corrupt(
+                "journal tail recovery read back a frame checksum mismatch",
+            ));
+        }
+        offset = payload_end;
+    }
+    Ok(())
 }
 
 fn append_durable_journal_record<T: DurableCodec>(
@@ -2192,7 +2365,17 @@ pub(super) fn append_block_journal_records_unsynced(
 }
 
 pub(super) fn load_block_journal_records(path: &Path) -> Result<Vec<BlockJournalRecord>> {
-    let batches = load_durable_journal_records::<Vec<BlockJournalRecord>>(
+    load_block_journal_records_with_consumed(path).map(|(records, _)| records)
+}
+
+/// Load one shard's records plus the cleanly-consumed byte offset (see
+/// `load_durable_journal_records_with_consumed`).
+pub(super) fn load_block_journal_records_with_consumed(
+    path: &Path,
+) -> Result<(Vec<BlockJournalRecord>, u64)> {
+    let (batches, consumed) = load_durable_journal_records_with_consumed::<
+        Vec<BlockJournalRecord>,
+    >(
         path,
         &BLOCK_JOURNAL_MAGIC,
         "block journal has invalid frame magic",
@@ -2200,7 +2383,7 @@ pub(super) fn load_block_journal_records(path: &Path) -> Result<Vec<BlockJournal
         "block journal frame length overflows",
         "block journal frame checksum mismatch",
     )?;
-    Ok(batches.into_iter().flatten().collect())
+    Ok((batches.into_iter().flatten().collect(), consumed))
 }
 
 fn block_journal_commit_is_materialized(
@@ -2686,7 +2869,7 @@ impl DurableSqliteStore {
             append_log_service,
             block_journal_shard_locks: Arc::new(
                 (0..block_journal_shard_nodes.len())
-                    .map(|_| Mutex::new(()))
+                    .map(|_| Mutex::new(BlockJournalShardTail::default()))
                     .collect(),
             ),
             block_journal_shard_nodes: Arc::new(block_journal_shard_nodes),
@@ -2709,6 +2892,12 @@ impl DurableSqliteStore {
             append_payload_sync_delay,
             #[cfg(test)]
             fail_next_block_journal_append: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_block_journal_sync: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            block_journal_sync_delay: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_next_block_journal_tail_recovery: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_node_segment_append: Arc::new(Mutex::new(None)),
         })
@@ -3114,27 +3303,145 @@ impl DurableSqliteStore {
         Ok(block_journal_shard_path(&self.paths.data_dir, *storage_node))
     }
 
+    fn block_journal_shard_lock(&self, shard: usize) -> Result<&Mutex<BlockJournalShardTail>> {
+        self.block_journal_shard_locks.get(shard).ok_or_else(|| {
+            StorageError::invalid_argument("block journal shard index out of range")
+        })
+    }
+
+    /// Establish the tracked tail on first touch.
+    ///
+    /// The good tail is the prefix that parses as intact frames (what
+    /// replay actually consumes), NOT the physical file length: a crash can
+    /// leave a partial trailing frame that the loader silently stops at,
+    /// and blessing those residue bytes would let new frames land beyond a
+    /// region replay never reads. Such a tail starts poisoned as torn so
+    /// the first append truncates the residue. Bytes that parsed cleanly
+    /// survived replay at open and are treated as the durable baseline.
+    fn ensure_block_journal_tail_initialized(
+        &self,
+        path: &Path,
+        tail: &mut BlockJournalShardTail,
+    ) -> Result<()> {
+        if tail.initialized {
+            return Ok(());
+        }
+        if !path.exists() {
+            tail.end_offset = 0;
+            tail.synced_offset = 0;
+            tail.initialized = true;
+            return Ok(());
+        }
+        let physical = self.low_level_io.file_len_after_alignment_padding(path)?;
+        let (_, consumed) = load_block_journal_records_with_consumed(path)?;
+        tail.end_offset = consumed;
+        tail.synced_offset = consumed;
+        tail.poison = (physical > consumed).then_some(BlockJournalTailPoison::Torn);
+        tail.initialized = true;
+        Ok(())
+    }
+
+    /// Re-establish a poisoned shard tail before the next append.
+    ///
+    /// Runs under the shard lock. The poison clears only after the
+    /// backend-side repair fully succeeds; on error the shard stays
+    /// poisoned and the caller's append fails, so the lane keeps erroring
+    /// flush boundaries instead of laundering suspect bytes (fail-safe).
+    fn recover_block_journal_tail_locked(
+        &self,
+        path: &Path,
+        tail: &mut BlockJournalShardTail,
+    ) -> Result<()> {
+        let Some(poison) = tail.poison else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if self
+            .fail_next_block_journal_tail_recovery
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::unavailable(
+                "injected block journal tail recovery failure",
+            ));
+        }
+        match poison {
+            BlockJournalTailPoison::Torn => {
+                self.low_level_io
+                    .recover_torn_tail(path, tail.end_offset)?;
+            }
+            BlockJournalTailPoison::SyncSuspect => {
+                // Rewrite, never truncate: see `BlockJournalTailPoison`.
+                // The read-back must still parse as the intact frames that
+                // were appended — after an fsync error the kernel may have
+                // dropped the suspect pages (dropped extents read back as
+                // zeros), and rewriting zeros would silently destroy
+                // records that a later Flush could then falsely promise as
+                // durable. On validation failure recovery fails and the
+                // shard stays poisoned: fail-safe unavailability, which
+                // acknowledged-durability semantics tolerate because the
+                // suspect records were never flush-covered.
+                let region = self.low_level_io.read_tail_region(
+                    path,
+                    tail.synced_offset,
+                    tail.end_offset,
+                )?;
+                validate_block_journal_frame_region(
+                    &region,
+                    self.low_level_io.append_alignment(),
+                )?;
+                // The rewrite re-dirties every suspect page, which is what
+                // makes the recovery fsync trustworthy: fsync reports an
+                // error once and clears it, so only pages dirtied AFTER the
+                // failure are covered by the next successful fsync.
+                self.low_level_io.rewrite_tail_region(
+                    path,
+                    tail.synced_offset,
+                    &region,
+                )?;
+                tail.synced_offset = tail.end_offset;
+            }
+        }
+        tail.poison = None;
+        Ok(())
+    }
+
     /// `measure` carries the persist sink's enabled flag; the shard-lock
     /// wait is measured only when set (see `lock_timed`).
+    ///
+    /// Every shard append (lane batches and the acknowledged bypass path)
+    /// goes through here: a poisoned tail is repaired before any new frame
+    /// is written, and an append failure poisons the tail as torn so no
+    /// later frame can land beyond the damage.
     fn append_block_journal_records_unsynced(
         &self,
         shard: usize,
         records: &[BlockJournalRecord],
         measure: bool,
     ) -> Result<AppendVisibleJournalProfile> {
+        let path = self.block_journal_shard_path(shard)?;
+        let shard_lock = self.block_journal_shard_lock(shard)?;
+        let (mut tail, lock_wait_nanos) = lock_timed(shard_lock, measure)?;
+        self.ensure_block_journal_tail_initialized(&path, &mut tail)?;
+        let tail_recovered = tail.poison.is_some();
+        self.recover_block_journal_tail_locked(&path, &mut tail)?;
         #[cfg(test)]
         if self.fail_next_block_journal_append.swap(false, Ordering::SeqCst) {
+            tail.poison = Some(BlockJournalTailPoison::Torn);
             return Err(StorageError::unavailable(
                 "injected block journal append failure",
             ));
         }
-        let path = self.block_journal_shard_path(shard)?;
-        let shard_lock = self.block_journal_shard_locks.get(shard).ok_or_else(|| {
-            StorageError::invalid_argument("block journal shard index out of range")
-        })?;
-        let (_journal_guard, lock_wait_nanos) = lock_timed(shard_lock, measure)?;
-        let mut profile = append_block_journal_records_unsynced(&path, records, &self.low_level_io)?;
+        let mut profile =
+            match append_block_journal_records_unsynced(&path, records, &self.low_level_io) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    tail.poison = Some(BlockJournalTailPoison::Torn);
+                    return Err(error);
+                }
+            };
+        tail.end_offset = tail.end_offset.saturating_add(profile.frame_bytes);
         profile.lock_wait_nanos = lock_wait_nanos;
+        profile.tail_recovered = tail_recovered;
         Ok(profile)
     }
 
@@ -3143,15 +3450,60 @@ impl DurableSqliteStore {
     /// The data sync deliberately runs outside the shard lock so concurrent
     /// unsynced appends are not serialized behind device flushes. Concurrent
     /// appends may be partially covered by the sync; they remain unsynced
-    /// records until a later boundary covers them.
+    /// records until a later boundary covers them. Coverage is tracked
+    /// explicitly: on success the synced offset advances to the tail end
+    /// captured BEFORE the fsync was issued, so bytes appended while the
+    /// sync was in flight are never credited to it. A failed sync poisons
+    /// the tail (see `BlockJournalTailPoison::SyncSuspect`).
     fn sync_block_journal(&self, shard: usize) -> Result<u64> {
-        let file = OpenOptions::new()
-            .append(true)
-            .open(self.block_journal_shard_path(shard)?)
-            .map_err(fs_error)?;
-        let sync_started = Instant::now();
-        file.sync_data().map_err(fs_error)?;
-        Ok(duration_nanos_u64(sync_started.elapsed()))
+        let path = self.block_journal_shard_path(shard)?;
+        let shard_lock = self.block_journal_shard_lock(shard)?;
+        let cover = {
+            let mut tail = lock(shard_lock)?;
+            self.ensure_block_journal_tail_initialized(&path, &mut tail)?;
+            if tail.poison.is_some() {
+                // Syncing a poisoned tail would launder suspect bytes into
+                // an acknowledged durability boundary.
+                return Err(StorageError::unavailable(
+                    "block journal shard tail is poisoned",
+                ));
+            }
+            tail.end_offset
+        };
+        let sync_result = (|| -> Result<u64> {
+            #[cfg(test)]
+            if self.fail_next_block_journal_sync.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::unavailable(
+                    "injected block journal sync failure",
+                ));
+            }
+            // Test-only: hold this fsync in flight after its coverage was
+            // captured, so appends landing during the sync are provably not
+            // credited to it.
+            #[cfg(test)]
+            if let Some(delay) = lock(&self.block_journal_sync_delay)?.take() {
+                std::thread::sleep(delay);
+            }
+            let file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .map_err(fs_error)?;
+            let sync_started = Instant::now();
+            file.sync_data().map_err(fs_error)?;
+            Ok(duration_nanos_u64(sync_started.elapsed()))
+        })();
+        let mut tail = lock(shard_lock)?;
+        match sync_result {
+            Ok(nanos) => {
+                tail.synced_offset = tail.synced_offset.max(cover);
+                Ok(nanos)
+            }
+            Err(error) => {
+                tail.poison
+                    .get_or_insert(BlockJournalTailPoison::SyncSuspect);
+                Err(error)
+            }
+        }
     }
 
     /// Load every shard's records as one list.
@@ -3163,10 +3515,7 @@ impl DurableSqliteStore {
         let mut records = Vec::new();
         for shard in 0..self.block_journal_shard_nodes.len() {
             let path = self.block_journal_shard_path(shard)?;
-            let shard_lock = self.block_journal_shard_locks.get(shard).ok_or_else(|| {
-                StorageError::invalid_argument("block journal shard index out of range")
-            })?;
-            let _journal_guard = lock(shard_lock)?;
+            let _journal_guard = lock(self.block_journal_shard_lock(shard)?)?;
             records.extend(load_block_journal_records(&path)?);
         }
         Ok(records)
@@ -3181,12 +3530,18 @@ impl DurableSqliteStore {
         }
         for shard in 0..self.block_journal_shard_nodes.len() {
             let path = self.block_journal_shard_path(shard)?;
-            let shard_lock = self.block_journal_shard_locks.get(shard).ok_or_else(|| {
-                StorageError::invalid_argument("block journal shard index out of range")
-            })?;
-            let _journal_guard = lock(shard_lock)?;
+            let mut tail = lock(self.block_journal_shard_lock(shard)?)?;
+            if tail.poison.is_some() {
+                // A poisoned tail truncates the record load at the damage;
+                // pruning from that partial view could drop reachable
+                // frames. Skip until the lane re-establishes the tail.
+                continue;
+            }
             prune_block_journal_records_through(&path, materialized)?;
             self.low_level_io.forget_path(&path)?;
+            // The prune rewrote (and fsynced) the file under a new inode;
+            // re-derive the tail lazily from the new file.
+            *tail = BlockJournalShardTail::default();
         }
         Ok(())
     }
