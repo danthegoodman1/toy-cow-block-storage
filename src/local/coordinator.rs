@@ -741,7 +741,13 @@ impl LocalCoordinator {
             next_keyspace_root_id: metadata.next_keyspace_root_id,
             next_keyspace_catalog_shard_id: metadata.next_keyspace_catalog_shard_id,
             next_commit_group_id: metadata.next_commit_group_id,
-            next_commit_seq: metadata.next_commit_seq,
+            // Read the LIVE allocator, not the snapshot mirror (M6): the
+            // mirror can lag block-lane reservations, and a cursor behind
+            // its own persisted rows fails reopen validation. The atomic
+            // read has today's semantics — "the counter at some instant
+            // during this call" — because pre-M6 the value could likewise
+            // include reservations that landed just before this lock.
+            next_commit_seq: self.metadata.next_commit_seq.load(Ordering::SeqCst),
             next_checkpoint_id: metadata.next_checkpoint_id,
             next_gc_epoch: metadata.next_gc_epoch,
             next_write_intent: *lock(&self.next_write_intent)?,
@@ -2318,10 +2324,15 @@ impl LocalCoordinator {
         let publish_started = Instant::now();
         let mut metadata = lock(&self.metadata.inner)?;
         let publish_lock_wait_nanos = duration_nanos_u64(publish_started.elapsed());
+        // Compare the durable cursor against the LIVE allocator (M6): the
+        // guard's `next_commit_seq` is a snapshot mirror that lane
+        // reservations no longer touch, and a stale one reads as "the
+        // durable cursor is ahead of local", failing every prepared publish.
+        let local_next_commit_seq = self.metadata.next_commit_seq.load(Ordering::SeqCst);
         if !Self::append_publish_commit_gap_is_in_flight(
             &metadata,
             previous.next_commit_seq,
-            metadata.next_commit_seq,
+            local_next_commit_seq,
         )? {
             self.metadata.record_publish_profile(MetadataPublishProfile {
                 lock_wait_nanos: publish_lock_wait_nanos,
@@ -2404,7 +2415,7 @@ impl LocalCoordinator {
             .cloned()
             .ok_or_else(|| StorageError::not_found("metadata_node", new_root.to_string()))?;
         let commit_seq_started = Instant::now();
-        let commit_seq = metadata.alloc_commit_seq()?;
+        let commit_seq = self.metadata.alloc_commit_seq()?;
         let commit_sequence_alloc_nanos = duration_nanos_u64(commit_seq_started.elapsed());
         let commit_group_id = metadata.alloc_commit_group_id();
         let commit_group = CommitGroup {
@@ -2886,6 +2897,13 @@ impl LocalCoordinator {
             new_size: record.new_size,
         };
 
+        // Materializing a published record consumed its sequence: advance
+        // the LIVE allocator, not just the snapshot mirror (M6). Missing
+        // this hands the same sequence out twice, and the persisted cursor
+        // then lands at or below rows that already exist — the reopen
+        // validator's "next_commit_seq is behind persisted rows".
+        self.metadata
+            .observe_allocated_commit_seq(record.commit_seq)?;
         let next_commit_seq = record
             .commit_seq
             .raw()

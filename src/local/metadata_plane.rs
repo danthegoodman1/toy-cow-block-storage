@@ -13,6 +13,15 @@ pub(super) struct MetadataInner {
     next_keyspace_root_id: u128,
     next_keyspace_catalog_shard_id: u128,
     next_commit_group_id: u128,
+    /// Snapshot MIRROR of the live allocator
+    /// `InMemoryMetadataPlane::next_commit_seq` (kept here for the
+    /// serialized image shape). Refreshed under the lock at snapshot
+    /// points (`state_inner`, the explicit setters); between refreshes it
+    /// may lag the allocator by in-flight block-lane reservations. Its
+    /// remaining live readers are retention heuristics
+    /// (`current_commit_seq_locked` callers), where under-counting the
+    /// current commit only retains MORE history — the safe direction.
+    /// Gates and allocations must use the plane-level atomic, never this.
     next_commit_seq: u64,
     next_checkpoint_id: u128,
     next_gc_epoch: u64,
@@ -165,15 +174,6 @@ impl MetadataInner {
         let id = CommitGroupId::from_raw(self.next_commit_group_id);
         self.next_commit_group_id += 1;
         id
-    }
-
-    fn alloc_commit_seq(&mut self) -> Result<CommitSeq> {
-        let seq = CommitSeq::from_raw(self.next_commit_seq);
-        self.next_commit_seq = self
-            .next_commit_seq
-            .checked_add(1)
-            .ok_or_else(|| StorageError::conflict("commit sequence overflow"))?;
-        Ok(seq)
     }
 
     fn alloc_checkpoint_id(&mut self) -> CheckpointId {
@@ -614,6 +614,37 @@ enum AppendPublishTicketStatus {
 pub struct InMemoryMetadataPlane {
     config: LocalStoreConfig,
     inner: Mutex<MetadataInner>,
+    /// Live commit-sequence allocator. Lives OUTSIDE the `inner` mutex so
+    /// the block-journal write paths can reserve a sequence inside their
+    /// tiny staging hold without nesting the global metadata mutex there
+    /// (the GCP staging convoy, Phase 3 M6). Every allocation — the lane
+    /// paths lock-free, every other path while holding the `inner` guard —
+    /// goes through this one cell, so the sequence space stays single and
+    /// gap-free at the allocator (abandoned reservations leave gaps in
+    /// COMMITTED history exactly as they always did).
+    /// `MetadataInner::next_commit_seq` remains as the serialized snapshot
+    /// mirror, refreshed from this cell at snapshot points (`state_inner`,
+    /// the explicit setters); it may lag by in-flight reservations, which
+    /// its remaining readers (retention heuristics) tolerate in the safe
+    /// direction. All accesses use `Ordering::SeqCst`: the traffic is one
+    /// RMW per commit, far too cold to justify weaker-ordering reasoning.
+    next_commit_seq: AtomicU64,
+    /// Counts removals of live device heads. `delete_device` is the sole
+    /// `device_heads` removal site and bumps this while holding `inner`,
+    /// which is itself nested inside the durable coordinator's
+    /// `block_delta_staging_lock` hold (`run_and_maybe_persist`).
+    ///
+    /// The block-journal write paths read it BEFORE their existence
+    /// witness (`device_info`) and re-read it INSIDE their staging hold:
+    /// an unchanged value proves no device head was removed in between,
+    /// which is the fence that used to be the reservation's
+    /// `device_heads` probe (Phase 3 M6 hoisted the reservation out of
+    /// the metadata mutex). A bump for some other device is harmless — it
+    /// only sends that writer to the slow-path existence probe. All
+    /// accesses `SeqCst`; the real ordering comes from the staging-lock
+    /// handoff, so the load is deliberately over-ordered rather than
+    /// subtle.
+    device_delete_generation: AtomicU64,
     append_stream_allocator: Mutex<AppendStreamAllocator>,
     append_publish_tickets: Mutex<BTreeMap<AppendPublishTicketId, AppendPublishTicketRecord>>,
     publish_profiler: ShardedProfileSink<MetadataPublishProfile>,
@@ -625,6 +656,8 @@ impl InMemoryMetadataPlane {
         Ok(Self {
             config,
             inner: Mutex::new(MetadataInner::new()),
+            next_commit_seq: AtomicU64::new(1),
+            device_delete_generation: AtomicU64::new(0),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
             append_publish_tickets: Mutex::new(BTreeMap::new()),
             publish_profiler: ShardedProfileSink::new(),
@@ -633,17 +666,79 @@ impl InMemoryMetadataPlane {
 
     fn from_inner(config: LocalStoreConfig, inner: MetadataInner) -> Result<Self> {
         config.validate()?;
+        let next_commit_seq = AtomicU64::new(inner.next_commit_seq);
         Ok(Self {
             config,
             inner: Mutex::new(inner),
+            next_commit_seq,
+            device_delete_generation: AtomicU64::new(0),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
             append_publish_tickets: Mutex::new(BTreeMap::new()),
             publish_profiler: ShardedProfileSink::new(),
         })
     }
 
+    /// Snapshot of the device-deletion counter (see
+    /// `device_delete_generation`).
+    fn device_delete_generation(&self) -> u64 {
+        self.device_delete_generation.load(Ordering::SeqCst)
+    }
+
+    /// Confirm the device still has a live head, returning the measured
+    /// wait to acquire the metadata lock.
+    ///
+    /// This is the slow path behind `device_delete_generation`: it costs
+    /// exactly what the pre-M6 reservation cost (one metadata-mutex
+    /// acquisition) and runs only when some device was deleted while a
+    /// writer was in flight.
+    fn ensure_device_head_exists_profiled(
+        &self,
+        device_id: DeviceId,
+        measure: bool,
+    ) -> Result<u64> {
+        let (inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
+        if inner.device_heads.contains_key(&device_id) {
+            Ok(lock_wait_nanos)
+        } else {
+            Err(StorageError::not_found("device", device_id.to_string()))
+        }
+    }
+
+    /// Allocate the next commit sequence (see `next_commit_seq`).
+    fn alloc_commit_seq(&self) -> Result<CommitSeq> {
+        let raw = self.next_commit_seq.fetch_add(1, Ordering::SeqCst);
+        if raw == u64::MAX {
+            // Park the counter at the ceiling so every later allocation
+            // keeps failing instead of wrapping (mirrors the pre-atomic
+            // `checked_add` behavior, which never handed out `u64::MAX`).
+            self.next_commit_seq.store(u64::MAX, Ordering::SeqCst);
+            return Err(StorageError::conflict("commit sequence overflow"));
+        }
+        Ok(CommitSeq::from_raw(raw))
+    }
+
+    /// Ensure the allocator never re-issues `commit_seq`
+    /// (replay/materialization observation; monotonic, race-safe against
+    /// concurrent allocations via `fetch_max`).
+    fn observe_allocated_commit_seq_floor(
+        &self,
+        commit_seq: CommitSeq,
+        overflow_reason: &'static str,
+    ) -> Result<()> {
+        let floor = commit_seq
+            .raw()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::conflict(overflow_reason))?;
+        self.next_commit_seq.fetch_max(floor, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn state_inner(&self) -> Result<MetadataInner> {
-        Ok(lock(&self.inner)?.clone())
+        let mut inner = lock(&self.inner)?;
+        // Refresh the snapshot mirror so exported images and cursors carry
+        // the exact allocator position (see `next_commit_seq`).
+        inner.next_commit_seq = self.next_commit_seq.load(Ordering::SeqCst);
+        Ok(inner.clone())
     }
 
     fn config(&self) -> LocalStoreConfig {
@@ -925,28 +1020,18 @@ impl InMemoryMetadataPlane {
 
     #[cfg(test)]
     fn set_next_commit_seq_for_test(&self, next_commit_seq: u64) -> Result<()> {
-        lock(&self.inner)?.next_commit_seq = next_commit_seq;
+        let mut inner = lock(&self.inner)?;
+        inner.next_commit_seq = next_commit_seq;
+        self.next_commit_seq.store(next_commit_seq, Ordering::SeqCst);
         Ok(())
     }
 
     fn set_next_commit_seq_for_replay(&self, next_commit_seq: CommitSeq) -> Result<()> {
-        lock(&self.inner)?.next_commit_seq = next_commit_seq.raw();
+        let mut inner = lock(&self.inner)?;
+        inner.next_commit_seq = next_commit_seq.raw();
+        self.next_commit_seq
+            .store(next_commit_seq.raw(), Ordering::SeqCst);
         Ok(())
-    }
-
-    /// Reserve the next block-journal commit sequence, returning it with
-    /// the measured wait to acquire the metadata lock.
-    fn reserve_block_journal_commit_seq_profiled(
-        &self,
-        device_id: DeviceId,
-        measure: bool,
-    ) -> Result<(CommitSeq, u64)> {
-        let (mut inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
-        inner
-            .device_heads
-            .get(&device_id)
-            .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
-        inner.alloc_commit_seq().map(|seq| (seq, lock_wait_nanos))
     }
 
     /// `publish_reserved_block_journal_commit` returning the measured wait
@@ -963,7 +1048,10 @@ impl InMemoryMetadataPlane {
             .get(&device_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
-        if commit_seq.raw() >= inner.next_commit_seq {
+        // Gate against the LIVE allocator, not the snapshot mirror: lane
+        // reservations are allocated lock-free, so the mirror can lag
+        // behind legitimately reserved sequences.
+        if commit_seq.raw() >= self.next_commit_seq.load(Ordering::SeqCst) {
             return Err(StorageError::conflict(
                 "reserved block journal commit sequence was not allocated",
             ));
@@ -1027,13 +1115,10 @@ impl InMemoryMetadataPlane {
     /// nothing, but their sequences must never be handed out again: a reused
     /// sequence would create duplicate write records in the journal.
     fn observe_allocated_commit_seq(&self, commit_seq: CommitSeq) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
-        if commit_seq.raw() >= inner.next_commit_seq {
-            inner.next_commit_seq = commit_seq.raw().checked_add(1).ok_or_else(|| {
-                StorageError::conflict("block journal commit sequence overflows")
-            })?;
-        }
-        Ok(())
+        self.observe_allocated_commit_seq_floor(
+            commit_seq,
+            "block journal commit sequence overflows",
+        )
     }
 
     fn replay_block_journal_commit(&self, device_id: DeviceId, commit_seq: CommitSeq) -> Result<()> {
@@ -1043,11 +1128,10 @@ impl InMemoryMetadataPlane {
             .get(&device_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
-        if commit_seq.raw() >= inner.next_commit_seq {
-            inner.next_commit_seq = commit_seq.raw().checked_add(1).ok_or_else(|| {
-                StorageError::conflict("block journal commit sequence overflows")
-            })?;
-        }
+        self.observe_allocated_commit_seq_floor(
+            commit_seq,
+            "block journal commit sequence overflows",
+        )?;
         if commit_seq.raw() <= current.latest_commit.raw() {
             return Ok(());
         }
@@ -2396,6 +2480,11 @@ impl InMemoryMetadataPlane {
         Ok(roots)
     }
 
+    /// Current commit high-water as seen by the SNAPSHOT MIRROR (see
+    /// `MetadataInner::next_commit_seq`): may lag the live allocator by
+    /// in-flight block-lane reservations. Only retention heuristics read
+    /// this, where a smaller "current" strictly retains more history; a
+    /// gate or an exported cursor must use the plane atomic instead.
     fn current_commit_seq_locked(inner: &MetadataInner) -> CommitSeq {
         CommitSeq::from_raw(inner.next_commit_seq.saturating_sub(1))
     }
@@ -2713,6 +2802,12 @@ impl InMemoryMetadataPlane {
 
     pub fn mark_reachable_for_gc(&self, policy: RetentionPolicy) -> Result<MetadataMarkReport> {
         let mut inner = lock(&self.inner)?;
+        // Retention arithmetic compares checkpoint/head ages against the
+        // CURRENT commit; refresh the snapshot mirror at entry so the
+        // comparisons see the live allocator position (M6: allocations no
+        // longer touch the mirror; an unboundedly stale mirror would
+        // retain history forever).
+        inner.next_commit_seq = self.next_commit_seq.load(Ordering::SeqCst);
         Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
         let epoch = inner.alloc_gc_epoch()?;
         let roots = Self::roots_for_gc_locked(&inner, policy.clone())?;
@@ -2745,6 +2840,12 @@ impl InMemoryMetadataPlane {
         }
 
         let mut inner = lock(&self.inner)?;
+        // Retention arithmetic compares checkpoint/head ages against the
+        // CURRENT commit; refresh the snapshot mirror at entry so the
+        // comparisons see the live allocator position (M6: allocations no
+        // longer touch the mirror; an unboundedly stale mirror would
+        // retain history forever).
+        inner.next_commit_seq = self.next_commit_seq.load(Ordering::SeqCst);
         if epoch >= inner.next_gc_epoch {
             return Err(StorageError::invalid_argument("unknown GC epoch"));
         }
@@ -2968,11 +3069,10 @@ impl InMemoryMetadataPlane {
         inner
             .commit_groups
             .insert(commit_group.commit_group, commit_group.clone());
-        if commit_seq.raw() >= inner.next_commit_seq {
-            inner.next_commit_seq = commit_seq.raw().checked_add(1).ok_or_else(|| {
-                StorageError::conflict("block journal materialization sequence overflows")
-            })?;
-        }
+        self.observe_allocated_commit_seq_floor(
+            commit_seq,
+            "block journal materialization sequence overflows",
+        )?;
         self.record_publish_profile(MetadataPublishProfile {
             lock_wait_nanos: publish_lock_wait_nanos,
             touched_shard_head_rows: usize_to_u64(commit_group.updates.len()),
@@ -3106,7 +3206,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 BlockCount::from_raw(self.config.file_root_blocks),
             ),
         )?;
-        let commit_seq = inner.alloc_commit_seq()?;
+        let commit_seq = self.alloc_commit_seq()?;
         let commit_group_id = inner.alloc_commit_group_id();
         let file_head = FileHead {
             file_id,
@@ -3302,7 +3402,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                 }
 
                 let commit_seq_started = Instant::now();
-                let commit_seq = inner.alloc_commit_seq()?;
+                let commit_seq = self.alloc_commit_seq()?;
                 let commit_sequence_alloc_nanos = duration_nanos_u64(commit_seq_started.elapsed());
                 let commit_group_id = inner.alloc_commit_group_id();
                 let commit_group = CommitGroup {
@@ -3445,7 +3545,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
                         })?;
 
                 let commit_seq_started = Instant::now();
-                let commit_seq = inner.alloc_commit_seq()?;
+                let commit_seq = self.alloc_commit_seq()?;
                 let commit_sequence_alloc_nanos = duration_nanos_u64(commit_seq_started.elapsed());
                 let commit_group = CommitGroup {
                     commit_group: inner.alloc_commit_group_id(),
@@ -3561,7 +3661,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
             }
             None => inner.alloc_device_id(),
         };
-        let latest_commit = inner.alloc_commit_seq()?;
+        let latest_commit = self.alloc_commit_seq()?;
         let shard_roots = source_head.shard_roots.clone();
         let head = DeviceHead {
             device_id: target,
@@ -3606,7 +3706,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
             }
         }
         let target = inner.alloc_device_id();
-        let latest_commit = inner.alloc_commit_seq()?;
+        let latest_commit = self.alloc_commit_seq()?;
         let head = DeviceHead {
             device_id: target,
             generation: DeviceGeneration::from_raw(0),
@@ -3641,7 +3741,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
             }
             None => inner.alloc_keyspace_id(),
         };
-        let latest_commit = inner.alloc_commit_seq()?;
+        let latest_commit = self.alloc_commit_seq()?;
         let head = KeyspaceHead {
             keyspace_id: target,
             generation: KeyspaceGeneration::from_raw(0),
@@ -3701,7 +3801,7 @@ impl MetadataPlane for InMemoryMetadataPlane {
             }
         };
         let target = inner.alloc_keyspace_id();
-        let latest_commit = inner.alloc_commit_seq()?;
+        let latest_commit = self.alloc_commit_seq()?;
         let head = KeyspaceHead {
             keyspace_id: target,
             generation: KeyspaceGeneration::from_raw(0),
@@ -3730,7 +3830,13 @@ impl MetadataPlane for InMemoryMetadataPlane {
             .get(&device_id)
             .cloned()
             .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
-        let commit_seq = inner.alloc_commit_seq()?;
+        let commit_seq = self.alloc_commit_seq()?;
+        // Sole live `device_heads` removal: bump the deletion counter in
+        // the same metadata-mutex hold so a block-journal writer that
+        // witnessed this head (its `device_info`, under this same mutex)
+        // and later finds the counter unchanged inside its staging hold
+        // can conclude the head is still there.
+        self.device_delete_generation.fetch_add(1, Ordering::SeqCst);
         inner.device_heads.remove(&device_id);
         head.latest_commit = commit_seq;
         let record = DeleteRecord {
@@ -3795,6 +3901,12 @@ impl MetadataPlane for InMemoryMetadataPlane {
 
     fn roots_for_gc(&self, policy: RetentionPolicy) -> Result<Vec<MetadataNodeId>> {
         let mut inner = lock(&self.inner)?;
+        // Retention arithmetic compares checkpoint/head ages against the
+        // CURRENT commit; refresh the snapshot mirror at entry so the
+        // comparisons see the live allocator position (M6: allocations no
+        // longer touch the mirror; an unboundedly stale mirror would
+        // retain history forever).
+        inner.next_commit_seq = self.next_commit_seq.load(Ordering::SeqCst);
         Self::ensure_pitr_anchor_checkpoints_locked(&mut inner, &policy)?;
         Self::roots_for_gc_locked(&inner, policy)
     }

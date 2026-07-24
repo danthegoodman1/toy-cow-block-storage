@@ -231,13 +231,14 @@ pub(super) struct BlockJournalLaneBatchTiming {
     /// Device-pending-payloads mutex wait on the row's path (acknowledged
     /// registration or the lane leader's payload recheck).
     pub(super) pending_payload_lock_wait_nanos: u64,
-    /// Pipeline ordering wait, two components: the append-window wait
+    /// Pipeline ordering wait, three components: the append-window wait
     /// (parked through the predecessor's whole fsync — the dominant
     /// component by design; the window IS this batch's sync turn, held
-    /// through its own fsync) and the publish-turn wait (near zero: a
-    /// predecessor's publish runs under this batch's much longer fsync).
-    /// A time bucket, not a lock-wait column: these are the deliberate
-    /// serialization points of the pipeline.
+    /// through its own fsync), the M6 cohort-capture wait (shallow batches
+    /// only; see `cohort_seal_ready`), and the publish-turn wait (near
+    /// zero: a predecessor's publish runs under this batch's much longer
+    /// fsync). A time bucket, not a lock-wait column: these are the
+    /// deliberate serialization points of the pipeline.
     pub(super) pipeline_order_wait_nanos: u64,
 }
 
@@ -269,6 +270,50 @@ pub(super) struct BlockJournalFlushState {
     next_publish_ticket: u64,
     generation: u64,
     next_request_id: u64,
+    /// Set by an elected owner that is parked in its append window waiting
+    /// for a cohort rather than for its sync turn (see
+    /// `cohort_seal_ready`). It arms the only wake edge the cohort clause
+    /// needs and the pipeline does not already have: `enqueue` notifies
+    /// `pipeline_cvar` only while this is set, so deep-queue owners — which
+    /// never park for a cohort — are not woken once per arrival.
+    cohort_seal_waiting: bool,
+    /// Number of threads parked inside `wait_for_block_journal_lanes_idle`
+    /// on this lane. A drainer holds `block_delta_staging_lock`, which is
+    /// the same lock every writer needs before it can enqueue, so cohort
+    /// capture can only time out while one is waiting: its presence
+    /// cancels the cohort clause.
+    lanes_idle_waiters: usize,
+    /// Number of WRITE requests completed by the most recent publish, and
+    /// the arrival counter at that instant. Together they say how many
+    /// resubmissions a shallow successor may still expect from the cohort
+    /// its predecessor just released (see `cohort_seal_ready`).
+    last_publish_write_cohort: u64,
+    arrivals_at_last_publish: u64,
+    /// One-bit predictor for "completions on this lane are followed by
+    /// resubmissions". Cleared when a cohort wait ends on its ceiling
+    /// instead of on the wave, re-armed the moment a wave is observed to
+    /// have returned on its own. A completed writer is never obliged to
+    /// come back — an open-loop app that stops, a writer that exits or
+    /// errors, an acknowledged writer whose next write takes the bypass —
+    /// and this bit is what keeps those cases from paying the ceiling on
+    /// every batch instead of once per regime change.
+    cohort_arrivals_expected: bool,
+    /// Duration of the most recent SUCCESSFUL journal fsync on this lane,
+    /// which is the lane's own service time and therefore the ceiling on
+    /// how long a batch may delay its seal to capture a cohort: waiting
+    /// longer than one fsync can never pay, because the batch would have
+    /// finished a whole sync in that time. Zero until the lane has synced
+    /// once (which disables cohort capture for the very first batch).
+    last_sync_nanos: u64,
+    /// How many batches parked on the cohort clause at all, and how many of
+    /// those ended on the ceiling instead of on the wave. A ceiling-bound
+    /// wait is the only way the hybrid seal can cost latency, so the second
+    /// is the number to judge it by, and the first is what proves the c1
+    /// claim (a single writer never parks). The deterministic tests assert
+    /// both directly; they stay lane counters rather than profile columns
+    /// because column positions 1-103 are frozen.
+    cohort_capture_waits: u64,
+    cohort_capture_timeouts: u64,
     pending: BTreeMap<u64, BlockJournalLaneRequest>,
     completed: BTreeMap<u64, Result<()>>,
     // Per-device count of lane writes whose overlay apply has not finished.
@@ -297,6 +342,93 @@ impl BlockJournalFlushState {
     /// progress); revisit only if profiles show pathological queuing.
     fn admits_election(&self) -> bool {
         self.next_batch_ticket.saturating_sub(self.next_sync_ticket) <= 1
+    }
+
+    /// Whether AS MANY REQUESTS as the predecessor's completed write cohort
+    /// have entered the lane since the publish edge that released it.
+    ///
+    /// It counts arrivals of every kind — writes, flush boundaries, lease
+    /// records — against a cohort counted in WRITES only, so a flush or a
+    /// lease landing in that window is credited as if it were a returning
+    /// writer. That is deliberate slack in the direction of sealing early:
+    /// an over-count only ends a capture wait sooner, never later, and the
+    /// alternative (a per-kind arrival counter) buys precision the seal
+    /// decision does not need.
+    fn cohort_wave_returned(&self) -> bool {
+        self.next_request_id
+            .wrapping_sub(self.arrivals_at_last_publish)
+            >= self.last_publish_write_cohort
+    }
+
+    /// Whether an elected batch holding `captured` requests may seal now,
+    /// once it owns its sync turn (the M6 hybrid seal). Evaluating this is
+    /// also how the lane learns whether cohort capture pays (the one
+    /// documented side effect: re-arming `cohort_arrivals_expected`).
+    ///
+    /// DEEP QUEUE — `captured + pending >= target_requests`: seal at the
+    /// predecessor's fsync end exactly as M2/M3 did. This is the c16/c32
+    /// regime and its timing is untouched.
+    ///
+    /// DRAIN REQUESTED — a thread parked in `wait_for_block_journal_lanes_idle`
+    /// holds `block_delta_staging_lock`, the same lock every writer must
+    /// take before it can enqueue, so no arrival this batch is waiting for
+    /// can possibly happen. Seal immediately instead of waiting out the
+    /// ceiling on every materialization.
+    ///
+    /// SHALLOW QUEUE — hold the seal until the predecessor's publish AND
+    /// completion have run (`next_publish_ticket == ticket`), its waiters
+    /// have all picked their results up (`completed` empty — the wave is
+    /// awake and back in the app), and the write cohort it released has
+    /// re-entered the lane. The last two are what make capture a property
+    /// rather than a scheduling race: the completion wake and this owner's
+    /// wake come from the same `notify_all`, and the owner — which only has
+    /// to reacquire this mutex — otherwise beats every wave member's
+    /// return-to-app-and-resubmit path, so the shallow batch would seal solo
+    /// exactly as it does today.
+    ///
+    /// The two structural facts differ in kind. `completed` draining is
+    /// GUARANTEED: those threads are parked in the lane and must wake to
+    /// collect their results. Re-entry is NOT guaranteed — hence both the
+    /// caller's ceiling and `cohort_arrivals_expected`.
+    ///
+    /// Everything here is monotone once the batch owns its sync turn: it
+    /// holds the write stage, so no other batch can be elected, drain
+    /// `pending`, or complete anything, and publish tickets only ever reach
+    /// `ticket` and stop.
+    ///
+    /// At c1 every clause is already true on arrival — the predecessor
+    /// published long ago, this thread collected its own completion before
+    /// resubmitting, and that resubmission IS the one arrival its cohort
+    /// expects — so the hybrid adds no wait and no wakeups at c1.
+    fn cohort_seal_ready(&mut self, ticket: u64, captured: usize, target_requests: usize) -> bool {
+        if captured.saturating_add(self.pending.len()) >= target_requests {
+            return true;
+        }
+        if self.lanes_idle_waiters > 0 {
+            return true;
+        }
+        if self.next_publish_ticket != ticket {
+            return false;
+        }
+        if !self.completed.is_empty() {
+            return false;
+        }
+        if self.cohort_wave_returned() {
+            // Direct evidence that completions on this lane are followed by
+            // resubmissions: re-arm a predictor that an earlier timeout
+            // cleared. This is what keeps the predictor from sticking off
+            // after one transient stall.
+            self.cohort_arrivals_expected = true;
+            return true;
+        }
+        !self.cohort_arrivals_expected
+    }
+
+    /// Record what the publish stage just released, for the successor's
+    /// cohort clause (see `cohort_seal_ready`).
+    fn note_publish_cohort(&mut self, write_count: u64) {
+        self.last_publish_write_cohort = write_count;
+        self.arrivals_at_last_publish = self.next_request_id;
     }
 
     fn enqueue(&mut self, request: BlockJournalLaneRequest) -> u64 {
@@ -329,7 +461,13 @@ impl BlockJournalFlushState {
 impl BlockJournalFlushCoordinator {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(BlockJournalFlushState::default()),
+            inner: Mutex::new(BlockJournalFlushState {
+                // Start optimistic; the predictor self-corrects in both
+                // directions after one batch either way (a `false` start
+                // would simply skip capture until the first observed wave).
+                cohort_arrivals_expected: true,
+                ..BlockJournalFlushState::default()
+            }),
             cvar: Condvar::new(),
             pipeline_cvar: Condvar::new(),
         }

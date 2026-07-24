@@ -4695,12 +4695,7 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
         .unwrap();
     let lease = store.acquire_block_writer(device_id).unwrap();
 
-    let first_seq = store
-        .local
-        .metadata
-        .reserve_block_journal_commit_seq_profiled(device_id, true)
-        .unwrap()
-        .0;
+    let first_seq = store.local.metadata.alloc_commit_seq().unwrap();
     let first = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4714,12 +4709,7 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
             bytes: repeated_blocks(1, 41),
         }],
     };
-    let second_seq = store
-        .local
-        .metadata
-        .reserve_block_journal_commit_seq_profiled(device_id, true)
-        .unwrap()
-        .0;
+    let second_seq = store.local.metadata.alloc_commit_seq().unwrap();
     let second = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4797,12 +4787,7 @@ fn durable_block_journal_packed_inline_writes_replay_mixed_records_and_ignore_to
         .unwrap();
     let _ = store.drain_persist_profiles(16).unwrap();
 
-    let first_seq = store
-        .local
-        .metadata
-        .reserve_block_journal_commit_seq_profiled(device_id, true)
-        .unwrap()
-        .0;
+    let first_seq = store.local.metadata.alloc_commit_seq().unwrap();
     let first = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4816,12 +4801,7 @@ fn durable_block_journal_packed_inline_writes_replay_mixed_records_and_ignore_to
             bytes: repeated_blocks(1, 41),
         }],
     };
-    let second_seq = store
-        .local
-        .metadata
-        .reserve_block_journal_commit_seq_profiled(device_id, true)
-        .unwrap()
-        .0;
+    let second_seq = store.local.metadata.alloc_commit_seq().unwrap();
     let second = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4974,12 +4954,7 @@ fn durable_block_journal_lane_merges_concurrent_flush_boundaries() {
 
     let mut commits = Vec::new();
     for block in 0..2_u64 {
-        let commit_seq = store
-            .local
-            .metadata
-            .reserve_block_journal_commit_seq_profiled(device_id, true)
-            .unwrap()
-            .0;
+        let commit_seq = store.local.metadata.alloc_commit_seq().unwrap();
         commits.push(BlockJournalCommit {
             device_id,
             writer_epoch: lease.writer_epoch,
@@ -5055,12 +5030,7 @@ fn durable_block_journal_lane_orders_acknowledged_writes_behind_pending_lane_wri
         .unwrap();
     let lease = store.acquire_block_writer(device_id).unwrap();
 
-    let first_seq = store
-        .local
-        .metadata
-        .reserve_block_journal_commit_seq_profiled(device_id, true)
-        .unwrap()
-        .0;
+    let first_seq = store.local.metadata.alloc_commit_seq().unwrap();
     let (first_shard, first_request) = store
         .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
             commit: BlockJournalCommit {
@@ -24178,13 +24148,28 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
     // Hammer one device from many threads: per-device reserve->enqueue
     // ordering and fencing must hold under concurrency regardless of the
     // reservation lock structure (publish would corrupt-error on any
-    // commit-seq inversion), and every write must remain readable.
-    let workers = 8_u64;
+    // commit-seq inversion), and every write must remain readable. A
+    // second device runs interleaved on the same allocator so the M6
+    // lock-free reservation is exercised across devices too: sequences are
+    // handed out from one global cell, but only PER-DEVICE order is
+    // load-bearing, and cross-device interleaving must not disturb it.
+    let second_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 4096,
+                block_size: 4096,
+            },
+            name: Some("m4-concurrent-reservation-second".to_string()),
+        })
+        .unwrap();
+    let second_lease = store.acquire_block_writer(second_id).unwrap();
+    let workers = 12_u64;
     let writes_per_worker = 20_u64;
     thread::scope(|scope| {
         for worker in 0..workers {
             let store = std::sync::Arc::clone(&store);
             let lease = &lease;
+            let second_lease = &second_lease;
             scope.spawn(move || {
                 for index in 0..writes_per_worker {
                     let block = worker * writes_per_worker + index;
@@ -24193,11 +24178,16 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
                     } else {
                         WriteDurability::Flushed
                     };
+                    let (lease, byte) = if worker.is_multiple_of(4) {
+                        (second_lease, 200 + (block % 50) as u8)
+                    } else {
+                        (lease, 100 + (block % 100) as u8)
+                    };
                     store
                         .write_device_with_writer(
                             lease,
                             block * 4096,
-                            &repeated_blocks(1, 100 + (block % 100) as u8),
+                            &repeated_blocks(1, byte),
                             durability,
                             PayloadIntegrity::Verified,
                         )
@@ -24207,10 +24197,13 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
         }
     });
     for block in 0..workers * writes_per_worker {
-        assert_eq!(
-            read_block(&store, device_id, block),
-            repeated_blocks(1, 100 + (block % 100) as u8)
-        );
+        let worker = block / writes_per_worker;
+        let (device, byte) = if worker.is_multiple_of(4) {
+            (second_id, 200 + (block % 50) as u8)
+        } else {
+            (device_id, 100 + (block % 100) as u8)
+        };
+        assert_eq!(read_block(&store, device, block), repeated_blocks(1, byte));
     }
     // Fencing survives the stripe change: a stale lease still fails at
     // validation before any reservation.
@@ -24225,6 +24218,708 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
         ),
         Err(StorageError::Conflict { .. })
     ));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// A write that loses the race to `delete_device` must fail as a per-op
+// not_found with NO journal record for the dead device. If one reached the
+// journal it would be appended and fsynced before publish noticed, and the
+// next `open()` would fail permanently in replay (`device_info` not_found on
+// a frame nothing prunes). The staging hold's deletion fence is what keeps
+// that frame out; this test drives exactly the losing interleaving.
+#[test]
+fn durable_block_journal_write_racing_device_delete_stays_out_of_the_journal() {
+    let root = durable_temp_dir("m6-delete-race");
+    let cfg = config();
+    let store = std::sync::Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let doomed = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("m6-delete-race-doomed".to_string()),
+        })
+        .unwrap();
+    let survivor = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 16,
+                block_size: 4096,
+            },
+            name: Some("m6-delete-race-survivor".to_string()),
+        })
+        .unwrap();
+    let doomed_lease = store.acquire_block_writer(doomed).unwrap();
+    let survivor_lease = store.acquire_block_writer(survivor).unwrap();
+    store
+        .write_device_with_writer(
+            &survivor_lease,
+            0,
+            &repeated_blocks(1, 71),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    // `delete_device` holds `block_delta_staging_lock` across its whole
+    // metadata mutation; pausing it at the root-copy scan point freezes it
+    // holding that lock with the device still live. The writer then passes
+    // `validate_block_writer` and `device_info` against a live device and
+    // blocks on the staging lock — the exact interleaving the fence exists
+    // for.
+    store
+        .pause_block_journal_after_lane_wait_before_scan_for_test()
+        .unwrap();
+    let deleter_store = std::sync::Arc::clone(&store);
+    let deleter = std::thread::spawn(move || deleter_store.delete_device(doomed));
+    store
+        .wait_until_block_journal_lane_wait_before_scan_paused_for_test()
+        .unwrap();
+    let writer_store = std::sync::Arc::clone(&store);
+    let writer = std::thread::spawn(move || {
+        writer_store.write_device_with_writer(
+            &doomed_lease,
+            0,
+            &repeated_blocks(1, 72),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+    });
+    store
+        .wait_until_block_journal_writer_reached_staging_after_lane_wait_for_test()
+        .unwrap();
+    store
+        .resume_block_journal_lane_wait_before_scan_for_test()
+        .unwrap();
+    deleter.join().unwrap().unwrap();
+    let raced = writer.join().unwrap();
+    assert!(
+        matches!(raced, Err(StorageError::NotFound { .. })),
+        "a write that lost the delete race must fail per-op, got {raced:?}"
+    );
+
+    // THE REGRESSION ASSERTION: no journal record for the dead device. This
+    // is what reopen would choke on — a Write frame for a device replay
+    // cannot resolve, which nothing prunes (prune keys off the materialized
+    // high-water map, where a deleted device never appears). Asserted on the
+    // journal itself rather than through `open()` because a SEPARATE,
+    // PRE-EXISTING hazard already bricks reopen for any leased-then-deleted
+    // device: `Lease` records are never pruned
+    // (`block_journal_record_pruned`) and their replay calls
+    // `seed_block_writer_epoch` -> `device_info`. Reproduced at cee1cc6 with
+    // no lane write involved, so it is not M6's to fix and would mask this
+    // assertion if used as the proxy.
+    // The lane is untouched by the loser, so the surviving device keeps
+    // working. This write also anchors the journal check below: the delete's
+    // own root-copy materialization pruned every earlier write record, so
+    // without it an empty journal would make that check vacuous.
+    store
+        .write_device_with_writer(
+            &survivor_lease,
+            4096,
+            &repeated_blocks(1, 73),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let records = store.durable.block_journal_records().unwrap();
+    assert!(
+        !records.iter().any(|record| matches!(
+            record,
+            BlockJournalRecord::Write(commit) if commit.device_id == doomed
+        )),
+        "a record for the deleted device reached the journal: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            BlockJournalRecord::Write(commit) if commit.device_id == survivor
+        )),
+        "the survivor's post-delete write must be in the journal, or the check above is vacuous"
+    );
+    assert_eq!(read_block(&store, survivor, 0), repeated_blocks(1, 71));
+    assert_eq!(read_block(&store, survivor, 1), repeated_blocks(1, 73));
+    assert!(matches!(
+        store.read_device(doomed, ByteRange::new(0, 4096), &mut vec![0; 4096]),
+        Err(StorageError::NotFound { .. })
+    ));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// The commit-sequence allocator is a lock-free atomic since M6; parked at
+// the ceiling it must keep erroring instead of wrapping around and
+// re-issuing sequences that already name durable records.
+#[test]
+fn commit_seq_allocator_at_ceiling_keeps_erroring_without_wrapping() {
+    let metadata = InMemoryMetadataPlane::new(config()).unwrap();
+    let head = metadata.create_device(device_request()).unwrap();
+    metadata.set_next_commit_seq_for_test(u64::MAX).unwrap();
+
+    for _ in 0..4 {
+        assert!(matches!(
+            metadata.alloc_commit_seq(),
+            Err(StorageError::Conflict { .. })
+        ));
+    }
+    // A wrapped allocator would hand out sequence 0..3 here and let the
+    // delete publish under a sequence some earlier record already owns.
+    assert!(metadata.delete_device(head.device_id).is_err());
+    assert_eq!(metadata.get_head(head.device_id).unwrap(), head);
+}
+
+// The export cursor is captured from the LIVE allocator, so it must never
+// lag the rows it is exported beside — including sequences reserved by
+// in-flight lane writes at the instant of capture. A cursor behind its own
+// persisted rows fails reopen validation outright.
+#[test]
+fn durable_export_cursor_under_live_lane_traffic_reopens_with_complete_replay() {
+    let root = durable_temp_dir("m6-live-cursor");
+    let cfg = config();
+    let store = std::sync::Arc::new(DurableCoordinator::open(&root, cfg).unwrap());
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 512,
+                block_size: 4096,
+            },
+            name: Some("m6-live-cursor".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    let workers = 4_u64;
+    let writes_per_worker = 25_u64;
+    let writers_done = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let mut writers = Vec::new();
+        for worker in 0..workers {
+            let store = std::sync::Arc::clone(&store);
+            let lease = &lease;
+            writers.push(scope.spawn(move || {
+                for index in 0..writes_per_worker {
+                    let block = worker * writes_per_worker + index;
+                    store
+                        .write_device_with_writer(
+                            lease,
+                            block * 4096,
+                            &repeated_blocks(1, 30 + (block % 90) as u8),
+                            WriteDurability::Flushed,
+                            PayloadIntegrity::Verified,
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+        // Persist WITHOUT draining the lane: the cursor is captured while
+        // reservations are in flight, which is precisely the case a
+        // snapshot-mirror read gets wrong.
+        let persist_store = std::sync::Arc::clone(&store);
+        let writers_done = &writers_done;
+        let persister = scope.spawn(move || {
+            while !writers_done.load(Ordering::SeqCst) {
+                persist_store
+                    .persist_without_block_journal_materialization_for_test()
+                    .unwrap();
+                std::thread::yield_now();
+            }
+        });
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        writers_done.store(true, Ordering::SeqCst);
+        persister.join().unwrap();
+    });
+    store
+        .persist_without_block_journal_materialization_for_test()
+        .unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    for block in 0..workers * writes_per_worker {
+        assert_eq!(
+            read_block(&reopened, device_id, block),
+            repeated_blocks(1, 30 + (block % 90) as u8)
+        );
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Spin until `cond` holds, failing the test rather than hanging. Used
+/// where the awaited fact is a lane-state transition with no notify of its
+/// own; it is a wait on a condition, never a fixed sleep.
+fn wait_for_condition(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::yield_now();
+    }
+}
+
+// A single writer must never park on the cohort clause: its own
+// resubmission IS the arrival its predecessor's cohort expects, so the
+// hybrid seal adds no wait at c1. Proven by the lane's own counter, not by
+// timing.
+#[test]
+fn durable_block_journal_cohort_capture_never_parks_a_single_writer() {
+    let (root, store, device_id, lease) = pipeline_store("m6-cohort-c1");
+    for block in 0..12_u64 {
+        // Give the lane a real service time, so "never parked" is a
+        // statement about the seal condition and not about a ceiling that
+        // was zero anyway.
+        store
+            .delay_next_block_journal_sync_for_test(Duration::from_millis(2))
+            .unwrap();
+        store
+            .write_device_with_writer(
+                &lease,
+                block * 4096,
+                &repeated_blocks(1, 80 + block as u8),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+    }
+    let (waits, timeouts, _) = store
+        .block_journal_cohort_capture_counts_for_test(device_id)
+        .unwrap();
+    assert_eq!(
+        (waits, timeouts),
+        (0, 0),
+        "a sequential writer must never enter the cohort wait"
+    );
+    for block in 0..12_u64 {
+        assert_eq!(
+            read_block(&store, device_id, block),
+            repeated_blocks(1, 80 + block as u8)
+        );
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// A batch that captured no write has nothing for a resubmission wave to
+// coalesce with, so it must never park on the cohort clause. The batch this
+// protects is the flush-only one `flush_visible_block_journal_heads` elects
+// from inside a root-copy section: `block_delta_staging_lock` is held there,
+// so a capture wait would stall every writer in the store for the whole
+// ceiling AND no arrival could reach the lane to end it early.
+#[test]
+fn durable_block_journal_flush_only_batch_does_not_park_for_a_cohort() {
+    let (root, store, device_id, lease) = pipeline_store("m6-flush-only-batch");
+    // Two writes in ONE batch, so the cohort the next batch inherits is two
+    // and a single arrival cannot satisfy the wave clause. The 20ms sync
+    // keeps the capture ceiling at the policy cap, so a park would cost 5ms
+    // and land in the counters.
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(20))
+        .unwrap();
+    let mut request_ids = Vec::new();
+    let mut last_seq = CommitSeq::from_raw(0);
+    for index in 0..2_u64 {
+        let commit_seq = store.local.metadata.alloc_commit_seq().unwrap();
+        last_seq = commit_seq;
+        request_ids.push(
+            store
+                .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+                    commit: BlockJournalCommit {
+                        device_id,
+                        writer_epoch: lease.writer_epoch,
+                        commit_seq,
+                        write_count: 1,
+                        collapsed_range_count: 1,
+                        committed_bytes: 4096,
+                        entries: vec![BlockJournalEntry::Write {
+                            range: ByteRange::new(index * 4096, 4096),
+                            payload_integrity: PayloadIntegrity::Verified,
+                            bytes: repeated_blocks(1, 60 + index as u8),
+                        }],
+                    },
+                    enqueue_waits: BlockJournalEnqueueWaits::default(),
+                })
+                .unwrap(),
+        );
+    }
+    for (shard, request_id) in &request_ids {
+        store
+            .wait_for_block_journal_request(*shard, *request_id)
+            .unwrap();
+    }
+    let (waits, timeouts, expected) = store
+        .block_journal_cohort_capture_counts_for_test(device_id)
+        .unwrap();
+    assert_eq!(
+        (waits, timeouts),
+        (0, 0),
+        "the write batch itself must not have parked, or the check below is \
+         measuring the wrong batch"
+    );
+    assert!(expected, "the predictor must still be armed");
+
+    // The flush-only batch: shallow, its predecessor released a cohort of
+    // two, and its own enqueue is the only arrival since — every condition
+    // for a capture wait except having a write to coalesce with.
+    let (shard, flush_request) = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Flush {
+            device_id,
+            writer_epoch: lease.writer_epoch,
+            durable_through: last_seq,
+        })
+        .unwrap();
+    store
+        .wait_for_block_journal_request(shard, flush_request)
+        .unwrap();
+    let (waits, timeouts, _) = store
+        .block_journal_cohort_capture_counts_for_test(device_id)
+        .unwrap();
+    assert_eq!(
+        (waits, timeouts),
+        (0, 0),
+        "a batch carrying no writes must never wait for a cohort"
+    );
+    assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 60));
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 61));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// The point of the hybrid seal: a shallow successor holds its seal until
+// the cohort released by its predecessor's publish has re-entered the lane,
+// so that wave rides the successor's batch instead of paying a whole extra
+// pipeline period. Race-realistic by construction — the resubmission is
+// issued only after the publish pause is released, so it races the parked
+// owner's wake exactly as it does in production. Without the arrival count
+// the owner (which only has to reacquire the lane mutex) wins that race and
+// seals solo.
+#[test]
+fn durable_block_journal_cohort_capture_rides_the_successor_batch() {
+    let (root, store, device_id, lease) = pipeline_store("m6-cohort-capture");
+    store.enable_persist_profiling(64).unwrap();
+    // Cohort capture is bounded by the lane's own measured service time, so
+    // give this lane one: a real fsync here costs under a microsecond, at
+    // which point capture correctly refuses to wait at all. The injected
+    // delay counts as sync time, exactly as a slow device would.
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(20))
+        .unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 90),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    store
+        .request_block_journal_publish_stage_pause_for_test()
+        .unwrap();
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(20))
+        .unwrap();
+    let paused_store = std::sync::Arc::clone(&store);
+    let paused_lease = lease;
+    let paused_writer = std::thread::spawn(move || {
+        paused_store
+            .write_device_with_writer(
+                &paused_lease,
+                4096,
+                &repeated_blocks(1, 91),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+        // The resubmission that forms the cohort: issued after this thread's
+        // own completion, racing the parked successor's wake.
+        paused_store
+            .write_device_with_writer(
+                &paused_lease,
+                3 * 4096,
+                &repeated_blocks(1, 93),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+    });
+    store
+        .wait_for_block_journal_publish_stage_pause_for_test()
+        .unwrap();
+
+    // Successor: elects behind the paused batch, owns its sync turn as soon
+    // as that batch's fsync returned, and parks on the cohort clause.
+    let successor_store = std::sync::Arc::clone(&store);
+    let successor_lease = lease;
+    let successor = std::thread::spawn(move || {
+        successor_store
+            .write_device_with_writer(
+                &successor_lease,
+                2 * 4096,
+                &repeated_blocks(1, 92),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+            .unwrap();
+    });
+    wait_for_condition("the successor to park on the cohort clause", || {
+        store
+            .block_journal_cohort_seal_waiting_for_test(device_id)
+            .unwrap()
+    });
+    let _ = store.drain_persist_profiles(256).unwrap();
+    store.resume_block_journal_publish_stage_for_test().unwrap();
+    paused_writer.join().unwrap();
+    successor.join().unwrap();
+
+    let (waits, timeouts, expected) = store
+        .block_journal_cohort_capture_counts_for_test(device_id)
+        .unwrap();
+    assert_eq!(waits, 1, "exactly one batch should have parked");
+    assert_eq!(
+        timeouts, 0,
+        "the cohort returned, so the wait must end on the wave, not the ceiling"
+    );
+    assert!(expected, "a returning wave must leave the predictor armed");
+    let profiles = store.drain_persist_profiles(256).unwrap();
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.block_journal_flush_group_size >= 2),
+        "the resubmitted write must ride the successor's batch"
+    );
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 91));
+    assert_eq!(read_block(&store, device_id, 2), repeated_blocks(1, 92));
+    assert_eq!(read_block(&store, device_id, 3), repeated_blocks(1, 93));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// A completed writer is never obliged to come back: an app that stops
+// mid-run, a writer that exits or errors out, or an acknowledged writer
+// whose next write takes the bypass. Those must degrade to "seal promptly",
+// which here means (1) one ceiling-bound wait, bounded by the lane's own
+// last fsync rather than by any fixed constant, and (2) the lane's
+// predictor turning the wave clause off so the NEXT shallow batch does not
+// pay it again — asserted through behaviour, not only through the flag.
+#[test]
+fn durable_block_journal_cohort_capture_stops_paying_when_the_cohort_never_returns() {
+    let (root, store, device_id, lease) = pipeline_store("m6-cohort-no-return");
+    // Both batches below are built by hand as TWO-write batches, and the
+    // sizes are what make the second half of this test mean anything: the
+    // batch that times out must release a cohort of two, so the single write
+    // that follows it cannot satisfy the wave clause on its own. Then the
+    // only possible reason for that write not to park is the disarmed
+    // predictor.
+    let mut commits = (0..4_u64).map(|index| {
+        let commit_seq = store.local.metadata.alloc_commit_seq().unwrap();
+        BlockJournalCommit {
+            device_id,
+            writer_epoch: lease.writer_epoch,
+            commit_seq,
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: 4096,
+            entries: vec![BlockJournalEntry::Write {
+                range: ByteRange::new(index * 4096, 4096),
+                payload_integrity: PayloadIntegrity::Verified,
+                bytes: repeated_blocks(1, 94 + index as u8),
+            }],
+        }
+    });
+    let paused_commits = vec![commits.next().unwrap(), commits.next().unwrap()];
+    let successor_commits = vec![commits.next().unwrap(), commits.next().unwrap()];
+
+    // A 20ms sync keeps the capture ceiling at the policy cap (5ms) instead
+    // of a sub-microsecond fsync, which would expire for the wrong reason.
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(20))
+        .unwrap();
+    store
+        .request_block_journal_publish_stage_pause_for_test()
+        .unwrap();
+    // Neither of these two writers ever comes back after its completion.
+    let paused_store = std::sync::Arc::clone(&store);
+    let paused_writers = std::thread::spawn(move || {
+        drive_block_journal_write_batch(&paused_store, paused_commits);
+    });
+    store
+        .wait_for_block_journal_publish_stage_pause_for_test()
+        .unwrap();
+    let successor_store = std::sync::Arc::clone(&store);
+    let successor = std::thread::spawn(move || {
+        drive_block_journal_write_batch(&successor_store, successor_commits);
+    });
+    wait_for_condition("the successor to park on the cohort clause", || {
+        store
+            .block_journal_cohort_seal_waiting_for_test(device_id)
+            .unwrap()
+    });
+    // Keep the successor's own fsync slow too, so the ceiling the
+    // observation write below sees is still the policy cap.
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(20))
+        .unwrap();
+    store.resume_block_journal_publish_stage_for_test().unwrap();
+    paused_writers.join().unwrap();
+    successor.join().unwrap();
+    let (waits, timeouts, expected) = store
+        .block_journal_cohort_capture_counts_for_test(device_id)
+        .unwrap();
+    assert_eq!((waits, timeouts), (1, 1), "the absent cohort must time out");
+    assert!(
+        !expected,
+        "a cohort that never came back disarms the wave clause"
+    );
+
+    // THE BEHAVIOURAL HALF. This write is shallow, its predecessor released
+    // a cohort of two, and its own enqueue is the only arrival since — the
+    // wave clause is false. With the predictor still armed this batch would
+    // park and wait out the whole 5ms ceiling; the disarmed clause is the
+    // only thing that lets it seal at once.
+    store
+        .write_device_with_writer(
+            &lease,
+            4 * 4096,
+            &repeated_blocks(1, 98),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let (waits, timeouts, expected) = store
+        .block_journal_cohort_capture_counts_for_test(device_id)
+        .unwrap();
+    assert_eq!(
+        (waits, timeouts),
+        (1, 1),
+        "a disarmed wave clause must not park a shallow batch again"
+    );
+    assert!(
+        !expected,
+        "no wave returned, so the predictor stays disarmed"
+    );
+
+    // ...and it re-arms as soon as a wave IS observed, so one stalled cohort
+    // does not disable capture for the rest of the lane's life: the batch
+    // above released a cohort of one, and this write is that one arrival.
+    store
+        .write_device_with_writer(
+            &lease,
+            5 * 4096,
+            &repeated_blocks(1, 99),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let (waits, timeouts, expected) = store
+        .block_journal_cohort_capture_counts_for_test(device_id)
+        .unwrap();
+    assert_eq!(
+        (waits, timeouts),
+        (1, 1),
+        "an observed returning wave costs no wait"
+    );
+    assert!(
+        expected,
+        "an observed returning wave must re-arm the predictor"
+    );
+    for block in 0..4_u64 {
+        assert_eq!(
+            read_block(&store, device_id, block),
+            repeated_blocks(1, 94 + block as u8)
+        );
+    }
+    assert_eq!(read_block(&store, device_id, 4), repeated_blocks(1, 98));
+    assert_eq!(read_block(&store, device_id, 5), repeated_blocks(1, 99));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Enqueue every commit as one lane batch and wait for all of them: the
+/// first wait elects the batch and takes all of them, so the batch's write
+/// count is exactly `commits.len()`.
+fn drive_block_journal_write_batch(store: &DurableCoordinator, commits: Vec<BlockJournalCommit>) {
+    let mut requests = Vec::new();
+    for commit in commits {
+        requests.push(
+            store
+                .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+                    commit,
+                    enqueue_waits: BlockJournalEnqueueWaits::default(),
+                })
+                .unwrap(),
+        );
+    }
+    for (shard, request_id) in requests {
+        store
+            .wait_for_block_journal_request(shard, request_id)
+            .unwrap();
+    }
+}
+
+// Liveness of the hybrid seal against the failure path that motivated M3's
+// completion contract: a parked successor must be released by a publish
+// that FAILS, not only by one that succeeds. `next_publish_ticket` advances
+// on every exit, so the clause opens; the cohort it then waits for never
+// re-enters (those writers got errors), which the ceiling bounds.
+#[test]
+fn durable_block_journal_cohort_capture_survives_a_failed_predecessor_publish() {
+    let (root, store, device_id, lease) = pipeline_store("m6-cohort-publish-failure");
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(20))
+        .unwrap();
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 98),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    store
+        .request_block_journal_publish_stage_pause_for_test()
+        .unwrap();
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(20))
+        .unwrap();
+    let paused_store = std::sync::Arc::clone(&store);
+    let paused_lease = lease;
+    let paused_writer = std::thread::spawn(move || {
+        paused_store.write_device_with_writer(
+            &paused_lease,
+            4096,
+            &repeated_blocks(1, 99),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+    });
+    store
+        .wait_for_block_journal_publish_stage_pause_for_test()
+        .unwrap();
+    let successor_store = std::sync::Arc::clone(&store);
+    let successor_lease = lease;
+    let successor = std::thread::spawn(move || {
+        successor_store.write_device_with_writer(
+            &successor_lease,
+            2 * 4096,
+            &repeated_blocks(1, 100),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+    });
+    wait_for_condition("the successor to park on the cohort clause", || {
+        store
+            .block_journal_cohort_seal_waiting_for_test(device_id)
+            .unwrap()
+    });
+    store.fail_next_block_journal_publish_mark_for_test();
+    store.resume_block_journal_publish_stage_for_test().unwrap();
+    assert!(paused_writer.join().unwrap().is_err());
+    successor.join().unwrap().unwrap();
+    assert_eq!(read_block(&store, device_id, 2), repeated_blocks(1, 100));
     drop(store);
     let _ = fs::remove_dir_all(root);
 }

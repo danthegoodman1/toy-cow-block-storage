@@ -155,9 +155,11 @@ pub struct DurablePersistProfile {
     /// it is an unconditional time bucket.
     pub block_journal_append_lock_wait_nanos: u64,
     /// Contended metadata-plane mutex wait on this row's own commit path:
-    /// device-spec lookups, commit-seq reserves, and publish-head advances
-    /// measured on the thread that records this row (contended-only, zero
-    /// when uncontended; see `lock_timed`).
+    /// device-spec lookups and publish-head advances measured on the
+    /// thread that records this row (contended-only, zero when
+    /// uncontended; see `lock_timed`). Commit-seq reservation left this
+    /// column in M6: it is a lock-free atomic allocation with no
+    /// metadata-mutex acquisition to wait on.
     pub block_journal_publish_reserve_lock_wait_nanos: u64,
     /// Contended wait for the block-journal overlay mutex during this row's
     /// publish apply and durable-mark steps (contended-only, zero when
@@ -174,24 +176,30 @@ pub struct DurablePersistProfile {
     /// nanos were spent outside this row's wall clock and can exceed
     /// `total_nanos`.
     pub block_journal_enqueue_staging_lock_wait_nanos: u64,
-    /// Contended metadata-plane mutex waits (device-spec lookup plus
-    /// commit-seq reserve) carried by the batch's row-less writers
-    /// (contended-only, zero when uncontended). Batch-attributed like
-    /// `block_journal_enqueue_staging_lock_wait_nanos`.
+    /// Contended metadata-plane mutex waits (device-spec lookup) carried
+    /// by the batch's row-less writers (contended-only, zero when
+    /// uncontended). Batch-attributed like
+    /// `block_journal_enqueue_staging_lock_wait_nanos`. Commit-seq
+    /// reservation left this column in M6 (lock-free atomic allocation),
+    /// so it is structurally near zero except for the device-info lookup
+    /// on the inline path.
     pub block_journal_enqueue_reserve_lock_wait_nanos: u64,
     /// Contended wait for the device-pending-payloads mutex on this row's
     /// path: acknowledged segment-ref registration, and the lane leader's
     /// flush-boundary payload recheck (inside the payload-recheck bucket;
     /// contended-only, zero when uncontended; see `lock_timed`).
     pub block_journal_pending_payload_lock_wait_nanos: u64,
-    /// Pipeline ordering wait, two components: the append-window wait
+    /// Pipeline ordering wait, three components: the append-window wait
     /// (the batch owner parks through its predecessor's whole fsync — the
     /// dominant component by design; the window IS the batch's sync turn,
-    /// held through its own fsync) and the publish-turn wait
-    /// (arithmetically near zero: a predecessor's publish runs under this
-    /// batch's much longer fsync). An unconditional time bucket like the
-    /// other `*_nanos` stage columns, not a contended-only lock-wait
-    /// column.
+    /// held through its own fsync), the cohort-capture wait added in M6
+    /// (a SHALLOW batch holds its seal for the resubmission wave the
+    /// predecessor's publish releases, bounded by the lane's own last
+    /// fsync; zero for deep batches, which is every batch at c16/c32),
+    /// and the publish-turn wait (arithmetically near zero: a
+    /// predecessor's publish runs under this batch's much longer fsync).
+    /// An unconditional time bucket like the other `*_nanos` stage
+    /// columns, not a contended-only lock-wait column.
     pub block_journal_pipeline_order_wait_nanos: u64,
 }
 
@@ -3632,22 +3640,32 @@ impl DurableSqliteStore {
             // captured, so appends landing during the sync are provably not
             // credited to it. The delay runs BEFORE the injected failure so
             // tests can stage faults (like a bypass tear) during a held
-            // fsync that then fails.
+            // fsync that then fails. It counts as sync time in the returned
+            // duration: the hook simulates a slow device, and consumers that
+            // reason about the lane's service time (the M6 cohort-capture
+            // ceiling) must see the simulated slowness rather than the real
+            // sub-microsecond fsync underneath it.
             #[cfg(test)]
-            if let Some(delay) = lock(&self.block_journal_sync_delay)?.take() {
-                std::thread::sleep(delay);
-            }
+            let injected_delay_nanos = match lock(&self.block_journal_sync_delay)?.take() {
+                Some(delay) => {
+                    std::thread::sleep(delay);
+                    duration_nanos_u64(delay)
+                }
+                None => 0,
+            };
+            #[cfg(not(test))]
+            let injected_delay_nanos = 0_u64;
             #[cfg(test)]
             if self.fail_next_block_journal_sync.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::unavailable(
                     "injected block journal sync failure",
                 ));
             }
-            match &cached_file {
+            let measured = match &cached_file {
                 Some(file) => {
                     let sync_started = Instant::now();
                     file.sync_data().map_err(fs_error)?;
-                    Ok(duration_nanos_u64(sync_started.elapsed()))
+                    duration_nanos_u64(sync_started.elapsed())
                 }
                 // No cached fd: the direct-I/O backend (always), or a
                 // filesystem tail with no append since open/prune — a cold
@@ -3661,9 +3679,10 @@ impl DurableSqliteStore {
                         .map_err(fs_error)?;
                     let sync_started = Instant::now();
                     file.sync_data().map_err(fs_error)?;
-                    Ok(duration_nanos_u64(sync_started.elapsed()))
+                    duration_nanos_u64(sync_started.elapsed())
                 }
-            }
+            };
+            Ok(measured.saturating_add(injected_delay_nanos))
         })();
         let mut tail = lock(shard_lock)?;
         match sync_result {
