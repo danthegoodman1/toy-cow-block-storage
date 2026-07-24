@@ -4622,6 +4622,15 @@ impl DurableCoordinator {
             // Write records were appended in commit-seq order, so iterating
             // them in record order preserves the publish order.
             let publish_started = Instant::now();
+            // Batch-local device block-size memo: one metadata-plane
+            // `device_info` per distinct device per batch instead of one
+            // per record. Safe because specs are immutable after create
+            // (no resize exists) and `delete_device` waits for lanes-idle,
+            // which since M3 includes this publish stage — a device in
+            // this batch cannot disappear or change mid-loop. The memo
+            // must NOT outlive the batch: `validate_block_writer` remains
+            // the per-op fence on the write paths.
+            let mut block_sizes: BTreeMap<DeviceId, u32> = BTreeMap::new();
             for record in &records {
                 let BlockJournalRecord::Write(commit) = record else {
                     continue;
@@ -4637,11 +4646,19 @@ impl DurableCoordinator {
                         commit.commit_seq,
                         measure,
                     )?;
-                let (device_info, device_info_lock_wait_nanos) = self
-                    .local
-                    .metadata
-                    .device_info_profiled(commit.device_id, measure)?;
-                let block_size = u64::from(device_info.spec.block_size);
+                let mut device_info_lock_wait_nanos = 0_u64;
+                let block_size = match block_sizes.get(&commit.device_id) {
+                    Some(block_size) => u64::from(*block_size),
+                    None => {
+                        let (device_info, lock_wait_nanos) = self
+                            .local
+                            .metadata
+                            .device_info_profiled(commit.device_id, measure)?;
+                        device_info_lock_wait_nanos = lock_wait_nanos;
+                        block_sizes.insert(commit.device_id, device_info.spec.block_size);
+                        u64::from(device_info.spec.block_size)
+                    }
+                };
                 let apply_started = Instant::now();
                 let apply_nanos = self.block_journal.apply_commit(commit, block_size, measure)?;
                 lane_timing.publish_mark_nanos = lane_timing

@@ -2566,6 +2566,44 @@ fn block_journal_records_frame(records: &[BlockJournalRecord]) -> Result<Vec<u8>
     )
 }
 
+/// Append one block-journal frame for `records` to `out` in place: reserve
+/// the 24-byte header, encode the payload directly into `out`, then
+/// backpatch the payload length and checksum. Byte-for-byte identical to
+/// appending `block_journal_records_frame(records)?`, without the
+/// intermediate payload and frame buffers (and their copies) that the
+/// hot append path would otherwise pay per batch. On error `out` is
+/// restored to its incoming length.
+fn append_block_journal_records_frame_into(
+    records: &[BlockJournalRecord],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let header_start = out.len();
+    out.extend_from_slice(&BLOCK_JOURNAL_MAGIC);
+    out.extend_from_slice(&[0_u8; 16]);
+    let payload_start = out.len();
+    debug_assert_eq!(payload_start - header_start, DURABLE_JOURNAL_HEADER_BYTES);
+    let mut encoder = DurableEncoder {
+        bytes: std::mem::take(out),
+    };
+    let encoded = encode_block_journal_record_sequence(records, &mut encoder);
+    *out = encoder.finish();
+    if let Err(error) = encoded {
+        out.truncate(header_start);
+        return Err(error);
+    }
+    let payload_len = usize_to_u64(out.len() - payload_start);
+    if payload_len > MAX_DURABLE_JOURNAL_PAYLOAD_BYTES {
+        out.truncate(header_start);
+        return Err(StorageError::conflict(
+            "block journal record exceeds durable payload limit",
+        ));
+    }
+    let checksum = data_log_checksum(&out[payload_start..]);
+    out[header_start + 8..header_start + 16].copy_from_slice(&payload_len.to_le_bytes());
+    out[header_start + 16..payload_start].copy_from_slice(&checksum.to_le_bytes());
+    Ok(())
+}
+
 fn observe_block_journal_replay_write(
     local: &LocalCoordinator,
     overlay: &BlockJournalOverlay,

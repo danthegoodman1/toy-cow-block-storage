@@ -21,7 +21,7 @@ STORAGE_NODES="${STORAGE_NODES:-5}"
 AB_REPEATS="${AB_REPEATS:-2}"
 WRITE_CONCURRENCY="${WRITE_CONCURRENCY:-16,32}"
 READ_CONCURRENCY="${READ_CONCURRENCY:-16,32}"
-GUARD_CONCURRENCY="${GUARD_CONCURRENCY:-16,32}"
+FOURK_CONCURRENCY="${FOURK_CONCURRENCY:-1,4,16,32}"
 TOY_DURABLE_IO_BACKEND="${TOY_DURABLE_IO_BACKEND:-filesystem}"
 TOY_CHUNK_MIB="${TOY_CHUNK_MIB:-2}"
 DELAY_MODE="${DELAY_MODE:-spin}"
@@ -83,13 +83,22 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     source "${HOME}/.cargo/env"
   fi
 
-  log "extracting and building base tree"
+  # Both sides build with the pinned release codegen (codegen-units=1, fat
+  # LTO) regardless of what their Cargo.toml says: refs that predate the
+  # Phase 3 M1 pin would otherwise compare CGU16 partition luck against
+  # pinned code (up to 27% hot-path noise on base-identical bodies — see the
+  # M1 evidence comment in Cargo.toml). Env overrides are a no-op on trees
+  # that already carry the pin.
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+  export CARGO_PROFILE_RELEASE_LTO=true
+
+  log "extracting and building base tree (pinned release profile)"
   rm -rf "${SRC_BASE_DIR}"
   mkdir -p "${SRC_BASE_DIR}"
   tar -C "${SRC_BASE_DIR}" -xzf "${BASE_TGZ}"
   (cd "${SRC_BASE_DIR}" && cargo build --release --bin loadbench)
 
-  log "extracting and building fix tree"
+  log "extracting and building fix tree (pinned release profile)"
   rm -rf "${SRC_FIX_DIR}"
   mkdir -p "${SRC_FIX_DIR}"
   tar -C "${SRC_FIX_DIR}" -xzf "${FIX_TGZ}"
@@ -136,7 +145,7 @@ fi
   echo "ab_repeats=${AB_REPEATS}"
   echo "write_concurrency=${WRITE_CONCURRENCY}"
   echo "read_concurrency=${READ_CONCURRENCY}"
-  echo "guard_concurrency=${GUARD_CONCURRENCY}"
+  echo "fourk_concurrency=${FOURK_CONCURRENCY}"
   echo "toy_durable_io_backend=${TOY_DURABLE_IO_BACKEND}"
   echo "toy_chunk_mib=${TOY_CHUNK_MIB}"
   echo "colocated_node=${COLOCATED_NODE}"
@@ -314,17 +323,20 @@ run_confirm_matrix() {
         --block-batch-overlap random \
         --block-batch-profile-csv "${RESULT_ROOT}/${side}/size-64k-rtt-0-dur-flushed-rep-${rep}/block-batch-profile.csv"
     done
+    # 4k is a first-class interleaved cell (Phase 3 completion gate rows),
+    # not a single-rep guard: c1/c4/c16/c32 by default via FOURK_CONCURRENCY.
+    for side in base fix; do
+      run_ab_case "${side}" "size-4k-rtt-0-dur-flushed-rep-${rep}" \
+        block-batch-4k-16ops "${FOURK_CONCURRENCY}" \
+        --block-batch-ops 1 \
+        --block-batch-bytes "${bytes_4k}" \
+        --block-batch-overlap random \
+        --block-batch-profile-csv "${RESULT_ROOT}/${side}/size-4k-rtt-0-dur-flushed-rep-${rep}/block-batch-profile.csv"
+    done
     for side in base fix; do
       run_ab_case "${side}" "read-rtt-0-dur-flushed-rep-${rep}" \
         block-read-4k,block-read-1m "${READ_CONCURRENCY}"
     done
-  done
-  for side in base fix; do
-    run_ab_case "${side}" "size-4k-rtt-0-dur-flushed-rep-1" \
-      block-batch-4k-16ops "${GUARD_CONCURRENCY}" \
-      --block-batch-ops 1 \
-      --block-batch-bytes "${bytes_4k}" \
-      --block-batch-overlap random
   done
   if [[ "${DRY_RUN}" != "1" ]]; then
     teardown_storage

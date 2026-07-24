@@ -23906,3 +23906,325 @@ fn durable_block_journal_double_fault_still_validates_suspect_range() {
     drop(reopened);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn durable_block_journal_prune_interleaving_sync_skips_stale_cover() {
+    let (root, store, device_id, lease) = pipeline_store("m4-prune-stale-cover");
+    let shard = store.durable.block_journal_shard_for_device(device_id);
+    // Direction B first: without a prune, a completed sync advances the
+    // cover normally in the same generation.
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 91),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let (generation_before, synced_before, end_before) = {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        (tail.generation, tail.synced_offset, tail.end_offset)
+    };
+    assert_eq!(synced_before, end_before);
+    assert!(synced_before > 0);
+
+    // Direction A: hold a batch's fsync in flight (cover captured in the
+    // OLD file's coordinates), prune the shard underneath it (new inode,
+    // tail reset, generation bump), and let the fsync complete.
+    store
+        .delay_next_block_journal_sync_for_test(Duration::from_millis(150))
+        .unwrap();
+    thread::scope(|scope| {
+        let write_store = std::sync::Arc::clone(&store);
+        let lease = &lease;
+        let inflight = scope.spawn(move || {
+            write_store.write_device_with_writer(
+                lease,
+                4096,
+                &repeated_blocks(1, 92),
+                WriteDurability::Flushed,
+                PayloadIntegrity::Verified,
+            )
+        });
+        thread::sleep(Duration::from_millis(50));
+        // Prune only the first (already materialized-in-spirit) commit;
+        // the in-flight batch's records are unmaterialized and survive the
+        // rewrite. NOTE: the map is synthesized for the interleaving — the
+        // first write's records are dropped from the journal without real
+        // materialization, so it is deliberately NOT asserted after
+        // reopen.
+        let mut materialized = BTreeMap::new();
+        materialized.insert(device_id, CommitSeq::from_raw(1));
+        store
+            .durable
+            .prune_block_journal_records_through(&materialized)
+            .unwrap();
+        inflight.join().unwrap().unwrap();
+    });
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        assert!(
+            tail.generation > generation_before,
+            "prune must bump the tail coordinate generation"
+        );
+        // The stale old-coordinate cover must NOT have been applied to the
+        // reset tail: it stays unestablished (zero) until the next append
+        // re-derives it from the new file.
+        assert!(!tail.initialized);
+        assert_eq!(tail.synced_offset, 0);
+    }
+    // The lane keeps working in the new epoch and coverage re-establishes.
+    store
+        .write_device_with_writer(
+            &lease,
+            2 * 4096,
+            &repeated_blocks(1, 93),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        assert!(tail.initialized);
+        assert_eq!(tail.synced_offset, tail.end_offset);
+        assert!(tail.synced_offset > 0);
+    }
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 92));
+    assert_eq!(read_block(&store, device_id, 2), repeated_blocks(1, 93));
+    drop(store);
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 1), repeated_blocks(1, 92));
+    assert_eq!(read_block(&reopened, device_id, 2), repeated_blocks(1, 93));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_fs_fd_cache_reuses_across_batches_and_drops_on_prune() {
+    let (root, store, device_id, lease) = pipeline_store("m4-fd-cache");
+    let shard = store.durable.block_journal_shard_for_device(device_id);
+    assert_eq!(
+        store.resolved_low_level_io_backend_for_test(),
+        DurableResolvedLowLevelIoBackend::Filesystem,
+        "fd cache under test is the filesystem-backend arm"
+    );
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 81),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let first = {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        tail.file.clone().expect("first append caches the shard fd")
+    };
+    store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 82),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        let second = tail.file.clone().expect("cache survives later appends");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "later appends must reuse the cached fd, not reopen"
+        );
+    }
+    // A prune rewrites the shard under a NEW inode: the tail reset must
+    // drop the cached fd in the same locked block that bumps the
+    // coordinate generation. (The prune map is synthesized, so the pruned
+    // first write is deliberately not asserted after reopen — see the
+    // prune-interleave test.)
+    let mut materialized = BTreeMap::new();
+    materialized.insert(device_id, CommitSeq::from_raw(1));
+    store
+        .durable
+        .prune_block_journal_records_through(&materialized)
+        .unwrap();
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        assert!(
+            tail.file.is_none(),
+            "prune tail-reset must drop the cached fd"
+        );
+    }
+    // The next append opens the new file and re-caches; coverage
+    // re-establishes through the fresh fd.
+    store
+        .write_device_with_writer(
+            &lease,
+            2 * 4096,
+            &repeated_blocks(1, 83),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    {
+        let tail = store.durable.block_journal_shard_locks[shard]
+            .lock()
+            .unwrap();
+        let recached = tail
+            .file
+            .clone()
+            .expect("post-prune append re-caches the shard fd");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &recached),
+            "post-prune cache must be a fresh fd for the new inode"
+        );
+        assert_eq!(tail.synced_offset, tail.end_offset);
+        assert!(tail.synced_offset > 0);
+    }
+    assert_eq!(read_block(&store, device_id, 2), repeated_blocks(1, 83));
+    drop(store);
+    // Reopen and sync with no append since open: exercises the cold
+    // open-per-sync fallback (no cached fd) against the existing file.
+    let reopened = DurableCoordinator::open(&root, config()).unwrap();
+    reopened.durable.sync_block_journal(shard).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 2), repeated_blocks(1, 83));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_block_journal_fused_frame_encoding_matches_reference() {
+    // The in-place frame writer used by the hot append path must produce
+    // byte-for-byte what the reference per-frame builder produces: same
+    // header, same payload encoding, same checksum, at any buffer offset.
+    let device_id = DeviceId::from_raw(17);
+    let epoch = WriterEpoch::from_raw(3);
+    let records = vec![
+        BlockJournalRecord::Lease {
+            device_id,
+            writer_epoch: epoch,
+        },
+        BlockJournalRecord::Write(BlockJournalCommit {
+            device_id,
+            writer_epoch: epoch,
+            commit_seq: CommitSeq::from_raw(1),
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: 4096,
+            entries: vec![BlockJournalEntry::Write {
+                range: ByteRange::new(0, 4096),
+                payload_integrity: PayloadIntegrity::Verified,
+                bytes: repeated_blocks(1, 57),
+            }],
+        }),
+        BlockJournalRecord::Flush {
+            device_id,
+            writer_epoch: epoch,
+            durable_through: CommitSeq::from_raw(1),
+        },
+    ];
+    let reference = block_journal_records_frame(&records).unwrap();
+    let mut fused = Vec::new();
+    append_block_journal_records_frame_into(&records, &mut fused).unwrap();
+    assert_eq!(fused, reference);
+    // Appending at a non-zero offset must leave the prefix intact and
+    // produce the same frame bytes after it.
+    let mut offset = b"prefix".to_vec();
+    append_block_journal_records_frame_into(&records, &mut offset).unwrap();
+    assert_eq!(&offset[..6], b"prefix");
+    assert_eq!(&offset[6..], reference.as_slice());
+    // The batch encoder's frame-split path (records exceeding the target
+    // frame size) must equal the reference frames laid end to end.
+    let big = |seq: u64, fill: u8| {
+        BlockJournalRecord::Write(BlockJournalCommit {
+            device_id,
+            writer_epoch: epoch,
+            commit_seq: CommitSeq::from_raw(seq),
+            write_count: 1,
+            collapsed_range_count: 1,
+            committed_bytes: 9 * 1024 * 1024,
+            entries: vec![BlockJournalEntry::Write {
+                range: ByteRange::new(0, 9 * 1024 * 1024),
+                payload_integrity: PayloadIntegrity::Verified,
+                bytes: vec![fill; 9 * 1024 * 1024],
+            }],
+        })
+    };
+    let split = vec![big(2, 11), big(3, 12)];
+    let mut split_reference = block_journal_records_frame(&split[..1]).unwrap();
+    split_reference.extend_from_slice(&block_journal_records_frame(&split[1..]).unwrap());
+    let mut split_fused = Vec::new();
+    encode_block_journal_frames_into(&split, &mut split_fused).unwrap();
+    assert_eq!(split_fused, split_reference);
+}
+
+#[test]
+fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fencing() {
+    let (root, store, device_id, lease) = pipeline_store("m4-concurrent-reservation");
+    // Hammer one device from many threads: per-device reserve->enqueue
+    // ordering and fencing must hold under concurrency regardless of the
+    // reservation lock structure (publish would corrupt-error on any
+    // commit-seq inversion), and every write must remain readable.
+    let workers = 8_u64;
+    let writes_per_worker = 20_u64;
+    thread::scope(|scope| {
+        for worker in 0..workers {
+            let store = std::sync::Arc::clone(&store);
+            let lease = &lease;
+            scope.spawn(move || {
+                for index in 0..writes_per_worker {
+                    let block = worker * writes_per_worker + index;
+                    let durability = if block.is_multiple_of(3) {
+                        WriteDurability::Acknowledged
+                    } else {
+                        WriteDurability::Flushed
+                    };
+                    store
+                        .write_device_with_writer(
+                            lease,
+                            block * 4096,
+                            &repeated_blocks(1, 100 + (block % 100) as u8),
+                            durability,
+                            PayloadIntegrity::Verified,
+                        )
+                        .unwrap();
+                }
+            });
+        }
+    });
+    for block in 0..workers * writes_per_worker {
+        assert_eq!(
+            read_block(&store, device_id, block),
+            repeated_blocks(1, 100 + (block % 100) as u8)
+        );
+    }
+    // Fencing survives the stripe change: a stale lease still fails at
+    // validation before any reservation.
+    let _fresh = store.acquire_block_writer(device_id).unwrap();
+    assert!(matches!(
+        store.write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 99),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        ),
+        Err(StorageError::Conflict { .. })
+    ));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}

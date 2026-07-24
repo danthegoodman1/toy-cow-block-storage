@@ -1915,9 +1915,41 @@ const APPEND_VISIBLE_PUBLISH_JOURNAL_MAGIC: [u8; 8] = *b"AVPJNL01";
 /// failure no writer can put an intact frame beyond the damaged region,
 /// which replay would silently drop after truncating at the first torn
 /// frame.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 pub(super) struct BlockJournalShardTail {
     initialized: bool,
+    /// Coordinate epoch of the offsets below. A prune rewrites the shard
+    /// file under a NEW inode and resets the tail, so offsets captured
+    /// before the prune (an in-flight sync's cover) are meaningless
+    /// afterwards; the generation is bumped at every prune reset and
+    /// captured alongside the cover so stale coordinates are never applied
+    /// to the new file (a stale cover can exceed the new end offset,
+    /// marking fresh bytes durable and shrinking a later suspect range
+    /// past validated recovery). The fd cache invalidates on the same
+    /// seam.
+    generation: u64,
+    /// Cached filesystem-backend fd for this shard's journal file: opened
+    /// once (create + preallocate + parent-dir sync on first creation) and
+    /// reused by every append and fsync, instead of an open/close pair per
+    /// batch append plus another per sync. Lives and dies with the
+    /// coordinate generation above: the prune tail-reset replaces the whole
+    /// tail in the same shard-locked block that bumps the generation, so an
+    /// fd captured under generation g is unreachable once the generation
+    /// moves. (A prune with surviving records renames a NEW inode into
+    /// place; a prune that keeps nothing truncates the SAME inode in place
+    /// and fsyncs the truncation — in both branches the old fd's view of
+    /// offsets is stale and fsyncing through it can no longer establish
+    /// anything about the post-prune file.) Always
+    /// `None` under the direct-I/O backend, which caches file handles
+    /// internally (`DirectIoFileBackend`).
+    file: Option<Arc<File>>,
+    /// Pooled encode buffer for this shard's batch appends (frames are
+    /// encoded in place, so steady state pays no per-batch allocation).
+    /// Purely an allocation cache — carries no state across batches (it is
+    /// cleared before each encode) and is exempt from the generation seam.
+    /// Oversized capacities are not returned to the pool (see the append
+    /// path), so one giant batch cannot pin its footprint on the shard.
+    encode_buffer: Vec<u8>,
     /// Exclusive end offset of the last fully successful append (physical
     /// bytes, including any direct-I/O alignment padding).
     end_offset: u64,
@@ -1956,6 +1988,15 @@ impl BlockJournalTailPoison {
     fn is_active(self) -> bool {
         self.torn || self.sync_suspect
     }
+}
+
+/// One-time cost of a `BlockJournalShardTail::file` cache miss, folded into
+/// the miss's append profile; a cache hit reports all-zero.
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockJournalFileOpenCost {
+    open_nanos: u64,
+    dir_sync_nanos: u64,
+    created: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2335,18 +2376,20 @@ fn load_native_publish_journal_commits_since(
 /// write; the lane owner issues one data sync for the whole batch.
 const BLOCK_JOURNAL_TARGET_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 
-pub(super) fn append_block_journal_records_unsynced(
-    path: &Path,
+/// Encode a batch of records into one contiguous run of journal frames
+/// (splitting at `BLOCK_JOURNAL_TARGET_FRAME_BYTES`) appended to `bytes`,
+/// ready for a single append. Frames are built in place (see
+/// `append_block_journal_records_frame_into`), so a pooled caller buffer
+/// pays no intermediate per-frame allocations or copies.
+fn encode_block_journal_frames_into(
     records: &[BlockJournalRecord],
-    low_level_io: &ResolvedDurableLowLevelIoBackend,
-) -> Result<AppendVisibleJournalProfile> {
+    bytes: &mut Vec<u8>,
+) -> Result<()> {
     if records.is_empty() {
         return Err(StorageError::invalid_argument(
             "block journal batch must include records",
         ));
     }
-    let encode_started = Instant::now();
-    let mut bytes = Vec::new();
     let mut frame_start = 0_usize;
     let mut frame_bytes = 0_u64;
     for (index, record) in records.iter().enumerate() {
@@ -2367,18 +2410,14 @@ pub(super) fn append_block_journal_records_unsynced(
         if index > frame_start
             && frame_bytes.saturating_add(record_bytes) > BLOCK_JOURNAL_TARGET_FRAME_BYTES
         {
-            bytes.extend_from_slice(&block_journal_records_frame(&records[frame_start..index])?);
+            append_block_journal_records_frame_into(&records[frame_start..index], bytes)?;
             frame_start = index;
             frame_bytes = 0;
         }
         frame_bytes = frame_bytes.saturating_add(record_bytes);
     }
-    bytes.extend_from_slice(&block_journal_records_frame(&records[frame_start..])?);
-    let encode_nanos = duration_nanos_u64(encode_started.elapsed());
-    let mut profile = append_durable_journal_bytes_with_backend(path, &bytes, false, low_level_io)?;
-    profile.encode_nanos = encode_nanos;
-    profile.record_count = usize_to_u64(records.len());
-    Ok(profile)
+    append_block_journal_records_frame_into(&records[frame_start..], bytes)?;
+    Ok(())
 }
 
 pub(super) fn load_block_journal_records(path: &Path) -> Result<Vec<BlockJournalRecord>> {
@@ -3426,6 +3465,60 @@ impl DurableSqliteStore {
         Ok(())
     }
 
+    /// Filesystem-backend cached-fd acquisition, under the shard lock: open
+    /// the shard file once — creating it, preallocating, and syncing the
+    /// parent directory when it did not exist — and pin the fd on the tail
+    /// for every later append and fsync (see `BlockJournalShardTail::file`
+    /// for the generation seam that invalidates it). The fd is opened in
+    /// append mode, so writes always land at the inode's current end and a
+    /// torn-tail truncation through a separate fd stays coherent with it.
+    fn block_journal_cached_file_locked(
+        &self,
+        path: &Path,
+        tail: &mut BlockJournalShardTail,
+    ) -> Result<(Arc<File>, BlockJournalFileOpenCost)> {
+        if let Some(file) = &tail.file {
+            return Ok((Arc::clone(file), BlockJournalFileOpenCost::default()));
+        }
+        let mut dir_sync_nanos = 0_u64;
+        let parent = path.parent().ok_or_else(|| {
+            StorageError::invalid_argument("journal path has no parent directory")
+        })?;
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(fs_error)?;
+            let dir_sync_started = Instant::now();
+            sync_parent_dir(parent)?;
+            dir_sync_nanos =
+                dir_sync_nanos.saturating_add(duration_nanos_u64(dir_sync_started.elapsed()));
+        }
+        let existed = path.exists();
+        let open_started = Instant::now();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(path)
+            .map_err(fs_error)?;
+        let open_nanos = duration_nanos_u64(open_started.elapsed());
+        if !existed {
+            preallocate_durable_journal_file(&file, DURABLE_JOURNAL_PREALLOC_BYTES)?;
+            let dir_sync_started = Instant::now();
+            sync_parent_dir(path)?;
+            dir_sync_nanos =
+                dir_sync_nanos.saturating_add(duration_nanos_u64(dir_sync_started.elapsed()));
+        }
+        let file = Arc::new(file);
+        tail.file = Some(Arc::clone(&file));
+        Ok((
+            file,
+            BlockJournalFileOpenCost {
+                open_nanos,
+                dir_sync_nanos,
+                created: !existed,
+            },
+        ))
+    }
+
     /// `measure` carries the persist sink's enabled flag; the shard-lock
     /// wait is measured only when set (see `lock_timed`).
     ///
@@ -3452,14 +3545,52 @@ impl DurableSqliteStore {
                 "injected block journal append failure",
             ));
         }
-        let mut profile =
-            match append_block_journal_records_unsynced(&path, records, &self.low_level_io) {
-                Ok(profile) => profile,
-                Err(error) => {
-                    tail.poison.torn = true;
-                    return Err(error);
-                }
-            };
+        // Any failure below poisons the tail as torn, exactly like before
+        // the fd cache: an encode error wrote nothing, but poisoning on it
+        // is the pre-existing fail-safe contract of this method.
+        let encode_started = Instant::now();
+        let mut bytes = std::mem::take(&mut tail.encode_buffer);
+        bytes.clear();
+        let encode_result = encode_block_journal_frames_into(records, &mut bytes);
+        let encode_nanos = duration_nanos_u64(encode_started.elapsed());
+        let append_result = encode_result.and_then(|()| match &self.low_level_io {
+            ResolvedDurableLowLevelIoBackend::Filesystem => {
+                let (file, open_cost) = self.block_journal_cached_file_locked(&path, &mut tail)?;
+                let write_started = Instant::now();
+                (&*file).write_all(&bytes).map_err(fs_error)?;
+                Ok(AppendVisibleJournalProfile {
+                    encode_nanos,
+                    open_nanos: open_cost.open_nanos,
+                    write_nanos: duration_nanos_u64(write_started.elapsed()),
+                    dir_sync_nanos: open_cost.dir_sync_nanos,
+                    record_count: usize_to_u64(records.len()),
+                    frame_bytes: usize_to_u64(bytes.len()),
+                    created: if open_cost.created { 1 } else { 0 },
+                    ..AppendVisibleJournalProfile::default()
+                })
+            }
+            // Direct I/O caches file handles inside its backend; keep the
+            // shared open-per-append path, which resolves to that cache.
+            backend @ ResolvedDurableLowLevelIoBackend::DirectIo(_) => {
+                let mut profile =
+                    append_durable_journal_bytes_with_backend(&path, &bytes, false, backend)?;
+                profile.encode_nanos = encode_nanos;
+                profile.record_count = usize_to_u64(records.len());
+                Ok(profile)
+            }
+        });
+        // Return the pooled buffer, except oversized capacities: one giant
+        // batch must not pin its footprint on the shard.
+        if bytes.capacity() as u64 <= 2 * BLOCK_JOURNAL_TARGET_FRAME_BYTES {
+            tail.encode_buffer = bytes;
+        }
+        let mut profile = match append_result {
+            Ok(profile) => profile,
+            Err(error) => {
+                tail.poison.torn = true;
+                return Err(error);
+            }
+        };
         tail.end_offset = tail.end_offset.saturating_add(profile.frame_bytes);
         profile.lock_wait_nanos = lock_wait_nanos;
         profile.tail_recovered = tail_recovered;
@@ -3479,7 +3610,12 @@ impl DurableSqliteStore {
     fn sync_block_journal(&self, shard: usize) -> Result<u64> {
         let path = self.block_journal_shard_path(shard)?;
         let shard_lock = self.block_journal_shard_lock(shard)?;
-        let cover = {
+        // The cached fd is cloned in the SAME locked section that captures
+        // (cover, generation), so file, cover, and coordinate epoch are
+        // mutually consistent: a prune that interleaves after this block
+        // drops the cache and bumps the generation, and this sync's fsync
+        // of the OLD inode is then rejected at the guarded advance below.
+        let (cover, cover_generation, cached_file) = {
             let mut tail = lock(shard_lock)?;
             self.ensure_block_journal_tail_initialized(&path, &mut tail)?;
             if tail.poison.is_active() {
@@ -3489,7 +3625,7 @@ impl DurableSqliteStore {
                     "block journal shard tail is poisoned",
                 ));
             }
-            tail.end_offset
+            (tail.end_offset, tail.generation, tail.file.clone())
         };
         let sync_result = (|| -> Result<u64> {
             // Test-only: hold this fsync in flight after its coverage was
@@ -3507,23 +3643,56 @@ impl DurableSqliteStore {
                     "injected block journal sync failure",
                 ));
             }
-            let file = OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .map_err(fs_error)?;
-            let sync_started = Instant::now();
-            file.sync_data().map_err(fs_error)?;
-            Ok(duration_nanos_u64(sync_started.elapsed()))
+            match &cached_file {
+                Some(file) => {
+                    let sync_started = Instant::now();
+                    file.sync_data().map_err(fs_error)?;
+                    Ok(duration_nanos_u64(sync_started.elapsed()))
+                }
+                // No cached fd: the direct-I/O backend (always), or a
+                // filesystem tail with no append since open/prune — a cold
+                // one-shot, kept on the old open-per-sync path. An fsync
+                // through any fd covers the inode's dirty pages regardless
+                // of which fd wrote them.
+                None => {
+                    let file = OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .map_err(fs_error)?;
+                    let sync_started = Instant::now();
+                    file.sync_data().map_err(fs_error)?;
+                    Ok(duration_nanos_u64(sync_started.elapsed()))
+                }
+            }
         })();
         let mut tail = lock(shard_lock)?;
         match sync_result {
             Ok(nanos) => {
-                tail.synced_offset = tail.synced_offset.max(cover);
+                // The advance applies ONLY in the coordinate epoch the
+                // cover was captured in: if a prune interleaved with this
+                // fsync, the cover is in old-inode coordinates and must not
+                // touch the new tail. The completed batch's durability
+                // claim still holds across that prune, but by
+                // TRANSITIVITY, not by this fsync: the pruner read the
+                // batch's bytes under the shard lock (after the append)
+                // and made the surviving state durable before swapping it
+                // in (tmp-file sync before the rename when records
+                // survive; every dropped record already materialized plus
+                // a synced truncation when none do) — that prune-side
+                // durability is the only thing making the claim true, and
+                // the path-based "the fsync hit the new inode anyway"
+                // answer dies once the fd cache pins the old inode.
+                if tail.generation == cover_generation {
+                    tail.synced_offset = tail.synced_offset.max(cover);
+                }
                 Ok(nanos)
             }
             Err(error) => {
                 // Never erase a concurrent tear: both facts must survive
-                // for the combined recovery.
+                // for the combined recovery. On a generation mismatch this
+                // may poison the NEW file spuriously (the failure belonged
+                // to the old inode); that costs one validated recovery,
+                // which is the fail-safe direction.
                 tail.poison.sync_suspect = true;
                 Err(error)
             }
@@ -3563,9 +3732,18 @@ impl DurableSqliteStore {
             }
             prune_block_journal_records_through(&path, materialized)?;
             self.low_level_io.forget_path(&path)?;
-            // The prune rewrote (and fsynced) the file under a new inode;
-            // re-derive the tail lazily from the new file.
-            *tail = BlockJournalShardTail::default();
+            // The prune made the surviving state durable (rename of a
+            // synced NEW inode when records survive; an in-place synced
+            // truncation of the same inode when none do);
+            // re-derive the tail lazily from the new file, and bump the
+            // coordinate generation so any in-flight sync's cover (old
+            // coordinates) cannot apply to it. The whole-tail replacement
+            // also drops the cached fd (old inode) in this same locked
+            // block — the fd cache invalidates on the generation seam.
+            *tail = BlockJournalShardTail {
+                generation: tail.generation.saturating_add(1),
+                ..BlockJournalShardTail::default()
+            };
         }
         Ok(())
     }
