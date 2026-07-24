@@ -25540,3 +25540,403 @@ fn durable_device_id_reused_after_retention_expires_the_deleted_head_reopens() {
     drop(reopened);
     let _ = fs::remove_dir_all(root);
 }
+
+// A bounded persist truncates the image at `target_commit`, so the commits it
+// makes durable are a strict prefix of the ones live metadata has
+// materialized. Prune used to read the high-water live and drop every journal
+// record at or below it, which for the commits past the target meant deleting
+// the only durable copy of an already-acknowledged `Flushed` write. Nothing
+// failed at the time; the loss only appeared on the next reopen, as zeroes.
+//
+// Both devices here are written `Flushed`, so both own `Write` and `Flush`
+// records. The persist targets the first device's commit, which is exactly
+// the line the image is cut on: the first device's records are genuinely
+// redundant afterwards and must still prune, and the second device's must
+// not. Asserting both is what keeps this from passing on a prune that simply
+// stopped pruning.
+//
+// Fixing this moved no existing expectation in the suite, and that fact is a
+// warning rather than a reassurance: nothing here exercised prune on a
+// bounded persist at all. The only bounded-persist block test that existed,
+// `durable_persist_until_does_not_export_later_block_commits`, writes
+// `Acknowledged`, and an `Acknowledged` block write puts NO record in the
+// block journal — so prune ran there with an empty shard and could not have
+// told the two high-waters apart whatever it read. Read "every other test
+// still passes" as "this path had no coverage until now".
+#[test]
+fn durable_bounded_persist_keeps_journal_records_past_the_persisted_image() {
+    let root = durable_temp_dir("bounded-persist-prune-data-loss");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let covered = store
+        .create_device(lease_delete_device_request("covered"))
+        .unwrap();
+    let beyond = store
+        .create_device(lease_delete_device_request("beyond"))
+        .unwrap();
+    let covered_lease = store.acquire_block_writer(covered).unwrap();
+    let beyond_lease = store.acquire_block_writer(beyond).unwrap();
+    let covered_commit = store
+        .write_device_with_writer(
+            &covered_lease,
+            0,
+            &repeated_blocks(1, 11),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+    let beyond_commit = store
+        .write_device_with_writer(
+            &beyond_lease,
+            0,
+            &repeated_blocks(1, 22),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+    assert!(
+        beyond_commit.raw() > covered_commit.raw(),
+        "the second write must land past the persist target, or nothing is being bounded out"
+    );
+    assert_eq!(
+        block_journal_record_classes_for_device(
+            &store.durable.block_journal_records().unwrap(),
+            beyond,
+        ),
+        BTreeSet::from(["flush", "lease", "write"]),
+        "the beyond-target device must own every record class before the persist, or the check below is vacuous"
+    );
+
+    store.persist_until(covered_commit).unwrap();
+
+    assert_eq!(
+        block_journal_record_classes_for_device(
+            &store.durable.block_journal_records().unwrap(),
+            covered,
+        ),
+        BTreeSet::from(["lease"]),
+        "a commit the image does carry must still prune, or this fix has just disabled prune"
+    );
+    assert_eq!(
+        block_journal_record_classes_for_device(
+            &store.durable.block_journal_records().unwrap(),
+            beyond,
+        ),
+        BTreeSet::from(["flush", "lease", "write"]),
+        "a commit the image does not carry is the only durable copy of an acknowledged write"
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&reopened, covered, 0), repeated_blocks(1, 11));
+    assert_eq!(
+        read_block(&reopened, beyond, 0),
+        repeated_blocks(1, 22),
+        "an acknowledged Flushed write must survive a crash after a bounded persist"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+// Pins the other half of the same rule: prune's `retired` set must come from
+// the persisted image too. Swapping it back to a live read leaves every other
+// test in this crate green, because the two views only diverge on a bounded
+// persist — and until `persist_until` was reachable from here, nothing could
+// build that shape.
+//
+// The divergence is `metadata_through_commit`: a device deleted after
+// `target_commit` has its deleted head rewound into the image's live heads
+// and its `DeleteRecord` truncated away, so the image shows it LIVE while
+// live metadata calls it retired. A live read therefore retires a device the
+// restored store still has, and prune drops its records as dead state — one
+// of which is the only durable copy of its post-target write.
+//
+// Two setup notes, both load-bearing:
+//   * `delete_device` persists unboundedly, and that persist both prunes the
+//     doomed device's records and monotonically raises `requested_through`
+//     past the delete — after which `persist_until` can never target below
+//     it. Failing that persist is what leaves the journal unpruned and the
+//     target reachable. This is not a crash proxy: `run_and_maybe_persist`
+//     returns the persist error WITHOUT undoing the mutation `op` already
+//     made, so "`delete_device` returned `Err` and the device is deleted in
+//     live metadata anyway" is the ordinary outcome of any persist I/O
+//     failure, with the process still running. If failed persists ever learn
+//     to roll back, this setup stops being reachable and the test needs
+//     rebuilding on whatever replaces it — it must not simply be deleted,
+//     because the rule it pins outlives the way it is reached here.
+//   * The doomed device is written twice. The persist targets the first
+//     write, so the image carries it and the journal is the sole home of the
+//     second — the difference the assertion reads.
+#[test]
+fn durable_bounded_persist_prune_judges_retirement_by_the_image_not_live_metadata() {
+    let root = durable_temp_dir("bounded-persist-prune-retired-source");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let doomed = store
+        .create_device(lease_delete_device_request("doomed"))
+        .unwrap();
+    let doomed_lease = store.acquire_block_writer(doomed).unwrap();
+    let target = store
+        .write_device_with_writer(
+            &doomed_lease,
+            0,
+            &repeated_blocks(1, 61),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+    let past_target = store
+        .write_device_with_writer(
+            &doomed_lease,
+            0,
+            &repeated_blocks(1, 62),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+
+    // The delete lands in metadata; its persist does not, so nothing prunes
+    // and nothing raises `requested_through` past the delete commit.
+    store.fail_next_persist_for_test();
+    assert!(store.delete_device(doomed).is_err());
+    assert!(
+        store
+            .metadata()
+            .deleted_device_ids()
+            .unwrap()
+            .contains(&doomed),
+        "the delete must have landed in live metadata, or live and image agree and this test is vacuous"
+    );
+    assert_eq!(
+        block_journal_record_classes_for_device(
+            &store.durable.block_journal_records().unwrap(),
+            doomed,
+        ),
+        BTreeSet::from(["flush", "lease", "write"]),
+        "the failed persist must leave the journal unpruned, or there is nothing left to prune wrongly"
+    );
+
+    // Bounded persist below the delete: the image rewinds the doomed device
+    // back into its live heads and drops the `DeleteRecord`, so the image
+    // does not call it retired even though live metadata does.
+    store.persist_until(target).unwrap();
+    assert!(
+        past_target.raw() > target.raw(),
+        "the second write must land past the target, or the image would carry it anyway"
+    );
+    assert_eq!(
+        block_journal_record_classes_for_device(
+            &store.durable.block_journal_records().unwrap(),
+            doomed,
+        ),
+        BTreeSet::from(["flush", "lease", "write"]),
+        "a device the image shows live must keep its records, whatever live metadata says"
+    );
+    drop(store);
+
+    // The restored image has the device; replay of the retained records is
+    // what carries it forward to its last acknowledged write.
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(
+        read_block(&reopened, doomed, 0),
+        repeated_blocks(1, 62),
+        "the reopened store shows the device live, so its acknowledged writes must be there too"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+// The bounded persist above ran on a store with no export cursor, so its
+// image carried the whole prefix up to the target. With a cursor the image is
+// a delta: `metadata_through_commit` windows `shard_commits` down to
+// `[cursor.next_commit_seq, target]`, so the high-water read off it names only
+// the devices committing inside that window. That is an under-statement of
+// what the durable store holds — the rows below the cursor are still there
+// from the export that produced it — and under-stating is the safe direction,
+// but it would be worth nothing if it under-stated so far that prune stopped
+// reclaiming. It does not, and the reason is upstream of the window: every
+// `persist_physical` opens with `flush_visible_block_journal_heads` and
+// `materialize_durable_block_journal`, BEFORE it snapshots. So by the time
+// the image whose window spans a commit is taken, that commit already has a
+// `Flush` and is already materialized — including the `Acknowledged` leased
+// write, which takes the ack bypass and publishes through
+// `publish_reserved_block_journal_commit` without writing a `shard_commits`
+// row of its own. It is that opening pair, not any ordering between a `Write`
+// record and its `shard_commits` row, that keeps a commit from falling
+// between two windows. So the commit at the target still prunes here, and
+// only the one past it survives.
+//
+// The premise does leak in one direction, and only towards retention. An
+// export that SKIPS its prune still advances the cursor, so the records below
+// it are not offered to that prune and later windows start above them. Two
+// ways in: the native-delta fast path advances the cursor through
+// `persist_row_native_metadata_delta` and then returns from `persist_physical`
+// before the prune runs at all, and prune itself skips any shard whose tail
+// poison is active. Both are self-correcting rather than permanent — an
+// unbounded persist judges the unwindowed image and reclaims everything below
+// it, and create/delete/fork/restore/the custodian/`persist_now` all persist
+// unboundedly — so what leaks is reclamation, deferred to the next unbounded
+// persist. No record is ever dropped early by it.
+#[test]
+fn durable_bounded_persist_on_an_export_cursor_still_prunes_up_to_its_target() {
+    let root = durable_temp_dir("bounded-persist-prune-incremental");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let device_id = store
+        .create_device(lease_delete_device_request("dev"))
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+    // Creating a second device runs an unbounded persist, which is what
+    // leaves an export cursor behind for the bounded persist to build on.
+    store
+        .create_device(lease_delete_device_request("cursor-maker"))
+        .unwrap();
+    assert!(
+        store.durable.export_cursor().unwrap().is_some(),
+        "the bounded persist below must run incrementally, or this repeats the no-cursor case"
+    );
+
+    let target = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 71),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+    store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 72),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+
+    store.persist_until(target).unwrap();
+    let records = store.durable.block_journal_records().unwrap();
+    let retained_writes = records
+        .iter()
+        .filter(|record| matches!(record, BlockJournalRecord::Write(_)))
+        .count();
+    assert_eq!(
+        retained_writes, 1,
+        "only the write past the target may survive; the targeted one is durable and must prune"
+    );
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 72));
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
+// The same loss with no private access anywhere: `flush_file` is public, and
+// it persists only up to the file's own `latest_commit`. A block device
+// writing `Flushed` in the same store commits past that, so the file's flush
+// is a bounded persist whose image stops short of the block writes — and the
+// live high-water prune read named them anyway.
+//
+// The interleaving is what makes this reachable rather than theoretical. Two
+// mechanisms otherwise hide it, and both are defeated by ordering alone:
+//   * `requested_through` is a monotone max that every unbounded persist
+//     raises to `durable_through`, so the target has to be a commit no
+//     unbounded persist has passed — which the file's own commit is, since
+//     `Acknowledged` file batches and `Flushed` block writes both persist
+//     nothing.
+//   * `persist_physical`'s native-delta fast path returns before the prune,
+//     and it is taken unless a pending block delta falls inside the exported
+//     range. The FIRST block write puts one there; the SECOND is the one that
+//     gets lost. A single block write reaches the fast path and survives.
+// Neither is a durability invariant — they are an allocator artifact and an
+// optimisation — so this test is the thing standing between the defect and a
+// user, not them.
+#[test]
+fn durable_flush_file_does_not_prune_concurrent_block_writes_past_its_commit() {
+    let root = durable_temp_dir("flush-file-bounded-prune-block-loss");
+    let cfg = config();
+    let store = DurableCoordinator::open(&root, cfg).unwrap();
+    let keyspace_id = store
+        .create_keyspace(CreateKeyspaceRequest {
+            name: Some("ks".to_string()),
+        })
+        .unwrap();
+    let file_id = store
+        .create_file(
+            keyspace_id,
+            CreateFileRequest {
+                spec: FileSpec {
+                    name: Some("file".to_string()),
+                },
+            },
+        )
+        .unwrap();
+    let device_id = store
+        .create_device(lease_delete_device_request("dev"))
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    let covered = store
+        .write_device_with_writer(
+            &lease,
+            0,
+            &repeated_blocks(1, 98),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+    let file_commit = store
+        .commit_file_batch(
+            keyspace_id,
+            file_id,
+            &[FileBatchWrite::new(0, b"hello".to_vec())],
+            WriteDurability::Acknowledged,
+        )
+        .unwrap()
+        .commit_seq;
+    let beyond = store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 99),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap()
+        .commit_seq;
+    assert!(
+        covered.raw() < file_commit.raw() && file_commit.raw() < beyond.raw(),
+        "the file's commit must sit between the two block writes, or neither mask is defeated"
+    );
+
+    store.flush_file(keyspace_id, file_id).unwrap();
+    drop(store);
+
+    let reopened = DurableCoordinator::open(&root, cfg).unwrap();
+    let mut bytes = vec![0; b"hello".len()];
+    reopened
+        .read_file(
+            keyspace_id,
+            file_id,
+            ByteRange::new(0, b"hello".len() as u64),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"hello");
+    assert_eq!(read_block(&reopened, device_id, 0), repeated_blocks(1, 98));
+    assert_eq!(
+        read_block(&reopened, device_id, 1),
+        repeated_blocks(1, 99),
+        "flushing an unrelated file must not discard a block write acknowledged as Flushed"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}

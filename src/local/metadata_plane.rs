@@ -895,10 +895,22 @@ impl InMemoryMetadataPlane {
     /// block-journal paths that need both.
     pub(super) fn block_journal_device_view(&self) -> Result<BlockJournalDeviceView> {
         let inner = lock(&self.inner)?;
-        Ok(BlockJournalDeviceView {
-            materialized: Self::block_materialized_high_water_locked(&inner),
-            retired: Self::retired_block_device_ids_locked(&inner),
-        })
+        Ok(Self::block_journal_device_view_locked(&inner))
+    }
+
+    /// The same two answers read off a metadata value the caller already
+    /// holds, so a durable image can be judged by the rule live metadata is
+    /// judged by. Both halves come from the one value on purpose: prune
+    /// destroys records, and a view that mixed an image's retirements with a
+    /// live high-water (or the reverse) would be describing a store that
+    /// exists nowhere.
+    pub(super) fn block_journal_device_view_locked(
+        inner: &MetadataInner,
+    ) -> BlockJournalDeviceView {
+        BlockJournalDeviceView {
+            materialized: Self::block_materialized_high_water_locked(inner),
+            retired: Self::retired_block_device_ids_locked(inner),
+        }
     }
 
     pub fn shard_commits_for_device(&self, device_id: DeviceId) -> Result<Vec<ShardCommit>> {
@@ -2997,6 +3009,12 @@ impl InMemoryMetadataPlane {
         Ok(inner.segment_last_mark_epoch.get(&segment_id).copied())
     }
 
+    /// Test-only since prune stopped calling it. Every production reader of
+    /// this map judges a specific metadata value — a durable image, or the
+    /// one lock hold `block_journal_device_view` takes — and a bare live read
+    /// is the shape that made prune drop records for commits the image it had
+    /// just written did not carry. Tests still want it to observe live state.
+    #[cfg(test)]
     pub(super) fn block_materialized_high_water(&self) -> Result<BTreeMap<DeviceId, CommitSeq>> {
         let inner = lock(&self.inner)?;
         Ok(Self::block_materialized_high_water_locked(&inner))

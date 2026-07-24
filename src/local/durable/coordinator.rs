@@ -2431,21 +2431,37 @@ impl DurableCoordinator {
         let durable_through = CommitSeq::from_raw(profile.durable_commit_high_water);
         self.prune_pending_block_deltas_through(durable_through)?;
         self.prune_pending_native_file_deltas_through(durable_through)?;
-        let materialized = self.local.metadata.block_materialized_high_water()?;
-        // Judged against the image that was just persisted, NOT against live
-        // metadata. Prune destroys records, and the store a crash here
-        // reopens from is exactly this image, so the two must agree on which
-        // devices are gone. A live read disagrees in both directions: a
-        // delete landing after the snapshot would retire a device the image
-        // still shows live, and a bounded persist rewinds a device deleted
-        // after `target_commit` back into the image's live heads
+        // Both halves are judged against the image that was just persisted,
+        // NOT against live metadata. Prune destroys records, and the store a
+        // crash here reopens from is exactly this image, so the two must
+        // agree on what the image carries.
+        //
+        // For `retired`: a live read disagrees in both directions. A delete
+        // landing after the snapshot would retire a device the image still
+        // shows live, and a bounded persist rewinds a device deleted after
+        // `target_commit` back into the image's live heads
         // (`metadata_through_commit`) while live metadata calls it deleted.
         // Either way the reopened store would find a live device whose
         // `Lease` record had been pruned out from under it, leaving its
         // writer epoch unseeded.
-        let retired = InMemoryMetadataPlane::retired_block_device_ids_locked(&image.metadata);
+        //
+        // For `materialized`: a live read is strictly worse, because it
+        // silently loses acknowledged writes. The high-water is the whole
+        // licence to drop a `Write`/`Flush` record — "the compact roots
+        // already carry this commit, the journal copy is redundant" — and
+        // only the image's roots are durable. `metadata_through_commit`
+        // truncates `shard_commits` at `target_commit`, so on a bounded
+        // persist live metadata claims commits the image does not carry;
+        // pruning on that claim deletes the only surviving copy of a
+        // `Flushed` write that was already acknowledged to its caller, and
+        // the reopened device reads back zeroes. The same gap opens without
+        // any bound whenever a commit materializes between the snapshot and
+        // this line. Reading the image closes both: it can only ever
+        // under-state what is durable, and under-stating costs a retained
+        // record, which the next persist reclaims.
+        let devices = InMemoryMetadataPlane::block_journal_device_view_locked(&image.metadata);
         self.durable
-            .prune_block_journal_records_through(&materialized, &retired)?;
+            .prune_block_journal_records_through(&devices.materialized, &devices.retired)?;
         self.attach_metadata_publish_profile(&mut profile)?;
         self.record_persist_profile(profile)?;
         Ok(durable_through)
