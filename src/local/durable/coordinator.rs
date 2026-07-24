@@ -41,11 +41,11 @@ pub struct DurableCoordinator {
     append_ingest_admission: Arc<AppendIngestAdmissionGate>,
     append_ingest_node_admission:
         Arc<Mutex<BTreeMap<StorageNodeId, Arc<AppendIngestAdmissionGate>>>>,
-    persist_profiler: Arc<Mutex<Option<PersistProfiler>>>,
-    append_publish_wait_profiler: Arc<Mutex<Option<AppendPublishWaitProfiler>>>,
-    append_ingest_profiler: Arc<Mutex<Option<AppendIngestProfiler>>>,
+    persist_profiler: Arc<ShardedProfileSink<DurablePersistProfile>>,
+    append_publish_wait_profiler: Arc<ShardedProfileSink<AppendPublishWaitProfile>>,
+    append_ingest_profiler: Arc<ShardedProfileSink<AppendIngestProfile>>,
     append_ingest_profile_enabled: Arc<AtomicBool>,
-    read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
+    read_profiler: Arc<ShardedProfileSink<ReadProfile>>,
     maintenance_policy: MaintenancePolicy,
     maintenance_cursor: Arc<Mutex<Option<DurableDataLogRef>>>,
     maintenance_worker: Option<Arc<MaintenanceWorker>>,
@@ -387,9 +387,11 @@ fn publish_block_segment_rows(
 /// Any flush boundary that would cover the write's sequence must first sync
 /// and catalog these payloads, so a durable Flush record never references
 /// segment bytes that could be lost in a crash.
+type DevicePendingPayloadMap = BTreeMap<DeviceId, BTreeMap<u64, PendingBlockPayload>>;
+
 #[derive(Debug, Default)]
 struct BlockDevicePendingPayloads {
-    inner: Mutex<BTreeMap<DeviceId, BTreeMap<u64, PendingBlockPayload>>>,
+    inner: Mutex<DevicePendingPayloadMap>,
 }
 
 #[derive(Debug, Clone)]
@@ -399,28 +401,34 @@ struct PendingBlockPayload {
 }
 
 impl BlockDevicePendingPayloads {
+    /// Returns the wait to acquire the payload-map mutex, measured only
+    /// when `measure` is set (see `lock_timed`).
     fn register(
         &self,
         device_id: DeviceId,
         commit_seq: CommitSeq,
         payload: PendingBlockPayload,
-    ) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
+        measure: bool,
+    ) -> Result<u64> {
+        let (mut inner, lock_wait_nanos) = lock_timed(&self.inner, measure)?;
         inner
             .entry(device_id)
             .or_default()
             .insert(commit_seq.raw(), payload);
-        Ok(())
+        Ok(lock_wait_nanos)
     }
 
+    /// Returns drained entries plus the mutex wait (measured only when
+    /// `measure` is set).
     fn drain_through(
         &self,
         device_id: DeviceId,
         through: CommitSeq,
-    ) -> Result<Vec<(u64, PendingBlockPayload)>> {
-        let mut inner = lock(&self.inner)?;
+        measure: bool,
+    ) -> Result<(Vec<(u64, PendingBlockPayload)>, u64)> {
+        let (mut inner, lock_wait_nanos) = lock_timed(&self.inner, measure)?;
         let Some(device) = inner.get_mut(&device_id) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), lock_wait_nanos));
         };
         let covered: Vec<u64> = device
             .range(..=through.raw())
@@ -433,23 +441,26 @@ impl BlockDevicePendingPayloads {
         if device.is_empty() {
             inner.remove(&device_id);
         }
-        Ok(drained)
+        Ok((drained, lock_wait_nanos))
     }
 
+    /// Returns the wait to acquire the payload-map mutex (measured only
+    /// when `measure` is set).
     fn reinsert(
         &self,
         device_id: DeviceId,
         entries: Vec<(u64, PendingBlockPayload)>,
-    ) -> Result<()> {
+        measure: bool,
+    ) -> Result<u64> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        let mut inner = lock(&self.inner)?;
+        let (mut inner, lock_wait_nanos) = lock_timed(&self.inner, measure)?;
         let device = inner.entry(device_id).or_default();
         for (seq, payload) in entries {
             device.insert(seq, payload);
         }
-        Ok(())
+        Ok(lock_wait_nanos)
     }
 }
 
@@ -984,11 +995,11 @@ impl DurableCoordinator {
             append_auto_persist_policy: append_ingest_policy.auto_persist,
             append_ingest_admission: Arc::new(AppendIngestAdmissionGate::default()),
             append_ingest_node_admission: Arc::new(Mutex::new(BTreeMap::new())),
-            persist_profiler: Arc::new(Mutex::new(None)),
-            append_publish_wait_profiler: Arc::new(Mutex::new(None)),
-            append_ingest_profiler: Arc::new(Mutex::new(None)),
+            persist_profiler: Arc::new(ShardedProfileSink::new()),
+            append_publish_wait_profiler: Arc::new(ShardedProfileSink::new()),
+            append_ingest_profiler: Arc::new(ShardedProfileSink::new()),
             append_ingest_profile_enabled: Arc::new(AtomicBool::new(false)),
-            read_profiler: Arc::new(Mutex::new(None)),
+            read_profiler: Arc::new(ShardedProfileSink::new()),
             maintenance_policy,
             maintenance_cursor,
             maintenance_worker: None,
@@ -1048,17 +1059,13 @@ impl DurableCoordinator {
     }
 
     pub fn enable_persist_profiling(&self, capacity: usize) -> Result<()> {
-        *lock(&self.persist_profiler)? = Some(PersistProfiler::new(capacity)?);
+        self.persist_profiler.enable(capacity)?;
         self.local.metadata.enable_publish_profiling(capacity)?;
         Ok(())
     }
 
     pub fn drain_persist_profiles(&self, max: usize) -> Result<Vec<DurablePersistProfile>> {
-        let mut profiler = lock(&self.persist_profiler)?;
-        Ok(profiler
-            .as_mut()
-            .map(|profiler| profiler.drain(max))
-            .unwrap_or_default())
+        self.persist_profiler.drain(max)
     }
 
     /// Snapshot and reset per-acquirer catalog-mutex hold accounting for
@@ -1072,37 +1079,25 @@ impl DurableCoordinator {
     }
 
     fn record_persist_profile(&self, profile: DurablePersistProfile) -> Result<()> {
-        if let Some(profiler) = lock(&self.persist_profiler)?.as_mut() {
-            profiler.record(profile);
-        }
-        Ok(())
+        self.persist_profiler.record(profile)
     }
 
     pub fn enable_append_publish_wait_profiling(&self, capacity: usize) -> Result<()> {
-        *lock(&self.append_publish_wait_profiler)? =
-            Some(AppendPublishWaitProfiler::new(capacity)?);
-        Ok(())
+        self.append_publish_wait_profiler.enable(capacity)
     }
 
     pub fn drain_append_publish_wait_profiles(
         &self,
         max: usize,
     ) -> Result<Vec<AppendPublishWaitProfile>> {
-        let mut profiler = lock(&self.append_publish_wait_profiler)?;
-        Ok(profiler
-            .as_mut()
-            .map(|profiler| profiler.drain(max))
-            .unwrap_or_default())
+        self.append_publish_wait_profiler.drain(max)
     }
 
     fn record_append_publish_wait_profile(
         &self,
         profile: AppendPublishWaitProfile,
     ) -> Result<()> {
-        if let Some(profiler) = lock(&self.append_publish_wait_profiler)?.as_mut() {
-            profiler.record(profile);
-        }
-        Ok(())
+        self.append_publish_wait_profiler.record(profile)
     }
 
     fn finish_append_publish_wait_profile(
@@ -1117,18 +1112,14 @@ impl DurableCoordinator {
     }
 
     pub fn enable_append_ingest_profiling(&self, capacity: usize) -> Result<()> {
-        *lock(&self.append_ingest_profiler)? = Some(AppendIngestProfiler::new(capacity)?);
+        self.append_ingest_profiler.enable(capacity)?;
         self.append_ingest_profile_enabled
             .store(true, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn drain_append_ingest_profiles(&self, max: usize) -> Result<Vec<AppendIngestProfile>> {
-        let mut profiler = lock(&self.append_ingest_profiler)?;
-        Ok(profiler
-            .as_mut()
-            .map(|profiler| profiler.drain(max))
-            .unwrap_or_default())
+        self.append_ingest_profiler.drain(max)
     }
 
     fn record_append_ingest_profile(&self, profile: AppendIngestProfile) -> Result<()> {
@@ -1138,10 +1129,7 @@ impl DurableCoordinator {
         {
             return Ok(());
         }
-        if let Some(profiler) = lock(&self.append_ingest_profiler)?.as_mut() {
-            profiler.record(profile);
-        }
-        Ok(())
+        self.append_ingest_profiler.record(profile)
     }
 
     fn finish_append_ingest_profile(
@@ -1510,16 +1498,11 @@ impl DurableCoordinator {
     }
 
     pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
-        *lock(&self.read_profiler)? = Some(ReadProfiler::new(capacity)?);
-        Ok(())
+        self.read_profiler.enable(capacity)
     }
 
     pub fn drain_read_profiles(&self, max: usize) -> Result<Vec<ReadProfile>> {
-        let mut profiler = lock(&self.read_profiler)?;
-        Ok(profiler
-            .as_mut()
-            .map(|profiler| profiler.drain(max))
-            .unwrap_or_default())
+        self.read_profiler.drain(max)
     }
 
     pub fn enable_native_file_batch_profiling(&self, capacity: usize) -> Result<()> {
@@ -1534,10 +1517,7 @@ impl DurableCoordinator {
     }
 
     fn record_read_profile(&self, profile: ReadProfile) -> Result<()> {
-        if let Some(profiler) = lock(&self.read_profiler)?.as_mut() {
-            profiler.record(profile);
-        }
-        Ok(())
+        self.read_profiler.record(profile)
     }
 
     fn attach_metadata_publish_profile(&self, profile: &mut DurablePersistProfile) -> Result<()> {
@@ -4121,6 +4101,17 @@ impl DurableCoordinator {
             block_journal_publish_mark_lock_wait_nanos: lane_timing.publish_mark_lock_wait_nanos,
             block_journal_publish_mark_observability_nanos: lane_timing
                 .publish_mark_observability_nanos,
+            block_journal_append_lock_wait_nanos: profile.lock_wait_nanos,
+            block_journal_publish_reserve_lock_wait_nanos: lane_timing
+                .publish_reserve_lock_wait_nanos,
+            block_journal_overlay_lock_wait_nanos: lane_timing.overlay_lock_wait_nanos,
+            block_journal_staging_lock_wait_nanos: lane_timing.staging_lock_wait_nanos,
+            block_journal_enqueue_staging_lock_wait_nanos: lane_timing
+                .enqueue_staging_lock_wait_nanos,
+            block_journal_enqueue_reserve_lock_wait_nanos: lane_timing
+                .enqueue_reserve_lock_wait_nanos,
+            block_journal_pending_payload_lock_wait_nanos: lane_timing
+                .pending_payload_lock_wait_nanos,
             durable_commit_high_water: durable_commit_high_water.raw(),
             ..DurablePersistProfile::default()
         })
@@ -4148,7 +4139,7 @@ impl DurableCoordinator {
         request: BlockJournalLaneRequest,
     ) -> Result<(usize, u64)> {
         let device_id = match &request {
-            BlockJournalLaneRequest::Write(commit) => commit.device_id,
+            BlockJournalLaneRequest::Write { commit, .. } => commit.device_id,
             BlockJournalLaneRequest::Flush { device_id, .. }
             | BlockJournalLaneRequest::Lease { device_id, .. } => *device_id,
         };
@@ -4310,6 +4301,7 @@ impl DurableCoordinator {
 
         let mut leases = Vec::new();
         let mut commits = Vec::new();
+        let mut carried_enqueue_waits = BlockJournalEnqueueWaits::default();
         let mut flushes = BTreeMap::<DeviceId, (WriterEpoch, CommitSeq)>::new();
         for request in batch.into_values() {
             match request {
@@ -4317,7 +4309,18 @@ impl DurableCoordinator {
                     device_id,
                     writer_epoch,
                 } => leases.push((device_id, writer_epoch)),
-                BlockJournalLaneRequest::Write(commit) => commits.push(commit),
+                BlockJournalLaneRequest::Write {
+                    commit,
+                    enqueue_waits,
+                } => {
+                    carried_enqueue_waits.staging_lock_wait_nanos = carried_enqueue_waits
+                        .staging_lock_wait_nanos
+                        .saturating_add(enqueue_waits.staging_lock_wait_nanos);
+                    carried_enqueue_waits.reserve_lock_wait_nanos = carried_enqueue_waits
+                        .reserve_lock_wait_nanos
+                        .saturating_add(enqueue_waits.reserve_lock_wait_nanos);
+                    commits.push(commit);
+                }
                 BlockJournalLaneRequest::Flush {
                     device_id,
                     writer_epoch,
@@ -4377,7 +4380,14 @@ impl DurableCoordinator {
             });
         }
 
-        let mut lane_timing = BlockJournalLaneBatchTiming::default();
+        let mut lane_timing = BlockJournalLaneBatchTiming {
+            enqueue_staging_lock_wait_nanos: carried_enqueue_waits.staging_lock_wait_nanos,
+            enqueue_reserve_lock_wait_nanos: carried_enqueue_waits.reserve_lock_wait_nanos,
+            ..BlockJournalLaneBatchTiming::default()
+        };
+        // One relaxed load per batch gates every lock-wait measurement on
+        // the leader's path.
+        let measure = self.persist_profiler.is_enabled();
         let result = (|| -> Result<AppendVisibleJournalProfile> {
             // Every Flush this batch makes durable must not cover an
             // acknowledged segment payload that is still volatile. Callers
@@ -4386,7 +4396,11 @@ impl DurableCoordinator {
             // caller's drain and this batch.
             let recheck_started = Instant::now();
             for (device_id, (_, durable_through)) in &flushes {
-                self.make_device_payloads_durable(*device_id, *durable_through)?;
+                let pending_payload_lock_wait_nanos =
+                    self.make_device_payloads_durable(*device_id, *durable_through, measure)?;
+                lane_timing.pending_payload_lock_wait_nanos = lane_timing
+                    .pending_payload_lock_wait_nanos
+                    .saturating_add(pending_payload_lock_wait_nanos);
             }
             lane_timing.payload_recheck_nanos = duration_nanos_u64(recheck_started.elapsed());
             // The append holds the shard's journal lock only for the file
@@ -4395,7 +4409,7 @@ impl DurableCoordinator {
             // boundary.
             let mut profile = self
                 .durable
-                .append_block_journal_records_unsynced(shard, &records)?;
+                .append_block_journal_records_unsynced(shard, &records, measure)?;
             #[cfg(test)]
             self.pause_after_block_journal_append_before_sync_if_requested_for_test()?;
             profile.sync_nanos = self.durable.sync_block_journal(shard)?;
@@ -4414,32 +4428,49 @@ impl DurableCoordinator {
                 let mark_started = Instant::now();
                 mark_block_journal_segment_refs_referenced(&self.local, commit, &mut lane_timing)?;
                 let reserve_started = Instant::now();
-                self.local
+                let reserve_lock_wait_nanos =
+                    self.local.metadata.publish_reserved_block_journal_commit(
+                        commit.device_id,
+                        commit.commit_seq,
+                        measure,
+                    )?;
+                let (device_info, device_info_lock_wait_nanos) = self
+                    .local
                     .metadata
-                    .publish_reserved_block_journal_commit(commit.device_id, commit.commit_seq)?;
-                let block_size =
-                    u64::from(self.local.metadata.device_info(commit.device_id)?.spec.block_size);
+                    .device_info_profiled(commit.device_id, measure)?;
+                let block_size = u64::from(device_info.spec.block_size);
                 let apply_started = Instant::now();
-                let lba_map_update_nanos = self.block_journal.apply_commit(commit, block_size)?;
+                let apply_nanos = self.block_journal.apply_commit(commit, block_size, measure)?;
                 lane_timing.publish_mark_nanos = lane_timing
                     .publish_mark_nanos
                     .saturating_add(duration_nanos_u64(reserve_started - mark_started));
                 lane_timing.publish_reserve_nanos = lane_timing
                     .publish_reserve_nanos
                     .saturating_add(duration_nanos_u64(apply_started - reserve_started));
+                lane_timing.publish_reserve_lock_wait_nanos = lane_timing
+                    .publish_reserve_lock_wait_nanos
+                    .saturating_add(reserve_lock_wait_nanos)
+                    .saturating_add(device_info_lock_wait_nanos);
                 lane_timing.publish_apply_nanos = lane_timing
                     .publish_apply_nanos
                     .saturating_add(duration_nanos_u64(apply_started.elapsed()));
                 lane_timing.lba_map_update_nanos = lane_timing
                     .lba_map_update_nanos
-                    .saturating_add(lba_map_update_nanos);
+                    .saturating_add(apply_nanos.total_nanos);
+                lane_timing.overlay_lock_wait_nanos = lane_timing
+                    .overlay_lock_wait_nanos
+                    .saturating_add(apply_nanos.lock_wait_nanos);
             }
             for (device_id, (writer_epoch, durable_through)) in &flushes {
-                self.block_journal.mark_durable(
+                let mark_durable_lock_wait_nanos = self.block_journal.mark_durable(
                     *device_id,
                     *writer_epoch,
                     *durable_through,
+                    measure,
                 )?;
+                lane_timing.overlay_lock_wait_nanos = lane_timing
+                    .overlay_lock_wait_nanos
+                    .saturating_add(mark_durable_lock_wait_nanos);
             }
             lane_timing.publish_nanos = duration_nanos_u64(publish_started.elapsed());
             Ok(profile)
@@ -4487,27 +4518,38 @@ impl DurableCoordinator {
         &self,
         total_started: Instant,
         commit: &BlockJournalCommit,
+        enqueue_waits: BlockJournalEnqueueWaits,
     ) -> Result<()> {
+        let measure = self.persist_profiler.is_enabled();
         let shard = self.durable.block_journal_shard_for_device(commit.device_id);
         let profile = self.durable.append_block_journal_records_unsynced(
             shard,
             &[BlockJournalRecord::Write(commit.clone())],
+            measure,
         )?;
-        self.local
+        let reserve_lock_wait_nanos = self.local.metadata.publish_reserved_block_journal_commit(
+            commit.device_id,
+            commit.commit_seq,
+            measure,
+        )?;
+        let (device_info, device_info_lock_wait_nanos) = self
+            .local
             .metadata
-            .publish_reserved_block_journal_commit(commit.device_id, commit.commit_seq)?;
-        let block_size = u64::from(
-            self.local
-                .metadata
-                .device_info(commit.device_id)?
-                .spec
-                .block_size,
-        );
+            .device_info_profiled(commit.device_id, measure)?;
+        let block_size = u64::from(device_info.spec.block_size);
         let apply_started = Instant::now();
-        let lba_map_update_nanos = self.block_journal.apply_commit(commit, block_size)?;
+        let apply_nanos = self.block_journal.apply_commit(commit, block_size, measure)?;
+        // The caller-measured enqueue waits are same-op and same-thread on
+        // this bypass path, so they land in the row's same-row columns.
         let lane_timing = BlockJournalLaneBatchTiming {
             publish_apply_nanos: duration_nanos_u64(apply_started.elapsed()),
-            lba_map_update_nanos,
+            lba_map_update_nanos: apply_nanos.total_nanos,
+            overlay_lock_wait_nanos: apply_nanos.lock_wait_nanos,
+            publish_reserve_lock_wait_nanos: enqueue_waits
+                .reserve_lock_wait_nanos
+                .saturating_add(reserve_lock_wait_nanos)
+                .saturating_add(device_info_lock_wait_nanos),
+            staging_lock_wait_nanos: enqueue_waits.staging_lock_wait_nanos,
             ..BlockJournalLaneBatchTiming::default()
         };
         self.record_block_journal_profile(
@@ -4533,7 +4575,10 @@ impl DurableCoordinator {
         // Acknowledged segment payloads covered by this boundary sync here,
         // outside the lane, so concurrent flushes fan payload syncs out
         // across storage nodes. The lane leader re-checks as a safety net.
-        self.make_device_payloads_durable(device_id, durable_through)?;
+        // Flush boundaries record no profile row, so nothing is measured
+        // here; the lane leader's re-check measures the same mutex under
+        // the same contention.
+        let _ = self.make_device_payloads_durable(device_id, durable_through, false)?;
         let writer_epoch = self.block_journal.writer_epoch(device_id)?;
         let (shard, request_id) =
             self.enqueue_block_journal_request(BlockJournalLaneRequest::Flush {
@@ -5187,14 +5232,25 @@ impl DurableCoordinator {
         // Reserve the sequence immediately before enqueueing so per-device
         // enqueue order equals commit-seq order, which the lane's ordered
         // publish step requires.
-        let info = self.local.metadata.device_info(lease.device_id)?;
-        #[cfg(test)]
-        self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
-        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
-        let commit_seq = self
+        let measure = self.persist_profiler.is_enabled();
+        let (info, device_info_lock_wait_nanos) = self
             .local
             .metadata
-            .reserve_block_journal_commit_seq(lease.device_id)?;
+            .device_info_profiled(lease.device_id, measure)?;
+        #[cfg(test)]
+        self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
+        let (_enqueue_guard, staging_lock_wait_nanos) =
+            lock_timed(&self.block_delta_staging_lock, measure)?;
+        let (commit_seq, reserve_lock_wait_nanos) = self
+            .local
+            .metadata
+            .reserve_block_journal_commit_seq_profiled(lease.device_id, measure)?;
+        // This writer records its own row, so its staging and metadata waits
+        // report here as same-row carve-outs and the lane request carries
+        // zeros (each measured wait lands in exactly one row).
+        base_profile.block_journal_staging_lock_wait_nanos = staging_lock_wait_nanos;
+        base_profile.block_journal_publish_reserve_lock_wait_nanos =
+            reserve_lock_wait_nanos.saturating_add(device_info_lock_wait_nanos);
         let commit = BlockJournalCommit {
             device_id: lease.device_id,
             writer_epoch: lease.writer_epoch,
@@ -5217,7 +5273,10 @@ impl DurableCoordinator {
         // referencing journal record may now enter the shared commit lane.
         let lane_wait_started = Instant::now();
         let (shard, request_id) =
-            self.enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
+            self.enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+                commit,
+                enqueue_waits: BlockJournalEnqueueWaits::default(),
+            })?;
         drop(_enqueue_guard);
         self.wait_for_block_journal_request(shard, request_id)?;
         base_profile.block_journal_lane_wait_nanos =
@@ -5255,11 +5314,16 @@ impl DurableCoordinator {
     ) -> Result<BlockBatchCommit> {
         let total_started = Instant::now();
         let (staged, appended) = self.stage_block_journal_segment_refs(lease, writes)?;
-        let info = self.local.metadata.device_info(lease.device_id)?;
+        let measure = self.persist_profiler.is_enabled();
+        let (info, device_info_lock_wait_nanos) = self
+            .local
+            .metadata
+            .device_info_profiled(lease.device_id, measure)?;
 
         #[cfg(test)]
         self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
-        let enqueue_guard = lock(&self.block_delta_staging_lock)?;
+        let (enqueue_guard, staging_lock_wait_nanos) =
+            lock_timed(&self.block_delta_staging_lock, measure)?;
         // Live overlay applies must follow commit-seq order per device, so
         // the acknowledged write joins the lane (becoming flushed-strength,
         // which acknowledged durability allows) whenever earlier lane writes
@@ -5276,10 +5340,10 @@ impl DurableCoordinator {
                 total_started,
             );
         }
-        let commit_seq = self
+        let (commit_seq, reserve_lock_wait_nanos) = self
             .local
             .metadata
-            .reserve_block_journal_commit_seq(lease.device_id)?;
+            .reserve_block_journal_commit_seq_profiled(lease.device_id, measure)?;
         let commit = BlockJournalCommit {
             device_id: lease.device_id,
             writer_epoch: lease.writer_epoch,
@@ -5302,31 +5366,46 @@ impl DurableCoordinator {
         let profile = self.durable.append_block_journal_records_unsynced(
             shard,
             &[BlockJournalRecord::Write(commit.clone())],
+            measure,
         )?;
         // Register before publish so any flush boundary observing this
         // sequence also observes the payload it must make durable first.
-        self.block_device_pending_payloads.register(
+        let pending_payload_lock_wait_nanos = self.block_device_pending_payloads.register(
             lease.device_id,
             commit_seq,
             PendingBlockPayload {
                 appended,
                 segment_ids: staged.segment_ids,
             },
+            measure,
         )?;
-        let mut lane_timing = BlockJournalLaneBatchTiming::default();
+        let mut lane_timing = BlockJournalLaneBatchTiming {
+            staging_lock_wait_nanos,
+            publish_reserve_lock_wait_nanos: reserve_lock_wait_nanos
+                .saturating_add(device_info_lock_wait_nanos),
+            pending_payload_lock_wait_nanos,
+            ..BlockJournalLaneBatchTiming::default()
+        };
         mark_block_journal_segment_refs_referenced(&self.local, &commit, &mut lane_timing)?;
-        self.local
+        let publish_head_lock_wait_nanos = self
+            .local
             .metadata
-            .publish_reserved_block_journal_commit(lease.device_id, commit_seq)?;
+            .publish_reserved_block_journal_commit(lease.device_id, commit_seq, measure)?;
+        lane_timing.publish_reserve_lock_wait_nanos = lane_timing
+            .publish_reserve_lock_wait_nanos
+            .saturating_add(publish_head_lock_wait_nanos);
         let block_size = u64::from(info.spec.block_size);
         let apply_started = Instant::now();
-        let lba_map_update_nanos = self.block_journal.apply_commit(&commit, block_size)?;
+        let apply_nanos = self.block_journal.apply_commit(&commit, block_size, measure)?;
         lane_timing.publish_apply_nanos = lane_timing
             .publish_apply_nanos
             .saturating_add(duration_nanos_u64(apply_started.elapsed()));
         lane_timing.lba_map_update_nanos = lane_timing
             .lba_map_update_nanos
-            .saturating_add(lba_map_update_nanos);
+            .saturating_add(apply_nanos.total_nanos);
+        lane_timing.overlay_lock_wait_nanos = lane_timing
+            .overlay_lock_wait_nanos
+            .saturating_add(apply_nanos.lock_wait_nanos);
         drop(enqueue_guard);
         self.record_block_journal_profile(
             total_started,
@@ -5344,16 +5423,19 @@ impl DurableCoordinator {
     /// This runs before any Flush record covering those sequences becomes
     /// durable, preserving the rule that durable metadata never references
     /// segment bytes that are not yet stable.
+    /// Returns the summed wait to acquire the pending-payloads mutex
+    /// (measured only when `measure` is set).
     fn make_device_payloads_durable(
         &self,
         device_id: DeviceId,
         through: CommitSeq,
-    ) -> Result<()> {
-        let drained = self
+        measure: bool,
+    ) -> Result<u64> {
+        let (drained, mut pending_payload_lock_wait_nanos) = self
             .block_device_pending_payloads
-            .drain_through(device_id, through)?;
+            .drain_through(device_id, through, measure)?;
         if drained.is_empty() {
-            return Ok(());
+            return Ok(pending_payload_lock_wait_nanos);
         }
         let result = (|| -> Result<()> {
             let mut merged = PendingDataLogAppend::default();
@@ -5369,10 +5451,12 @@ impl DurableCoordinator {
             Ok(())
         })();
         if result.is_err() {
-            self.block_device_pending_payloads
-                .reinsert(device_id, drained)?;
+            pending_payload_lock_wait_nanos = pending_payload_lock_wait_nanos.saturating_add(
+                self.block_device_pending_payloads
+                    .reinsert(device_id, drained, measure)?,
+            );
         }
-        result
+        result.map(|_| pending_payload_lock_wait_nanos)
     }
 
     fn commit_block_journal_batch_with_writer(
@@ -5394,7 +5478,11 @@ impl DurableCoordinator {
                 }
             };
         }
-        let info = self.local.metadata.device_info(lease.device_id)?;
+        let measure = self.persist_profiler.is_enabled();
+        let (info, device_info_lock_wait_nanos) = self
+            .local
+            .metadata
+            .device_info_profiled(lease.device_id, measure)?;
         let max_inline_bytes = self
             .block_journal_batch_policy
             .inline_max_total_bytes
@@ -5403,11 +5491,19 @@ impl DurableCoordinator {
         let total_started = Instant::now();
         #[cfg(test)]
         self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
-        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
-        let commit_seq = self
+        let (_enqueue_guard, staging_lock_wait_nanos) =
+            lock_timed(&self.block_delta_staging_lock, measure)?;
+        let (commit_seq, reserve_lock_wait_nanos) = self
             .local
             .metadata
-            .reserve_block_journal_commit_seq(lease.device_id)?;
+            .reserve_block_journal_commit_seq_profiled(lease.device_id, measure)?;
+        // Inline writers record no row of their own; the lane batch row
+        // reports these waits in its batch-attributed `enqueue_*` columns.
+        let enqueue_waits = BlockJournalEnqueueWaits {
+            staging_lock_wait_nanos,
+            reserve_lock_wait_nanos: reserve_lock_wait_nanos
+                .saturating_add(device_info_lock_wait_nanos),
+        };
         let collapsed_range_count = usize_to_u64(collapsed.len());
         let (entries, committed_bytes) =
             self.block_journal_entries_from_collapsed(collapsed, u64::from(info.spec.block_size))?;
@@ -5431,8 +5527,11 @@ impl DurableCoordinator {
         };
         match durability {
             crate::api::WriteDurability::Flushed => {
-                let (shard, request_id) = self
-                    .enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
+                let (shard, request_id) =
+                    self.enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+                        commit,
+                        enqueue_waits,
+                    })?;
                 drop(_enqueue_guard);
                 self.wait_for_block_journal_request(shard, request_id)?;
             }
@@ -5446,12 +5545,19 @@ impl DurableCoordinator {
                 let lane_ordered =
                     lock(&device_lane.inner)?.has_unapplied_writes(lease.device_id);
                 if lane_ordered {
-                    let (shard, request_id) = self
-                        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
+                    let (shard, request_id) =
+                        self.enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+                            commit,
+                            enqueue_waits,
+                        })?;
                     drop(_enqueue_guard);
                     self.wait_for_block_journal_request(shard, request_id)?;
                 } else {
-                    self.append_acknowledged_block_journal_commit(total_started, &commit)?;
+                    self.append_acknowledged_block_journal_commit(
+                        total_started,
+                        &commit,
+                        enqueue_waits,
+                    )?;
                 }
             }
         }
@@ -5516,11 +5622,13 @@ impl DurableCoordinator {
 
         #[cfg(test)]
         self.note_block_journal_writer_reached_staging_after_lane_wait_for_test()?;
-        let _enqueue_guard = lock(&self.block_delta_staging_lock)?;
-        let commit_seq = self
+        let measure = self.persist_profiler.is_enabled();
+        let (_enqueue_guard, staging_lock_wait_nanos) =
+            lock_timed(&self.block_delta_staging_lock, measure)?;
+        let (commit_seq, reserve_lock_wait_nanos) = self
             .local
             .metadata
-            .reserve_block_journal_commit_seq(lease.device_id)?;
+            .reserve_block_journal_commit_seq_profiled(lease.device_id, measure)?;
         let commit = BlockJournalCommit {
             device_id: lease.device_id,
             writer_epoch: lease.writer_epoch,
@@ -5531,8 +5639,16 @@ impl DurableCoordinator {
             entries: vec![BlockJournalEntry::Sparse { range }],
         };
         commit.validate(&info.spec)?;
+        // Sparse writers record no row of their own; the lane batch row
+        // reports these waits in its batch-attributed `enqueue_*` columns.
         let (shard, request_id) =
-            self.enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))?;
+            self.enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+                commit,
+                enqueue_waits: BlockJournalEnqueueWaits {
+                    staging_lock_wait_nanos,
+                    reserve_lock_wait_nanos,
+                },
+            })?;
         drop(_enqueue_guard);
         self.wait_for_block_journal_request(shard, request_id)?;
         Ok(WriteCommit {
@@ -5627,20 +5743,30 @@ impl DurableCoordinator {
         verification: ReadVerification,
     ) -> Result<()> {
         let total_started = Instant::now();
+        // One relaxed load decides whether any read instrumentation runs;
+        // with the sink disabled the resolve and overlay take their base
+        // fast paths (no clock reads, no wait measurement).
+        let measure = self.read_profiler.is_enabled();
         let resolve_started = Instant::now();
         let (plan, resolve_profile) =
-            MetadataReadService::resolve_block_read(&self.local, device_id, range)?;
+            self.local.resolve_block_read_plan(device_id, range, measure)?;
         let metadata_resolve_nanos = duration_nanos_u64(resolve_started.elapsed());
         let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
-        let overlay_nanos =
-            self.block_journal
-                .apply_read_overlay(self, device_id, range, verification, buf)?;
+        let overlay_nanos = self.block_journal.apply_read_overlay(
+            self,
+            device_id,
+            range,
+            verification,
+            buf,
+            measure,
+        )?;
         profile.metadata_resolve_nanos = metadata_resolve_nanos;
         profile.metadata_lock_wait_nanos = resolve_profile.metadata_lock_wait_nanos;
         profile.metadata_tree_walk_nanos = resolve_profile.metadata_tree_walk_nanos;
         profile.metadata_placement_lookup_nanos =
             resolve_profile.metadata_placement_lookup_nanos;
-        profile.block_journal_overlay_read_nanos = overlay_nanos;
+        profile.block_journal_overlay_read_nanos = overlay_nanos.total_nanos;
+        profile.block_journal_overlay_lock_wait_nanos = overlay_nanos.lock_wait_nanos;
         profile.total_nanos = duration_nanos_u64(total_started.elapsed());
         self.record_read_profile(profile)
     }
@@ -6433,8 +6559,12 @@ impl DurableCoordinator {
     ) -> Result<()> {
         let total_started = Instant::now();
         let resolve_started = Instant::now();
-        let (plan, resolve_profile) =
-            MetadataReadService::resolve_file_read(&self.local, keyspace_id, file_id, range)?;
+        let (plan, resolve_profile) = self.local.resolve_file_read_plan(
+            keyspace_id,
+            file_id,
+            range,
+            self.read_profiler.is_enabled(),
+        )?;
         let metadata_resolve_nanos = duration_nanos_u64(resolve_started.elapsed());
         let mut profile = assemble_read_plan_profiled(self, plan, verification, buf)?;
         profile.metadata_resolve_nanos = metadata_resolve_nanos;

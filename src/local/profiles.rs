@@ -42,6 +42,17 @@ pub(super) struct ReadSourceProfile {
     copy_nanos: u64,
 }
 
+/// Timing for the metadata-resolve half of one read.
+///
+/// `metadata_tree_walk_nanos` is the wall time of the head fetch plus tree
+/// traversal minus the placement-lookup section, so tree walk and placement
+/// lookup partition the walk. `metadata_lock_wait_nanos` sums the CONTENDED
+/// wait for the metadata-plane mutex across every acquisition the resolve
+/// makes (device info, head, and each tree node); uncontended acquisitions
+/// report zero (see `lock_timed`), unlike the pair-per-acquisition
+/// "acquisition elapsed" metric the pre-existing lock-wait columns and the
+/// M5 catalog-hold CSV keep. It is a carve-out that overlaps the other
+/// buckets.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ReadResolveProfile {
     pub metadata_lock_wait_nanos: u64,
@@ -70,6 +81,11 @@ pub struct ReadProfile {
     pub verification_nanos: u64,
     pub copy_nanos: u64,
     pub block_journal_overlay_read_nanos: u64,
+    /// Contended wait for the block-journal overlay mutex during the
+    /// overlay read; uncontended acquisitions report zero (see
+    /// `lock_timed`). A carve-out subset of
+    /// `block_journal_overlay_read_nanos`.
+    pub block_journal_overlay_lock_wait_nanos: u64,
     pub logical_bytes: u64,
     pub extent_count: u64,
     pub zero_extent_count: u64,
@@ -99,39 +115,228 @@ impl ReadProfile {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct ReadProfiler {
-    capacity: usize,
-    next_sequence: u64,
-    profiles: VecDeque<ReadProfile>,
+/// Number of shards in every profile sink.
+///
+/// Sized so concurrent bench workers (typically up to 32) rarely share a
+/// shard mutex; two threads per shard at c32 keeps each shard lock
+/// effectively uncontended.
+const PROFILE_SINK_SHARD_COUNT: usize = 16;
+
+/// Stable per-thread shard slot for profile sinks.
+///
+/// Threads take round-robin slots at first use, so bench worker threads
+/// spread evenly across shards regardless of thread-id values. The slot is
+/// shared by every sink in the process, which is fine: it only picks which
+/// shard mutex a thread uses.
+fn profile_sink_thread_shard() -> usize {
+    static NEXT_PROFILE_SINK_THREAD_SLOT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static PROFILE_SINK_THREAD_SLOT: usize = NEXT_PROFILE_SINK_THREAD_SLOT
+            .fetch_add(1, Ordering::Relaxed)
+            % PROFILE_SINK_SHARD_COUNT;
+    }
+    PROFILE_SINK_THREAD_SLOT.with(|slot| *slot)
 }
 
-impl ReadProfiler {
-    fn new(capacity: usize) -> Result<Self> {
+/// Profile records a `ShardedProfileSink` can store.
+///
+/// The sink assigns a process-wide drain-order sequence at record time;
+/// record types that expose a `sequence` field store it, others ignore it.
+pub(super) trait ShardedProfileRecord {
+    fn set_profile_sequence(&mut self, _sequence: u64) {}
+}
+
+impl ShardedProfileRecord for ReadProfile {
+    fn set_profile_sequence(&mut self, sequence: u64) {
+        self.sequence = sequence;
+    }
+}
+
+impl ShardedProfileRecord for NativeFileBatchCommitProfile {
+    fn set_profile_sequence(&mut self, sequence: u64) {
+        self.sequence = sequence;
+    }
+}
+
+impl ShardedProfileRecord for DurablePersistProfile {
+    fn set_profile_sequence(&mut self, sequence: u64) {
+        self.sequence = sequence;
+    }
+}
+
+impl ShardedProfileRecord for AppendPublishWaitProfile {
+    fn set_profile_sequence(&mut self, sequence: u64) {
+        self.sequence = sequence;
+    }
+}
+
+impl ShardedProfileRecord for AppendIngestProfile {
+    fn set_profile_sequence(&mut self, sequence: u64) {
+        self.sequence = sequence;
+    }
+}
+
+impl ShardedProfileRecord for MetadataPublishProfile {}
+
+/// One sink shard, aligned to two cache lines so neighboring shard mutexes
+/// never share a line.
+///
+/// `len` mirrors `queue.len()` (updated under the queue lock, read without
+/// it) so drains skip empty shards without touching their mutexes.
+#[repr(align(128))]
+#[derive(Debug)]
+struct ProfileSinkShard<T> {
+    len: AtomicUsize,
+    queue: Mutex<VecDeque<(u64, T)>>,
+}
+
+impl<T> ProfileSinkShard<T> {
+    fn new() -> Self {
+        Self {
+            len: AtomicUsize::new(0),
+            queue: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+/// Low-contention, opt-in profile sink.
+///
+/// Replaces the former single-mutex profilers: recording a sample locks only
+/// the recording thread's shard (round-robin thread-to-shard slots), so
+/// concurrent workers do not serialize on one global sink mutex, and a
+/// disabled sink costs one relaxed atomic load instead of a lock. Retention
+/// approximates the old ring buffer: a process-wide length counter bounds
+/// the sink at roughly `capacity` samples, evicting the recording shard's
+/// oldest sample once the bound is reached (single-threaded recording
+/// matches the old exact ring). `drain` merges shards by the record-time
+/// sequence, so drained order equals record order; draining removes the
+/// returned samples and later drains cover later windows. `enable` clears
+/// the sink and restarts sequences at 1.
+#[derive(Debug)]
+pub(super) struct ShardedProfileSink<T> {
+    enabled: AtomicBool,
+    capacity: AtomicUsize,
+    len: AtomicUsize,
+    next_sequence: AtomicU64,
+    shards: Vec<ProfileSinkShard<T>>,
+}
+
+impl<T: ShardedProfileRecord> ShardedProfileSink<T> {
+    pub(super) fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            capacity: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+            next_sequence: AtomicU64::new(1),
+            shards: (0..PROFILE_SINK_SHARD_COUNT)
+                .map(|_| ProfileSinkShard::new())
+                .collect(),
+        }
+    }
+
+    pub(super) fn enable(&self, capacity: usize) -> Result<()> {
         if capacity == 0 {
             return Err(StorageError::invalid_argument(
-                "read profile capacity must be greater than zero",
+                "profile capacity must be greater than zero",
             ));
         }
-        Ok(Self {
-            capacity,
-            next_sequence: 1,
-            profiles: VecDeque::with_capacity(capacity.min(1024)),
-        })
-    }
-
-    fn record(&mut self, mut profile: ReadProfile) {
-        profile.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.profiles.len() == self.capacity {
-            self.profiles.pop_front();
+        // Hold every shard lock so the reset is atomic against concurrent
+        // records.
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            guards.push(lock(&shard.queue)?);
         }
-        self.profiles.push_back(profile);
+        for (shard, guard) in self.shards.iter().zip(guards.iter_mut()) {
+            guard.clear();
+            shard.len.store(0, Ordering::Relaxed);
+        }
+        self.capacity.store(capacity, Ordering::Relaxed);
+        self.len.store(0, Ordering::Relaxed);
+        self.next_sequence.store(1, Ordering::Relaxed);
+        self.enabled.store(true, Ordering::Release);
+        Ok(())
     }
 
-    fn drain(&mut self, max: usize) -> Vec<ReadProfile> {
-        let count = max.min(self.profiles.len());
-        self.profiles.drain(..count).collect()
+    pub(super) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub(super) fn record(&self, mut profile: T) -> Result<()> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let shard = &self.shards[profile_sink_thread_shard()];
+        let mut queue = lock(&shard.queue)?;
+        // Sequences are assigned under the shard lock so each shard queue
+        // stays sequence-sorted, which drain's merge relies on.
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        profile.set_profile_sequence(sequence);
+        if self.len.load(Ordering::Relaxed) >= self.capacity.load(Ordering::Relaxed)
+            && queue.pop_front().is_some()
+        {
+            // Evicted this shard's oldest sample; the process-wide length is
+            // unchanged. The length counter is approximate under races and
+            // may overshoot by at most the shard count.
+        } else {
+            self.len.fetch_add(1, Ordering::Relaxed);
+        }
+        queue.push_back((sequence, profile));
+        shard.len.store(queue.len(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn drain(&self, max: usize) -> Result<Vec<T>> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        // Fast path for the per-op drains (`attach_metadata_publish_profile`
+        // runs on every persist): an empty sink returns without locking or
+        // allocating, and non-empty drains lock only shards that hold
+        // samples. A record racing a drain lands in the next drain window,
+        // which the diagnostics contract tolerates.
+        if self.len.load(Ordering::Relaxed) == 0 || max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            if shard.len.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            guards.push((&shard.len, lock(&shard.queue)?));
+        }
+        let mut out = Vec::new();
+        while out.len() < max {
+            let mut best: Option<usize> = None;
+            let mut best_sequence = u64::MAX;
+            for (index, (_, guard)) in guards.iter().enumerate() {
+                if let Some((sequence, _)) = guard.front()
+                    && *sequence < best_sequence
+                {
+                    best_sequence = *sequence;
+                    best = Some(index);
+                }
+            }
+            let Some(index) = best else {
+                break;
+            };
+            let Some((_, profile)) = guards[index].1.pop_front() else {
+                break;
+            };
+            out.push(profile);
+        }
+        for (len, guard) in &guards {
+            len.store(guard.len(), Ordering::Relaxed);
+        }
+        if !out.is_empty() {
+            // Still under the drained shard locks, so no record on those
+            // shards races the length update.
+            let _ = self
+                .len
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |len| {
+                    Some(len.saturating_sub(out.len()))
+                });
+        }
+        Ok(out)
     }
 }
 
@@ -276,42 +481,6 @@ impl NativeFileBatchCommitProfile {
         self.mark_reference_catalog_lock_wait_nanos = self
             .mark_reference_catalog_lock_wait_nanos
             .saturating_add(profile.catalog_mark_lock_wait_nanos);
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct NativeFileBatchCommitProfiler {
-    capacity: usize,
-    next_sequence: u64,
-    profiles: VecDeque<NativeFileBatchCommitProfile>,
-}
-
-impl NativeFileBatchCommitProfiler {
-    fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(StorageError::invalid_argument(
-                "native file batch profile capacity must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            capacity,
-            next_sequence: 1,
-            profiles: VecDeque::with_capacity(capacity.min(1024)),
-        })
-    }
-
-    fn record(&mut self, mut profile: NativeFileBatchCommitProfile) {
-        profile.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.profiles.len() == self.capacity {
-            self.profiles.pop_front();
-        }
-        self.profiles.push_back(profile);
-    }
-
-    fn drain(&mut self, max: usize) -> Vec<NativeFileBatchCommitProfile> {
-        let count = max.min(self.profiles.len());
-        self.profiles.drain(..count).collect()
     }
 }
 

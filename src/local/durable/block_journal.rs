@@ -130,6 +130,29 @@ pub(super) struct BlockJournalOverlay {
     inner: Mutex<BTreeMap<DeviceId, BlockJournalDeviceOverlay>>,
 }
 
+/// Timing for one overlay operation: total wall time and, as a carve-out
+/// subset, the measured wait to acquire the overlay mutex.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct BlockJournalOverlayOpNanos {
+    pub(super) total_nanos: u64,
+    pub(super) lock_wait_nanos: u64,
+}
+
+/// Writer-side lock waits measured before a lane request enqueues.
+///
+/// In-memory instrumentation only: the values ride the lane request (never
+/// the journal record, whose codec is untouched) so the batch owner can
+/// attribute row-less writers' staging and metadata (device-spec lookup plus
+/// commit-seq reserve) lock waits to the batch row's `enqueue_*` columns.
+/// Writers that record their own row (the segment-ref seal path) report
+/// these waits in their own row instead and carry zeros here, so every
+/// measured wait lands in exactly one row.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct BlockJournalEnqueueWaits {
+    pub(super) staging_lock_wait_nanos: u64,
+    pub(super) reserve_lock_wait_nanos: u64,
+}
+
 /// One unit of work for the group-committed block journal lane.
 ///
 /// Every durable block boundary becomes a lane request so concurrent waiters
@@ -138,7 +161,10 @@ pub(super) struct BlockJournalOverlay {
 /// be merged per device inside one batch.
 #[derive(Debug, Clone)]
 pub(super) enum BlockJournalLaneRequest {
-    Write(BlockJournalCommit),
+    Write {
+        commit: BlockJournalCommit,
+        enqueue_waits: BlockJournalEnqueueWaits,
+    },
     Flush {
         device_id: DeviceId,
         writer_epoch: WriterEpoch,
@@ -178,6 +204,25 @@ pub(super) struct BlockJournalLaneBatchTiming {
     pub(super) publish_mark_lock_wait_nanos: u64,
     /// Node-side observability event/counter recording during the mark.
     pub(super) publish_mark_observability_nanos: u64,
+    /// Metadata-plane lock wait measured on the row-recording thread's own
+    /// commit path: device-spec lookups, commit-seq reserves, and
+    /// publish-head advances.
+    pub(super) publish_reserve_lock_wait_nanos: u64,
+    /// Block-journal overlay lock wait across publish apply and durable
+    /// marks.
+    pub(super) overlay_lock_wait_nanos: u64,
+    /// Global block-delta staging lock wait measured on the row-recording
+    /// thread.
+    pub(super) staging_lock_wait_nanos: u64,
+    /// Staging-lock waits carried by the batch's row-less writers
+    /// (batch-attributed; may exceed the row's wall clock).
+    pub(super) enqueue_staging_lock_wait_nanos: u64,
+    /// Metadata-plane waits (device-spec lookup plus reserve) carried by the
+    /// batch's row-less writers (batch-attributed).
+    pub(super) enqueue_reserve_lock_wait_nanos: u64,
+    /// Device-pending-payloads mutex wait on the row's path (acknowledged
+    /// registration or the lane leader's payload recheck).
+    pub(super) pending_payload_lock_wait_nanos: u64,
 }
 
 #[derive(Debug, Default)]
@@ -196,7 +241,7 @@ pub(super) struct BlockJournalFlushState {
 
 impl BlockJournalFlushState {
     fn enqueue(&mut self, request: BlockJournalLaneRequest) -> u64 {
-        if let BlockJournalLaneRequest::Write(commit) = &request {
+        if let BlockJournalLaneRequest::Write { commit, .. } = &request {
             *self.unapplied_writes.entry(commit.device_id).or_default() += 1;
         }
         let request_id = self.next_request_id;
@@ -1261,9 +1306,18 @@ impl BlockJournalOverlay {
             .unwrap_or_else(|| CommitSeq::from_raw(0)))
     }
 
-    fn apply_commit(&self, commit: &BlockJournalCommit, block_size: u64) -> Result<u64> {
+    /// `measure` carries the persist sink's enabled flag: lock waits come
+    /// from `lock_timed` (free when off; contended-only clock reads when
+    /// on). The op wall clock predates this instrumentation and stays
+    /// unconditional.
+    fn apply_commit(
+        &self,
+        commit: &BlockJournalCommit,
+        block_size: u64,
+        measure: bool,
+    ) -> Result<BlockJournalOverlayOpNanos> {
         let started = Instant::now();
-        let mut inner = lock(&self.inner)?;
+        let (mut inner, lock_wait_nanos) = lock_timed(&self.inner, measure)?;
         let device = inner.entry(commit.device_id).or_default();
         set_block_journal_overlay_block_size(device, block_size)?;
         device.writer_epoch = device.writer_epoch.max(commit.writer_epoch);
@@ -1271,22 +1325,47 @@ impl BlockJournalOverlay {
         for entry in commit.overlay_entries()? {
             insert_block_journal_lba_run(&mut device.lba_runs, block_size, entry)?;
         }
-        Ok(duration_nanos_u64(started.elapsed()))
+        Ok(BlockJournalOverlayOpNanos {
+            total_nanos: duration_nanos_u64(started.elapsed()),
+            lock_wait_nanos,
+        })
     }
 
+    /// Advance a device's durable high-water, returning the wait to acquire
+    /// the overlay mutex (measured only when `measure` is set, and only for
+    /// contended acquisitions; see `lock_timed`).
     fn mark_durable(
         &self,
         device_id: DeviceId,
         writer_epoch: WriterEpoch,
         durable_through: CommitSeq,
-    ) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
+        measure: bool,
+    ) -> Result<u64> {
+        let (mut inner, lock_wait_nanos) = lock_timed(&self.inner, measure)?;
         let device = inner.entry(device_id).or_default();
         device.writer_epoch = device.writer_epoch.max(writer_epoch);
         device.durable_through = device.durable_through.max(durable_through);
+        Ok(lock_wait_nanos)
+    }
+
+    /// Test-only contention injection: hold the overlay mutex, release the
+    /// barrier so the contending thread starts its acquisition while the
+    /// lock is provably held, then keep holding for `hold`.
+    #[cfg(test)]
+    pub(super) fn hold_lock_for_test(
+        &self,
+        held: &std::sync::Barrier,
+        hold: Duration,
+    ) -> Result<()> {
+        let _guard = lock(&self.inner)?;
+        held.wait();
+        std::thread::sleep(hold);
         Ok(())
     }
 
+    /// `measure` carries the read sink's enabled flag; the op wall clock
+    /// (`block_journal_overlay_read_nanos`) predates this instrumentation
+    /// and stays unconditional.
     fn apply_read_overlay(
         &self,
         storage: &impl StorageNodeReadService,
@@ -1294,15 +1373,20 @@ impl BlockJournalOverlay {
         requested: ByteRange,
         verification: ReadVerification,
         buf: &mut [u8],
-    ) -> Result<u64> {
+        measure: bool,
+    ) -> Result<BlockJournalOverlayOpNanos> {
         let started = Instant::now();
         let requested_end = requested.end_exclusive()?;
-        let inner = lock(&self.inner)?;
+        let (inner, lock_wait_nanos) = lock_timed(&self.inner, measure)?;
+        let finish = |started: Instant| BlockJournalOverlayOpNanos {
+            total_nanos: duration_nanos_u64(started.elapsed()),
+            lock_wait_nanos,
+        };
         let Some(device) = inner.get(&device_id) else {
-            return Ok(duration_nanos_u64(started.elapsed()));
+            return Ok(finish(started));
         };
         if device.lba_runs.is_empty() {
-            return Ok(duration_nanos_u64(started.elapsed()));
+            return Ok(finish(started));
         }
         let Some(block_size) = device.block_size else {
             return Err(StorageError::corrupt(
@@ -1318,7 +1402,7 @@ impl BlockJournalOverlay {
         let start_lba = requested.offset / block_size;
         let end_lba = requested_end / block_size;
         if start_lba == end_lba {
-            return Ok(duration_nanos_u64(started.elapsed()));
+            return Ok(finish(started));
         }
         let first_key = match device.lba_runs.range(..=start_lba).next_back() {
             Some((key, entry)) => {
@@ -1344,7 +1428,10 @@ impl BlockJournalOverlay {
         for entry in entries {
             apply_block_journal_read_entry(storage, &entry, requested, verification, buf)?;
         }
-        Ok(duration_nanos_u64(started.elapsed()))
+        Ok(BlockJournalOverlayOpNanos {
+            total_nanos: duration_nanos_u64(started.elapsed()),
+            lock_wait_nanos,
+        })
     }
 
     #[cfg(test)]
@@ -1563,7 +1650,7 @@ mod block_journal_tests {
         let device_id = DeviceId::from_raw(7);
         let block = 4096_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 4]), block as u64)
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 4]), block as u64, true)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -1571,7 +1658,7 @@ mod block_journal_tests {
                 2,
                 block as u64,
                 vec![2; block],
-            ), block as u64)
+            ), block as u64, true)
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 3);
 
@@ -1583,6 +1670,7 @@ mod block_journal_tests {
                 ByteRange::new(0, (block * 4) as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         assert_eq!(&read[..block], vec![1; block]);
@@ -1596,7 +1684,7 @@ mod block_journal_tests {
         let device_id = DeviceId::from_raw(8);
         let block = 4096_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]), block as u64)
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]), block as u64, true)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -1604,7 +1692,7 @@ mod block_journal_tests {
                 2,
                 block as u64,
                 vec![2; block],
-            ), block as u64)
+            ), block as u64, true)
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 2);
 
@@ -1616,6 +1704,7 @@ mod block_journal_tests {
                 ByteRange::new(0, (block * 2) as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         assert_eq!(&read[..block], vec![1; block]);
@@ -1628,7 +1717,7 @@ mod block_journal_tests {
         let device_id = DeviceId::from_raw(9);
         let block = 4096_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]), block as u64)
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block]), block as u64, true)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -1636,7 +1725,7 @@ mod block_journal_tests {
                 2,
                 (block * 2) as u64,
                 vec![2; block],
-            ), block as u64)
+            ), block as u64, true)
             .unwrap();
         overlay
             .apply_commit(&journal_commit(
@@ -1644,7 +1733,7 @@ mod block_journal_tests {
                 3,
                 block as u64,
                 vec![3; block * 2],
-            ), block as u64)
+            ), block as u64, true)
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 2);
 
@@ -1656,6 +1745,7 @@ mod block_journal_tests {
                 ByteRange::new(0, (block * 3) as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         assert_eq!(&read[..block], vec![1; block]);
@@ -1668,7 +1758,7 @@ mod block_journal_tests {
         let device_id = DeviceId::from_raw(10);
         let block = 4096_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 3]), block as u64)
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![1; block * 3]), block as u64, true)
             .unwrap();
         overlay
             .apply_commit(
@@ -1678,6 +1768,7 @@ mod block_journal_tests {
                     ByteRange::new(block as u64, block as u64),
                 ),
                 block as u64,
+                true,
             )
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 3);
@@ -1690,6 +1781,7 @@ mod block_journal_tests {
                 ByteRange::new(0, (block * 3) as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         assert_eq!(&read[..block], repeated_block(1, block));
@@ -1706,6 +1798,7 @@ mod block_journal_tests {
             .apply_commit(
                 &journal_commit(device_id, 1, block as u64, vec![4; block]),
                 block as u64,
+                true,
             )
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
@@ -1718,6 +1811,7 @@ mod block_journal_tests {
                 ByteRange::new(0, (block * 3) as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         assert_eq!(&read[..block], repeated_block(9, block));
@@ -1731,12 +1825,13 @@ mod block_journal_tests {
         let device_id = DeviceId::from_raw(12);
         let block = 64 * 1024_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![5; block * 2]), block as u64)
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![5; block * 2]), block as u64, true)
             .unwrap();
         overlay
             .apply_commit(
                 &journal_commit(device_id, 2, block as u64, vec![6; block]),
                 block as u64,
+                true,
             )
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 2);
@@ -1749,6 +1844,7 @@ mod block_journal_tests {
                 ByteRange::new(0, (block * 2) as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         assert_eq!(&read[..block], repeated_block(5, block));
@@ -1761,7 +1857,7 @@ mod block_journal_tests {
         let device_id = DeviceId::from_raw(13);
         let block = 4096_u64;
         let error = overlay
-            .apply_commit(&journal_commit(device_id, 1, 1, vec![1; block as usize]), block)
+            .apply_commit(&journal_commit(device_id, 1, 1, vec![1; block as usize]), block, true)
             .unwrap_err();
         assert!(matches!(error, StorageError::Corrupt { .. }));
     }
@@ -1773,7 +1869,7 @@ mod block_journal_tests {
         let block = 4096_usize;
         let write_len = 1024 * 1024_usize;
         overlay
-            .apply_commit(&journal_commit(device_id, 1, 0, vec![8; write_len]), block as u64)
+            .apply_commit(&journal_commit(device_id, 1, 0, vec![8; write_len]), block as u64, true)
             .unwrap();
 
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
@@ -1797,6 +1893,7 @@ mod block_journal_tests {
             .apply_commit(
                 &journal_commit_from_writes(device_id, 1, writes.clone()),
                 block as u64,
+                true,
             )
             .unwrap();
 
@@ -1815,6 +1912,7 @@ mod block_journal_tests {
                 ByteRange::new(0, (block * 256) as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         let expected = writes
@@ -1843,6 +1941,7 @@ mod block_journal_tests {
                     &receipt,
                 ),
                 block as u64,
+                true,
             )
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
@@ -1855,6 +1954,7 @@ mod block_journal_tests {
                 ByteRange::new(block as u64, block as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
         assert_eq!(read, repeated_block(2, block));
@@ -1882,6 +1982,7 @@ mod block_journal_tests {
                     &receipt,
                 ),
                 block as u64,
+                true,
             )
             .unwrap();
         assert_eq!(overlay.lba_run_count_for_test(device_id).unwrap(), 1);
@@ -1895,6 +1996,7 @@ mod block_journal_tests {
                 ByteRange::new(0, read_len as u64),
                 ReadVerification::RequireVerified,
                 &mut read,
+                true,
             )
             .unwrap();
 
@@ -2508,7 +2610,7 @@ impl DurableSqliteStore {
                         .metadata
                         .observe_allocated_commit_seq(flushed_through)?;
                     local.seed_block_writer_epoch(device_id, writer_epoch)?;
-                    overlay.mark_durable(device_id, writer_epoch, flushed_through)?;
+                    overlay.mark_durable(device_id, writer_epoch, flushed_through, false)?;
                     latest_epoch
                         .entry(device_id)
                         .and_modify(|epoch| *epoch = (*epoch).max(writer_epoch))
@@ -2593,12 +2695,13 @@ impl DurableSqliteStore {
                 local
                     .metadata
                     .replay_block_journal_commit(device_id, commit.commit_seq)?;
-                overlay.apply_commit(commit, block_size)?;
+                overlay.apply_commit(commit, block_size, false)?;
             }
             overlay.mark_durable(
                 device_id,
                 overlay.writer_epoch(device_id)?,
                 durable,
+                false,
             )?;
         }
 

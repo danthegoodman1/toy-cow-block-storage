@@ -60,8 +60,8 @@ pub struct LocalCoordinator {
     next_write_intent: Arc<Mutex<u128>>,
     next_extent_id: Arc<Mutex<u128>>,
     observability: Arc<Observability>,
-    read_profiler: Arc<Mutex<Option<ReadProfiler>>>,
-    native_file_batch_profiler: Arc<Mutex<Option<NativeFileBatchCommitProfiler>>>,
+    read_profiler: Arc<ShardedProfileSink<ReadProfile>>,
+    native_file_batch_profiler: Arc<ShardedProfileSink<NativeFileBatchCommitProfile>>,
     verified_receipt_cache: Arc<Mutex<BTreeMap<SegmentId, VerifiedSegmentReceipt>>>,
     block_writer_epochs: Arc<Mutex<BTreeMap<DeviceId, WriterEpoch>>>,
 }
@@ -95,8 +95,8 @@ impl LocalCoordinator {
             next_write_intent: Arc::new(Mutex::new(1)),
             next_extent_id: Arc::new(Mutex::new(1)),
             observability,
-            read_profiler: Arc::new(Mutex::new(None)),
-            native_file_batch_profiler: Arc::new(Mutex::new(None)),
+            read_profiler: Arc::new(ShardedProfileSink::new()),
+            native_file_batch_profiler: Arc::new(ShardedProfileSink::new()),
             verified_receipt_cache: Arc::new(Mutex::new(BTreeMap::new())),
             block_writer_epochs: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -124,8 +124,8 @@ impl LocalCoordinator {
             next_write_intent: Arc::new(Mutex::new(image.next_write_intent)),
             next_extent_id: Arc::new(Mutex::new(image.next_extent_id)),
             observability,
-            read_profiler: Arc::new(Mutex::new(None)),
-            native_file_batch_profiler: Arc::new(Mutex::new(None)),
+            read_profiler: Arc::new(ShardedProfileSink::new()),
+            native_file_batch_profiler: Arc::new(ShardedProfileSink::new()),
             verified_receipt_cache: Arc::new(Mutex::new(BTreeMap::new())),
             block_writer_epochs: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -1141,54 +1141,37 @@ impl LocalCoordinator {
     }
 
     pub fn enable_read_profiling(&self, capacity: usize) -> Result<()> {
-        *lock(&self.read_profiler)? = Some(ReadProfiler::new(capacity)?);
-        Ok(())
+        self.read_profiler.enable(capacity)
     }
 
     pub fn drain_read_profiles(&self, max: usize) -> Result<Vec<ReadProfile>> {
-        let mut profiler = lock(&self.read_profiler)?;
-        Ok(profiler
-            .as_mut()
-            .map(|profiler| profiler.drain(max))
-            .unwrap_or_default())
+        self.read_profiler.drain(max)
     }
 
     fn record_read_profile(&self, profile: ReadProfile) -> Result<()> {
-        if let Some(profiler) = lock(&self.read_profiler)?.as_mut() {
-            profiler.record(profile);
-        }
-        Ok(())
+        self.read_profiler.record(profile)
     }
 
     pub fn enable_native_file_batch_profiling(&self, capacity: usize) -> Result<()> {
-        *lock(&self.native_file_batch_profiler)? =
-            Some(NativeFileBatchCommitProfiler::new(capacity)?);
-        Ok(())
+        self.native_file_batch_profiler.enable(capacity)
     }
 
     pub fn drain_native_file_batch_commit_profiles(
         &self,
         max: usize,
     ) -> Result<Vec<NativeFileBatchCommitProfile>> {
-        let mut profiler = lock(&self.native_file_batch_profiler)?;
-        Ok(profiler
-            .as_mut()
-            .map(|profiler| profiler.drain(max))
-            .unwrap_or_default())
+        self.native_file_batch_profiler.drain(max)
     }
 
     fn native_file_batch_profile_enabled(&self) -> Result<bool> {
-        Ok(lock(&self.native_file_batch_profiler)?.is_some())
+        Ok(self.native_file_batch_profiler.is_enabled())
     }
 
     fn record_native_file_batch_profile(
         &self,
         profile: NativeFileBatchCommitProfile,
     ) -> Result<()> {
-        if let Some(profiler) = lock(&self.native_file_batch_profiler)?.as_mut() {
-            profiler.record(profile);
-        }
-        Ok(())
+        self.native_file_batch_profiler.record(profile)
     }
 
     #[cfg(test)]
@@ -3106,8 +3089,10 @@ impl LocalCoordinator {
                         StorageError::invalid_argument("native preserved length overflows usize")
                     })?;
                     let started = profile_enabled.then(Instant::now);
+                    // The resolve profile is discarded on this path, so
+                    // measurement stays off.
                     let (plan, _) =
-                        self.resolve_file_read_plan(keyspace_id, file_id, preserved_range)?;
+                        self.resolve_file_read_plan(keyspace_id, file_id, preserved_range, false)?;
                     assemble_read_plan(
                         self,
                         plan,
@@ -5147,18 +5132,42 @@ impl LocalCoordinator {
         })
     }
 
+    /// Runtime dispatch for the const-generic resolve: `measure` carries
+    /// the read sink's enabled flag. The `false` instantiation compiles to
+    /// the uninstrumented walk (no clock reads, no accumulates, a default
+    /// profile that no one records), so a disabled sink costs one
+    /// predictable branch per op; the `true` instantiation spends one wall
+    /// clock pair on the walk and takes lock waits from `lock_timed` (only
+    /// contended acquisitions read the clock).
     fn resolve_block_read_plan(
         &self,
         device_id: DeviceId,
         range: ByteRange,
+        measure: bool,
     ) -> Result<(ReadPlan, ReadResolveProfile)> {
-        let info = self.metadata.device_info(device_id)?;
+        if measure {
+            self.resolve_block_read_plan_measured::<true>(device_id, range)
+        } else {
+            self.resolve_block_read_plan_measured::<false>(device_id, range)
+        }
+    }
+
+    fn resolve_block_read_plan_measured<const MEASURE: bool>(
+        &self,
+        device_id: DeviceId,
+        range: ByteRange,
+    ) -> Result<(ReadPlan, ReadResolveProfile)> {
+        let mut profile = ReadResolveProfile::default();
+        let (info, info_lock_wait_nanos) =
+            self.metadata.device_info_profiled(device_id, MEASURE)?;
+        if MEASURE {
+            profile.metadata_lock_wait_nanos = profile
+                .metadata_lock_wait_nanos
+                .saturating_add(info_lock_wait_nanos);
+        }
         range.validate_for_device(&info.spec)?;
         if range.len == 0 {
-            return Ok((
-                ReadPlan::from_non_zero_extents(0, Vec::new())?,
-                ReadResolveProfile::default(),
-            ));
+            return Ok((ReadPlan::from_non_zero_extents(0, Vec::new())?, profile));
         }
 
         let block_size = u64::from(info.spec.block_size);
@@ -5166,33 +5175,72 @@ impl LocalCoordinator {
             BlockIndex::from_raw(range.offset / block_size),
             BlockCount::from_raw(range.len / block_size),
         );
+        let walk_started = MEASURE.then(Instant::now);
         let mut extents = Vec::new();
-        let head = self.metadata.get_head(device_id)?;
+        let (head, head_lock_wait_nanos) = self.metadata.get_head_profiled(device_id, MEASURE)?;
+        if MEASURE {
+            profile.metadata_lock_wait_nanos = profile
+                .metadata_lock_wait_nanos
+                .saturating_add(head_lock_wait_nanos);
+        }
         for root in head.shard_roots {
-            let node = self.metadata.get_metadata_node(root)?;
+            let (node, node_lock_wait_nanos) =
+                self.metadata.get_metadata_node_profiled(root, MEASURE)?;
+            if MEASURE {
+                profile.metadata_lock_wait_nanos = profile
+                    .metadata_lock_wait_nanos
+                    .saturating_add(node_lock_wait_nanos);
+            }
             if node.covered_range.overlaps(requested)? {
-                self.collect_segment_read_extents_for_metadata_node(
+                self.collect_segment_read_extents_for_metadata_node::<MEASURE>(
                     &node,
                     requested,
                     range,
                     block_size,
                     &mut extents,
+                    &mut profile,
                 )?;
             }
         }
-        Ok((
-            ReadPlan::from_non_zero_extents(range.len, extents)?,
-            ReadResolveProfile::default(),
-        ))
+        // Tree walk and placement lookup partition the walk wall time; the
+        // metadata lock wait is a carve-out subset that overlaps both.
+        if let Some(walk_started) = walk_started {
+            profile.metadata_tree_walk_nanos = duration_nanos_u64(walk_started.elapsed())
+                .saturating_sub(profile.metadata_placement_lookup_nanos);
+        }
+        Ok((ReadPlan::from_non_zero_extents(range.len, extents)?, profile))
     }
 
+    /// See `resolve_block_read_plan` for the `measure` contract.
     fn resolve_file_read_plan(
         &self,
         keyspace_id: KeyspaceId,
         file_id: FileId,
         range: ByteRange,
+        measure: bool,
     ) -> Result<(ReadPlan, ReadResolveProfile)> {
-        let head = self.metadata.get_file_head(keyspace_id, file_id)?;
+        if measure {
+            self.resolve_file_read_plan_measured::<true>(keyspace_id, file_id, range)
+        } else {
+            self.resolve_file_read_plan_measured::<false>(keyspace_id, file_id, range)
+        }
+    }
+
+    fn resolve_file_read_plan_measured<const MEASURE: bool>(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        range: ByteRange,
+    ) -> Result<(ReadPlan, ReadResolveProfile)> {
+        let mut profile = ReadResolveProfile::default();
+        let (head, head_lock_wait_nanos) =
+            self.metadata
+                .get_file_head_profiled(keyspace_id, file_id, MEASURE)?;
+        if MEASURE {
+            profile.metadata_lock_wait_nanos = profile
+                .metadata_lock_wait_nanos
+                .saturating_add(head_lock_wait_nanos);
+        }
         let end = range.end_exclusive()?;
         if end > head.size {
             return Err(StorageError::invalid_argument(
@@ -5200,11 +5248,14 @@ impl LocalCoordinator {
             ));
         }
         if range.len == 0 {
-            let _ = self.metadata.get_metadata_node(head.root)?;
-            return Ok((
-                ReadPlan::from_non_zero_extents(0, Vec::new())?,
-                ReadResolveProfile::default(),
-            ));
+            let (_, root_lock_wait_nanos) =
+                self.metadata.get_metadata_node_profiled(head.root, MEASURE)?;
+            if MEASURE {
+                profile.metadata_lock_wait_nanos = profile
+                    .metadata_lock_wait_nanos
+                    .saturating_add(root_lock_wait_nanos);
+            }
+            return Ok((ReadPlan::from_non_zero_extents(0, Vec::new())?, profile));
         }
 
         let block_size = u64::from(self.metadata.config.block_size);
@@ -5217,29 +5268,41 @@ impl LocalCoordinator {
             BlockIndex::from_raw(first_block),
             BlockCount::from_raw(requested_blocks),
         );
-        let root = self.metadata.get_metadata_node(head.root)?;
+        let walk_started = MEASURE.then(Instant::now);
+        let (root, root_lock_wait_nanos) =
+            self.metadata.get_metadata_node_profiled(head.root, MEASURE)?;
+        if MEASURE {
+            profile.metadata_lock_wait_nanos = profile
+                .metadata_lock_wait_nanos
+                .saturating_add(root_lock_wait_nanos);
+        }
         let mut segment_extents = Vec::new();
-        self.collect_segment_read_extents_for_metadata_node(
+        self.collect_segment_read_extents_for_metadata_node::<MEASURE>(
             &root,
             requested,
             range,
             block_size,
             &mut segment_extents,
+            &mut profile,
         )?;
         let mut run_extents = Vec::new();
-        self.collect_append_run_read_extents_for_metadata_node(
+        self.collect_append_run_read_extents_for_metadata_node::<MEASURE>(
             &root,
             requested,
             range,
             &mut run_extents,
+            &mut profile,
         )?;
         let mut extents =
             Self::trim_segment_read_extents_for_append_runs(segment_extents, &run_extents)?;
         extents.extend(run_extents);
-        Ok((
-            ReadPlan::from_non_zero_extents(range.len, extents)?,
-            ReadResolveProfile::default(),
-        ))
+        // Tree walk and placement lookup partition the walk wall time; the
+        // metadata lock wait is a carve-out subset that overlaps both.
+        if let Some(walk_started) = walk_started {
+            profile.metadata_tree_walk_nanos = duration_nanos_u64(walk_started.elapsed())
+                .saturating_sub(profile.metadata_placement_lookup_nanos);
+        }
+        Ok((ReadPlan::from_non_zero_extents(range.len, extents)?, profile))
     }
 
     fn trim_segment_read_extents_for_append_runs(
@@ -5336,25 +5399,34 @@ impl LocalCoordinator {
         })
     }
 
-    fn collect_segment_read_extents_for_metadata_node(
+    fn collect_segment_read_extents_for_metadata_node<const MEASURE: bool>(
         &self,
         node: &MetadataNode,
         requested_blocks: crate::api::BlockRange,
         requested_bytes: ByteRange,
         block_size: u64,
         out: &mut Vec<ReadExtent>,
+        profile: &mut ReadResolveProfile,
     ) -> Result<()> {
         match &node.kind {
             MetadataNodeKind::Internal { children } => {
                 for child in children {
                     if child.range.overlaps(requested_blocks)? {
-                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
-                        self.collect_segment_read_extents_for_metadata_node(
+                        let (child_node, lock_wait_nanos) = self
+                            .metadata
+                            .get_metadata_node_profiled(child.node_id, MEASURE)?;
+                        if MEASURE {
+                            profile.metadata_lock_wait_nanos = profile
+                                .metadata_lock_wait_nanos
+                                .saturating_add(lock_wait_nanos);
+                        }
+                        self.collect_segment_read_extents_for_metadata_node::<MEASURE>(
                             &child_node,
                             requested_blocks,
                             requested_bytes,
                             block_size,
                             out,
+                            profile,
                         )?;
                     }
                 }
@@ -5362,11 +5434,12 @@ impl LocalCoordinator {
             }
             MetadataNodeKind::Leaf { entries, .. } => {
                 for entry in entries {
-                    self.collect_segment_entry_read_extent(
+                    self.collect_segment_entry_read_extent::<MEASURE>(
                         entry,
                         requested_bytes,
                         block_size,
                         out,
+                        profile,
                     )?;
                 }
                 Ok(())
@@ -5374,12 +5447,13 @@ impl LocalCoordinator {
         }
     }
 
-    fn collect_segment_entry_read_extent(
+    fn collect_segment_entry_read_extent<const MEASURE: bool>(
         &self,
         entry: &LeafEntry,
         requested_bytes: ByteRange,
         block_size: u64,
         out: &mut Vec<ReadExtent>,
+        profile: &mut ReadResolveProfile,
     ) -> Result<()> {
         let entry_start = entry
             .logical_start
@@ -5408,8 +5482,14 @@ impl LocalCoordinator {
             .offset
             .checked_sub(requested_bytes.offset)
             .ok_or_else(|| StorageError::corrupt("read extent precedes requested range"))?;
+        let placement_started = MEASURE.then(Instant::now);
         let receipt = self.storage_nodes.receipt_for_segment(entry.segment_id)?;
         let verified = self.authority.verify_segment_receipt(&receipt)?;
+        if let Some(placement_started) = placement_started {
+            profile.metadata_placement_lookup_nanos = profile
+                .metadata_placement_lookup_nanos
+                .saturating_add(duration_nanos_u64(placement_started.elapsed()));
+        }
         let descriptor = verified.descriptor();
         if segment_offset
             .checked_add(overlap.len)
@@ -5433,23 +5513,32 @@ impl LocalCoordinator {
         Ok(())
     }
 
-    fn collect_append_run_read_extents_for_metadata_node(
+    fn collect_append_run_read_extents_for_metadata_node<const MEASURE: bool>(
         &self,
         node: &MetadataNode,
         requested_blocks: crate::api::BlockRange,
         requested_bytes: ByteRange,
         out: &mut Vec<ReadExtent>,
+        profile: &mut ReadResolveProfile,
     ) -> Result<()> {
         match &node.kind {
             MetadataNodeKind::Internal { children } => {
                 for child in children {
                     if child.range.overlaps(requested_blocks)? {
-                        let child_node = self.metadata.get_metadata_node(child.node_id)?;
-                        self.collect_append_run_read_extents_for_metadata_node(
+                        let (child_node, lock_wait_nanos) = self
+                            .metadata
+                            .get_metadata_node_profiled(child.node_id, MEASURE)?;
+                        if MEASURE {
+                            profile.metadata_lock_wait_nanos = profile
+                                .metadata_lock_wait_nanos
+                                .saturating_add(lock_wait_nanos);
+                        }
+                        self.collect_append_run_read_extents_for_metadata_node::<MEASURE>(
                             &child_node,
                             requested_blocks,
                             requested_bytes,
                             out,
+                            profile,
                         )?;
                     }
                 }
@@ -5494,7 +5583,7 @@ impl MetadataReadService for LocalCoordinator {
         device_id: DeviceId,
         range: ByteRange,
     ) -> Result<(ReadPlan, ReadResolveProfile)> {
-        self.resolve_block_read_plan(device_id, range)
+        self.resolve_block_read_plan(device_id, range, self.read_profiler.is_enabled())
     }
 
     fn resolve_file_read(
@@ -5503,7 +5592,7 @@ impl MetadataReadService for LocalCoordinator {
         file_id: FileId,
         range: ByteRange,
     ) -> Result<(ReadPlan, ReadResolveProfile)> {
-        self.resolve_file_read_plan(keyspace_id, file_id, range)
+        self.resolve_file_read_plan(keyspace_id, file_id, range, self.read_profiler.is_enabled())
     }
 }
 

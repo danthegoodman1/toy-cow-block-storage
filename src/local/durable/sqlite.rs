@@ -104,6 +104,10 @@ pub struct DurablePersistProfile {
     pub block_journal_frame_bytes: u64,
     pub block_journal_created: u64,
     pub block_journal_flush_group_size: u64,
+    /// Wall time from lane enqueue to request completion. This includes the
+    /// lane queue-mutex waits themselves (enqueue, notify-all wakeups, and
+    /// the acknowledged-path ordering probe), so the targeted-wakeup trim
+    /// reads this bucket.
     pub block_journal_lane_wait_nanos: u64,
     pub block_journal_payload_recheck_nanos: u64,
     pub block_journal_publish_nanos: u64,
@@ -125,6 +129,49 @@ pub struct DurablePersistProfile {
     pub touched_manifest_rows: u64,
     pub commit_rows_written: u64,
     pub durable_commit_high_water: u64,
+    /// Contended wait for the block-journal shard file lock during this
+    /// row's journal append; an uncontended acquisition reports zero (see
+    /// `lock_timed`). Same-row carve-out, like every other
+    /// `*_lock_wait_nanos` column below except the `enqueue_` pair.
+    ///
+    /// Metric convention note for this and the six columns below: these
+    /// report CONTENDED-ONLY wait via `lock_timed`, while the pre-existing
+    /// `*_lock_wait_nanos` columns above (persist, sqlite, metadata
+    /// publish, node-catalog, append-visible journal, publish mark) and the
+    /// M5 catalog-hold CSV keep their original pair-per-acquisition
+    /// "acquisition elapsed" meaning — cross-column comparisons mix the two
+    /// metrics.
+    pub block_journal_append_lock_wait_nanos: u64,
+    /// Contended metadata-plane mutex wait on this row's own commit path:
+    /// device-spec lookups, commit-seq reserves, and publish-head advances
+    /// measured on the thread that records this row (contended-only, zero
+    /// when uncontended; see `lock_timed`).
+    pub block_journal_publish_reserve_lock_wait_nanos: u64,
+    /// Contended wait for the block-journal overlay mutex during this row's
+    /// publish apply and durable-mark steps (contended-only, zero when
+    /// uncontended; see `lock_timed`).
+    pub block_journal_overlay_lock_wait_nanos: u64,
+    /// Contended wait for the global block-delta staging lock, measured on
+    /// the thread that records this row (contended-only, zero when
+    /// uncontended; see `lock_timed`).
+    pub block_journal_staging_lock_wait_nanos: u64,
+    /// Contended staging-lock waits measured by OTHER threads' writes that
+    /// this lane batch committed (writers whose ops record no row of their
+    /// own carry their enqueue waits on the lane request; contended-only,
+    /// zero when uncontended). Batch-attributed, not a carve-out: these
+    /// nanos were spent outside this row's wall clock and can exceed
+    /// `total_nanos`.
+    pub block_journal_enqueue_staging_lock_wait_nanos: u64,
+    /// Contended metadata-plane mutex waits (device-spec lookup plus
+    /// commit-seq reserve) carried by the batch's row-less writers
+    /// (contended-only, zero when uncontended). Batch-attributed like
+    /// `block_journal_enqueue_staging_lock_wait_nanos`.
+    pub block_journal_enqueue_reserve_lock_wait_nanos: u64,
+    /// Contended wait for the device-pending-payloads mutex on this row's
+    /// path: acknowledged segment-ref registration, and the lane leader's
+    /// flush-boundary payload recheck (inside the payload-recheck bucket;
+    /// contended-only, zero when uncontended; see `lock_timed`).
+    pub block_journal_pending_payload_lock_wait_nanos: u64,
 }
 
 /// Process-local timing for one append publish wait call.
@@ -311,38 +358,6 @@ pub(super) struct MetadataPublishProfile {
     commit_rows_written: u64,
 }
 
-#[derive(Debug)]
-pub(super) struct MetadataPublishProfiler {
-    capacity: usize,
-    profiles: VecDeque<MetadataPublishProfile>,
-}
-
-impl MetadataPublishProfiler {
-    fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(StorageError::invalid_argument(
-                "metadata publish profile capacity must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            capacity,
-            profiles: VecDeque::with_capacity(capacity.min(1024)),
-        })
-    }
-
-    fn record(&mut self, profile: MetadataPublishProfile) {
-        if self.profiles.len() == self.capacity {
-            self.profiles.pop_front();
-        }
-        self.profiles.push_back(profile);
-    }
-
-    fn drain(&mut self, max: usize) -> Vec<MetadataPublishProfile> {
-        let count = max.min(self.profiles.len());
-        self.profiles.drain(..count).collect()
-    }
-}
-
 pub(super) fn summarize_metadata_publish_profiles(
     profiles: impl IntoIterator<Item = MetadataPublishProfile>,
 ) -> MetadataPublishProfile {
@@ -366,114 +381,6 @@ pub(super) fn summarize_metadata_publish_profiles(
             .saturating_add(profile.commit_rows_written);
     }
     out
-}
-
-#[derive(Debug)]
-pub(super) struct PersistProfiler {
-    capacity: usize,
-    next_sequence: u64,
-    profiles: VecDeque<DurablePersistProfile>,
-}
-
-impl PersistProfiler {
-    fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(StorageError::invalid_argument(
-                "persist profile capacity must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            capacity,
-            next_sequence: 1,
-            profiles: VecDeque::with_capacity(capacity.min(1024)),
-        })
-    }
-
-    fn record(&mut self, mut profile: DurablePersistProfile) {
-        profile.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.profiles.len() == self.capacity {
-            self.profiles.pop_front();
-        }
-        self.profiles.push_back(profile);
-    }
-
-    fn drain(&mut self, max: usize) -> Vec<DurablePersistProfile> {
-        let count = max.min(self.profiles.len());
-        self.profiles.drain(..count).collect()
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct AppendPublishWaitProfiler {
-    capacity: usize,
-    next_sequence: u64,
-    profiles: VecDeque<AppendPublishWaitProfile>,
-}
-
-impl AppendPublishWaitProfiler {
-    fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(StorageError::invalid_argument(
-                "append publish wait profile capacity must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            capacity,
-            next_sequence: 1,
-            profiles: VecDeque::with_capacity(capacity.min(1024)),
-        })
-    }
-
-    fn record(&mut self, mut profile: AppendPublishWaitProfile) {
-        profile.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.profiles.len() == self.capacity {
-            self.profiles.pop_front();
-        }
-        self.profiles.push_back(profile);
-    }
-
-    fn drain(&mut self, max: usize) -> Vec<AppendPublishWaitProfile> {
-        let count = max.min(self.profiles.len());
-        self.profiles.drain(..count).collect()
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct AppendIngestProfiler {
-    capacity: usize,
-    next_sequence: u64,
-    profiles: VecDeque<AppendIngestProfile>,
-}
-
-impl AppendIngestProfiler {
-    fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(StorageError::invalid_argument(
-                "append ingest profile capacity must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            capacity,
-            next_sequence: 1,
-            profiles: VecDeque::with_capacity(capacity.min(1024)),
-        })
-    }
-
-    fn record(&mut self, mut profile: AppendIngestProfile) {
-        profile.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.profiles.len() == self.capacity {
-            self.profiles.pop_front();
-        }
-        self.profiles.push_back(profile);
-    }
-
-    fn drain(&mut self, max: usize) -> Vec<AppendIngestProfile> {
-        let count = max.min(self.profiles.len());
-        self.profiles.drain(..count).collect()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -3207,10 +3114,13 @@ impl DurableSqliteStore {
         Ok(block_journal_shard_path(&self.paths.data_dir, *storage_node))
     }
 
+    /// `measure` carries the persist sink's enabled flag; the shard-lock
+    /// wait is measured only when set (see `lock_timed`).
     fn append_block_journal_records_unsynced(
         &self,
         shard: usize,
         records: &[BlockJournalRecord],
+        measure: bool,
     ) -> Result<AppendVisibleJournalProfile> {
         #[cfg(test)]
         if self.fail_next_block_journal_append.swap(false, Ordering::SeqCst) {
@@ -3222,8 +3132,10 @@ impl DurableSqliteStore {
         let shard_lock = self.block_journal_shard_locks.get(shard).ok_or_else(|| {
             StorageError::invalid_argument("block journal shard index out of range")
         })?;
-        let _journal_guard = lock(shard_lock)?;
-        append_block_journal_records_unsynced(&path, records, &self.low_level_io)
+        let (_journal_guard, lock_wait_nanos) = lock_timed(shard_lock, measure)?;
+        let mut profile = append_block_journal_records_unsynced(&path, records, &self.low_level_io)?;
+        profile.lock_wait_nanos = lock_wait_nanos;
+        Ok(profile)
     }
 
     /// Make every record written to one block journal shard so far durable.

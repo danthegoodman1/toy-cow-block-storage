@@ -616,7 +616,7 @@ pub struct InMemoryMetadataPlane {
     inner: Mutex<MetadataInner>,
     append_stream_allocator: Mutex<AppendStreamAllocator>,
     append_publish_tickets: Mutex<BTreeMap<AppendPublishTicketId, AppendPublishTicketRecord>>,
-    publish_profiler: Mutex<Option<MetadataPublishProfiler>>,
+    publish_profiler: ShardedProfileSink<MetadataPublishProfile>,
 }
 
 impl InMemoryMetadataPlane {
@@ -627,7 +627,7 @@ impl InMemoryMetadataPlane {
             inner: Mutex::new(MetadataInner::new()),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
             append_publish_tickets: Mutex::new(BTreeMap::new()),
-            publish_profiler: Mutex::new(None),
+            publish_profiler: ShardedProfileSink::new(),
         })
     }
 
@@ -638,7 +638,7 @@ impl InMemoryMetadataPlane {
             inner: Mutex::new(inner),
             append_stream_allocator: Mutex::new(AppendStreamAllocator::new(0)),
             append_publish_tickets: Mutex::new(BTreeMap::new()),
-            publish_profiler: Mutex::new(None),
+            publish_profiler: ShardedProfileSink::new(),
         })
     }
 
@@ -650,24 +650,26 @@ impl InMemoryMetadataPlane {
         self.config
     }
 
+    /// Lock the metadata state, measuring the wait only when `measure` is
+    /// set (the caller passes its profile sink's enabled flag).
+    ///
+    /// Delegates to `lock_timed`: free when off; when on, an uncontended
+    /// acquisition costs the same single atomic as a plain lock and reports
+    /// zero wait, and only contended acquisitions read the clock.
+    fn lock_inner_timed(&self, measure: bool) -> Result<(MutexGuard<'_, MetadataInner>, u64)> {
+        lock_timed(&self.inner, measure)
+    }
+
     fn enable_publish_profiling(&self, capacity: usize) -> Result<()> {
-        *lock(&self.publish_profiler)? = Some(MetadataPublishProfiler::new(capacity)?);
-        Ok(())
+        self.publish_profiler.enable(capacity)
     }
 
     fn record_publish_profile(&self, profile: MetadataPublishProfile) -> Result<()> {
-        if let Some(profiler) = lock(&self.publish_profiler)?.as_mut() {
-            profiler.record(profile);
-        }
-        Ok(())
+        self.publish_profiler.record(profile)
     }
 
     fn drain_publish_profiles(&self, max: usize) -> Result<Vec<MetadataPublishProfile>> {
-        let mut profiler = lock(&self.publish_profiler)?;
-        Ok(profiler
-            .as_mut()
-            .map(|profiler| profiler.drain(max))
-            .unwrap_or_default())
+        self.publish_profiler.drain(max)
     }
 
     fn use_append_stream_incarnation(&self, incarnation: u64) -> Result<()> {
@@ -676,7 +678,13 @@ impl InMemoryMetadataPlane {
     }
 
     pub fn device_info(&self, device_id: DeviceId) -> Result<DeviceInfo> {
-        let inner = lock(&self.inner)?;
+        self.device_info_profiled(device_id, false).map(|(info, _)| info)
+    }
+
+    /// `device_info` plus the wait to acquire the metadata lock, measured
+    /// only when `measure` is set.
+    fn device_info_profiled(&self, device_id: DeviceId, measure: bool) -> Result<(DeviceInfo, u64)> {
+        let (inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
         let head = inner
             .device_heads
             .get(&device_id)
@@ -686,12 +694,15 @@ impl InMemoryMetadataPlane {
             .get(&device_id)
             .ok_or_else(|| StorageError::corrupt("device head exists without spec"))?;
 
-        Ok(DeviceInfo {
-            device_id,
-            generation: head.generation,
-            spec: spec.clone(),
-            latest_commit: head.latest_commit,
-        })
+        Ok((
+            DeviceInfo {
+                device_id,
+                generation: head.generation,
+                spec: spec.clone(),
+                latest_commit: head.latest_commit,
+            },
+            lock_wait_nanos,
+        ))
     }
 
     pub fn commit_group(&self, commit_group: CommitGroupId) -> Result<CommitGroup> {
@@ -923,21 +934,30 @@ impl InMemoryMetadataPlane {
         Ok(())
     }
 
-    fn reserve_block_journal_commit_seq(&self, device_id: DeviceId) -> Result<CommitSeq> {
-        let mut inner = lock(&self.inner)?;
+    /// Reserve the next block-journal commit sequence, returning it with
+    /// the measured wait to acquire the metadata lock.
+    fn reserve_block_journal_commit_seq_profiled(
+        &self,
+        device_id: DeviceId,
+        measure: bool,
+    ) -> Result<(CommitSeq, u64)> {
+        let (mut inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
         inner
             .device_heads
             .get(&device_id)
             .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))?;
-        inner.alloc_commit_seq()
+        inner.alloc_commit_seq().map(|seq| (seq, lock_wait_nanos))
     }
 
+    /// `publish_reserved_block_journal_commit` returning the measured wait
+    /// to acquire the metadata lock.
     fn publish_reserved_block_journal_commit(
         &self,
         device_id: DeviceId,
         commit_seq: CommitSeq,
-    ) -> Result<()> {
-        let mut inner = lock(&self.inner)?;
+        measure: bool,
+    ) -> Result<u64> {
+        let (mut inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
         let current = inner
             .device_heads
             .get(&device_id)
@@ -957,7 +977,47 @@ impl InMemoryMetadataPlane {
         next.generation = Self::next_generation(next.generation)?;
         next.latest_commit = commit_seq;
         inner.device_heads.insert(device_id, next);
-        Ok(())
+        Ok(lock_wait_nanos)
+    }
+
+    /// `get_head` plus the wait to acquire the metadata lock, measured only
+    /// when `measure` is set.
+    fn get_head_profiled(&self, device_id: DeviceId, measure: bool) -> Result<(DeviceHead, u64)> {
+        let (inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
+        inner
+            .device_heads
+            .get(&device_id)
+            .cloned()
+            .map(|head| (head, lock_wait_nanos))
+            .ok_or_else(|| StorageError::not_found("device", device_id.to_string()))
+    }
+
+    /// `get_file_head` plus the wait to acquire the metadata lock, measured
+    /// only when `measure` is set.
+    fn get_file_head_profiled(
+        &self,
+        keyspace_id: KeyspaceId,
+        file_id: FileId,
+        measure: bool,
+    ) -> Result<(FileHead, u64)> {
+        let (inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
+        Self::file_head_locked(&inner, keyspace_id, file_id).map(|head| (head, lock_wait_nanos))
+    }
+
+    /// `get_metadata_node` plus the wait to acquire the metadata lock,
+    /// measured only when `measure` is set.
+    fn get_metadata_node_profiled(
+        &self,
+        node_id: MetadataNodeId,
+        measure: bool,
+    ) -> Result<(MetadataNode, u64)> {
+        let (inner, lock_wait_nanos) = self.lock_inner_timed(measure)?;
+        inner
+            .metadata_nodes
+            .get(&node_id)
+            .cloned()
+            .map(|node| (node, lock_wait_nanos))
+            .ok_or_else(|| StorageError::not_found("metadata_node", node_id.to_string()))
     }
 
     /// Advance the commit sequence allocator past an observed sequence.

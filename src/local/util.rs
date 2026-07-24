@@ -4,6 +4,35 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
         .map_err(|_| StorageError::unavailable("local provider lock poisoned"))
 }
 
+/// `lock` with opt-in wait measurement that is free when off and nearly
+/// free when on.
+///
+/// `measure == false` (the owning profile sink is disabled): a plain `lock`,
+/// no clocks, no extra atomics — the measurement code does not run.
+/// `measure == true`: `try_lock` first, so an uncontended acquisition costs
+/// the same single atomic as `lock` and reports zero wait (sub-microsecond
+/// uncontended acquire times round to zero by design; the wait columns
+/// exist to expose contention). Only a contended acquisition timestamps
+/// before blocking in `lock` and reads the clock once after acquiring — the
+/// thread was parked anyway, and no clock read lands inside an uncontended
+/// critical section.
+pub(super) fn lock_timed<T>(mutex: &Mutex<T>, measure: bool) -> Result<(MutexGuard<'_, T>, u64)> {
+    if !measure {
+        return Ok((lock(mutex)?, 0));
+    }
+    match mutex.try_lock() {
+        Ok(guard) => Ok((guard, 0)),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let wait_started = Instant::now();
+            let guard = lock(mutex)?;
+            Ok((guard, duration_nanos_u64(wait_started.elapsed())))
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => Err(StorageError::unavailable(
+            "local provider lock poisoned",
+        )),
+    }
+}
+
 pub(super) fn read_lock<T>(rwlock: &RwLock<T>) -> Result<RwLockReadGuard<'_, T>> {
     rwlock
         .read()

@@ -4698,8 +4698,9 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
     let first_seq = store
         .local
         .metadata
-        .reserve_block_journal_commit_seq(device_id)
-        .unwrap();
+        .reserve_block_journal_commit_seq_profiled(device_id, true)
+        .unwrap()
+        .0;
     let first = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4716,8 +4717,9 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
     let second_seq = store
         .local
         .metadata
-        .reserve_block_journal_commit_seq(device_id)
-        .unwrap();
+        .reserve_block_journal_commit_seq_profiled(device_id, true)
+        .unwrap()
+        .0;
     let second = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4732,10 +4734,16 @@ fn durable_block_journal_flush_runner_coalesces_pending_commits() {
         }],
     };
     let (shard, first_request) = store
-        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(first))
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+            commit: first,
+            enqueue_waits: BlockJournalEnqueueWaits::default(),
+        })
         .unwrap();
     let (_, second_request) = store
-        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(second))
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+            commit: second,
+            enqueue_waits: BlockJournalEnqueueWaits::default(),
+        })
         .unwrap();
 
     store
@@ -4792,8 +4800,9 @@ fn durable_block_journal_packed_inline_writes_replay_mixed_records_and_ignore_to
     let first_seq = store
         .local
         .metadata
-        .reserve_block_journal_commit_seq(device_id)
-        .unwrap();
+        .reserve_block_journal_commit_seq_profiled(device_id, true)
+        .unwrap()
+        .0;
     let first = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4810,8 +4819,9 @@ fn durable_block_journal_packed_inline_writes_replay_mixed_records_and_ignore_to
     let second_seq = store
         .local
         .metadata
-        .reserve_block_journal_commit_seq(device_id)
-        .unwrap();
+        .reserve_block_journal_commit_seq_profiled(device_id, true)
+        .unwrap()
+        .0;
     let second = BlockJournalCommit {
         device_id,
         writer_epoch: lease.writer_epoch,
@@ -4826,10 +4836,16 @@ fn durable_block_journal_packed_inline_writes_replay_mixed_records_and_ignore_to
         }],
     };
     let (shard, first_request) = store
-        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(first))
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+            commit: first,
+            enqueue_waits: BlockJournalEnqueueWaits::default(),
+        })
         .unwrap();
     let (_, second_request) = store
-        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(second))
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+            commit: second,
+            enqueue_waits: BlockJournalEnqueueWaits::default(),
+        })
         .unwrap();
     store
         .wait_for_block_journal_request(shard, second_request)
@@ -4961,8 +4977,9 @@ fn durable_block_journal_lane_merges_concurrent_flush_boundaries() {
         let commit_seq = store
             .local
             .metadata
-            .reserve_block_journal_commit_seq(device_id)
-            .unwrap();
+            .reserve_block_journal_commit_seq_profiled(device_id, true)
+            .unwrap()
+            .0;
         commits.push(BlockJournalCommit {
             device_id,
             writer_epoch: lease.writer_epoch,
@@ -4982,7 +4999,10 @@ fn durable_block_journal_lane_merges_concurrent_flush_boundaries() {
     for commit in commits {
         request_ids.push(
             store
-                .enqueue_block_journal_request(BlockJournalLaneRequest::Write(commit))
+                .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+                    commit,
+                    enqueue_waits: BlockJournalEnqueueWaits::default(),
+                })
                 .unwrap(),
         );
     }
@@ -5038,22 +5058,26 @@ fn durable_block_journal_lane_orders_acknowledged_writes_behind_pending_lane_wri
     let first_seq = store
         .local
         .metadata
-        .reserve_block_journal_commit_seq(device_id)
-        .unwrap();
+        .reserve_block_journal_commit_seq_profiled(device_id, true)
+        .unwrap()
+        .0;
     let (first_shard, first_request) = store
-        .enqueue_block_journal_request(BlockJournalLaneRequest::Write(BlockJournalCommit {
-            device_id,
-            writer_epoch: lease.writer_epoch,
-            commit_seq: first_seq,
-            write_count: 1,
-            collapsed_range_count: 1,
-            committed_bytes: 4096,
-            entries: vec![BlockJournalEntry::Write {
-                range: ByteRange::new(0, 4096),
-                payload_integrity: PayloadIntegrity::Verified,
-                bytes: repeated_blocks(1, 71),
-            }],
-        }))
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+            commit: BlockJournalCommit {
+                device_id,
+                writer_epoch: lease.writer_epoch,
+                commit_seq: first_seq,
+                write_count: 1,
+                collapsed_range_count: 1,
+                committed_bytes: 4096,
+                entries: vec![BlockJournalEntry::Write {
+                    range: ByteRange::new(0, 4096),
+                    payload_integrity: PayloadIntegrity::Verified,
+                    bytes: repeated_blocks(1, 71),
+                }],
+            },
+            enqueue_waits: BlockJournalEnqueueWaits::default(),
+        })
         .unwrap();
 
     let ack = store
@@ -5955,6 +5979,7 @@ fn durable_block_journal_replay_rejects_segment_ref_carrying_wrong_storage_node(
                     durable_through: poisoned_seq,
                 },
             ],
+            false,
         )
         .unwrap();
     store.durable.sync_block_journal(shard).unwrap();
@@ -22296,5 +22321,284 @@ fn assert_model_bytes(actual: &[u8], model: &[u8], seed: u64, trace: &[String], 
         model.len(),
         actual.len(),
         trace.join("\n")
+    );
+}
+
+#[test]
+fn sharded_profile_sink_orders_cross_thread_records_and_resets_on_enable() {
+    let sink = ShardedProfileSink::<ReadProfile>::new();
+    assert!(sink.enable(0).is_err());
+
+    // Opt-in: records before enable are dropped.
+    assert!(!sink.is_enabled());
+    sink.record(ReadProfile::default()).unwrap();
+    sink.enable(4).unwrap();
+    assert!(sink.drain(16).unwrap().is_empty());
+
+    // Single-threaded retention matches the old exact ring: capacity 4
+    // keeps the newest four samples and drain returns them in record order.
+    for marker in 1..=6_u64 {
+        sink.record(ReadProfile {
+            total_nanos: marker,
+            ..ReadProfile::default()
+        })
+        .unwrap();
+    }
+    let drained = sink.drain(16).unwrap();
+    assert_eq!(
+        drained
+            .iter()
+            .map(|profile| profile.total_nanos)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5, 6]
+    );
+    assert_eq!(
+        drained
+            .iter()
+            .map(|profile| profile.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5, 6]
+    );
+    assert!(sink.drain(16).unwrap().is_empty());
+
+    // Re-enable clears the sink and restarts sequences at 1.
+    sink.enable(1024).unwrap();
+    sink.record(ReadProfile::default()).unwrap();
+    let drained = sink.drain(16).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].sequence, 1);
+
+    // Concurrent recorders across shards: every sample survives and drain
+    // merges them into one strictly increasing sequence order.
+    sink.enable(1024).unwrap();
+    let threads = 8_usize;
+    let per_thread = 25_u64;
+    let start = std::sync::Barrier::new(threads);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..per_thread {
+                    sink.record(ReadProfile::default()).unwrap();
+                }
+            });
+        }
+    });
+    let drained = sink.drain(10_000).unwrap();
+    assert_eq!(drained.len(), threads * per_thread as usize);
+    let sequences: Vec<u64> = drained.iter().map(|profile| profile.sequence).collect();
+    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(sequences[0], 1);
+    assert_eq!(*sequences.last().unwrap(), threads as u64 * per_thread);
+    assert!(sink.drain(10_000).unwrap().is_empty());
+}
+
+#[test]
+fn block_journal_overlay_reports_contended_lock_wait() {
+    let overlay = BlockJournalOverlay::default();
+    let device_id = DeviceId::from_raw(1);
+    let commit = |seq: u64| BlockJournalCommit {
+        device_id,
+        writer_epoch: WriterEpoch::from_raw(1),
+        commit_seq: CommitSeq::from_raw(seq),
+        write_count: 1,
+        collapsed_range_count: 1,
+        committed_bytes: 4096,
+        entries: vec![BlockJournalEntry::Write {
+            range: ByteRange::new(0, 4096),
+            payload_integrity: PayloadIntegrity::Verified,
+            bytes: vec![7; 4096],
+        }],
+    };
+
+    // Uncontended: the wait is a carve-out of the op total.
+    let uncontended = overlay.apply_commit(&commit(1), 4096, true).unwrap();
+    assert!(uncontended.lock_wait_nanos <= uncontended.total_nanos);
+
+    // Contended: the holder provably owns the mutex (barrier) before the
+    // apply starts, so the measured wait must cover most of the hold.
+    let hold = Duration::from_millis(50);
+    let held = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| overlay.hold_lock_for_test(&held, hold).unwrap());
+        held.wait();
+        let contended = overlay.apply_commit(&commit(2), 4096, true).unwrap();
+        assert!(
+            contended.lock_wait_nanos >= 10_000_000,
+            "expected contended overlay apply to record lock wait, got {} nanos",
+            contended.lock_wait_nanos
+        );
+        assert!(contended.total_nanos >= contended.lock_wait_nanos);
+    });
+
+    let held = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| overlay.hold_lock_for_test(&held, hold).unwrap());
+        held.wait();
+        let mark_wait = overlay
+            .mark_durable(
+                device_id,
+                WriterEpoch::from_raw(1),
+                CommitSeq::from_raw(2),
+                true,
+            )
+            .unwrap();
+        assert!(
+            mark_wait >= 10_000_000,
+            "expected contended mark_durable to record lock wait, got {mark_wait} nanos"
+        );
+    });
+}
+
+#[test]
+fn durable_block_journal_rows_report_staging_and_reserve_lock_waits() {
+    let root = durable_temp_dir("lock-wait-columns");
+    let store = DurableCoordinator::open(&root, config()).unwrap();
+    store.enable_persist_profiling(64).unwrap();
+    let device_id = store
+        .create_device(CreateDeviceRequest {
+            spec: DeviceSpec {
+                logical_blocks: 64,
+                block_size: 4096,
+            },
+            name: Some("lock-wait-columns".to_string()),
+        })
+        .unwrap();
+    let lease = store.acquire_block_writer(device_id).unwrap();
+
+    // Inline 4k writers record no row; the lane batch row must carry their
+    // staging-lock wait in the batch-attributed enqueue column.
+    let writer_started = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let staging_guard = lock(&store.block_delta_staging_lock).unwrap();
+        scope.spawn(|| {
+            writer_started.store(true, Ordering::SeqCst);
+            store
+                .write_device_with_writer(
+                    &lease,
+                    0,
+                    &repeated_blocks(1, 31),
+                    WriteDurability::Flushed,
+                    PayloadIntegrity::Verified,
+                )
+                .unwrap();
+        });
+        while !writer_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        drop(staging_guard);
+    });
+    let profiles = store.drain_persist_profiles(64).unwrap();
+    assert!(
+        profiles.iter().any(|profile| {
+            profile.block_journal_record_count > 0
+                && profile.block_journal_enqueue_staging_lock_wait_nanos >= 1_000_000
+        }),
+        "expected a lane row carrying the writer's staging-lock wait"
+    );
+
+    // Segment-ref (large-batch) writers record their own row; the staging
+    // wait must land there as a same-row carve-out, not in the lane row's
+    // enqueue column.
+    let writer_started = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let staging_guard = lock(&store.block_delta_staging_lock).unwrap();
+        scope.spawn(|| {
+            writer_started.store(true, Ordering::SeqCst);
+            store
+                .write_device_with_writer(
+                    &lease,
+                    0,
+                    &repeated_blocks(16, 32),
+                    WriteDurability::Flushed,
+                    PayloadIntegrity::Verified,
+                )
+                .unwrap();
+        });
+        while !writer_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        drop(staging_guard);
+    });
+    let profiles = store.drain_persist_profiles(64).unwrap();
+    let seal_row = profiles
+        .iter()
+        .find(|profile| profile.data_log_prestaged_segment_count > 0)
+        .expect("segment-ref writer records its own row");
+    assert!(
+        seal_row.block_journal_staging_lock_wait_nanos >= 1_000_000,
+        "expected the seal row to carve out its staging-lock wait, got {} nanos",
+        seal_row.block_journal_staging_lock_wait_nanos
+    );
+    assert!(seal_row.total_nanos >= seal_row.block_journal_staging_lock_wait_nanos);
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_resolve_profile_reports_tree_walk_placement_and_contended_metadata_lock_wait() {
+    let store = LocalCoordinator::new();
+    let device_id = store
+        .metadata()
+        .create_device(device_request())
+        .map(|head| head.device_id)
+        .unwrap();
+    store
+        .write_device(
+            device_id,
+            0,
+            &repeated_blocks(2, 5),
+            WriteDurability::Flushed,
+        )
+        .unwrap();
+    store.enable_read_profiling(16).unwrap();
+
+    // Uncontended read: the resolve profile is no longer a default-zero
+    // stub — the tree walk and receipt/placement lookups report real time.
+    let mut buf = vec![0_u8; 8192];
+    store
+        .read_device(device_id, ByteRange::new(0, 8192), &mut buf)
+        .unwrap();
+    assert_eq!(buf, repeated_blocks(2, 5));
+    let profiles = store.drain_read_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 1);
+    let profile = &profiles[0];
+    assert!(profile.segment_extent_count > 0);
+    assert!(
+        profile.metadata_tree_walk_nanos > 0,
+        "tree walk must be measured"
+    );
+    assert!(
+        profile.metadata_placement_lookup_nanos > 0,
+        "placement lookup must be measured"
+    );
+    assert!(profile.total_nanos >= profile.metadata_lock_wait_nanos);
+
+    // Contended read: while another thread provably holds the metadata
+    // mutex, the resolve must report the wait.
+    let reader_started = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let metadata_guard = lock(&store.metadata.inner).unwrap();
+        scope.spawn(|| {
+            reader_started.store(true, Ordering::SeqCst);
+            let mut buf = vec![0_u8; 4096];
+            store
+                .read_device(device_id, ByteRange::new(0, 4096), &mut buf)
+                .unwrap();
+        });
+        while !reader_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        drop(metadata_guard);
+    });
+    let profiles = store.drain_read_profiles(16).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert!(
+        profiles[0].metadata_lock_wait_nanos >= 1_000_000,
+        "expected contended resolve to record metadata lock wait, got {} nanos",
+        profiles[0].metadata_lock_wait_nanos
     );
 }

@@ -11,6 +11,18 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 
+# Benchmark determinism: this crate compiles as one giant include!-module, so
+# with the default release profile (16 codegen units, no LTO) rustc's CGU
+# partitioning assigns hot storage-path functions to units by luck, and any
+# code change — even inert, never-executed additions — can reshuffle the
+# partitions and de-inline a hot loop. The Phase 3 M1 A/B measured a 27%
+# block-read-1m c32 swing from exactly this (base-identical function bodies,
+# different partitions). One codegen unit plus fat LTO removes the
+# partitioning lottery so A/B deltas measure code, not unit boundaries.
+[profile.release]
+codegen-units = 1
+lto = true
+
 [dev-dependencies]
 criterion = "0.8.2"
 
