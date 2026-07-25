@@ -4176,6 +4176,16 @@ impl DurableCoordinator {
         Ok((shard, lane))
     }
 
+    /// Hand a request to its device's lane and return the id to wait on.
+    ///
+    /// Since M7 this only POSTS the request (see
+    /// `BlockJournalFlushCoordinator::post_arrival`): it takes no lane
+    /// mutex and issues no wakeup, so the write paths — which all run this
+    /// inside the global staging hold — no longer serialize the whole store
+    /// behind one writer's lane-mutex acquisition and `notify_all`. The
+    /// arrival is folded into `pending` (and the lane woken) by the first
+    /// thread to take the lane state afterwards, which for every caller is
+    /// its own immediately-following `wait_for_block_journal_request`.
     fn enqueue_block_journal_request(
         &self,
         request: BlockJournalLaneRequest,
@@ -4186,23 +4196,7 @@ impl DurableCoordinator {
             | BlockJournalLaneRequest::Lease { device_id, .. } => *device_id,
         };
         let (shard, lane) = self.block_journal_lane(device_id)?;
-        let mut state = lock(&lane.inner)?;
-        let request_id = state.enqueue(request);
-        lane.cvar.notify_all();
-        if state.cohort_seal_waiting {
-            // The arrival edge for the hybrid seal (M6). An owner parked on
-            // its cohort clause waits on `pipeline_cvar`, which otherwise
-            // only carries the sync-ticket and publish-ticket advances, so
-            // without this notify "arrivals fill the batch and it seals
-            // early" would be re-checked only on edges that already wake the
-            // owner — silently inert. Gated on the flag so a deep-queue
-            // owner is never woken once per arrival, and NOT moved to
-            // `lane.cvar`: `advance_block_journal_sync_ticket` skips its
-            // `lane.cvar` notify while the write stage is busy, which it
-            // always is for a parked owner, so the sync edge would be lost.
-            lane.pipeline_cvar.notify_all();
-        }
-        drop(state);
+        let request_id = lane.post_arrival(request)?;
         Ok((shard, request_id))
     }
 
@@ -4222,7 +4216,9 @@ impl DurableCoordinator {
             .get(shard)
             .ok_or_else(|| StorageError::corrupt("block journal shard has no lane"))?;
         loop {
-            let mut state = lock(&lane.inner)?;
+            // This acquisition is also what folds this caller's own posted
+            // arrival into `pending` and wakes the lane (M7).
+            let mut state = lane.lock_state()?;
             if let Some(result) = state.completed.remove(&request_id) {
                 if state.cohort_seal_waiting && state.completed.is_empty() {
                     // Last member of the completed cohort leaving the lane:
@@ -4242,7 +4238,7 @@ impl DurableCoordinator {
                         (batch, ticket)
                     }
                     Err(error) => {
-                        let mut state = lock(&lane.inner)?;
+                        let mut state = lane.lock_state()?;
                         state.write_stage_busy = false;
                         state.generation = state.generation.saturating_add(1);
                         lane.cvar.notify_all();
@@ -4262,7 +4258,7 @@ impl DurableCoordinator {
 
             let generation = state.generation;
             while state.generation == generation && !state.completed.contains_key(&request_id) {
-                state = wait_on_cvar(&lane.cvar, state)?;
+                state = lane.wait_arrivals(state)?;
             }
         }
     }
@@ -4276,18 +4272,22 @@ impl DurableCoordinator {
             // DRAIN MODE. Every caller of this function reaches it holding
             // `block_delta_staging_lock` (materialization and the root-copy
             // section), which is the lock every WRITE path must take before
-            // it can enqueue — so for as long as this thread is here, no
-            // write can arrive on this lane, including from the batches this
-            // thread elects itself. Publishing that fact cancels the cohort
+            // it can post to this lane — so for as long as this thread is
+            // here, no write can arrive on this lane, including from the
+            // batches this thread elects itself. Writes posted BEFORE this
+            // thread took the staging lock are already in the lane's arrival
+            // buffer, and every acquisition below folds that buffer into
+            // `pending` first (M7: `lock_state`), so the idle test cannot
+            // step over one. Publishing the drain fact cancels the cohort
             // clause of the M6 hybrid seal: without it, every batch elected
             // during a drain would wait out its whole capture ceiling for
-            // arrivals that cannot come. (Lease and flush enqueues do not
-            // take the staging lock and so are still possible; sealing early
-            // on their account is the conservative direction.)
-            lock(&lane.inner)?.lanes_idle_waiters += 1;
+            // arrivals that cannot come. (Lease and flush posts do not take
+            // the staging lock and so are still possible; sealing early on
+            // their account is the conservative direction.)
+            lane.lock_state()?.lanes_idle_waiters += 1;
             lane.pipeline_cvar.notify_all();
             let drained = self.drain_block_journal_lane(shard, lane);
-            if let Ok(mut state) = lock(&lane.inner) {
+            if let Ok(mut state) = lane.lock_state() {
                 state.lanes_idle_waiters = state.lanes_idle_waiters.saturating_sub(1);
             }
             drained?;
@@ -4303,7 +4303,9 @@ impl DurableCoordinator {
         lane: &BlockJournalFlushCoordinator,
     ) -> Result<()> {
         loop {
-            let mut state = lock(&lane.inner)?;
+            // Folds in any arrival posted before the caller took the
+            // staging lock: an un-absorbed post must never read as idle.
+            let mut state = lane.lock_state()?;
             // Idle means no batch anywhere in the pipeline: the write
             // stage is free AND every allocated ticket has passed both
             // the sync stage and the publish stage.
@@ -4329,7 +4331,7 @@ impl DurableCoordinator {
 
             let generation = state.generation;
             while state.generation == generation {
-                state = wait_on_cvar(&lane.cvar, state)?;
+                state = lane.wait_arrivals(state)?;
             }
         }
         Ok(())
@@ -4365,7 +4367,7 @@ impl DurableCoordinator {
             if delay.is_zero() {
                 break;
             }
-            let (next_state, timed_out) = wait_timeout_on_cvar(&lane.cvar, state, delay)?;
+            let (next_state, timed_out) = lane.wait_arrivals_timeout(state, delay)?;
             state = next_state;
             let next_demand = state.pending.len();
             if next_demand > demand {
@@ -4399,7 +4401,7 @@ impl DurableCoordinator {
             // Elections take non-empty pending sets, but stay safe if that
             // ever changes: release the write stage and pass the ticket
             // through both stages with nothing to complete.
-            let mut state = lock(&lane.inner)?;
+            let mut state = lane.lock_state()?;
             state.write_stage_busy = false;
             state.generation = state.generation.saturating_add(1);
             lane.cvar.notify_all();
@@ -4576,7 +4578,7 @@ impl DurableCoordinator {
                 // Hand the write stage to the next batch: it may elect and
                 // coalesce now, parking in its window until this batch's
                 // fsync returns.
-                let mut state = lock(&lane.inner)?;
+                let mut state = lane.lock_state()?;
                 state.write_stage_busy = false;
                 state.generation = state.generation.saturating_add(1);
                 lane.cvar.notify_all();
@@ -4584,7 +4586,7 @@ impl DurableCoordinator {
                 profile
             }
             Err(error) => {
-                let mut state = lock(&lane.inner)?;
+                let mut state = lane.lock_state()?;
                 state.write_stage_busy = false;
                 state.generation = state.generation.saturating_add(1);
                 lane.cvar.notify_all();
@@ -4650,10 +4652,21 @@ impl DurableCoordinator {
         // preserved because:
         //   1. Publishes are serialized in ticket order by
         //      `next_publish_ticket`; ticket order equals per-device
-        //      enqueue order equals per-device commit-seq order (the
-        //      sequence is allocated and stamped inside the same staging
-        //      hold that enqueues, so the two orders cannot diverge), so
+        //      arrival order equals per-device commit-seq order, so
         //      per-device publish order is unchanged from the serial lane.
+        //      That chain has four links and every one of them is a
+        //      structural property, not a timing one: (i) the sequence is
+        //      allocated and the request POSTED inside one staging hold, and
+        //      the staging lock totally orders holds, so seq order equals
+        //      post order per lane; (ii) a fold takes the WHOLE arrival
+        //      buffer, so a request posted before another is folded into
+        //      `pending` no later than it; (iii) `pending` is keyed by the
+        //      post-time request id and a batch takes ALL of `pending`, and
+        //      those takes are themselves serialized (elections need the
+        //      write stage, late-arrival takes happen at the batch's append
+        //      window, i.e. in ticket order), so an earlier post is never in
+        //      a later batch than a later post; (iv) within a batch the
+        //      write records are sorted by commit seq.
         //   2. A batch reaches this point only after its OWN fsync
         //      succeeded, and completes its waiters only after its OWN
         //      publish applied — an ack can never precede durability or
@@ -4777,7 +4790,7 @@ impl DurableCoordinator {
         // `ensure_block_journal_device_live_in_staging_hold`) keeps records
         // for deleted devices out of the lane entirely, so that race stays
         // a per-op `not_found` and never costs innocent batch members.
-        let state = lock(&lane.inner)?;
+        let state = lane.lock_state()?;
         debug_assert_eq!(state.next_publish_ticket, ticket);
         self.complete_block_journal_lane_batch(
             lane,
@@ -4844,12 +4857,12 @@ impl DurableCoordinator {
         captured_requests: Option<usize>,
         lane_timing: &mut BlockJournalLaneBatchTiming,
     ) -> Result<MutexGuard<'a, BlockJournalFlushState>> {
-        let mut state = lock(&lane.inner)?;
+        let mut state = lane.lock_state()?;
         let mut wait_started = None;
         if state.next_sync_ticket != ticket {
             wait_started = Some(Instant::now());
             while state.next_sync_ticket != ticket {
-                state = wait_on_cvar(&lane.pipeline_cvar, state)?;
+                state = lane.wait_pipeline_arrivals(state)?;
             }
         }
         if let Some(captured) = captured_requests {
@@ -4882,7 +4895,7 @@ impl DurableCoordinator {
                         break;
                     }
                     let (next_state, timed_out) =
-                        wait_timeout_on_cvar(&lane.pipeline_cvar, state, remaining)?;
+                        lane.wait_pipeline_arrivals_timeout(state, remaining)?;
                     state = next_state;
                     if state.cohort_seal_ready(ticket, captured, policy.target_requests) {
                         ceiling_bound = false;
@@ -4923,7 +4936,7 @@ impl DurableCoordinator {
         device_id: DeviceId,
     ) -> Result<(u64, u64, bool)> {
         let (_, lane) = self.block_journal_lane(device_id)?;
-        let state = lock(&lane.inner)?;
+        let state = lane.lock_state()?;
         Ok((
             state.cohort_capture_waits,
             state.cohort_capture_timeouts,
@@ -4935,7 +4948,7 @@ impl DurableCoordinator {
     #[cfg(test)]
     fn block_journal_cohort_seal_waiting_for_test(&self, device_id: DeviceId) -> Result<bool> {
         let (_, lane) = self.block_journal_lane(device_id)?;
-        let waiting = lock(&lane.inner)?.cohort_seal_waiting;
+        let waiting = lane.lock_state()?.cohort_seal_waiting;
         Ok(waiting)
     }
 
@@ -4951,7 +4964,7 @@ impl DurableCoordinator {
         ticket: u64,
         sync_nanos: Option<u64>,
     ) -> Result<()> {
-        let mut state = lock(&lane.inner)?;
+        let mut state = lane.lock_state()?;
         debug_assert_eq!(state.next_sync_ticket, ticket);
         if let Some(sync_nanos) = sync_nanos {
             // The lane's service time, which bounds cohort capture (see
@@ -4979,13 +4992,13 @@ impl DurableCoordinator {
         ticket: u64,
         lane_timing: &mut BlockJournalLaneBatchTiming,
     ) -> Result<MutexGuard<'a, BlockJournalFlushState>> {
-        let mut state = lock(&lane.inner)?;
+        let mut state = lane.lock_state()?;
         if state.next_publish_ticket == ticket {
             return Ok(state);
         }
         let wait_started = Instant::now();
         while state.next_publish_ticket != ticket {
-            state = wait_on_cvar(&lane.pipeline_cvar, state)?;
+            state = lane.wait_pipeline_arrivals(state)?;
         }
         lane_timing.pipeline_order_wait_nanos = lane_timing
             .pipeline_order_wait_nanos
@@ -5922,12 +5935,12 @@ impl DurableCoordinator {
     /// WHY THIS RUNS INSIDE THE STAGING HOLD. `validate_block_writer` and
     /// the `device_info` lookup prove the device was live at some instant
     /// BEFORE the hold; nothing in that proof survives a `delete_device`
-    /// that lands between it and the enqueue. Until M6 the reservation
+    /// that lands between it and the post. Until M6 the reservation
     /// itself was the fence — it probed `device_heads` under the metadata
     /// mutex while holding `block_delta_staging_lock`, and `delete_device`
     /// runs its whole metadata mutation under that same staging lock
     /// (`run_and_maybe_persist`), so the probe happened-after any completed
-    /// delete and happened-before this writer's enqueue. M6 replaced the
+    /// delete and happened-before this writer's post. M6 replaced the
     /// reservation with a lock-free atomic add, so the fence has to be
     /// re-established explicitly, still inside the hold, or a losing racer
     /// would append and fsync a frame for a dead device: publish would
@@ -6002,11 +6015,11 @@ impl DurableCoordinator {
 
         // Build and validate everything BEFORE the staging hold; the hold
         // itself is the deletion fence, one lock-free sequence allocation,
-        // the stamp, and the enqueue (M6: the hold length is the GCP
-        // preemption-convoy amplifier — no nested metadata mutex, no struct
-        // builds, no validation inside it). Stamping the sequence inside the
-        // hold is what keeps per-device enqueue order equal to commit-seq
-        // order, which the lane's ordered publish step requires.
+        // the stamp, and the POST (M6: no nested metadata mutex, no struct
+        // builds, no validation inside it; M7: no lane mutex, no notify, no
+        // allocation either — see `post_arrival`). Stamping the sequence
+        // inside the hold is what keeps per-device arrival order equal to
+        // commit-seq order, which the lane's ordered publish step requires.
         let measure = self.persist_profiler.is_enabled();
         // Read the deletion counter BEFORE the `device_info` witness (see
         // `ensure_block_journal_device_live_in_staging_hold`).
@@ -6114,8 +6127,17 @@ impl DurableCoordinator {
         // the acknowledged write joins the lane (becoming flushed-strength,
         // which acknowledged durability allows) whenever earlier lane writes
         // for this device have not applied yet.
+        //
+        // THE GATE IS COMPLETE (M7). `lock_state` folds the lane's arrival
+        // buffer in before this reads `unapplied_writes`, so a lane write
+        // that was POSTED but not yet folded still counts. There is no
+        // window on the other side either: a lane write posted after this
+        // point cannot exist until this thread releases the staging lock,
+        // and it then allocates a strictly later sequence and publishes
+        // strictly later — which is exactly why the bypass keeps its hold
+        // across the whole inline publish below.
         let (_, device_lane) = self.block_journal_lane(lease.device_id)?;
-        let lane_ordered = lock(&device_lane.inner)?.has_unapplied_writes(lease.device_id);
+        let lane_ordered = device_lane.lock_state()?.has_unapplied_writes(lease.device_id);
         if lane_ordered {
             drop(enqueue_guard);
             return self.seal_staged_segment_refs_via_lane(
@@ -6288,7 +6310,7 @@ impl DurableCoordinator {
         let total_started = Instant::now();
         // Build and validate the commit BEFORE the staging hold (M6): the
         // hold is one lock-free sequence allocation, the stamp, and the
-        // enqueue (or the acknowledged bypass, which keeps its long hold).
+        // post (or the acknowledged bypass, which keeps its long hold).
         let collapsed_range_count = usize_to_u64(collapsed.len());
         let (entries, committed_bytes) =
             self.block_journal_entries_from_collapsed(collapsed, u64::from(info.spec.block_size))?;
@@ -6348,10 +6370,12 @@ impl DurableCoordinator {
                 // device, so an acknowledged write joins the lane whenever an
                 // earlier lane write for this device has not applied yet.
                 // That path is stronger than acknowledged durability, which
-                // is allowed.
+                // is allowed. `lock_state` folds posted-but-unfolded arrivals
+                // in first, so the gate sees them (M7; see the segment-ref
+                // bypass for the full argument).
                 let (_, device_lane) = self.block_journal_lane(lease.device_id)?;
                 let lane_ordered =
-                    lock(&device_lane.inner)?.has_unapplied_writes(lease.device_id);
+                    device_lane.lock_state()?.has_unapplied_writes(lease.device_id);
                 if lane_ordered {
                     let (shard, request_id) =
                         self.enqueue_block_journal_request(BlockJournalLaneRequest::Write {
@@ -6432,7 +6456,7 @@ impl DurableCoordinator {
         }
 
         // Build and validate BEFORE the staging hold (M6): the hold is one
-        // lock-free sequence allocation, the stamp, and the enqueue.
+        // lock-free sequence allocation, the stamp, and the post.
         let mut commit = BlockJournalCommit {
             device_id: lease.device_id,
             writer_epoch: lease.writer_epoch,

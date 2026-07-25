@@ -24165,12 +24165,60 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
     let second_lease = store.acquire_block_writer(second_id).unwrap();
     let workers = 12_u64;
     let writes_per_worker = 20_u64;
+    // A materializing thread runs alongside the writers for the whole test
+    // (M7). Materialization takes `block_delta_staging_lock` and then drains
+    // the lanes to idle, which is the exact path a `delete_device` uses to
+    // prove no journal record for the device can still be in flight — and
+    // since M7 a write's arrival can be POSTED (inside the staging hold)
+    // before it is folded into the lane's `pending`. If any lane-state
+    // acquisition could observe a posted arrival as absent, this thread
+    // would eventually declare a lane idle with a write still queued on it;
+    // the write would then be appended after the drain that was supposed to
+    // exclude it. Interleaving it with the writers is what turns that
+    // ordering claim into something the suite can fail on.
+    // Sparse writers punch this range back to zeros below. Pre-fill it with
+    // a non-zero pattern first, or the "reads as zeros" check at the end is
+    // satisfied by a freshly created device and would pass just as happily
+    // if every sparse write were dropped.
+    store
+        .write_device_with_writer(
+            &lease,
+            workers * writes_per_worker * 4096,
+            &repeated_blocks(workers * writes_per_worker, 0xAB),
+            WriteDurability::Flushed,
+            PayloadIntegrity::Verified,
+        )
+        .unwrap();
+    let materializing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     thread::scope(|scope| {
+        let materializer = {
+            let store = std::sync::Arc::clone(&store);
+            let materializing = std::sync::Arc::clone(&materializing);
+            scope.spawn(move || {
+                while materializing.load(std::sync::atomic::Ordering::Relaxed) {
+                    store.materialize_block_journal().unwrap();
+                }
+            })
+        };
+        // Stop the materializer on EVERY exit from this closure, including
+        // an unwind. A writer that panics — which is how this test reports
+        // the inversion it exists to catch — unwinds past the join loop
+        // below, and `thread::scope` then joins the materializer before it
+        // re-raises; with the flag still set that join never returns and
+        // the detection becomes a hang instead of a failure.
+        struct StopMaterializer<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopMaterializer<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _stop = StopMaterializer(&materializing);
+        let mut writers = Vec::new();
         for worker in 0..workers {
             let store = std::sync::Arc::clone(&store);
             let lease = &lease;
             let second_lease = &second_lease;
-            scope.spawn(move || {
+            writers.push(scope.spawn(move || {
                 for index in 0..writes_per_worker {
                     let block = worker * writes_per_worker + index;
                     let durability = if block.is_multiple_of(3) {
@@ -24193,8 +24241,29 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
                         )
                         .unwrap();
                 }
-            });
+            }));
         }
+        for worker in 0..workers {
+            let store = std::sync::Arc::clone(&store);
+            let lease = &lease;
+            // Sparse writers post from a third write path with its own
+            // staging hold, on the SAME device as the flushed/acknowledged
+            // writers above, so every posting path interleaves on one lane's
+            // arrival buffer.
+            writers.push(scope.spawn(move || {
+                for index in 0..writes_per_worker {
+                    let block = workers * writes_per_worker + worker * writes_per_worker + index;
+                    store
+                        .write_zeroes_with_writer(lease, block * 4096, 4096)
+                        .unwrap();
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        drop(_stop);
+        materializer.join().unwrap();
     });
     for block in 0..workers * writes_per_worker {
         let worker = block / writes_per_worker;
@@ -24204,6 +24273,14 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
             (device_id, 100 + (block % 100) as u8)
         };
         assert_eq!(read_block(&store, device, block), repeated_blocks(1, byte));
+    }
+    for block in workers * writes_per_worker..2 * workers * writes_per_worker {
+        assert_eq!(
+            read_block(&store, device_id, block),
+            vec![0_u8; 4096],
+            "sparse block {block} still reads the pre-fill pattern: its sparse \
+             write was lost"
+        );
     }
     // Fencing survives the stripe change: a stale lease still fails at
     // validation before any reservation.
@@ -24218,6 +24295,122 @@ fn durable_block_journal_concurrent_reservation_keeps_per_device_order_and_fenci
         ),
         Err(StorageError::Conflict { .. })
     ));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// M7: a POSTED arrival is logically already in `pending`, so no lane-state
+// acquisition may observe it as absent — least of all the lanes-idle drain,
+// which is how `delete_device` and materialization prove that nothing for a
+// device is still in flight before they mutate metadata. This is the
+// deterministic form of that claim: post a write and, without ever waiting
+// on it, run the drain. If the drain could step over an un-folded arrival it
+// would return with the write still queued; instead it must fold it in,
+// elect it, and carry it all the way through publish.
+#[test]
+fn durable_block_journal_posted_arrival_is_never_invisible_to_the_lane_drain() {
+    let (root, store, device_id, lease) = pipeline_store("m7-posted-arrival-drain");
+    let commit_seq = store.local.metadata.alloc_commit_seq().unwrap();
+    let (shard, request_id) = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+            commit: BlockJournalCommit {
+                device_id,
+                writer_epoch: lease.writer_epoch,
+                commit_seq,
+                write_count: 1,
+                collapsed_range_count: 1,
+                committed_bytes: 4096,
+                entries: vec![BlockJournalEntry::Write {
+                    range: ByteRange::new(0, 4096),
+                    payload_integrity: PayloadIntegrity::Verified,
+                    bytes: repeated_blocks(1, 77),
+                }],
+            },
+            enqueue_waits: BlockJournalEnqueueWaits::default(),
+        })
+        .unwrap();
+    // The drain runs on this thread while the posted arrival has never been
+    // folded by anyone: the poster has not reached its wait, and no other
+    // thread has touched the lane.
+    store.materialize_block_journal().unwrap();
+    // The drain must have carried the posted write through publish, so the
+    // completion is already recorded and the block is already visible.
+    assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 77));
+    store
+        .wait_for_block_journal_request(shard, request_id)
+        .unwrap();
+    assert_eq!(
+        store
+            .local
+            .metadata
+            .device_info(device_id)
+            .unwrap()
+            .latest_commit,
+        commit_seq,
+        "the drain-elected batch must have published the posted write"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// The other consumer of "a posted arrival is already in `pending`": the
+// acknowledged bypass. It publishes inline, out of band from the lane, and
+// is allowed to do so only while no lane write for the device is
+// outstanding — a lane write it fails to see would get a SMALLER commit seq
+// (allocated first) and publish LATER, which is exactly the inversion
+// `publish_reserved_block_journal_commit` rejects as
+// "reserved block journal commit sequence is stale", failing a whole batch
+// of innocent waiters. Here the outstanding lane write exists only as a
+// POSTED arrival that nothing has folded yet, so the bypass's own lane-state
+// acquisition is the only thing standing between this store and that
+// inversion.
+#[test]
+fn durable_block_journal_posted_arrival_blocks_the_acknowledged_bypass() {
+    let (root, store, device_id, lease) = pipeline_store("m7-posted-arrival-bypass");
+    let lane_seq = store.local.metadata.alloc_commit_seq().unwrap();
+    let (shard, request_id) = store
+        .enqueue_block_journal_request(BlockJournalLaneRequest::Write {
+            commit: BlockJournalCommit {
+                device_id,
+                writer_epoch: lease.writer_epoch,
+                commit_seq: lane_seq,
+                write_count: 1,
+                collapsed_range_count: 1,
+                committed_bytes: 4096,
+                entries: vec![BlockJournalEntry::Write {
+                    range: ByteRange::new(0, 4096),
+                    payload_integrity: PayloadIntegrity::Verified,
+                    bytes: repeated_blocks(1, 88),
+                }],
+            },
+            enqueue_waits: BlockJournalEnqueueWaits::default(),
+        })
+        .unwrap();
+    // Single-threaded on purpose: nothing has folded the arrival yet, so the
+    // acknowledged write's own gate is the only chance to see it. If the gate
+    // read the lane state without folding, it would take the bypass, publish
+    // its larger sequence inline, and the lane write's later publish would
+    // fail stale — which the wait below would surface as an error.
+    let ack_commit = store
+        .write_device_with_writer(
+            &lease,
+            4096,
+            &repeated_blocks(1, 99),
+            WriteDurability::Acknowledged,
+            PayloadIntegrity::Verified,
+        )
+        .expect("the acknowledged write must not observe a stale-sequence conflict");
+    store
+        .wait_for_block_journal_request(shard, request_id)
+        .expect("the lane write must publish before the acknowledged write, not stale against it");
+    assert!(
+        ack_commit.commit_seq > lane_seq,
+        "the acknowledged write allocated {:?} against a lane write already \
+         holding {lane_seq:?}",
+        ack_commit.commit_seq
+    );
+    assert_eq!(read_block(&store, device_id, 0), repeated_blocks(1, 88));
+    assert_eq!(read_block(&store, device_id, 1), repeated_blocks(1, 99));
     drop(store);
     let _ = fs::remove_dir_all(root);
 }

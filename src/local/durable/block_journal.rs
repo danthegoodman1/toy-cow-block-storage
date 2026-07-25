@@ -179,6 +179,51 @@ pub(super) enum BlockJournalLaneRequest {
 #[derive(Debug)]
 pub(super) struct BlockJournalFlushCoordinator {
     inner: Mutex<BlockJournalFlushState>,
+    /// Requests handed to this lane but not yet folded into `inner`.
+    ///
+    /// WHY THIS EXISTS (M7). Every write path posts its request while
+    /// holding the global `block_delta_staging_lock` — it must, because
+    /// that hold is simultaneously the deletion fence and the barrier the
+    /// acknowledged bypass relies on (see `post_arrival`). Until M7 posting
+    /// meant taking `inner` and calling `notify_all` INSIDE that global
+    /// hold, so every writer in the store queued behind one writer's
+    /// wakeup work. The measured decomposition of the post-M6 hold at 4k
+    /// c32 was: `notify_all` 61%, the unlock's futex wake 18%, the
+    /// contended `inner` acquisition 14%, the map insert 2% — and the
+    /// deletion fence plus the sequence allocation, which are the only
+    /// things that need the staging lock at all, 1.2%.
+    ///
+    /// This buffer is a LEAF lock. The only code that takes it is
+    /// `post_arrival` (one `Vec::push`) and `admit_arrivals` (one
+    /// `mem::replace`, or one `arrival_scratch` write-back on the
+    /// nothing-posted early return); it is never held across another lock,
+    /// a syscall, a notify, or — after warm-up and up to the recycled
+    /// capacity — an allocation. Lock order is `staging -> arrivals` and
+    /// `inner -> arrivals`; nothing ever acquires `inner` or `staging`
+    /// while holding it, so it cannot participate in a cycle.
+    ///
+    /// PEAK CONTENTION IS THREE, and usually one. Folders are mutually
+    /// exclusive with each other because `admit_arrivals` is only reachable
+    /// with `inner` already held, and write-path posters are mutually
+    /// exclusive with each other because they hold the staging lock — so
+    /// the most that can ever queue on this mutex is one folder, one
+    /// staging-held poster, and one of the two posts that do NOT take the
+    /// staging lock (a Lease from `acquire_block_writer`, or a Flush from
+    /// `flush_block_journal_device_through`, which `flush_device` and
+    /// `persist_physical` both reach with staging released).
+    ///
+    /// THE INVARIANT THAT MAKES IT SAFE: a posted arrival is logically
+    /// already in `pending`. Every acquisition of `inner` — and every
+    /// return from a wait on either condvar — folds the buffer in first
+    /// (`lock_state`, `wait_arrivals`, `wait_pipeline_arrivals`), so no
+    /// code that judges the lane empty, idle, or free of unapplied writes
+    /// can observe a posted arrival as absent.
+    arrivals: Mutex<Vec<(u64, BlockJournalLaneRequest)>>,
+    /// Request-id source. Allocated at POST time (so a poster knows the id
+    /// to wait on without touching `inner`); for write paths the
+    /// allocation happens inside the staging hold, which is what keeps id
+    /// order equal to commit-seq order.
+    next_request_id: AtomicU64,
     cvar: Condvar,
     /// Dedicated condvar for the pipeline's ordering waits (append window
     /// and publish turns). One window parker at most, but SEVERAL
@@ -269,17 +314,28 @@ pub(super) struct BlockJournalFlushState {
     /// AND its own publish.
     next_publish_ticket: u64,
     generation: u64,
-    next_request_id: u64,
+    /// Requests folded out of `arrivals` into `pending` over this lane's
+    /// lifetime. It is the lane's ARRIVAL COUNTER for the M6 cohort clause
+    /// (`cohort_wave_returned` / `note_publish_cohort`), counting requests
+    /// that are actually visible in `pending` — the same instant the
+    /// pre-M7 `next_request_id` counted, so cohort capture is unchanged.
+    /// Request IDENTITY comes from the lane's atomic instead, because a
+    /// poster must learn its id without taking this mutex.
+    absorbed_requests: u64,
+    /// Emptied arrival buffer handed back by the last `admit_arrivals`, so
+    /// posting never has to grow a `Vec` inside the staging hold.
+    arrival_scratch: Vec<(u64, BlockJournalLaneRequest)>,
     /// Set by an elected owner that is parked in its append window waiting
     /// for a cohort rather than for its sync turn (see
     /// `cohort_seal_ready`). It arms the only wake edge the cohort clause
-    /// needs and the pipeline does not already have: `enqueue` notifies
-    /// `pipeline_cvar` only while this is set, so deep-queue owners — which
-    /// never park for a cohort — are not woken once per arrival.
+    /// needs and the pipeline does not already have: `admit_arrivals`
+    /// notifies `pipeline_cvar` only while this is set, so deep-queue
+    /// owners — which never park for a cohort — are not woken once per
+    /// fold.
     cohort_seal_waiting: bool,
     /// Number of threads parked inside `wait_for_block_journal_lanes_idle`
     /// on this lane. A drainer holds `block_delta_staging_lock`, which is
-    /// the same lock every writer needs before it can enqueue, so cohort
+    /// the same lock every writer needs before it can post, so cohort
     /// capture can only time out while one is waiting: its presence
     /// cancels the cohort clause.
     lanes_idle_waiters: usize,
@@ -355,7 +411,7 @@ impl BlockJournalFlushState {
     /// alternative (a per-kind arrival counter) buys precision the seal
     /// decision does not need.
     fn cohort_wave_returned(&self) -> bool {
-        self.next_request_id
+        self.absorbed_requests
             .wrapping_sub(self.arrivals_at_last_publish)
             >= self.last_publish_write_cohort
     }
@@ -371,7 +427,7 @@ impl BlockJournalFlushState {
     ///
     /// DRAIN REQUESTED — a thread parked in `wait_for_block_journal_lanes_idle`
     /// holds `block_delta_staging_lock`, the same lock every writer must
-    /// take before it can enqueue, so no arrival this batch is waiting for
+    /// take before it can post, so no arrival this batch is waiting for
     /// can possibly happen. Seal immediately instead of waiting out the
     /// ceiling on every materialization.
     ///
@@ -428,17 +484,21 @@ impl BlockJournalFlushState {
     /// cohort clause (see `cohort_seal_ready`).
     fn note_publish_cohort(&mut self, write_count: u64) {
         self.last_publish_write_cohort = write_count;
-        self.arrivals_at_last_publish = self.next_request_id;
+        self.arrivals_at_last_publish = self.absorbed_requests;
     }
 
-    fn enqueue(&mut self, request: BlockJournalLaneRequest) -> u64 {
+    /// Make one posted arrival visible in `pending`.
+    ///
+    /// This is the pre-M7 `enqueue` body minus the id allocation: the same
+    /// unapplied-write accounting at the same instant (the request becoming
+    /// visible in `pending`), which is what the acknowledged bypass's
+    /// `has_unapplied_writes` gate and the lanes-idle drain both read.
+    fn absorb(&mut self, request_id: u64, request: BlockJournalLaneRequest) {
         if let BlockJournalLaneRequest::Write { commit, .. } = &request {
             *self.unapplied_writes.entry(commit.device_id).or_default() += 1;
         }
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.absorbed_requests = self.absorbed_requests.wrapping_add(1);
         self.pending.insert(request_id, request);
-        request_id
     }
 
     fn has_unapplied_writes(&self, device_id: DeviceId) -> bool {
@@ -468,9 +528,150 @@ impl BlockJournalFlushCoordinator {
                 cohort_arrivals_expected: true,
                 ..BlockJournalFlushState::default()
             }),
+            arrivals: Mutex::new(Vec::new()),
+            next_request_id: AtomicU64::new(0),
             cvar: Condvar::new(),
             pipeline_cvar: Condvar::new(),
         }
+    }
+
+    /// Hand a request to this lane WITHOUT touching `inner` (M7).
+    ///
+    /// Callers on the write paths run this inside the global staging hold,
+    /// and that placement is load-bearing in two directions:
+    ///
+    /// * DELETION FENCE. `delete_device` holds the staging lock across its
+    ///   lanes-idle drain AND its metadata mutation, so a post that happens
+    ///   inside a hold in which the device was proven live can never land
+    ///   after a delete completed. Posting outside the hold would reopen
+    ///   the durable-frame-for-a-deleted-device path that bricks reopen.
+    /// * ACKNOWLEDGED BYPASS. The bypass decides "no lane write for this
+    ///   device is outstanding" and then publishes inline, all under the
+    ///   staging lock; a lane write may not become visible in between.
+    ///
+    /// What the hold no longer contains is the WAKEUP work: no `inner`
+    /// acquisition, no `notify_all`, no unlock-side futex wake, and — after
+    /// warm-up, up to the recycled capacity — no allocation (the id is one
+    /// relaxed `fetch_add`, and `admit_arrivals` hands its emptied buffer
+    /// back so the push reuses that capacity). Both vectors do start empty,
+    /// so the first folds grow them, and a burst deeper than the recycled
+    /// capacity still reallocates inside the hold; that is a warm-up and
+    /// tail-burst cost, not an invariant, and the steady state this
+    /// milestone measures has neither. Waking the lane is the poster's
+    /// next step, taken after it has released the staging lock —
+    /// `wait_for_block_journal_request` folds the arrival in and notifies
+    /// under `inner`, which is the SAME acquisition the poster used to make
+    /// after enqueueing, so the restructure removes one lane-mutex
+    /// acquisition and one unlock wake per op rather than relocating them.
+    fn post_arrival(&self, request: BlockJournalLaneRequest) -> Result<u64> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        lock(&self.arrivals)?.push((request_id, request));
+        Ok(request_id)
+    }
+
+    /// Lock the lane state with every posted arrival already folded in.
+    ///
+    /// EVERY acquisition of `inner` goes through this (or through the
+    /// condvar wrappers below), which is what makes "a posted arrival is
+    /// logically already in `pending`" hold by construction instead of by
+    /// call-site discipline: nothing can judge the lane empty, idle, or
+    /// free of unapplied writes while an arrival sits in the buffer.
+    fn lock_state(&self) -> Result<MutexGuard<'_, BlockJournalFlushState>> {
+        let mut state = lock(&self.inner)?;
+        self.admit_arrivals(&mut state)?;
+        Ok(state)
+    }
+
+    /// Fold the posted arrivals into `pending` and issue the wakeups the
+    /// pre-M7 in-lock enqueue issued, once per fold rather than once per
+    /// request.
+    ///
+    /// THE TAKE MUST BE ATOMIC AND WHOLE. One `mem::replace` under the leaf
+    /// lock is what gives the ordering argument its second link: because a
+    /// fold removes everything that was posted at that instant, a request
+    /// posted before another is folded no later than it, and therefore
+    /// never lands in a LATER batch than a request posted after it. A
+    /// receive-until-empty loop over a channel would not give that in one
+    /// step — an interleaved post could be observed by the tail of the same
+    /// loop — which is the real reason this is a buffer swap and not
+    /// `std::sync::mpsc` (whose lock-freedom, being an undocumented
+    /// implementation detail, was only the secondary objection).
+    fn admit_arrivals(&self, state: &mut BlockJournalFlushState) -> Result<()> {
+        let scratch = std::mem::take(&mut state.arrival_scratch);
+        let mut posted = {
+            let mut arrivals = lock(&self.arrivals)?;
+            if arrivals.is_empty() {
+                state.arrival_scratch = scratch;
+                return Ok(());
+            }
+            std::mem::replace(&mut *arrivals, scratch)
+        };
+        for (request_id, request) in posted.drain(..) {
+            state.absorb(request_id, request);
+        }
+        // `posted` is now empty with its capacity intact: hand it back as
+        // the next poster's buffer so `post_arrival` never allocates.
+        state.arrival_scratch = posted;
+        self.cvar.notify_all();
+        if state.cohort_seal_waiting {
+            // The arrival edge for the hybrid seal (M6). An owner parked on
+            // its cohort clause waits on `pipeline_cvar`, which otherwise
+            // only carries the sync-ticket and publish-ticket advances, so
+            // without this notify "arrivals fill the batch and it seals
+            // early" would be re-checked only on edges that already wake the
+            // owner — silently inert. Gated on the flag so a deep-queue
+            // owner is never woken once per arrival, and NOT moved to
+            // `cvar`: `advance_block_journal_sync_ticket` skips its `cvar`
+            // notify while the write stage is busy, which it always is for a
+            // parked owner, so the sync edge would be lost.
+            self.pipeline_cvar.notify_all();
+        }
+        Ok(())
+    }
+
+    /// `wait_on_cvar` on the request condvar, re-folding arrivals posted
+    /// while this thread was parked.
+    fn wait_arrivals<'a>(
+        &self,
+        guard: MutexGuard<'a, BlockJournalFlushState>,
+    ) -> Result<MutexGuard<'a, BlockJournalFlushState>> {
+        let mut state = wait_on_cvar(&self.cvar, guard)?;
+        self.admit_arrivals(&mut state)?;
+        Ok(state)
+    }
+
+    /// `wait_timeout_on_cvar` on the request condvar, re-folding arrivals.
+    fn wait_arrivals_timeout<'a>(
+        &self,
+        guard: MutexGuard<'a, BlockJournalFlushState>,
+        timeout: Duration,
+    ) -> Result<(MutexGuard<'a, BlockJournalFlushState>, bool)> {
+        let (mut state, timed_out) = wait_timeout_on_cvar(&self.cvar, guard, timeout)?;
+        self.admit_arrivals(&mut state)?;
+        Ok((state, timed_out))
+    }
+
+    /// `wait_on_cvar` on the pipeline condvar, re-folding arrivals.
+    fn wait_pipeline_arrivals<'a>(
+        &self,
+        guard: MutexGuard<'a, BlockJournalFlushState>,
+    ) -> Result<MutexGuard<'a, BlockJournalFlushState>> {
+        let mut state = wait_on_cvar(&self.pipeline_cvar, guard)?;
+        self.admit_arrivals(&mut state)?;
+        Ok(state)
+    }
+
+    /// `wait_timeout_on_cvar` on the pipeline condvar, re-folding arrivals:
+    /// this is the M6 cohort clause's wait, and its `cohort_seal_ready`
+    /// re-check reads `pending`, so the fold has to happen before it.
+    fn wait_pipeline_arrivals_timeout<'a>(
+        &self,
+        guard: MutexGuard<'a, BlockJournalFlushState>,
+        timeout: Duration,
+    ) -> Result<(MutexGuard<'a, BlockJournalFlushState>, bool)> {
+        let (mut state, timed_out) = wait_timeout_on_cvar(&self.pipeline_cvar, guard, timeout)?;
+        self.admit_arrivals(&mut state)?;
+        Ok((state, timed_out))
     }
 }
 
