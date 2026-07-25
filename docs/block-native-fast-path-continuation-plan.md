@@ -21,6 +21,13 @@ toy-vs-Ceph throughput ratio / p99 ratio):
 `1m` and `32m` have not been measured on the current code, and reads have
 never been compared against Ceph on GCP.
 
+The 4k row above is the `stage6-filesystem-20260619-001` baseline and is now
+superseded for c32: Phase 3 closed with 4k c32 at 231.43 MBps, i.e. **1.15x**
+Ceph's 200.66 (was 0.82x), measured against Phase 2's close rather than
+against Ceph directly — a same-commit Ceph comparator re-measure is still
+owed before the headline claim ships. 4k c4 p99 remains a statistical tie
+with Ceph. See the Phase 3 closure note.
+
 The headline claim is the write matrix above. Reads are a first-class risk,
 not a footnote: the read path shares the block-journal overlay mutex with
 the write lane (`apply_read_overlay` and `apply_commit` lock the same map in
@@ -191,6 +198,49 @@ Status ledger:
 | Complete | Gate | Confirm trip: same-instance base-vs-fix A/B of the bounded-drain publisher fix | `infra/gcp-local-nvme-bench/results/phase2-confirm-ab-20260723/` (harness `run_phase2_confirm_ab.sh`, `c4-standard-32-lssd` us-east1-b, interleaved base rep-1/fix rep-1/base rep-2/fix rep-2, zero errors, teardown verified). 64k flushed rtt-0: base c16 814.1/877.6 MBps (p99 2792/2588us), c32 942.4/1011.2 (p99 5318/4482); fix c16 831.6/842.8 (p99 2596/2485), c32 972.4/1010.0 (p99 4967/4576). Rep-1 per-owner-batch splits: base c16 sync 174.6 / publish 51.6 / mark lock wait 36.6; base c32 228.8 / 100.1 / 77.5; fix c16 163.7 / 58.4 / 42.7; fix c32 200.5 / 137.1 / 112.0 — no lock-wait reduction from the fix. Reads per the reviewer's binding menu: `block-read-4k` c32 fix/base 266.4/285.5 = 0.93x (passes the >10% REVISE threshold; recorded as a watch item, direction consistent with the predicted drain-tail interaction), c16 0.95x; `block-read-1m` flat or better. 4k collateral guard flat (fix 37346/39808 vs base 37967/40290 iops at c16/c32). The fix stays landed for its TOCTOU-wedge repair and bounded-hold properties, not for throughput. |
 
 ## Phase 3: 4K Lane Pipeline And Batch CPU Trim
+
+**STATUS: CLOSED 2026-07-25.** One gate condition met robustly, the other a
+statistical tie; closed on that basis rather than continued, with the residual
+documented. Branch `phase3-lane-pipelining`, seven milestones from `a7c14a2`
+(Phase 2 close) to `36faff7`, plus two spun-out durability fixes merged at
+`dc0858c`. Final evidence: `infra/gcp-local-nvme-bench/results/phase3-m7-gate5x-20260725`
+(5 interleaved reps, same instance, both sides pinned-profile, zero errors).
+
+Outcome against the completion gate:
+- **4k c32 throughput MET** — 231.43 MBps against the 220.73 bar, with all five
+  reps clearing it individually, and **1.390x over the phase's starting point**.
+- **4k c4 p99 NOT DEMONSTRATED** — 591.85us against 585.7us. It improved 4.6%
+  over base, but the bar lies 0.27 standard errors from the mean, so the cell is
+  statistically indistinguishable from the reference and no claim is made.
+- c1 and c16 within tolerance (1.125x, 1.028x throughput); one tracked
+  regression, 4k c16 p99 +10.5%.
+- 64k unchanged by this phase (1.000 / 1.021 vs base; 1.125x / 1.221x vs
+  stage6), confirming that lane is purely fsync-bound as the Phase 2 handoff
+  predicted when it assigned the residual here.
+
+Why closed rather than continued: the pre-registered M7 stop clause did NOT
+fire — both its conditions were beaten by wide margins — so another milestone
+was permitted. It was declined because the blocking mechanism is eliminated
+rather than mitigated (the staging convoy went from 266.8 to 0.067 us/op, a
+99.97% collapse against a bar of 133), and because the one unmet condition has
+no remaining identified mechanism: it sits inside one standard error of the
+target, where further work would be tuning against noise. This phase refuted
+three of its own plan premises by measurement (the literal 3A lane pipelining,
+the M4 reservation stripes, the M6 hold-shortening), and each refutation was
+worth more than the fix it replaced; stopping at a statistical tie is the same
+discipline applied to itself.
+
+Methodology note worth carrying forward: a 2-rep trip
+(`phase3-m7-confirm-20260724`) scored the c4 p99 cell at 576.3us and would have
+been recorded as MET. Both gate conditions straddled their bars per-rep at 2
+reps, which is why the trip was repeated before the gate was scored. Gate cells
+near a bar need rep counts chosen for the margin, not the schedule.
+
+Delivered outside the performance scope, both pre-existing and both found by
+review rather than by testing: a leased-then-deleted device bricking `open()`
+permanently (`6942239`), and bounded persists silently dropping acknowledged
+`Flushed` writes, reachable through `flush_file` (`343440f`). Neither was on
+the plan when the phase opened.
 
 Goal:
 Overlap lane CPU work with the in-flight fsync and trim per-batch overhead so
