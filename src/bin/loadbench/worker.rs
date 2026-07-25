@@ -314,6 +314,9 @@ fn run_worker(context: BenchContext, worker: u64, config: WorkerConfig) -> Resul
         let elapsed = started.elapsed();
         let latency_nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
         let progress = result.as_ref().copied().unwrap_or_default();
+        if let Err(error) = &result {
+            report.record_error(error);
+        }
         report.record(
             latency_nanos,
             context.op_size as u64,
@@ -382,6 +385,7 @@ fn run_mixed_native_append_worker(
                 ticket
             }
             Err(error) => {
+                report.record_error(&error);
                 report.record_stream_append(
                     append_nanos,
                     context.payload.len() as u64,
@@ -429,6 +433,7 @@ fn run_mixed_native_append_worker(
                 );
             }
             Err(error) => {
+                report.record_error(&error);
                 report.record_stream_publish(
                     publish_nanos,
                     0,
@@ -501,6 +506,9 @@ fn run_mixed_native_batch_worker(
         });
         let latency_nanos = elapsed_nanos_u64(started);
         let progress = result.as_ref().copied().unwrap_or_default();
+        if let Err(error) = &result {
+            report.record_error(error);
+        }
         report.record(
             latency_nanos,
             config.native_file_batch.ops as u64 * config.native_file_batch.write_bytes as u64,
@@ -696,6 +704,7 @@ fn run_fixed_stream_publish_worker(
                 ticket
             }
             Err(error) => {
+                report.record_error(&error);
                 report.record_stream_append(
                     append_nanos,
                     context.payload.len() as u64,
@@ -826,6 +835,7 @@ fn publish_fixed_stream_boundary(
             Ok(())
         }
         Err(error) => {
+            report.record_error(&error);
             report.record_stream_publish(
                 publish_nanos,
                 0,

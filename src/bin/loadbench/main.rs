@@ -50,7 +50,9 @@ fn run() -> Result<()> {
         for &concurrency in &args.concurrency {
             let report = run_case(&args, *workload, concurrency)?;
             report.print_csv();
+            report.print_error_summary();
             append_matrix_csv(&args, &report)?;
+            append_errors_csv(&args, &report)?;
         }
     }
 

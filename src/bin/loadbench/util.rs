@@ -810,6 +810,468 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// A real RFC4180 field splitter: commas inside a quoted field do not
+    /// split it and `""` decodes to one literal quote. Used instead of
+    /// `split(',')` so the sidecar assertions model how a conforming reader
+    /// (`csv.DictReader`, which is what the GCP harness uses) sees the row,
+    /// and so the decoded sample can be compared against the original.
+    fn rfc4180_fields(row: &str) -> Vec<String> {
+        let mut fields = vec![String::new()];
+        let mut quoted = false;
+        let mut characters = row.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '"' if quoted => {
+                    if characters.peek() == Some(&'"') {
+                        characters.next();
+                        fields.last_mut().expect("at least one field").push('"');
+                    } else {
+                        quoted = false;
+                    }
+                }
+                '"' => quoted = true,
+                ',' if !quoted => fields.push(String::new()),
+                _ => fields
+                    .last_mut()
+                    .expect("at least one field")
+                    .push(character),
+            }
+        }
+        fields
+    }
+
+    fn unavailable_io_error(detail: &str) -> StorageError {
+        StorageError::unavailable(format!("filesystem operation failed: {detail}"))
+    }
+
+    /// Total errors across every group, however keyed.
+    fn tally_total(tally: &ErrorTally) -> u64 {
+        tally.groups.values().map(|group| group.count).sum()
+    }
+
+    #[test]
+    fn os_error_code_is_recovered_from_the_stringified_io_error() {
+        // Built from a real `io::Error` rather than a string literal: the
+        // errno is recovered out of std's Display output, which is a Display
+        // contract and not an API one. A literal here would test the parser
+        // and silently stop testing the contract it depends on.
+        for code in [11, 28, 13, 5] {
+            let rendered = format!(
+                "unavailable: filesystem operation failed: {}",
+                std::io::Error::from_raw_os_error(code)
+            );
+            assert_eq!(
+                parse_os_error_code(&rendered),
+                Some(code),
+                "errno lost from std Display output: {rendered}"
+            );
+        }
+        assert_eq!(
+            parse_os_error_code(
+                "unavailable: filesystem operation failed: Resource temporarily unavailable (os error 11)"
+            ),
+            Some(11)
+        );
+        assert_eq!(
+            parse_os_error_code("conflict: stale block writer lease"),
+            None
+        );
+        assert_eq!(
+            parse_os_error_code("unavailable: (os error not-a-number)"),
+            None
+        );
+    }
+
+    #[test]
+    fn matrix_csv_row_column_count_matches_header() {
+        let mut worker = WorkerReport::new(8);
+        let mut rng = Lcg::new(1);
+        worker.record_error(&unavailable_io_error(
+            "Resource temporarily unavailable (os error 11)",
+        ));
+        worker.record(10, 0, OpProgress::default(), false, &mut rng);
+        worker.record(10, 4096, OpProgress::default(), true, &mut rng);
+
+        let report = BenchReport::from_workers(Duration::from_secs(1), vec![worker]);
+        let row = report.csv_row();
+        // matrix.csv is consumed positionally by `score_trip.sh` with a
+        // quote-blind `awk -F,`, so the row must need no quoting at all:
+        // a naive split has to agree with the header.
+        assert_eq!(
+            row.split(',').count(),
+            BenchReport::csv_header().split(',').count(),
+            "matrix.csv row/header column mismatch: {row}"
+        );
+        assert_eq!(rfc4180_fields(&row).len(), row.split(',').count());
+        assert!(
+            !row.contains('"'),
+            "matrix.csv row must stay quote-free: {row}"
+        );
+    }
+
+    /// Packet §3's "same corruption as inserting a column" regression, with
+    /// teeth: the offending text is recorded *into the tally* and both
+    /// artifacts are checked. The `errors_*` columns are numeric so
+    /// matrix.csv cannot widen, but the sidecar carries the raw text and is
+    /// where a quoting mistake would actually land.
+    #[test]
+    fn a_comma_and_quote_bearing_error_widens_neither_artifact() {
+        let detail = "path \"/mnt/gcpsim/a,b\", len 65536 (os error 11)";
+        let expected_sample = format!("unavailable: filesystem operation failed: {detail}");
+
+        let mut worker = WorkerReport::new(8);
+        let mut rng = Lcg::new(1);
+        worker.record_error(&unavailable_io_error(detail));
+        worker.record(10, 0, OpProgress::default(), false, &mut rng);
+        let report = BenchReport::from_workers(Duration::from_secs(1), vec![worker]);
+
+        let matrix_row = report.csv_row();
+        assert_eq!(
+            matrix_row.split(',').count(),
+            BenchReport::csv_header().split(',').count(),
+            "matrix.csv widened: {matrix_row}"
+        );
+        assert!(
+            !matrix_row.contains('"') && !matrix_row.contains("a,b"),
+            "free text leaked into matrix.csv: {matrix_row}"
+        );
+
+        let header_fields = BenchReport::error_csv_header().split(',').count();
+        let rows = report.error_csv_rows();
+        assert_eq!(rows.len(), 1);
+        let fields = rfc4180_fields(&rows[0]);
+        assert_eq!(fields.len(), header_fields, "sidecar widened: {}", rows[0]);
+        // The point of the exercise: the sample must survive a conforming
+        // reader byte for byte, embedded comma and quotes included.
+        assert_eq!(fields[header_fields - 1], expected_sample);
+        // Guard the guard: unquoted, this row would carry two extra columns,
+        // so the assertion above is not passing by accident.
+        assert!(
+            rows[0].split(',').count() > header_fields,
+            "sample lost its embedded commas, so the test proves nothing: {}",
+            rows[0]
+        );
+    }
+
+    /// F1: the direct-I/O write loop returns three distinct `Unavailable`
+    /// errors that carry no errno at all (`io_backend.rs` "made no
+    /// progress" / "reported too many bytes" / "repeatedly returned
+    /// unaligned short writes"). Keying on `(variant, errno)` alone would
+    /// collapse all three into one row with one sample — a clean-looking
+    /// answer to the wrong question. The third is the retry-hardening path
+    /// that `22c269e` did not fix, so separating it is the whole point.
+    #[test]
+    fn errno_less_direct_io_write_failures_stay_distinct() {
+        let messages = [
+            "direct I/O write made no progress",
+            "direct I/O write reported too many bytes",
+            "direct I/O write repeatedly returned unaligned short writes",
+        ];
+        let mut worker = WorkerReport::new(8);
+        for (index, message) in messages.iter().enumerate() {
+            for _ in 0..=index {
+                worker.record_error(&StorageError::unavailable(*message));
+            }
+        }
+        let report = BenchReport::from_workers(Duration::from_secs(1), vec![worker]);
+
+        assert_eq!(report.errors_by_kind.groups.len(), 3);
+        let mut seen: Vec<(String, u64)> = report
+            .errors_by_kind
+            .groups
+            .values()
+            .map(|group| (group.first_sample.clone(), group.count))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "unavailable: direct I/O write made no progress".to_string(),
+                    1
+                ),
+                (
+                    "unavailable: direct I/O write repeatedly returned unaligned short writes"
+                        .to_string(),
+                    3
+                ),
+                (
+                    "unavailable: direct I/O write reported too many bytes".to_string(),
+                    2
+                ),
+            ]
+        );
+        // All three are errno-less, so the matrix.csv errno columns stay 0
+        // and the sidecar is the only place the answer lives.
+        assert_eq!(report.errors_by_kind.top_os_error(), (0, 0));
+    }
+
+    /// The normalized prefix must absorb variable numbers, or one group per
+    /// offset would defeat the bound.
+    #[test]
+    fn the_group_prefix_normalizes_variable_numbers() {
+        let mut tally = ErrorTally::default();
+        for block in 0..500_u64 {
+            tally.record(&StorageError::conflict(format!(
+                "block writer lease {block} is stale at offset {}",
+                block * 4096
+            )));
+        }
+        assert_eq!(tally.groups.len(), 1);
+        assert_eq!(tally_total(&tally), 500);
+    }
+
+    #[test]
+    fn worker_reports_group_errors_by_kind_and_errno_with_a_first_sample() {
+        let mut rng = Lcg::new(1);
+        let eagain = unavailable_io_error("Resource temporarily unavailable (os error 11)");
+        let enospc = unavailable_io_error("No space left on device (os error 28)");
+        let unsupported =
+            StorageError::unsupported("direct I/O backend requires Linux O_DIRECT support");
+
+        let mut first = WorkerReport::new(8);
+        for _ in 0..2 {
+            first.record_error(&eagain);
+            first.record(10, 0, OpProgress::default(), false, &mut rng);
+        }
+        let mut second = WorkerReport::new(8);
+        second.record_error(&eagain);
+        second.record(10, 0, OpProgress::default(), false, &mut rng);
+        second.record_error(&enospc);
+        second.record(10, 0, OpProgress::default(), false, &mut rng);
+        second.record_error(&unsupported);
+        second.record(10, 0, OpProgress::default(), false, &mut rng);
+        second.record(10, 4096, OpProgress::default(), true, &mut rng);
+
+        let report = BenchReport::from_workers(Duration::from_secs(1), vec![first, second]);
+
+        assert_eq!(report.errors, 5);
+        assert_eq!(report.successes, 1);
+
+        let groups: Vec<_> = report.errors_by_kind.groups.iter().collect();
+        assert_eq!(groups.len(), 3, "unexpected groups: {groups:?}");
+        assert_eq!(groups[0].0.kind, ErrorKindLabel::Unavailable);
+        assert_eq!(groups[0].0.os_error, Some(11));
+        assert_eq!(groups[0].1.count, 3, "EAGAIN must merge across workers");
+        assert_eq!(
+            groups[0].1.first_sample,
+            "unavailable: filesystem operation failed: Resource temporarily unavailable (os error 11)"
+        );
+        assert_eq!(groups[1].0.os_error, Some(28));
+        assert_eq!(groups[1].1.count, 1);
+        assert_eq!(groups[2].0.kind, ErrorKindLabel::Unsupported);
+        assert_eq!(groups[2].0.os_error, None);
+        assert_eq!(groups[2].1.count, 1);
+
+        // The fixed matrix.csv tail splits the same total by variant.
+        assert_eq!(
+            report
+                .errors_by_kind
+                .count_for_kind(ErrorKindLabel::Unavailable),
+            4
+        );
+        assert_eq!(
+            report
+                .errors_by_kind
+                .count_for_kind(ErrorKindLabel::Unsupported),
+            1
+        );
+        assert_eq!(
+            report
+                .errors_by_kind
+                .count_for_kind(ErrorKindLabel::Conflict),
+            0
+        );
+        let row = report.csv_row();
+        let columns: Vec<&str> = row.split(',').collect();
+        let tail = &columns[columns.len() - (ErrorKindLabel::VARIANTS.len() + 2)..];
+        // six variant counts, then the top errno and its count
+        assert_eq!(tail, ["0", "0", "0", "4", "0", "1", "11", "3"]);
+    }
+
+    /// F2: the six variant columns must always reconstruct the `errors`
+    /// column, including once the group cap is hit — otherwise a reader
+    /// silently loses errors with nothing in the file to say so.
+    #[test]
+    fn error_kind_columns_always_sum_to_the_errors_column() {
+        let mut rng = Lcg::new(1);
+        let mut worker = WorkerReport::new(8);
+        // Enough distinct errno groups to blow past the cap, spread over
+        // more than one variant so the per-variant overflow is exercised.
+        for code in 0..(ERROR_GROUP_LIMIT as i32 + 40) {
+            let error = if code % 3 == 0 {
+                StorageError::corrupt(format!("synthetic corrupt (os error {code})"))
+            } else {
+                unavailable_io_error(&format!("synthetic (os error {code})"))
+            };
+            worker.record_error(&error);
+            worker.record(10, 0, OpProgress::default(), false, &mut rng);
+        }
+        let report = BenchReport::from_workers(Duration::from_secs(1), vec![worker]);
+
+        let summed: u64 = ErrorKindLabel::VARIANTS
+            .iter()
+            .map(|kind| report.errors_by_kind.count_for_kind(*kind))
+            .sum();
+        assert_eq!(
+            summed, report.errors,
+            "the errors_* columns must reconstruct the errors column"
+        );
+        assert_eq!(tally_total(&report.errors_by_kind), report.errors);
+
+        // Summing is not enough: overflow must stay attributed to the
+        // variant it came from, or the split is wrong while the total looks
+        // right. 35 of the 104 injected errors are Corrupt, the rest
+        // Unavailable, and most of both land in overflow.
+        let expected_corrupt = (0..(ERROR_GROUP_LIMIT as i32 + 40))
+            .filter(|code| code % 3 == 0)
+            .count() as u64;
+        assert_eq!(
+            report
+                .errors_by_kind
+                .count_for_kind(ErrorKindLabel::Corrupt),
+            expected_corrupt
+        );
+        assert_eq!(
+            report
+                .errors_by_kind
+                .count_for_kind(ErrorKindLabel::Unavailable),
+            report.errors - expected_corrupt
+        );
+
+        // Bounded, and the overflow rows are labelled in the sidecar.
+        assert!(
+            report.errors_by_kind.groups.len()
+                <= ERROR_GROUP_LIMIT + ErrorKindLabel::VARIANTS.len(),
+            "group count escaped its bound: {}",
+            report.errors_by_kind.groups.len()
+        );
+        let overflow_rows: Vec<String> = report
+            .error_csv_rows()
+            .into_iter()
+            .filter(|row| row.contains("-overflow,"))
+            .collect();
+        assert!(
+            !overflow_rows.is_empty(),
+            "overflow must be visible in the sidecar, not silent"
+        );
+        for row in &overflow_rows {
+            let fields = rfc4180_fields(row);
+            assert_eq!(
+                fields.len(),
+                BenchReport::error_csv_header().split(',').count()
+            );
+            assert_eq!(fields[fields.len() - 1], ERROR_OVERFLOW_SAMPLE);
+        }
+    }
+
+    /// `errors_csv_path` against the paths the GCP harness actually passes
+    /// to `--matrix-csv`.
+    #[test]
+    fn errors_csv_path_matches_the_harness_layout() {
+        for (matrix, expected) in [
+            (
+                "/mnt/results/toy/size-4k-rtt-0-dur-flushed-rep-1/matrix.csv",
+                "/mnt/results/toy/size-4k-rtt-0-dur-flushed-rep-1/matrix.errors.csv",
+            ),
+            (
+                "/mnt/results/loadbench/raid-shared/matrix.csv",
+                "/mnt/results/loadbench/raid-shared/matrix.errors.csv",
+            ),
+            // A dotted directory must not confuse the extension swap.
+            ("/tmp/run.v2/matrix.csv", "/tmp/run.v2/matrix.errors.csv"),
+            // No extension at all still yields a distinct sidecar.
+            ("/tmp/run.v2/matrix", "/tmp/run.v2/matrix.errors.csv"),
+        ] {
+            assert_eq!(
+                errors_csv_path(Path::new(matrix)),
+                PathBuf::from(expected),
+                "unexpected sidecar path for {matrix}"
+            );
+        }
+        // It must never collide with the harness' own `matrix.csv` glob.
+        assert_ne!(
+            errors_csv_path(Path::new("/a/matrix.csv")),
+            PathBuf::from("/a/matrix.csv")
+        );
+    }
+
+    #[test]
+    fn errors_sidecar_is_written_next_to_the_matrix_csv() {
+        let matrix_csv = env::temp_dir().join(format!(
+            "toy-cow-block-storage-loadbench-errors-{}-matrix.csv",
+            NEXT_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sidecar = errors_csv_path(&matrix_csv);
+        assert_eq!(
+            sidecar.extension().and_then(|value| value.to_str()),
+            Some("csv")
+        );
+        assert!(
+            sidecar.to_string_lossy().ends_with("-matrix.errors.csv"),
+            "unexpected sidecar path: {}",
+            sidecar.display()
+        );
+        let _ = fs::remove_file(&matrix_csv);
+        let _ = fs::remove_file(&sidecar);
+
+        let mut args = test_loadbench_args(env::temp_dir().join("unused"));
+        args.matrix_csv = Some(matrix_csv.clone());
+
+        let mut worker = WorkerReport::new(8);
+        worker.record_error(&unavailable_io_error("a,b \"c\" (os error 11)"));
+        let mut report = BenchReport::from_workers(Duration::from_secs(1), vec![worker]);
+        report.workload = Workload::BlockWrite4k;
+        report.concurrency = 32;
+        report.op_size = 65536;
+        append_errors_csv(&args, &report).unwrap();
+
+        let contents = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(
+            contents,
+            format!(
+                "{}\nblock-write-4k,local,ack,0,0,32,65536,unavailable,11,1,\"unavailable: filesystem operation failed: a,b \"\"c\"\" (os error 11)\"\n",
+                BenchReport::error_csv_header()
+            )
+        );
+        assert!(
+            !matrix_csv.exists(),
+            "the sidecar writer must not create matrix.csv"
+        );
+        let _ = fs::remove_file(&sidecar);
+    }
+
+    /// A clean cell still writes the sidecar, header only. Absence of the
+    /// file must mean "the instrumentation never ran", never "the run was
+    /// clean" — that ambiguity is the dominant failure mode for a trip whose
+    /// entire purpose is reading the error tally.
+    #[test]
+    fn a_clean_run_still_writes_the_error_sidecar_header() {
+        let matrix_csv = env::temp_dir().join(format!(
+            "toy-cow-block-storage-loadbench-clean-{}-matrix.csv",
+            NEXT_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sidecar = errors_csv_path(&matrix_csv);
+        let _ = fs::remove_file(&sidecar);
+
+        let mut args = test_loadbench_args(env::temp_dir().join("unused"));
+        args.matrix_csv = Some(matrix_csv);
+
+        let mut worker = WorkerReport::new(8);
+        let mut rng = Lcg::new(1);
+        worker.record(10, 4096, OpProgress::default(), true, &mut rng);
+        let report = BenchReport::from_workers(Duration::from_secs(1), vec![worker]);
+
+        append_errors_csv(&args, &report).unwrap();
+        let contents = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(
+            contents,
+            format!("{}\n", BenchReport::error_csv_header()),
+            "a clean cell must leave a header-only sidecar"
+        );
+        let _ = fs::remove_file(&sidecar);
+    }
+
     fn assert_native_hot_append_reports_successes_without_errors(concurrency: usize) {
         let root = env::temp_dir().join(format!(
             "toy-cow-block-storage-hot-append-test-{}-c{}",

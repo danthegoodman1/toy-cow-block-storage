@@ -76,11 +76,277 @@ enum LatencyClass {
     StreamPublish,
 }
 
+/// Upper bound on distinct error groups a report retains per variant family.
+///
+/// Raw error strings carry offsets, paths and lengths, so grouping on them
+/// would grow without limit under a run that produces hundreds of thousands
+/// of errors. The key is bounded instead, and anything past the cap folds
+/// into a per-variant overflow bucket, so the tally can hold at most
+/// `ERROR_GROUP_LIMIT + ErrorKindLabel::VARIANTS.len()` groups.
+const ERROR_GROUP_LIMIT: usize = 64;
+
+/// Upper bound on a retained first-error sample. The errno is captured
+/// separately in `ErrorGroupKey::os_error`, so truncation here never costs
+/// the diagnosis.
+const ERROR_SAMPLE_MAX_BYTES: usize = 512;
+
+/// Upper bound on the normalized message prefix used to separate errno-less
+/// errors. Long enough to tell the direct-I/O write loop's three distinct
+/// errno-less failures apart, short enough to stay a bounded key.
+const ERROR_PREFIX_MAX_BYTES: usize = 96;
+
+const ERROR_OVERFLOW_SAMPLE: &str = "(overflow bucket: distinct error-group cap reached)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ErrorKindLabel {
+    InvalidArgument,
+    NotFound,
+    Conflict,
+    Unavailable,
+    Corrupt,
+    Unsupported,
+}
+
+impl ErrorKindLabel {
+    /// The `StorageError` variants, in the order their fixed `matrix.csv`
+    /// count columns appear.
+    const VARIANTS: [Self; 6] = [
+        Self::InvalidArgument,
+        Self::NotFound,
+        Self::Conflict,
+        Self::Unavailable,
+        Self::Corrupt,
+        Self::Unsupported,
+    ];
+
+    fn of(error: &StorageError) -> Self {
+        match error {
+            StorageError::InvalidArgument { .. } => Self::InvalidArgument,
+            StorageError::NotFound { .. } => Self::NotFound,
+            StorageError::Conflict { .. } => Self::Conflict,
+            StorageError::Unavailable { .. } => Self::Unavailable,
+            StorageError::Corrupt { .. } => Self::Corrupt,
+            StorageError::Unsupported { .. } => Self::Unsupported,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "invalid-argument",
+            Self::NotFound => "not-found",
+            Self::Conflict => "conflict",
+            Self::Unavailable => "unavailable",
+            Self::Corrupt => "corrupt",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Bounded grouping key.
+///
+/// `overflow` sorts after the real groups within a variant and, crucially,
+/// keeps the variant: the six `errors_*` columns therefore always sum to the
+/// `errors` column, whether or not the cap was hit.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ErrorGroupKey {
+    kind: ErrorKindLabel,
+    overflow: bool,
+    os_error: Option<i32>,
+    prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct ErrorGroup {
+    count: u64,
+    /// The sample from the first group occurrence in merge order, i.e. the
+    /// lowest-indexed worker holding this group. Deterministic, but not
+    /// necessarily the chronologically first error of the run.
+    first_sample: String,
+}
+
+#[derive(Debug, Default)]
+struct ErrorTally {
+    groups: BTreeMap<ErrorGroupKey, ErrorGroup>,
+}
+
+impl ErrorTally {
+    /// Error path only. Allocation and formatting here are fine; the success
+    /// path never reaches this function.
+    fn record(&mut self, error: &StorageError) {
+        let message = error.to_string();
+        let os_error = parse_os_error_code(&message);
+        let key = ErrorGroupKey {
+            kind: ErrorKindLabel::of(error),
+            overflow: false,
+            // With an errno, the errno is the discriminator; splitting
+            // further by call site would fragment the count the GCP trip
+            // exists to read. Without one, the normalized message prefix is
+            // the only thing separating distinct failures — the direct-I/O
+            // write loop alone returns three errno-less `Unavailable`s
+            // ("made no progress", "reported too many bytes", "repeatedly
+            // returned unaligned short writes") and telling them apart is
+            // the point of the exercise.
+            prefix: if os_error.is_some() {
+                String::new()
+            } else {
+                normalize_error_prefix(&message)
+            },
+            os_error,
+        };
+        self.add(key, 1, &message);
+    }
+
+    fn add(&mut self, key: ErrorGroupKey, count: u64, sample: &str) {
+        if let Some(group) = self.groups.get_mut(&key) {
+            group.count = group.count.saturating_add(count);
+            return;
+        }
+        let key = if self.groups.len() >= ERROR_GROUP_LIMIT {
+            ErrorGroupKey {
+                kind: key.kind,
+                overflow: true,
+                os_error: None,
+                prefix: String::new(),
+            }
+        } else {
+            key
+        };
+        let overflow = key.overflow;
+        self.groups
+            .entry(key)
+            .and_modify(|group| group.count = group.count.saturating_add(count))
+            .or_insert_with(|| ErrorGroup {
+                count,
+                first_sample: if overflow {
+                    ERROR_OVERFLOW_SAMPLE.to_string()
+                } else {
+                    truncate_error_sample(sample)
+                },
+            });
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (key, group) in other.groups {
+            self.add(key, group.count, &group.first_sample);
+        }
+    }
+
+    /// Total for one variant, overflow included. Summing this over
+    /// `VARIANTS` always reproduces the `errors` column.
+    fn count_for_kind(&self, kind: ErrorKindLabel) -> u64 {
+        self.groups
+            .iter()
+            .filter(|(key, _)| key.kind == kind)
+            .fold(0_u64, |total, (_, group)| total.saturating_add(group.count))
+    }
+
+    /// Errno of the highest-count group carrying one, with its count.
+    /// `(0, 0)` when no group has an errno. Ties resolve to the
+    /// lowest-ordered key, so the answer is deterministic.
+    ///
+    /// This is duplicated out of the sidecar into `matrix.csv` on purpose:
+    /// the errno is the one fact the GCP trip exists to obtain, and
+    /// `matrix.csv` is the artifact with positional consumers and a
+    /// historical series behind it.
+    fn top_os_error(&self) -> (i32, u64) {
+        self.groups
+            .iter()
+            .filter_map(|(key, group)| key.os_error.map(|code| (code, group.count)))
+            .fold((0_i32, 0_u64), |best, (code, count)| {
+                if count > best.1 { (code, count) } else { best }
+            })
+    }
+}
+
+/// Recover the errno from an `io::Error` that `fs_error` stringified.
+/// `io::Error`'s `Display` for an OS error ends in `(os error N)`.
+fn parse_os_error_code(message: &str) -> Option<i32> {
+    const MARKER: &str = "(os error ";
+    let start = message.rfind(MARKER)? + MARKER.len();
+    let rest = message.get(start..)?;
+    let end = rest.find(')')?;
+    rest.get(..end)?.trim().parse::<i32>().ok()
+}
+
+/// Collapse the variable parts of an error message into a bounded key.
+///
+/// Digit runs become a single `#`, so offsets, lengths and block numbers do
+/// not each mint a group; the result is then truncated. Distinct static
+/// messages that share a 96-byte prefix would still merge, which the group
+/// cap makes safe rather than correct — the sidecar's sample shows what
+/// landed in the group.
+///
+/// Digit collapse also merges messages that differ only in a type width:
+/// `"invalid u16"` and `"invalid u128"` both normalize to `"invalid u#"`,
+/// as do the `overflows u32`/`u64` guards. That is confined to the
+/// `InvalidArgument` and `Corrupt` width checks and cannot obscure the
+/// direct-I/O question this instrumentation exists to answer — those
+/// failures are `Unavailable` and either carry an errno (in which case the
+/// prefix is unused) or are the three digit-free write-loop messages.
+fn normalize_error_prefix(message: &str) -> String {
+    let mut prefix = String::with_capacity(ERROR_PREFIX_MAX_BYTES);
+    let mut previous_was_digit = false;
+    for character in message.chars() {
+        let is_digit = character.is_ascii_digit();
+        if is_digit && previous_was_digit {
+            continue;
+        }
+        previous_was_digit = is_digit;
+        let character = if is_digit {
+            '#'
+        } else if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if prefix.len() + character.len_utf8() > ERROR_PREFIX_MAX_BYTES {
+            break;
+        }
+        prefix.push(character);
+    }
+    prefix
+}
+
+/// Bound the retained sample and flatten control characters so one group is
+/// always one CSV line.
+fn truncate_error_sample(message: &str) -> String {
+    let mut sample = String::with_capacity(message.len().min(ERROR_SAMPLE_MAX_BYTES));
+    for character in message.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if sample.len() + character.len_utf8() > ERROR_SAMPLE_MAX_BYTES {
+            break;
+        }
+        sample.push(character);
+    }
+    sample
+}
+
+/// RFC4180 quoting: wrap in double quotes, double any embedded quote. The
+/// sidecar carries free-text error strings, so every sample field goes
+/// through this — otherwise one comma turns into a shifted column.
+fn csv_quote(field: &str) -> String {
+    let mut quoted = String::with_capacity(field.len() + 2);
+    quoted.push('"');
+    for character in field.chars() {
+        if character == '"' {
+            quoted.push('"');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[derive(Debug)]
 struct WorkerReport {
     attempts: u64,
     successes: u64,
     errors: u64,
+    errors_by_kind: ErrorTally,
     bytes: u64,
     durable_bytes: u64,
     published_bytes: u64,
@@ -112,6 +378,7 @@ impl WorkerReport {
             attempts: 0,
             successes: 0,
             errors: 0,
+            errors_by_kind: ErrorTally::default(),
             bytes: 0,
             durable_bytes: 0,
             published_bytes: 0,
@@ -221,6 +488,13 @@ impl WorkerReport {
         self.record_classified(latency_nanos, bytes, progress, success, None, rng);
     }
 
+    /// Classify a failed operation. Kept separate from `record` so the
+    /// success path pays only the branch that decides not to call this —
+    /// no allocation, formatting or map lookup per successful op.
+    fn record_error(&mut self, error: &StorageError) {
+        self.errors_by_kind.record(error);
+    }
+
     fn record_classified(
         &mut self,
         latency_nanos: u64,
@@ -322,6 +596,7 @@ struct BenchReport {
     attempts: u64,
     successes: u64,
     errors: u64,
+    errors_by_kind: ErrorTally,
     bytes: u64,
     durable_bytes: u64,
     published_bytes: u64,
@@ -360,13 +635,27 @@ struct BenchReport {
 
 impl BenchReport {
     fn csv_header() -> &'static str {
-        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,durable_mbps,published_mbps,durable_bytes,published_bytes,p50_us,p90_us,p99_us,p999_us,max_us,samples,stream_append_p50_us,stream_append_p90_us,stream_append_p99_us,stream_append_p999_us,stream_append_max_us,stream_append_samples,stream_publish_p50_us,stream_publish_p90_us,stream_publish_p99_us,stream_publish_p999_us,stream_publish_max_us,stream_publish_samples,stream_final_drain_p50_us,stream_final_drain_p99_us,stream_final_drain_max_us,stream_final_drain_samples,stream_append_phase_seconds,stream_boundary_phase_seconds,stream_barrier_wait_p50_us,stream_barrier_wait_p99_us,stream_barrier_wait_max_us,stream_barrier_wait_samples"
+        // APPEND ONLY. These columns are consumed positionally by
+        // `score_trip.sh` (`$14` mbps, `$21` p99) and by the GCP harness
+        // scripts; inserting anywhere but the end silently corrupts every
+        // historical comparison. The trailing `errors_*` columns are fixed
+        // shape and numeric on purpose — free-text error samples go to the
+        // `*.errors.csv` sidecar so this row never needs quoting.
+        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,seconds,attempts,successes,errors,success_iops,attempt_iops,mbps,durable_mbps,published_mbps,durable_bytes,published_bytes,p50_us,p90_us,p99_us,p999_us,max_us,samples,stream_append_p50_us,stream_append_p90_us,stream_append_p99_us,stream_append_p999_us,stream_append_max_us,stream_append_samples,stream_publish_p50_us,stream_publish_p90_us,stream_publish_p99_us,stream_publish_p999_us,stream_publish_max_us,stream_publish_samples,stream_final_drain_p50_us,stream_final_drain_p99_us,stream_final_drain_max_us,stream_final_drain_samples,stream_append_phase_seconds,stream_boundary_phase_seconds,stream_barrier_wait_p50_us,stream_barrier_wait_p99_us,stream_barrier_wait_max_us,stream_barrier_wait_samples,errors_invalid_argument,errors_not_found,errors_conflict,errors_unavailable,errors_corrupt,errors_unsupported,errors_top_os_error,errors_top_os_error_count"
+    }
+
+    /// Sidecar written next to `matrix.csv`. Carries the errno and the
+    /// verbatim first-error sample, which cannot live in `matrix.csv`
+    /// without making that file's column count variable.
+    fn error_csv_header() -> &'static str {
+        "workload,provider,durability,rtt_us,serial_rtts,concurrency,op_size,error_kind,os_error,count,first_sample"
     }
 
     fn from_workers(elapsed: Duration, workers: Vec<WorkerReport>) -> Self {
         let mut attempts = 0_u64;
         let mut successes = 0_u64;
         let mut errors = 0_u64;
+        let mut errors_by_kind = ErrorTally::default();
         let mut bytes = 0_u64;
         let mut durable_bytes = 0_u64;
         let mut published_bytes = 0_u64;
@@ -389,6 +678,7 @@ impl BenchReport {
             attempts = attempts.saturating_add(worker.attempts);
             successes = successes.saturating_add(worker.successes);
             errors = errors.saturating_add(worker.errors);
+            errors_by_kind.merge(worker.errors_by_kind);
             bytes = bytes.saturating_add(worker.bytes);
             durable_bytes = durable_bytes.saturating_add(worker.durable_bytes);
             published_bytes = published_bytes.saturating_add(worker.published_bytes);
@@ -431,6 +721,7 @@ impl BenchReport {
             attempts,
             successes,
             errors,
+            errors_by_kind,
             bytes,
             durable_bytes,
             published_bytes,
@@ -475,8 +766,23 @@ impl BenchReport {
         let mbps = self.bytes as f64 / seconds / 1_000_000.0;
         let durable_mbps = self.durable_bytes as f64 / seconds / 1_000_000.0;
         let published_mbps = self.published_bytes as f64 / seconds / 1_000_000.0;
+        // Fixed-shape numeric tail, in `ErrorKindLabel::VARIANTS` order so
+        // the row cannot drift from the header's `errors_*` columns. Every
+        // value here is a `u64`/`i32`, so this tail can never introduce a
+        // comma or a quote into a row that positional consumers parse with
+        // a quote-blind `awk -F,`.
+        let mut error_kind_counts = String::new();
+        for kind in ErrorKindLabel::VARIANTS {
+            error_kind_counts.push(',');
+            error_kind_counts.push_str(&self.errors_by_kind.count_for_kind(kind).to_string());
+        }
+        let (top_os_error, top_os_error_count) = self.errors_by_kind.top_os_error();
+        error_kind_counts.push(',');
+        error_kind_counts.push_str(&top_os_error.to_string());
+        error_kind_counts.push(',');
+        error_kind_counts.push_str(&top_os_error_count.to_string());
         format!(
-            "{},{},{},{},{},{},{},{:.6},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.6},{:.6},{:.3},{:.3},{:.3},{}",
+            "{},{},{},{},{},{},{},{:.6},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.6},{:.6},{:.3},{:.3},{:.3},{}{}",
             self.workload.name(),
             self.provider,
             self.durability,
@@ -522,12 +828,79 @@ impl BenchReport {
             nanos_to_micros(self.stream_barrier_wait_p50_nanos),
             nanos_to_micros(self.stream_barrier_wait_p99_nanos),
             nanos_to_micros(self.stream_barrier_wait_max_nanos),
-            self.stream_barrier_wait_samples
+            self.stream_barrier_wait_samples,
+            error_kind_counts
         )
+    }
+
+    /// One sidecar row per error group; empty on a clean run. The sidecar
+    /// file itself is written either way, so an absent file means the
+    /// instrumentation never ran rather than that the run was clean.
+    fn error_csv_rows(&self) -> Vec<String> {
+        self.errors_by_kind
+            .groups
+            .iter()
+            .map(|(key, group)| {
+                let kind = if key.overflow {
+                    format!("{}-overflow", key.kind.name())
+                } else {
+                    key.kind.name().to_string()
+                };
+                format!(
+                    "{},{},{},{},{},{},{},{},{},{},{}",
+                    self.workload.name(),
+                    self.provider,
+                    self.durability,
+                    self.rtt_us,
+                    self.serial_rtts,
+                    self.concurrency,
+                    self.op_size,
+                    kind,
+                    key.os_error
+                        .map(|code| code.to_string())
+                        .unwrap_or_default(),
+                    group.count,
+                    csv_quote(&group.first_sample)
+                )
+            })
+            .collect()
     }
 
     fn print_csv(&self) {
         println!("{}", self.csv_row());
+    }
+
+    /// Human-readable tally. Goes to stderr because stdout is captured as
+    /// CSV by the GCP harness (`remote_block_vs_rbd.sh` pipes it through
+    /// `tee .../stdout.csv`).
+    fn print_error_summary(&self) {
+        if self.errors_by_kind.groups.is_empty() {
+            return;
+        }
+        eprintln!(
+            "errors {} {} c{} op_size={}: {} total across {} kind(s)",
+            self.workload.name(),
+            self.provider,
+            self.concurrency,
+            self.op_size,
+            self.errors,
+            self.errors_by_kind.groups.len()
+        );
+        for (key, group) in &self.errors_by_kind.groups {
+            let errno = key
+                .os_error
+                .map(|code| format!(" os_error={code}"))
+                .unwrap_or_default();
+            let overflow = if key.overflow { "-overflow" } else { "" };
+            eprintln!(
+                "  {}{}{} count={} first={}",
+                key.kind.name(),
+                overflow,
+                errno,
+                group.count,
+                group.first_sample
+            );
+        }
     }
 }
 

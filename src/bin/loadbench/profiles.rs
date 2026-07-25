@@ -43,6 +43,34 @@ fn append_matrix_csv(args: &Args, report: &BenchReport) -> Result<()> {
     Ok(())
 }
 
+/// Path of the error sidecar for a given `--matrix-csv` target:
+/// `.../matrix.csv` becomes `.../matrix.errors.csv`.
+///
+/// Derived rather than flag-driven so the GCP harness collects it without
+/// any change to `infra/gcp-local-nvme-bench/*.sh`, and named so it does not
+/// match those scripts' `matrix.csv` globs.
+fn errors_csv_path(matrix_csv: &Path) -> PathBuf {
+    matrix_csv.with_extension("errors.csv")
+}
+
+/// Always writes the sidecar — header included — whenever `--matrix-csv` is
+/// set, even for a clean cell that contributes no rows. An absent file then
+/// unambiguously means the instrumentation never ran, rather than being
+/// indistinguishable from a run that saw no errors.
+fn append_errors_csv(args: &Args, report: &BenchReport) -> Result<()> {
+    let Some(matrix_csv) = &args.matrix_csv else {
+        return Ok(());
+    };
+    let mut file = open_csv_append(
+        &errors_csv_path(matrix_csv),
+        BenchReport::error_csv_header(),
+    )?;
+    for row in report.error_csv_rows() {
+        writeln!(file, "{row}").map_err(fs_error)?;
+    }
+    Ok(())
+}
+
 fn append_profile_csv(
     args: &Args,
     workload: Workload,
