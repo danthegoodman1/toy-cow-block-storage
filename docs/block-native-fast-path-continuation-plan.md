@@ -25,8 +25,8 @@ The 4k row above is the `stage6-filesystem-20260619-001` baseline and is now
 superseded for c32: Phase 3 closed with 4k c32 at 231.43 MBps, i.e. **1.15x**
 Ceph's 200.66 (was 0.82x), measured against Phase 2's close rather than
 against Ceph directly — a same-commit Ceph comparator re-measure is still
-owed before the headline claim ships. 4k c4 p99 remains a statistical tie
-with Ceph. See the Phase 3 closure note.
+owed before the headline claim ships (tracked in Owed Measurements below).
+4k c4 p99 remains a statistical tie with Ceph. See the Phase 3 closure note.
 
 The headline claim is the write matrix above. Reads are a first-class risk,
 not a footnote: the read path shares the block-journal overlay mutex with
@@ -78,6 +78,24 @@ measurements.
   toy and Ceph on identical disk layout, all five sizes recorded.
 - Lane and publish changes require failure-injection tests (append failure,
   sync failure, stale lease) and replay-equivalence tests.
+
+## Owed Measurements: The Next GCP Trip
+
+Three separate phases each owe a measurement, and by the batching principle
+above they are one trip, not three. Recorded here because the debt is
+cross-phase and was twice missed by being tracked only inside the phase that
+owed it — 4A and 8A were both written as "lands before Phase 2's GCP trip"
+and both were still missing when that trip ran.
+
+| Owed by | Item | Prerequisite | Why it is owed |
+| --- | --- | --- | --- |
+| Phase 3 (closed) | Same-commit Ceph comparator re-measure at 4k | none | Phase 3's 1.15x-Ceph claim is derived: 1.390x over Phase 2's close, multiplied against a June Ceph number. The headline claim must not ship on arithmetic across trips. |
+| Phase 8 | 8A read comparator cells (fio librbd `randread` vs toy `block-read-4k`/`block-read-1m`) | 8A harness work | Reads have never been compared against Ceph on GCP, and the Overarching Goal calls them a first-class risk. A read loss runs Phase 6 before Phase 8 ships. |
+| Phase 4 | Direct-I/O error-kind tally at 64k/256k c16/c32 | 4A errno plumbing | Decides whether Phase 4 is a root-cause phase or a deletion. |
+
+Sequencing consequence: 4A and 8A are both harness/instrumentation work with
+no dependency on each other, so they can land in parallel before the trip is
+booked. The trip itself should also carry anything else ready at that time.
 
 ## Phase 1: Foundation Audit
 
@@ -356,13 +374,18 @@ Root-cause the direct-I/O errors at 64k/256k c16/c32, then either make the
 backend a measured win or remove it.
 
 Scope:
-- 4A, landing before Phase 2's GCP trip: add error-kind tallies to loadbench
-  output (per workload/concurrency error kind counts plus a first-error
-  sample). Today `StorageError` carries no kind/errno — underlying
-  `io::Error`s are stringified into `Unavailable` and loadbench drops the
-  error entirely, keeping a bare `u64` count — so this includes plumbing
+- 4A, the phase's first move and a prerequisite for the next GCP trip: add
+  error-kind tallies to loadbench output (per workload/concurrency error kind
+  counts plus a first-error sample). Today `StorageError` carries no
+  kind/errno — underlying `io::Error`s are stringified into `Unavailable` and
+  loadbench drops the error entirely, keeping a bare `u64` count
+  (`src/bin/loadbench/report.rs:83`, and the CSV header at `report.rs:363`
+  has one undifferentiated `errors` column) — so this includes plumbing
   `io::ErrorKind`/errno through the error path (or at minimum sampling
-  first-error strings per worker).
+  first-error strings per worker). Ordering note: this item originally read
+  "lands before Phase 2's GCP trip"; that trip ran on 2026-07-23 without it
+  (see the Phase 2 gate row) and Phases 2 and 3 have both closed, so 4A is
+  simply owed to the next trip.
 - Leading hypothesis for 4B/4C: the direct-I/O write loop retries only
   unaligned short writes; every underlying `io::Error` (EAGAIN, EINVAL,
   ENOSPC) propagates immediately. O_DIRECT surfacing EAGAIN under queue
@@ -381,29 +404,52 @@ Scope:
   otherwise delete the backend and its selector plumbing. If kept, note the
   per-file mutex plus single scratch mmap serializes concurrent appends to
   one file; a scratch-buffer pool is part of making it a measured win.
+- The keep bar rose while this phase sat idle. Every direct-I/O number on
+  record (`stage6-direct-io-20260619-001` and the post-`22c269e` rerun) was
+  measured before Phase 2 and Phase 3, and the filesystem path has since
+  gained 4k c32 1.390x and 4k c4 1.180x over Phase 2's close. Direct-I/O has
+  never been measured with any of that work in it, and it is not frozen code
+  — `src/local/durable/io_backend.rs` was last touched by Phase 3's `8ba734b`.
+  So "beats the filesystem backend at equal concurrency" now means beating a
+  substantially faster opponent, and the comparison must be re-measured on a
+  current commit rather than read off the June directories.
+- Sequencing to keep this phase cheap: land 4A, take the tally on the next
+  bundled trip, and let the errno decide whether 4B/4C are worth building. If
+  the tally shows direct-I/O still erroring at 64k/256k while the filesystem
+  path is clean and faster, the remove decision is already justified and the
+  root-cause work is unnecessary — record the errno, delete the backend, and
+  close. Root-causing is worth spending only if the tally suggests a cheap fix
+  or if direct-I/O is competitive on the error-free cells.
 
 Out of scope:
 - io_uring, fixed buffers, polled I/O (only relevant after this gate).
 
 Completion gate:
-Zero errors across all comparator cells on GCP with direct-I/O, plus a
-recorded keep/remove decision backed by same-concurrency numbers. If removed,
-the backend code, flags, and docs are gone in the same change.
+Either (a) zero errors across all comparator cells on GCP with direct-I/O plus
+a keep decision backed by same-concurrency numbers against the current
+filesystem path, or (b) a recorded errno diagnosis plus a remove decision. The
+gate is the decision being evidence-backed, not the backend surviving. If
+removed, the backend code, flags, and docs are gone in the same change.
 
 Testing plan:
 - Regression test or harness case reproducing the failing high-concurrency
   shape locally on the loop-mounted filesystem.
-- Existing direct-I/O padding/replay/probe tests stay green if kept.
+- Existing direct-I/O padding/replay/probe tests stay green if kept. Note
+  these are conditional: `durable_direct_io_backend_pads_and_reopens_when_supported`
+  and its neighbours in `src/local/tests/mod.rs` (~4085-4250) skip their
+  assertions when the filesystem does not resolve to `DirectIo`, so on the dev
+  container's overlay filesystem they pass without exercising anything. Green
+  local tests are not evidence the backend works.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: loadbench error-kind tallies with errno/kind plumbed through `StorageError` | Missing: implementation in `src/bin/loadbench` and a column/summary in output; lands before Phase 2's GCP trip. |
+| Incomplete | Work | 4A: loadbench error-kind tallies with errno/kind plumbed through `StorageError` | Missing: implementation in `src/bin/loadbench` and a column/summary in output. Verified still missing 2026-07-25 (`report.rs:83` bare `u64`, single `errors` CSV column). Stale ordering ("before Phase 2's GCP trip") corrected: owed to the next trip. |
 | Incomplete | Work | 4B: local O_DIRECT reproduction on loop-mounted XFS | Missing: repro recipe and observed error kind/errno. |
 | Incomplete | Work | 4C: root-cause fix | Missing: diagnosis note and fix commit. Retry hardening `22c269e` did not reduce errors (rerun evidence in Phase 1). |
 | Incomplete | Gate | GCP re-verification with zero errors | Missing: results directory. |
-| Incomplete | Decision | Keep or remove the direct-I/O backend | Missing: same-concurrency comparison against filesystem backend after the fix. |
+| Incomplete | Decision | Keep or remove the direct-I/O backend | Missing: same-concurrency comparison against the filesystem backend **on a current commit**. All direct-I/O numbers on record predate Phases 2-3; the June comparison is no longer a valid input. Remove is a legitimate and cheap outcome — see the sequencing bullet in Scope. |
 
 ## Phase 5: Journal Replay And Fencing Hardening
 
@@ -550,8 +596,9 @@ Scope:
   pool size 1, environment recorded.
 - Read comparator cells: fio librbd `randread` vs toy `block-read-4k` and
   `block-read-1m` on the same disk layout, recording p50 and p99. The
-  harness work is tracked here as 8A but lands before Phase 2's bundled GCP
-  trip; Phase 8 re-runs reads on the final commit. Record whether 4K read
+  harness work is tracked here as 8A and is owed to the next GCP trip (it did
+  not land before Phase 2's, which ran without read cells); Phase 8 re-runs
+  reads on the final commit. Record whether 4K read
   p99 lands under 500us at c1/c4/c16, plus one mixed read-under-write-load
   cell if cheap in the harness (pure-read cells are the gate).
 - Update `docs/block-native-fast-path-plan.md` target-outcome status and the
@@ -577,7 +624,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 8A: read comparator cells in the GCP harness (lands before Phase 2's GCP trip) | Missing: `randread`/`block-read` support in `infra/gcp-local-nvme-bench/remote_block_vs_rbd.sh` and summary plumbing. |
+| Incomplete | Work | 8A: read comparator cells in the GCP harness (owed to the next GCP trip) | Missing: `randread`/`block-read` support in `infra/gcp-local-nvme-bench/remote_block_vs_rbd.sh` and summary plumbing. Did not land before Phase 2's trip as originally planned. |
 | Incomplete | Gate | Full five-size write matrix win with margins | Missing: results directory and `relative-summary.csv` meeting the gate. |
 | Incomplete | Gate | Read p99 comparison recorded, including the sub-500us check | Missing: read rows in the results summary. |
 | Incomplete | Doc | Plan and design doc updated with the final snapshot | Missing: doc updates on the commit under test. |
